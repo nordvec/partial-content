@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.0.1 (2026-07-06)
+
+Docs-only release, no code changes.
+
+- README restructured around evaluation flow: quick starts, comparison, and design summary up front.
+- Deep-dives moved into the shipped `docs/` folder: full API reference (`docs/API.md`), framework/kernel recipes (`docs/EXAMPLES.md`), and the complete benchmark methodology (`docs/BENCHMARKS.md`).
+- The npm tarball now includes the whole `docs/` folder (previously only `DESIGN.md`).
+
 ## 1.0.0 (2026-07-06)
 
 Initial public release. Zero-dependency, ESM-only HTTP file-serving protocol layer for any storage backend.
