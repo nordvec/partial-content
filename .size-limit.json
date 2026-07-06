@@ -1,0 +1,182 @@
+[
+  {
+    "name": "kernel (.)",
+    "path": "dist/index.js",
+    "limit": "5 kB",
+    "ignore": [
+      "node:fs/promises",
+      "node:path",
+      "node:stream",
+      "node:buffer",
+      "node:crypto",
+      "node:os",
+      "node:http",
+      "node:events"
+    ]
+  },
+  {
+    "name": "/web",
+    "path": "dist/web.js",
+    "limit": "7.5 kB",
+    "ignore": [
+      "node:fs/promises",
+      "node:path",
+      "node:stream",
+      "node:buffer",
+      "node:crypto",
+      "node:os",
+      "node:http",
+      "node:events"
+    ]
+  },
+  {
+    "name": "/node",
+    "path": "dist/node.js",
+    "limit": "8 kB",
+    "ignore": [
+      "node:fs/promises",
+      "node:path",
+      "node:stream",
+      "node:buffer",
+      "node:crypto",
+      "node:os",
+      "node:http",
+      "node:events"
+    ]
+  },
+  {
+    "name": "/hono",
+    "path": "dist/hono.js",
+    "limit": "7.5 kB",
+    "ignore": [
+      "node:fs/promises",
+      "node:path",
+      "node:stream",
+      "node:buffer",
+      "node:crypto",
+      "node:os",
+      "node:http",
+      "node:events"
+    ]
+  },
+  {
+    "name": "/s3",
+    "path": "dist/s3.js",
+    "limit": "3.5 kB",
+    "ignore": [
+      "node:fs/promises",
+      "node:path",
+      "node:stream",
+      "node:buffer",
+      "node:crypto",
+      "node:os",
+      "node:http",
+      "node:events"
+    ]
+  },
+  {
+    "name": "/r2",
+    "path": "dist/r2.js",
+    "limit": "1 kB",
+    "ignore": [
+      "node:fs/promises",
+      "node:path",
+      "node:stream",
+      "node:buffer",
+      "node:crypto",
+      "node:os",
+      "node:http",
+      "node:events"
+    ]
+  },
+  {
+    "name": "/gcs",
+    "path": "dist/gcs.js",
+    "limit": "2 kB",
+    "ignore": [
+      "node:fs/promises",
+      "node:path",
+      "node:stream",
+      "node:buffer",
+      "node:crypto",
+      "node:os",
+      "node:http",
+      "node:events"
+    ]
+  },
+  {
+    "name": "/azure",
+    "path": "dist/azure.js",
+    "limit": "2.25 kB",
+    "ignore": [
+      "node:fs/promises",
+      "node:path",
+      "node:stream",
+      "node:buffer",
+      "node:crypto",
+      "node:os",
+      "node:http",
+      "node:events"
+    ]
+  },
+  {
+    "name": "/fs",
+    "path": "dist/fs.js",
+    "limit": "2.25 kB",
+    "ignore": [
+      "node:fs/promises",
+      "node:path",
+      "node:stream",
+      "node:buffer",
+      "node:crypto",
+      "node:os",
+      "node:http",
+      "node:events"
+    ]
+  },
+  {
+    "name": "/http",
+    "path": "dist/http.js",
+    "limit": "2 kB",
+    "ignore": [
+      "node:fs/promises",
+      "node:path",
+      "node:stream",
+      "node:buffer",
+      "node:crypto",
+      "node:os",
+      "node:http",
+      "node:events"
+    ]
+  },
+  {
+    "name": "/memory",
+    "path": "dist/memory.js",
+    "limit": "0.75 kB",
+    "ignore": [
+      "node:fs/promises",
+      "node:path",
+      "node:stream",
+      "node:buffer",
+      "node:crypto",
+      "node:os",
+      "node:http",
+      "node:events"
+    ]
+  },
+  {
+    "name": "/mime",
+    "path": "dist/mime.js",
+    "limit": "0.75 kB",
+    "ignore": [
+      "node:fs/promises",
+      "node:path",
+      "node:stream",
+      "node:buffer",
+      "node:crypto",
+      "node:os",
+      "node:http",
+      "node:events"
+    ]
+  }
+]

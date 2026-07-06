@@ -130,7 +130,8 @@
     "smoke": "npm run build && node smoke/smoke.mjs",
     "check:exports": "npm run build && attw --pack . --profile esm-only",
     "check:consumer-types": "npm run build && tsc --noEmit -p smoke/tsconfig.consumer.json",
-    "test:live": "bun test src/__tests__/s3-live.test.ts"
+    "test:live": "bun test src/__tests__/s3-live.test.ts",
+    "size": "size-limit"
   },
   "license": "MIT",
   "author": "Nordvec <oss@nordvec.com>",
@@ -171,12 +172,14 @@
     "@arethetypeswrong/cli": "^0.18.4",
     "@aws-sdk/client-s3": "^3.1075.0",
     "@aws-sdk/s3-request-presigner": "^3.1075.0",
+    "@size-limit/preset-small-lib": "^12.1.0",
     "@stryker-mutator/core": "^9.6.1",
     "@types/node": "^26.1.0",
     "autocannon": "^8.0.0",
     "fast-check": "^4.8.0",
     "send": "^1.2.1",
     "sirv": "^3.0.2",
+    "size-limit": "^12.1.0",
     "typescript": "^6.0.3"
   }
 }

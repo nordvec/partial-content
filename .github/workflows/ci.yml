@@ -39,6 +39,10 @@ jobs:
       # exports map + .d.ts resolve for ESM/bundler consumers under NodeNext.
       - name: Check exports resolve for consumers (attw)
         run: bunx attw --pack . --profile esm-only
+      # Size budgets per export (.size-limit.json): keeps the "tiny, zero-dep"
+      # claim enforced instead of asserted; fails when an entry outgrows its limit.
+      - name: Check size budgets (size-limit)
+        run: bun run size
       # Consumer type-resolution under `lib: ["DOM"]` (Next.js/SvelteKit/Remix):
       # body types must stay `new Response(...)`-assignable.
       - name: Check consumer types compile under DOM lib
