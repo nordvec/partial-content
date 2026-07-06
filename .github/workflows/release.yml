@@ -37,7 +37,8 @@ jobs:
           node-version: 24
           registry-url: https://registry.npmjs.org
 
-      # npm runs prepublishOnly first: clean rebuild + tarball-content guard.
+      # Tokenless: npm authenticates via the Trusted Publisher (OIDC) configured
+      # on npmjs.com for this repo + workflow. Requires npm >= 11.5 (Node 24
+      # bundles it) and the id-token: write permission above. npm runs
+      # prepublishOnly first: clean rebuild + tarball-content guard.
       - run: npm publish --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
