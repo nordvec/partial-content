@@ -1,0 +1,182 @@
+{
+  "name": "partial-content",
+  "version": "1.0.0",
+  "description": "RFC-compliant HTTP file serving for any storage backend. Range requests (206), conditional caching (304/412), Content-Disposition, and ETag generation. Zero dependencies.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./s3": {
+      "types": "./dist/s3.d.ts",
+      "import": "./dist/s3.js",
+      "default": "./dist/s3.js"
+    },
+    "./web": {
+      "types": "./dist/web.d.ts",
+      "import": "./dist/web.js",
+      "default": "./dist/web.js"
+    },
+    "./fs": {
+      "types": "./dist/fs.d.ts",
+      "import": "./dist/fs.js",
+      "default": "./dist/fs.js"
+    },
+    "./node": {
+      "types": "./dist/node.d.ts",
+      "import": "./dist/node.js",
+      "default": "./dist/node.js"
+    },
+    "./hono": {
+      "types": "./dist/hono.d.ts",
+      "import": "./dist/hono.js",
+      "default": "./dist/hono.js"
+    },
+    "./gcs": {
+      "types": "./dist/gcs.d.ts",
+      "import": "./dist/gcs.js",
+      "default": "./dist/gcs.js"
+    },
+    "./azure": {
+      "types": "./dist/azure.d.ts",
+      "import": "./dist/azure.js",
+      "default": "./dist/azure.js"
+    },
+    "./r2": {
+      "types": "./dist/r2.d.ts",
+      "import": "./dist/r2.js",
+      "default": "./dist/r2.js"
+    },
+    "./mime": {
+      "types": "./dist/mime.d.ts",
+      "import": "./dist/mime.js",
+      "default": "./dist/mime.js"
+    },
+    "./http": {
+      "types": "./dist/http.d.ts",
+      "import": "./dist/http.js",
+      "default": "./dist/http.js"
+    },
+    "./memory": {
+      "types": "./dist/memory.d.ts",
+      "import": "./dist/memory.js",
+      "default": "./dist/memory.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "src",
+    "!src/__tests__",
+    "README.md",
+    "docs/DESIGN.md",
+    "CHANGELOG.md",
+    "SECURITY.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org",
+    "access": "public"
+  },
+  "sideEffects": false,
+  "keywords": [
+    "http",
+    "range-request",
+    "partial-content",
+    "byte-range",
+    "206",
+    "304",
+    "412",
+    "416",
+    "conditional-request",
+    "content-disposition",
+    "etag",
+    "etag-generation",
+    "s3",
+    "r2",
+    "gcs",
+    "azure-blob",
+    "object-storage",
+    "supabase-storage",
+    "presigned-url",
+    "hetzner",
+    "streaming",
+    "video-seeking",
+    "pdf",
+    "resume-download",
+    "file-serving",
+    "optimistic-concurrency",
+    "cloudflare-workers",
+    "bun",
+    "deno",
+    "hono",
+    "nextjs",
+    "express",
+    "fastify"
+  ],
+  "scripts": {
+    "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc",
+    "prepare": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc",
+    "test": "bun test --isolate --timeout 30000",
+    "test:mutation": "stryker run",
+    "test:mutation:ci": "node scripts/mutation-ci.mjs",
+    "prepublishOnly": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc && node -e \"const t=require('child_process').execSync('npm pack --dry-run --json',{encoding:'utf8'});const f=JSON.parse(t)[0].files.map(f=>f.path);const bad=f.filter(p=>/\\.(map|env|test|spec)/.test(p)&&!p.endsWith('.d.ts.map')&&!p.endsWith('.js.map'));if(bad.length){console.error('BLOCKED: tarball contains suspicious files:',bad);process.exit(1)}\"",
+    "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
+    "bench": "npm run build && node bench/run.mjs",
+    "smoke": "npm run build && node smoke/smoke.mjs",
+    "check:exports": "npm run build && attw --pack . --profile esm-only",
+    "check:consumer-types": "npm run build && tsc --noEmit -p smoke/tsconfig.consumer.json",
+    "test:live": "bun test src/__tests__/s3-live.test.ts"
+  },
+  "license": "MIT",
+  "author": "Nordvec <oss@nordvec.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nordvec/partial-content.git"
+  },
+  "bugs": "https://github.com/nordvec/partial-content/issues",
+  "homepage": "https://github.com/nordvec/partial-content#readme",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "peerDependencies": {
+    "@aws-sdk/client-s3": "^3.400.0",
+    "@aws-sdk/s3-request-presigner": "^3.400.0",
+    "@google-cloud/storage": "^7.0.0",
+    "@azure/storage-blob": "^12.0.0",
+    "hono": "^4.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@aws-sdk/client-s3": {
+      "optional": true
+    },
+    "@aws-sdk/s3-request-presigner": {
+      "optional": true
+    },
+    "@google-cloud/storage": {
+      "optional": true
+    },
+    "@azure/storage-blob": {
+      "optional": true
+    },
+    "hono": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@arethetypeswrong/cli": "^0.18.4",
+    "@aws-sdk/client-s3": "^3.1075.0",
+    "@aws-sdk/s3-request-presigner": "^3.1075.0",
+    "@stryker-mutator/core": "^9.6.1",
+    "@types/node": "^26.1.0",
+    "autocannon": "^8.0.0",
+    "fast-check": "^4.8.0",
+    "send": "^1.2.1",
+    "sirv": "^3.0.2",
+    "typescript": "^6.0.3"
+  }
+}

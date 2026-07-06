@@ -1,0 +1,20 @@
+name: mutation
+
+# Nightly mutation-score floors (scripts/mutation-ci.mjs owns the per-module
+# floors). Catches a change that guts a module's tests without breaking them.
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+jobs:
+  floors:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - run: bun install --frozen-lockfile
+      - run: node scripts/mutation-ci.mjs

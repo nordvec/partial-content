@@ -1,0 +1,54 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: unit tests (bun)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - run: bun install --frozen-lockfile
+      - run: bun test --isolate --timeout 30000
+
+  cross-runtime:
+    name: build once, smoke on Node + Bun + Deno
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - run: bun install --frozen-lockfile
+      # Build the shipped artifact once; every runtime smoke-tests the same dist/.
+      - name: Build dist
+        run: bun run build
+      # Consumer type-resolution guard: packs the package and verifies the
+      # exports map + .d.ts resolve for ESM/bundler consumers under NodeNext.
+      - name: Check exports resolve for consumers (attw)
+        run: bunx attw --pack . --profile esm-only
+      # Consumer type-resolution under `lib: ["DOM"]` (Next.js/SvelteKit/Remix):
+      # body types must stay `new Response(...)`-assignable.
+      - name: Check consumer types compile under DOM lib
+        run: bunx tsc --noEmit -p smoke/tsconfig.consumer.json
+      - name: Smoke on Node (runner built-in)
+        run: node smoke/smoke.mjs
+      - name: Smoke on Bun
+        run: bun smoke/smoke.mjs
+      # Deno via npm (no third-party action to pin); --allow-read for the dist import.
+      - name: Install Deno
+        run: npm install -g deno@2
+      - name: Smoke on Deno
+        run: deno run --allow-read smoke/smoke.mjs
