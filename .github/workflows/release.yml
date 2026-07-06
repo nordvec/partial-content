@@ -8,7 +8,7 @@ on:
     tags: ["v*"]
 
 permissions:
-  contents: read
+  contents: write # create the GitHub Release after a successful publish
   id-token: write # npm --provenance (Sigstore attestation via OIDC)
 
 jobs:
@@ -42,3 +42,10 @@ jobs:
       # bundles it) and the id-token: write permission above. npm runs
       # prepublishOnly first: clean rebuild + tarball-content guard.
       - run: npm publish --provenance --access public
+
+      # Only after a successful publish: the GitHub Release for the sidebar,
+      # with notes generated from the commits since the previous tag.
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes
