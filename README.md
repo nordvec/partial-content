@@ -145,7 +145,7 @@ const { stream } = range
 return new Response(stream, { status, headers });
 ```
 
-More recipes in **[docs/EXAMPLES.md](docs/EXAMPLES.md)**: Hono, Cloudflare Workers (R2 native), kernel-only Express, Content-Disposition, Repr-Digest, and the manual step-by-step primitives.
+More recipes in **[docs/EXAMPLES.md](docs/EXAMPLES.md)**: Hono, Cloudflare Workers (R2 native), kernel-only Express, Content-Disposition, Repr-Digest, and the manual step-by-step primitives. Coming from `send` or `sirv`? **[docs/MIGRATION.md](docs/MIGRATION.md)** maps every option and event, and is honest about what has no equivalent.
 
 ## Real-world example: authorized proxy from object storage
 
