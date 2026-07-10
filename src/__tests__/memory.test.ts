@@ -109,3 +109,20 @@ describe("memoryStore", () => {
         expect(await drain(after.body)).toBe("version-two!");
     });
 });
+
+describe("memoryStore contract edges", () => {
+    test("range start beyond EOF throws a loud RangeError (direct-caller contract)", async () => {
+        const store = memoryStore({ objects: { k: { body: "hello" } } });
+        await expect(
+            store.getObject("k", { range: { start: 10, end: 20 } }),
+        ).rejects.toThrow(RangeError);
+    });
+
+    test("range end beyond EOF is clamped and the SERVED bounds are reported", async () => {
+        const store = memoryStore({ objects: { k: { body: "hello" } } });
+        const res = await store.getObject("k", { range: { start: 2, end: 999 } });
+        expect(res.range).toEqual({ start: 2, end: 4 });
+        expect(res.contentLength).toBe(3);
+        expect(res.totalSize).toBe(5);
+    });
+});

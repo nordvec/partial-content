@@ -17,11 +17,13 @@
  * import { s3Store } from "partial-content/s3";
  *
  * const store = s3Store({ client, bucket: "documents" });
+ * const handler = serveObject(store, { disposition: "inline" });
  *
- * export const GET = serveObject(store, {
- *   key: (req) => req.url.split("/").pop()!,
- *   disposition: "inline",
- * });
+ * // The handler takes (request, context): the caller resolves the storage
+ * // key (and optional mime/filename) and passes them as the ServeContext.
+ * export async function GET(req: Request) {
+ *   return handler(req, { key: new URL(req.url).pathname.slice(1) });
+ * }
  * export const HEAD = GET;
  * ```
  *
@@ -34,6 +36,7 @@ import {
   buildContentDisposition,
   generateETag,
   clientWantsDigest,
+  clientWantsContentDigest,
   sanitizeHeaderValue,
   isRangeFresh,
   parseRanges,
@@ -106,7 +109,12 @@ export interface ServeContext {
   key: string;
   /** Override MIME type. When omitted, defaults to "application/octet-stream". */
   mime?: string;
-  /** Filename for Content-Disposition. When omitted, no disposition header is set. */
+  /**
+   * Filename for Content-Disposition. When provided, the header carries the
+   * sanitized `filename`/`filename*` parameters; when omitted, a bare
+   * `Content-Disposition: attachment` (or `inline`) is still set so the
+   * download/preview intent always reaches the browser.
+   */
   filename?: string;
   /**
    * Per-request Cache-Control, overriding {@link ServeObjectOptions.cacheControl}.
@@ -144,13 +152,34 @@ export interface ServeObjectOptions {
   immutable?: boolean;
 
   /**
-   * Security headers applied to every response that carries a body (200, 206).
+   * Extra headers applied to success responses: 200, 206, and 304.
    * Receives the MIME type so the policy can vary per format (e.g. relaxed
    * CSP for PDF.js, strict sandbox for images).
    *
-   * @default No extra security headers.
+   * Included on 304 deliberately: RFC 9110 Section 15.4.5 requires a 304 to
+   * carry any `Vary` (and `Cache-Control`/`Expires`/`Content-Location`) that
+   * the corresponding 200 would have carried, and this option is the
+   * mechanism for `Vary`. Security headers riding along on a bodyless 304
+   * are harmless.
+   *
+   * @default No extra headers.
    */
   securityHeaders?: (mime: string) => Record<string, string>;
+
+  /**
+   * Emit validators (`ETag`) derived from store metadata. Set `false` for
+   * deployments where the derived validator is unstable and would poison
+   * revalidation instead of helping it -- the classic case is a
+   * filesystem store replicated across servers whose file mtimes differ
+   * per replica, so each node computes a different weak ETag for identical
+   * bytes and every `If-None-Match` misses. `Last-Modified` (and
+   * `If-Modified-Since`/`If-Range` date handling) is unaffected. Disabling
+   * ETags also disables the ETag-based HEAD-to-GET drift guard on stores
+   * that cannot pin reads; the Last-Modified comparison remains.
+   *
+   * @default true
+   */
+  etag?: boolean;
 
   /**
    * Cross-Origin-Resource-Policy value for success responses.
@@ -214,10 +243,12 @@ export interface ServeObjectOptions {
    *
    * @param error - The original error from the storage backend
    * @param context - Additional context about the failed operation
-   * (`audit` = the consumer's own onServe hook threw; the response was
-   * still served, the hook failure is surfaced here instead of crashing).
+   * (`audit` = the consumer's own onServe/onTransfer hook threw; the
+   * response was still served, the hook failure is surfaced here instead
+   * of crashing. `context` = a consumer-supplied key/mime/filename
+   * extractor threw in a server adapter; the request became a 500).
    */
-  onError?: (error: unknown, context: { key: string; operation: "head" | "get" | "audit" }) => void;
+  onError?: (error: unknown, context: { key: string; operation: "head" | "get" | "audit" | "context" }) => void;
 
   /**
    * Audit callback for compliance logging (SOC 2 CC7.2, ISO 27001 A.8.15).
@@ -426,6 +457,7 @@ export function serveObjectRaw(
     disposition: dispositionOpt = "attachment",
     cacheControl: rawCacheControl = "private, no-cache",
     immutable: immutableOpt = false,
+    etag: etagEnabled = true,
     securityHeaders,
     crossOriginResourcePolicy,
     timingAllowOrigin,
@@ -477,14 +509,27 @@ export function serveObjectRaw(
     ctx: ServeContext,
   ): Promise<RawResponseParts> {
     // Method validation: only GET and HEAD are valid for file serving.
-    // Other methods get 405 with Allow header per RFC 9110 Section 15.5.6.
+    // OPTIONS gets its standard method-discovery answer (204 + Allow, no
+    // Content-Length per RFC 9110 Section 8.6); everything else gets 405
+    // with Allow per RFC 9110 Section 15.5.6.
     const method = req.method;
+    if (method === "OPTIONS") {
+      return {
+        status: 204,
+        statusText: "No Content",
+        headers: {
+          Allow: "GET, HEAD, OPTIONS",
+          "Cache-Control": "no-store",
+        },
+        body: null,
+      };
+    }
     if (method !== "GET" && method !== "HEAD") {
       return {
         status: 405,
         statusText: "Method Not Allowed",
         headers: {
-          Allow: "GET, HEAD",
+          Allow: "GET, HEAD, OPTIONS",
           "Content-Length": "0",
           "Cache-Control": "no-store",
           "Content-Security-Policy": "default-src 'none'",
@@ -502,11 +547,16 @@ export function serveObjectRaw(
     const dispositionType = typeof dispositionOpt === "function"
       ? dispositionOpt(mime)
       : dispositionOpt;
+    // Coerce on BOTH paths. A JS caller's disposition extractor can return an
+    // arbitrary computed string; with a filename, buildContentDisposition
+    // coerces it, but without one the value would previously reach the header
+    // verbatim. Anything but "inline" is "attachment", the safe default.
+    const safeDisposition = dispositionType === "inline" ? "inline" : "attachment";
     const disposition = ctx.filename
-      ? buildContentDisposition(ctx.filename, { type: dispositionType, fallback: fallbackFilename })
-      : dispositionType;
+      ? buildContentDisposition(ctx.filename, { type: safeDisposition, fallback: fallbackFilename })
+      : safeDisposition;
 
-    // Extra security headers for body responses
+    // Extra caller headers for success responses (200/206/304)
     const extraHeaders = securityHeaders ? securityHeaders(mime) : {};
 
     // Response-building context shared by all response paths
@@ -515,39 +565,65 @@ export function serveObjectRaw(
       cacheControl: ctx.cacheControl ?? cacheControl,
       crossOriginResourcePolicy, timingAllowOrigin, enforceCharset,
       digestWanted: clientWantsDigest(req.headers),
+      contentDigestWanted: clientWantsContentDigest(req.headers),
+      emitETag: etagEnabled,
+      isHead,
+      // A range-incapable store is served rangeless: advertise it.
+      acceptRanges: store.supportsRange === false ? "none" : "bytes",
     };
 
-    // ── Signed-URL fallback for backends that cannot stream ranges ───────
-    if (store.supportsRange === false) {
-      if (store.createSignedUrl) {
-        const result = await store.createSignedUrl(key, {
+    // ── Range-incapable stores: signed-URL redirect when available ───────
+    if (store.supportsRange === false && store.createSignedUrl) {
+      let result: Awaited<ReturnType<NonNullable<ObjectStore["createSignedUrl"]>>>;
+      try {
+        result = await store.createSignedUrl(key, {
           expiresInSeconds: 60,
           downloadFilename: ctx.filename,
         });
-        if ("url" in result) {
-          // A signed-URL redirect grants file access: audit it like a serve.
-          onServe?.({ key, method: isHead ? "HEAD" : "GET", status: 302, mime, bytesServed: 0 });
-          return {
-            status: 302,
-            statusText: "Found",
-            headers: {
-              // The signed URL is backend-derived: sanitize it like every
-              // other metadata-sourced header so a malformed provider
-              // response cannot inject a header or crash the writer.
-              Location: sanitizeHeaderValue(result.url),
-              "Cache-Control": "no-store, no-cache",
-              "Accept-Ranges": "none",
-              "Content-Length": "0",
-            },
-            body: null,
-          };
-        }
+      } catch (err) {
+        // Never-throw contract: a rejecting signed-URL provider becomes a
+        // reported 502, never an escaped rejection (which crashes Express 4).
+        onError?.(err, { key, operation: "get" });
+        return plainTextError(502, "Bad Gateway", "Storage backend error");
       }
-      return plainTextError(502, "Bad Gateway", "Storage backend does not support streaming");
+      if ("url" in result) {
+        // A signed-URL redirect grants file access: audit it like a serve.
+        onServe?.({ key, method: isHead ? "HEAD" : "GET", status: 302, mime, bytesServed: 0 });
+        return {
+          status: 302,
+          statusText: "Found",
+          headers: {
+            // The signed URL is backend-derived: sanitize it like every
+            // other metadata-sourced header so a malformed provider
+            // response cannot inject a header or crash the writer.
+            Location: sanitizeHeaderValue(result.url),
+            "Cache-Control": "no-store, no-cache",
+            "Accept-Ranges": "none",
+            "Content-Length": "0",
+          },
+          body: null,
+        };
+      }
+      // The provider declined ({ ok: false }): surface the reason to the
+      // consumer's telemetry (it never reaches the client) and answer an
+      // honest 502.
+      onError?.(
+        new Error(`createSignedUrl declined for ${key}: ${result.error}`),
+        { key, operation: "get" },
+      );
+      return plainTextError(502, "Bad Gateway", "Storage backend error");
     }
+    // supportsRange === false with no signed-URL path: serve the FULL
+    // representation through the origin instead of failing. Range and
+    // If-Range read as absent below (RFC 9110 Section 14.2 lets a server
+    // ignore Range), and every success response advertises
+    // `Accept-Ranges: none` (rctx.acceptRanges) so clients stop asking.
+    // Conditionals (304/412) still evaluate: they need no byte seeking.
 
     // ── Detect request characteristics ──────────────────────────────────
-    const headers = req.headers;
+    const headers = store.supportsRange === false
+      ? withoutRangeHeaders(req.headers)
+      : req.headers;
     const hasConditional = Boolean(
       headers.get("if-none-match") || headers.get("if-modified-since")
       || headers.get("if-match") || headers.get("if-unmodified-since"),
@@ -634,24 +710,24 @@ export function serveObjectRaw(
         return storeErrorResponse(err);
       }
       const storeMs = timingEnabled ? performance.now() - t0 : 0;
-      const etag = deriveETag(meta);
+      const etag = etagEnabled ? deriveETag(meta) : undefined;
 
       // RFC 7232/7233 full evaluation chain. Conditionals apply to HEAD
       // exactly as to GET (RFC 9110 Section 13.1) -- a conditional HEAD must
       // still yield 304/412. Range, however, is only defined for GET
-      // (RFC 9110 Section 14.2), so it is masked out for HEAD requests.
-      const evalHeaders = isHead ? withoutRangeHeaders(headers) : headers;
+      // (RFC 9110 Section 14.2): the kernel ignores it (and If-Range, and
+      // suppresses Content-Digest) when told the method is HEAD.
       const t1 = timingEnabled ? performance.now() : 0;
       let evaluation: ReturnType<typeof evaluateConditionalRequest>;
       try {
-        evaluation = evaluateConditionalRequest(evalHeaders, {
+        evaluation = evaluateConditionalRequest(headers, {
           totalSize: meta.contentLength,
           contentType: mime,
           etag,
           lastModified: meta.lastModified,
           cacheControl: rctx.cacheControl,
           digest: meta.digest,
-        });
+        }, { method: isHead ? "HEAD" : "GET" });
       } catch (err) {
         // The kernel rejects corrupt store metadata (NaN/negative sizes)
         // with a RangeError. That is an adapter bug, but a handler must
@@ -668,7 +744,11 @@ export function serveObjectRaw(
         return {
           status: 304,
           statusText: STATUS_TEXT[304],
-          headers: evaluation.headers,
+          // Caller extraHeaders ride the 304: RFC 9110 Section 15.4.5
+          // requires any Vary (and Cache-Control/Expires) that the 200
+          // would have carried to be generated on the 304 too, and
+          // securityHeaders is the mechanism that adds Vary to the 200.
+          headers: { ...evaluation.headers, ...rctx.extraHeaders },
           body: null,
         };
       }
@@ -753,8 +833,12 @@ export function serveObjectRaw(
             }
             return await serveMultipart({
               store, key, ranges: set.ranges, totalSize: meta.contentLength,
-              mime, etag, lastModified: meta.lastModified, digest: meta.digest,
+              mime, etag, lastModified: meta.lastModified,
+              // Same RFC 9530 Section 4 negotiation as every other path: a
+              // client that declined sha-256 gets no digest on multipart.
+              digest: rctx.digestWanted ? meta.digest : undefined,
               ifMatch: pinEtag, pin: meta.pin, ctx: rctx, signal: req.signal,
+              timingCtx: timingEnabled ? { storeMs, evaluateMs, onTiming } : undefined,
               onError, auditCtx: onServe ? { onServe, mime } : undefined, onTransfer,
             });
           } catch (err) {
@@ -814,9 +898,10 @@ export function serveObjectRaw(
 /**
  * Wrap a headers view so Range and If-Range read as absent.
  *
- * Used for HEAD requests: RFC 9110 Section 14.2 defines range handling only
- * for GET, so the evaluation chain must not see the Range header (a 206 or
- * 416 for HEAD would be wrong), while conditionals still apply.
+ * Used for range-incapable stores (`supportsRange: false` without a
+ * signed-URL path): RFC 9110 Section 14.2 lets a server ignore Range, so
+ * the whole pipeline serves the full representation while conditionals
+ * still apply. (HEAD needs no masking -- the kernel is method-aware.)
  */
 function withoutRangeHeaders(
   headers: { get(name: string): string | null },
@@ -866,8 +951,16 @@ interface ResponseContext {
   readonly crossOriginResourcePolicy?: string;
   readonly timingAllowOrigin?: string;
   readonly enforceCharset: boolean;
-  /** RFC 9530 Section 4: whether the client's Want-* headers accept sha-256. */
+  /** RFC 9530 Section 4: does Want-Repr-Digest accept sha-256? */
   readonly digestWanted: boolean;
+  /** RFC 9530 Section 4: does Want-Content-Digest accept sha-256? */
+  readonly contentDigestWanted: boolean;
+  /** Emit derived ETags (ServeObjectOptions.etag). */
+  readonly emitETag: boolean;
+  /** HEAD request: Content-Digest must not assert the representation hash. */
+  readonly isHead: boolean;
+  /** "none" for range-incapable stores served rangeless. */
+  readonly acceptRanges: "bytes" | "none";
 }
 
 /** Protocol metadata for building response headers. */
@@ -943,8 +1036,15 @@ function buildHeaders(
     // an algorithm list without sha-256 means "do not send"; honoring that
     // here keeps adapter responses consistent with the kernel orchestrator.
     digest: ctx.digestWanted ? meta.digest : undefined,
+    // Content-Digest requires an actual full body: never on HEAD (empty
+    // message content, RFC 9530 Appendix B.2), never when the client
+    // declined it via Want-Content-Digest.
+    contentDigest: !ctx.isHead && ctx.contentDigestWanted,
     cacheControl: ctx.cacheControl,
   });
+  // Range-incapable stores advertise honestly instead of inviting 206s
+  // the pipeline will never grant.
+  if (ctx.acceptRanges === "none") protocol["Accept-Ranges"] = "none";
 
   const headers = applyAdapterHeaders(protocol, ctx);
   if (meta.serverTiming) headers["Server-Timing"] = meta.serverTiming;
@@ -1048,11 +1148,14 @@ async function streamFromStore(opts: StreamOpts): Promise<RawResponseParts> {
   // backend hash when present, weak from size + mtime otherwise. This keeps
   // validators consistent between Path A (HEAD-derived) and Path C (GET-only),
   // so plain 200s from hash-less stores (fs) still carry a revalidator.
-  const finalEtag = generateETag({
-    hash: result.etag,
-    size: result.totalSize,
-    mtime: result.lastModified,
-  }) ?? headEtag;
+  const getEtag = ctx.emitETag
+    ? generateETag({
+        hash: result.etag,
+        size: result.totalSize,
+        mtime: result.lastModified,
+      })
+    : undefined;
+  const finalEtag = ctx.emitETag ? getEtag ?? headEtag : undefined;
   const finalLastModified = result.lastModified ?? headLastModified;
   const finalDigest = result.digest ?? reprDigest;
 
@@ -1095,6 +1198,30 @@ async function streamFromStore(opts: StreamOpts): Promise<RawResponseParts> {
     onError?.(err, { key, operation: "get" });
     cancelBody(result.body);
     return storeErrorResponse(err);
+  }
+  // A partial body must come from the representation the conditionals and
+  // If-Range were just evaluated against. Pinning stores guarantee that
+  // natively (ifMatch/pin); on stores that cannot pin (fs, an origin that
+  // ignores If-Match), the object may change between the validating HEAD
+  // and this GET. Comparing the GET's own validators against the HEAD's
+  // catches the swap: the throw reuses the caller's one-shot re-validation,
+  // so a stale If-Range then correctly yields a full 200 of the new bytes
+  // instead of splicing them into the client's cached copy. Full responses
+  // are exempt -- a 200 self-describes with its own validators. ETags are
+  // compared only at equal strength: a store that hands a hash-derived
+  // (strong) ETag to HEAD but only size+mtime (weak) to GET would otherwise
+  // always mismatch; those fall back to the Last-Modified comparison.
+  const etagsComparable = !!headEtag && !!getEtag
+    && headEtag.startsWith("W/") === getEtag.startsWith("W/");
+  if (
+    actualRange
+    && !sameRepresentation(
+      { etag: etagsComparable ? headEtag : undefined, lastModified: headLastModified },
+      { etag: etagsComparable ? getEtag : undefined, lastModified: result.lastModified },
+    )
+  ) {
+    cancelBody(result.body);
+    throw new ObjectChangedError(key);
   }
   const isPartial = actualRange !== null;
   const status = isPartial ? 206 : 200;
@@ -1175,6 +1302,8 @@ interface MultipartOpts {
   ctx: ResponseContext;
   signal?: AbortSignal;
   onError?: (error: unknown, context: { key: string; operation: "head" | "get" }) => void;
+  /** Timing context: measures the eagerly-fetched first part (lazy parts settle after headers). */
+  timingCtx?: TimingContext;
   auditCtx?: AuditContext;
   onTransfer?: (event: TransferEvent) => void;
 }
@@ -1196,7 +1325,7 @@ interface MultipartOpts {
 async function serveMultipart(opts: MultipartOpts): Promise<RawResponseParts> {
   const {
     store, key, ranges, totalSize, mime, etag, lastModified, digest,
-    ifMatch, pin, ctx, signal, onError, auditCtx, onTransfer,
+    ifMatch, pin, ctx, signal, onError, timingCtx, auditCtx, onTransfer,
   } = opts;
 
   const boundary = generateMultipartBoundary();
@@ -1208,6 +1337,7 @@ async function serveMultipart(opts: MultipartOpts): Promise<RawResponseParts> {
   // Fetch the first part up front: a pinned read losing its race throws
   // ObjectChangedError HERE, before any headers are committed, so the caller
   // can re-validate once. Abort and store errors map to responses.
+  const t0 = timingCtx ? performance.now() : 0;
   let firstStream: Awaited<ReturnType<ObjectStore["getObject"]>>;
   try {
     firstStream = await store.getObject(key, { range: ranges[0], signal, ifMatch, pin });
@@ -1217,13 +1347,19 @@ async function serveMultipart(opts: MultipartOpts): Promise<RawResponseParts> {
     onError?.(err, { key, operation: "get" });
     return storeErrorResponse(err);
   }
+  const getMs = timingCtx ? performance.now() - t0 : 0;
 
   // Validate the first part's served span BEFORE headers commit. On a
   // non-pinning store (one that cannot honor ifMatch/pin), a concurrent
   // overwrite between parts would otherwise splice bytes across
   // representations or under-run the precomputed Content-Length. A first-part
-  // mismatch re-validates once via the orchestrator's retry loop.
-  if (!servedSpanMatches(firstStream, ranges[0]!)) {
+  // mismatch re-validates once via the orchestrator's retry loop. A byte
+  // body's REAL length is checkable here too (streams settle lazily below).
+  if (
+    !servedSpanMatches(firstStream, ranges[0]!)
+    || (firstStream.body instanceof Uint8Array
+      && firstStream.body.byteLength !== ranges[0]!.end - ranges[0]!.start + 1)
+  ) {
     cancelBody(firstStream.body);
     throw new ObjectChangedError(key);
   }
@@ -1265,20 +1401,40 @@ async function serveMultipart(opts: MultipartOpts): Promise<RawResponseParts> {
       // (stream body) or is unneeded (byte body holds no resource). No await or
       // yield sits between here and getReader(), so a cancel cannot interleave.
       if (i === 0) firstPartOwned = true;
+      const partSpan = range.end - range.start + 1;
       if (body instanceof Uint8Array) {
+        // Claimed contentLength was validated above; the byte body's REAL
+        // length must match too, or the framing under/over-runs.
+        if (body.byteLength !== partSpan) {
+          throw new ObjectChangedError(key);
+        }
         yield body;
       } else {
         const reader = body.getReader();
+        let partBytes = 0;
         try {
           for (;;) {
             const { done, value } = await reader.read();
             if (done) break;
+            partBytes += value.byteLength;
             yield value;
           }
         } finally {
           // Release the backend resource on normal completion AND on an early
           // generator return (client cancelled mid-part).
           reader.cancel().catch(() => { /* already-settled reader */ });
+        }
+        // A gracefully-short (or long) part means the source diverged from
+        // the span the committed Content-Length was computed from. Erroring
+        // the stream (a reset the client sees as a failed transfer) beats
+        // emitting well-formed framing around a torn part -- adapters with
+        // internal length guards catch this earlier; this is the
+        // store-agnostic backstop at the framing layer.
+        if (partBytes !== partSpan) {
+          throw new Error(
+            `multipart part ${range.start}-${range.end} of ${key}: stream delivered `
+            + `${partBytes} bytes, expected ${partSpan} (source changed mid-read)`,
+          );
         }
       }
       yield enc.encode("\r\n");
@@ -1310,6 +1466,20 @@ async function serveMultipart(opts: MultipartOpts): Promise<RawResponseParts> {
   });
 
   const headers = applyAdapterHeaders(multipart.headers, ctx);
+
+  // Server-Timing mirrors streamFromStore: the store figure covers the HEAD
+  // plus the eagerly-fetched first part (lazy parts settle after headers
+  // commit and cannot be measured into a header that has already left).
+  if (timingCtx) {
+    const totalMs = timingCtx.storeMs + timingCtx.evaluateMs + getMs;
+    headers["Server-Timing"] =
+      `store;dur=${(timingCtx.storeMs + getMs).toFixed(1)},eval;dur=${timingCtx.evaluateMs.toFixed(1)}`;
+    timingCtx.onTiming?.({
+      storeMs: timingCtx.storeMs + getMs,
+      evaluateMs: timingCtx.evaluateMs,
+      totalMs,
+    });
+  }
 
   // Audit reports the multipart body's granted length (framing + all parts).
   auditCtx?.onServe({

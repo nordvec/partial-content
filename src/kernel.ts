@@ -85,13 +85,25 @@ export interface RangeResponseHeaderOpts {
    * responses. The digest covers the *full representation* (not the partial
    * range), so it remains stable across range requests.
    *
-   * Storage backends typically provide this:
-   * - S3: `x-amz-checksum-sha256`
-   * - GCS: `x-goog-hash: crc32c=...,md5=...`
-   *
-   * Must be a raw base64-encoded SHA-256 hash (no prefix, no colons).
+   * Storage backends typically provide this (S3: `x-amz-checksum-sha256`
+   * on objects uploaded with a SHA-256 checksum). It must be the raw base64
+   * of a 32-byte SHA-256 (43 base64 chars plus optional `=` padding, no
+   * prefix, no colons); anything else is silently not emitted, because a
+   * malformed or wrong-algorithm value framed as `sha-256=:...:` would be a
+   * false integrity assertion.
    */
   digest?: string;
+  /**
+   * Whether `Content-Digest` may accompany `Repr-Digest` on a full (200)
+   * response. Set `false` when the client sent
+   * `Want-Content-Digest: sha-256=0` (see {@link clientWantsContentDigest})
+   * or when the response answers a HEAD request: a HEAD message transfers no
+   * content, so a representation-valued `Content-Digest` would be false
+   * there (RFC 9530 Appendix B.2 computes the HEAD `Content-Digest` over
+   * empty content). Partial (206) responses never carry `Content-Digest`.
+   * @default true
+   */
+  contentDigest?: boolean;
   /**
    * Cache-Control directive to include in the response.
    *
@@ -131,13 +143,14 @@ export interface EvaluatedRequest extends RangeResponseHeaders {
  * Returns `null` for:
  *   - Missing or empty header
  *   - Malformed syntax
+ *   - An invalid int-range (first-pos greater than last-pos, RFC 9110
+ *     Section 14.1.1) -- the whole header is ignored per Section 14.2
  *   - Multi-range requests (e.g. `bytes=0-100,200-300`)
  *   - Non-byte range units
  *
  * Returns `"unsatisfiable"` for:
  *   - Start >= totalSize (valid syntax but out of bounds)
  *   - Suffix of 0 bytes
- *   - Start > end after clamping
  *
  * This distinction matters: `null` means "not a range request" (serve 200),
  * while `"unsatisfiable"` means "valid range syntax but cannot be honored" (serve 416).
@@ -211,9 +224,10 @@ function parseOneRange(spec: string, totalSize: number): ParsedRange | "unsatisf
   // Clamp end to file boundary
   end = Math.min(end, totalSize - 1);
 
-  // RFC 9110 Section 14.1.2: "A server that receives a byte-range-spec
-  // with a first-byte-pos that is greater than its last-byte-pos MUST
-  // ignore the invalid range." Ignore = serve full 200.
+  // RFC 9110 Section 14.1.1: "An int-range is invalid if the last-pos
+  // value is present and less than the first-pos", and one invalid
+  // range-spec makes the whole ranges-specifier invalid. Section 14.2
+  // permits ignoring such a Range header entirely: ignore = serve full 200.
   if (start > end) return null;
 
   return { start, end };
@@ -227,8 +241,10 @@ export const MAX_RANGES_DEFAULT = 50;
 /** A validated, coalesced set of satisfiable ranges. */
 export interface RangeSet {
   /**
-   * Coalesced satisfiable ranges in ascending order (length >= 1). A length
-   * of 1 is served as a normal single 206; length > 1 as multipart/byteranges.
+   * Coalesced satisfiable ranges (length >= 1) in REQUEST order: each part
+   * keeps the position of its earliest-appearing contributor, honoring the
+   * RFC 9110 Section 15.3.7.2 SHOULD on part ordering. A length of 1 is
+   * served as a normal single 206; length > 1 as multipart/byteranges.
    */
   ranges: ParsedRange[];
 }
@@ -245,14 +261,23 @@ export interface RangeSet {
  *   - {@link RangeSet} -- 1+ satisfiable ranges (overlapping/adjacent already
  *                        coalesced): serve 206 (single) or multipart (>1).
  *
- * Amplification defenses (informed by Go `net/http.ServeContent`'s
- * sum-of-ranges check and nginx `max_ranges` + adjacent coalescing):
- *   1. Overlapping/adjacent ranges are coalesced, so a client cannot force
- *      redundant bytes by requesting the same region many times.
- *   2. If the coalesced set still exceeds `maxRanges` distinct parts, or the
- *      bytes it covers reach or exceed the whole representation, the ranges
- *      are ignored and the full 200 is served -- multipart framing over the
- *      entire file is pure overhead and a classic amplification vector.
+ * Amplification defenses (RFC 9110 Section 14.2 explicitly permits ignoring
+ * abusive range sets; approach mirrors Go `net/http.ServeContent`'s
+ * sum-of-ranges check and nginx `max_ranges` + coalescing):
+ *   1. Overlapping, adjacent, and near-adjacent ranges are coalesced (gaps
+ *      smaller than the ~80-byte multipart part overhead are bridged, which
+ *      Section 15.3.7.2 sanctions and which strictly shrinks the response),
+ *      so a client cannot force redundant bytes or framing.
+ *   2. If the coalesced set still exceeds `maxRanges` distinct parts, the
+ *      ranges are ignored and the full 200 is served. The classic
+ *      whole-file-tiling amplification vector is subsumed by coalescing:
+ *      parts that would tile the representation merge into one range, and a
+ *      single coalesced range serves as a plain 206 with no framing,
+ *      consistent with {@link parseRangeHeader}.
+ *
+ * Part order honors the Section 15.3.7.2 SHOULD: parts are emitted in the
+ * order their range-specs appeared in the request, with a coalesced part
+ * taking its earliest contributor's position.
  *
  * Empty list elements (`bytes=0-1,,2-3`) are skipped per the RFC 9110
  * Section 5.6.1 list rule; a genuinely malformed element voids the whole
@@ -270,7 +295,7 @@ export function parseRanges(
   if (!lower.startsWith("bytes=")) return null;
 
   const specs = rangeHeader.slice(6).split(",");
-  const satisfiable: ParsedRange[] = [];
+  const satisfiable: OrderedRange[] = [];
   let sawUnsatisfiable = false;
 
   for (const rawSpec of specs) {
@@ -282,7 +307,9 @@ export function parseRanges(
       sawUnsatisfiable = true;
       continue;
     }
-    satisfiable.push(parsed);
+    // Position in the request's range-set, kept through coalescing for the
+    // RFC 9110 Section 15.3.7.2 part-order SHOULD.
+    satisfiable.push({ ...parsed, order: satisfiable.length });
   }
 
   if (satisfiable.length === 0) {
@@ -292,28 +319,51 @@ export function parseRanges(
 
   const coalesced = coalesceRanges(satisfiable);
 
-  // Amplification defenses: too many parts, or the parts already cover the
-  // whole file -- either way, serving the full 200 is cheaper and safe.
+  // Amplification defense: too many distinct parts -> serve the full 200.
+  // The classic whole-file-tiling vector needs no separate check: gap
+  // coalescing merges any set whose parts would tile the representation
+  // into a single range (coalesced parts are always separated by more than
+  // the framing overhead), and a single range serves as a plain 206 with
+  // no multipart framing, exactly like parseRangeHeader.
   if (coalesced.length > maxRanges) return null;
-  const covered = coalesced.reduce((n, r) => n + (r.end - r.start + 1), 0);
-  if (covered >= totalSize) return null;
 
-  return { ranges: coalesced };
+  // Emit parts in request order (a coalesced part inherits its earliest
+  // contributor's position), per the Section 15.3.7.2 SHOULD.
+  coalesced.sort((a, b) => a.order - b.order);
+
+  return { ranges: coalesced.map(({ start, end }) => ({ start, end })) };
+}
+
+/** A parsed range annotated with its position in the request's range-set. */
+interface OrderedRange extends ParsedRange {
+  order: number;
 }
 
 /**
- * Merge overlapping and adjacent ranges (sorted ascending). Adjacent means
- * `next.start <= cur.end + 1` (a 1-byte gap is NOT bridged; touching ranges
- * are). Prevents redundant bytes in the multipart body.
+ * Typical per-part cost of multipart/byteranges framing (boundary line +
+ * part headers + CRLFs). RFC 9110 Section 15.3.7.2 cites "around 80 bytes"
+ * and permits coalescing ranges "separated by a gap that is smaller than the
+ * overhead of sending multiple parts": bridging such gaps strictly shrinks
+ * the response body.
  */
-function coalesceRanges(ranges: ParsedRange[]): ParsedRange[] {
+const COALESCE_GAP_BYTES = 80;
+
+/**
+ * Merge overlapping, adjacent, and near-adjacent ranges. Near-adjacent means
+ * the gap between two ranges is at most {@link COALESCE_GAP_BYTES}, where the
+ * merged part (gap bytes included) is smaller than two framed parts. Prevents
+ * redundant bytes and framing in the multipart body. The merged range keeps
+ * the request position of its earliest-appearing contributor.
+ */
+function coalesceRanges(ranges: OrderedRange[]): OrderedRange[] {
   const sorted = [...ranges].sort((a, b) => a.start - b.start || a.end - b.end);
-  const merged: ParsedRange[] = [{ ...sorted[0]! }];
+  const merged: OrderedRange[] = [{ ...sorted[0]! }];
   for (let i = 1; i < sorted.length; i++) {
     const cur = sorted[i]!;
     const last = merged[merged.length - 1]!;
-    if (cur.start <= last.end + 1) {
+    if (cur.start <= last.end + 1 + COALESCE_GAP_BYTES) {
       if (cur.end > last.end) last.end = cur.end;
+      if (cur.order < last.order) last.order = cur.order;
     } else {
       merged.push({ ...cur });
     }
@@ -482,10 +532,14 @@ export function isConditionalFresh(
     const modifiedDate = parseHttpSeconds(lastModified);
     const sinceDate = parseRequestHttpSeconds(ifModifiedSince);
     if (!isNaN(modifiedDate) && !isNaN(sinceDate)) {
-      // RFC 9110 Section 13.1.3: "A recipient MUST ignore
-      // If-Modified-Since if the field value is not a valid HTTP-date,
-      // or if it is a date in the future." A future date would cause
-      // false freshness (always 304).
+      // Future dates are ignored (evaluate to "modified"). RFC 9110
+      // Section 13.1.3 requires interpreting the timestamp "in terms of
+      // the origin server's clock", and a future date cannot be a
+      // timestamp this origin ever generated -- it is clock skew or a
+      // fabricated value. RFC 2616 Section 14.25 made ignoring it
+      // explicit; the conservative full response is kept here because a
+      // skewed future date would otherwise be "fresh" forever (every
+      // real Last-Modified compares <= to it, a permanent false 304).
       if (sinceDate > Date.now()) return false;
       return modifiedDate <= sinceDate;
     }
@@ -605,16 +659,24 @@ export function isRangeFresh(
     return client === etag; // both strong: exact quoted match, no W/ stripping
   }
 
-  // If-Range as HTTP-date. RFC 9110 Section 13.1.5: the condition is true
-  // only if the date EXACTLY matches the representation's Last-Modified.
-  // A lenient `<=` would honor the range when the current Last-Modified is
-  // older than the client's cached date (clock skew, restored backup), even
-  // though the bytes may differ -- splicing corrupted content.
+  // If-Range as HTTP-date. RFC 9110 Section 13.1.5 evaluation:
+  //   1. "If the HTTP-date validator provided is not a strong validator in
+  //      the sense defined by Section 8.8.2.2, the condition is false."
+  //   2. The condition is true only if the date EXACTLY matches the
+  //      representation's Last-Modified. A lenient `<=` would honor the
+  //      range when the current Last-Modified is older than the client's
+  //      cached date (clock skew, restored backup), even though the bytes
+  //      may differ -- splicing corrupted content.
+  // Step 1 is implemented with the Section 8.8.2.2 one-second rule: the
+  // Last-Modified second must have fully elapsed, otherwise the
+  // representation could have been written twice within it (two different
+  // byte sequences sharing one validator) and honoring the range could
+  // splice bytes across them.
   if (lastModified) {
     const lastMod = parseHttpSeconds(lastModified);
     const ifRangeDate = parseRequestHttpSeconds(ifRange);
     if (!isNaN(lastMod) && !isNaN(ifRangeDate)) {
-      return lastMod === ifRangeDate;
+      return lastMod === ifRangeDate && Date.now() - lastMod >= 1000;
     }
   }
 
@@ -640,7 +702,7 @@ export function isRangeFresh(
  * @returns Status code and headers dict ready to pass to `new Response()`.
  */
 export function buildRangeResponseHeaders(opts: RangeResponseHeaderOpts): RangeResponseHeaders {
-  const { totalSize, range, contentType, etag, lastModified, digest, cacheControl } = opts;
+  const { totalSize, range, contentType, etag, lastModified, digest, cacheControl, contentDigest } = opts;
 
   // Validate totalSize to prevent invalid Content-Length / Content-Range headers.
   // Content-Length MUST be a non-negative integer (RFC 9110 Section 8.6).
@@ -674,9 +736,23 @@ export function buildRangeResponseHeaders(opts: RangeResponseHeaderOpts): RangeR
   }
 
   // RFC 9530: Repr-Digest covers the full representation.
-  if (digest) emitReprDigest(headers, digest, range !== null);
+  if (digest) emitReprDigest(headers, digest, range !== null || contentDigest === false);
 
   if (range) {
+    // Reject bounds the parser could never produce: non-integer or unordered
+    // positions, an end at/past a known total, or the OPEN_ENDED sentinel
+    // reaching serialization (adapters must resolve it to served bounds
+    // first -- emitting it would put a 16-digit last-byte-pos on the wire).
+    if (
+      !Number.isSafeInteger(range.start) || !Number.isSafeInteger(range.end)
+      || range.start < 0 || range.start > range.end
+      || (totalSize !== undefined ? range.end >= totalSize : range.end === OPEN_ENDED)
+    ) {
+      throw new RangeError(
+        `buildRangeResponseHeaders: invalid range ${range.start}-${range.end} `
+        + `for totalSize ${totalSize ?? "*"}`,
+      );
+    }
     // 206 Partial Content. The body length is the range span, so an unknown
     // total is emitted honestly as `*` (RFC 7233 Section 4.2) rather than a
     // fabricated number.
@@ -710,6 +786,14 @@ export function buildRangeResponseHeaders(opts: RangeResponseHeaderOpts): RangeR
  * on error responses can poison shared caches.
  */
 export function build416Headers(totalSize: number): RangeResponseHeaders {
+  // Same corrupt-metadata guard as the sibling builders: NaN, Infinity,
+  // negative, or fractional sizes would serialize a grammar-invalid
+  // `Content-Range: bytes */NaN` (complete-length = 1*DIGIT).
+  if (!Number.isSafeInteger(totalSize) || totalSize < 0) {
+    throw new RangeError(
+      `build416Headers: totalSize must be a non-negative safe integer, got ${totalSize}`,
+    );
+  }
   return {
     status: 416,
     headers: {
@@ -895,6 +979,17 @@ export function build304Headers(
  *   4. `parseRangeHeader`      -> Parse and validate the Range
  *   5. `buildRangeResponseHeaders` or `build416Headers`
  *
+ * Pass the request method via `opts.method` (default `"GET"`). For any
+ * method other than GET the Range and If-Range headers are ignored --
+ * RFC 9110 Section 14.2: range handling is defined only for GET, and a
+ * server MUST ignore Range otherwise -- so a HEAD request always evaluates
+ * to the headers its 200 counterpart would carry (full Content-Length,
+ * never 206/416), with `Content-Digest` suppressed because a HEAD response
+ * transfers no content (RFC 9530 Appendix B.2). Conditionals (304/412)
+ * apply to HEAD exactly as to GET. For write methods (PUT/PATCH/DELETE) use
+ * {@link evaluateConditionalWrite} instead: on writes a matching
+ * If-None-Match must yield 412, not 304.
+ *
  * @returns Status, headers, and the parsed range (null if full content or error status).
  */
 export function evaluateConditionalRequest(
@@ -907,6 +1002,14 @@ export function evaluateConditionalRequest(
     cacheControl?: string;
     /** RFC 9530 SHA-256 digest (raw base64, no prefix). Emitted as `Repr-Digest` on 200/206. */
     digest?: string;
+  },
+  opts?: {
+    /**
+     * Request method this evaluation answers. Range/If-Range are honored
+     * only for `"GET"`; `"HEAD"` additionally suppresses `Content-Digest`.
+     * @default "GET"
+     */
+    method?: string;
   },
 ): EvaluatedRequest {
   // Guard against corrupt metadata from storage adapters. NaN, Infinity,
@@ -947,9 +1050,13 @@ export function evaluateConditionalRequest(
     return { status: 304, headers, range: null };
   }
 
-  // Step 3-4: Range validation and parsing
-  const rangeHeader = reqHeaders.get("range");
-  const rangeFresh = isRangeFresh(reqHeaders, meta.etag, normalizedLastModified);
+  // Step 3-4: Range validation and parsing. RFC 9110 Section 14.2: range
+  // handling is defined only for GET; a server MUST ignore Range (and with
+  // it If-Range, Section 13.1.5) for any other method.
+  const method = (opts?.method ?? "GET").toUpperCase();
+  const rangeHeader = method === "GET" ? reqHeaders.get("range") : null;
+  const rangeFresh = rangeHeader !== null
+    && isRangeFresh(reqHeaders, meta.etag, normalizedLastModified);
   const parsed = rangeFresh && rangeHeader
     ? parseRangeHeader(rangeHeader, meta.totalSize)
     : null;
@@ -969,8 +1076,14 @@ export function evaluateConditionalRequest(
 
   // RFC 9530: Repr-Digest and Content-Digest.
   // Only emit when the client accepts sha-256 (or sends no Want-* header).
+  // Content-Digest additionally requires a full GET response (a 206 slice
+  // and an empty HEAD body both diverge from the representation digest) and
+  // a client that did not decline it via Want-Content-Digest.
   if (meta.digest && clientWantsDigest(reqHeaders)) {
-    emitReprDigest(headers, meta.digest, parsed !== null);
+    const reprOnly = parsed !== null
+      || method === "HEAD"
+      || !clientWantsContentDigest(reqHeaders);
+    emitReprDigest(headers, meta.digest, reprOnly);
   }
 
   // Emit Cache-Control on 200/206 (not only 304) so standalone orchestrator
@@ -1132,7 +1245,12 @@ export function fromNodeHeaders(
 ): { get(name: string): string | null } {
   // Normalize keys to lowercase at construction time so lookups
   // work regardless of the caller's casing convention.
-  const lower: Record<string, string | string[] | undefined> = {};
+  //
+  // Null prototype: header names are attacker-controlled and "__proto__"
+  // is a legal HTTP field name. On a plain object, assigning it would hit
+  // the prototype setter (an array value would REPLACE the prototype), and
+  // get("constructor") would return Object's constructor instead of null.
+  const lower: Record<string, string | string[] | undefined> = Object.create(null);
   for (const key in headers) {
     lower[key.toLowerCase()] = headers[key];
   }
@@ -1152,9 +1270,13 @@ export function fromNodeHeaders(
 /** Metadata from a storage backend used to derive an entity-tag. */
 export interface ETagSource {
   /**
-   * Content digest from the backend (S3/Azure/GCS object hash).
-   * Yields a STRONG validator. May include surrounding quotes or `W/` prefix,
-   * both of which are normalized.
+   * Backend version identifier that changes whenever the stored bytes
+   * change (S3/Azure ETag, GCS hash). Yields a STRONG validator: strength
+   * requires exactly that property, not that the value is a content digest
+   * (an S3 multipart-upload ETag is not one, yet every rewrite changes it).
+   * Never pass a value that can stay constant across a byte change. May
+   * include surrounding quotes or a `W/` prefix, both of which are
+   * normalized.
    */
   hash?: string;
   /** Object size in bytes. With `mtime`, yields a WEAK validator when no hash exists. */
@@ -1251,17 +1373,34 @@ export function sanitizeHeaderValue(s: string): string {
 }
 
 /**
- * Emit RFC 9530 `Repr-Digest` (and `Content-Digest` on a full response) for
- * a backend SHA-256 digest. Single source of truth for both the header
- * builder and the orchestrator: the digest is header-sanitized (custom
- * stores can return anything), and `Content-Digest` is omitted on a 206
- * because it would have to cover only the range slice (RFC 9530 Section 2),
- * which requires streaming the bytes through crypto.
+ * The raw base64 of a 32-byte SHA-256: exactly 43 base64 chars plus optional
+ * `=` padding. Gate for digest emission -- see {@link emitReprDigest}.
  */
-function emitReprDigest(headers: Record<string, string>, digest: string, isPartial: boolean): void {
-  const reprDigest = `sha-256=:${sanitizeHeaderValue(digest)}:`;
+const SHA256_BASE64_RE = /^[A-Za-z0-9+/]{43}=?$/;
+
+/**
+ * Emit RFC 9530 `Repr-Digest` (and `Content-Digest` unless `reprOnly`) for
+ * a backend SHA-256 digest. Single source of truth for both the header
+ * builder and the orchestrator.
+ *
+ * The digest must be the raw base64 of a 32-byte SHA-256; anything else
+ * (custom stores can return anything) is silently NOT emitted -- framing a
+ * malformed value as an sf-byte-sequence would produce a field recipients
+ * must discard at best, and a false integrity assertion at worst.
+ *
+ * `Content-Digest` covers the actual message content (RFC 9530 Section 2),
+ * so callers set `reprOnly` on a 206 (it would have to cover only the range
+ * slice, which requires streaming the bytes through crypto), on HEAD
+ * responses (the message content is empty; RFC 9530 Appendix B.2 computes a
+ * HEAD `Content-Digest` over zero bytes), and when the client declined it
+ * via `Want-Content-Digest`.
+ */
+function emitReprDigest(headers: Record<string, string>, digest: string, reprOnly: boolean): void {
+  const trimmed = digest.trim();
+  if (!SHA256_BASE64_RE.test(trimmed)) return;
+  const reprDigest = `sha-256=:${trimmed}:`;
   headers["Repr-Digest"] = reprDigest;
-  if (!isPartial) headers["Content-Digest"] = reprDigest;
+  if (!reprOnly) headers["Content-Digest"] = reprDigest;
 }
 
 /**
@@ -1451,48 +1590,83 @@ function toHttpDate(s: string): string | undefined {
 }
 
 /**
- * RFC 9530 Section 4: Check if the client wants a `sha-256` digest.
+ * RFC 9530 Section 4: does `Want-Repr-Digest` accept a `sha-256` digest?
  *
  * `Want-Repr-Digest` uses Structured Fields Dictionary syntax:
  *   Want-Repr-Digest: sha-256=5, sha-512=3
  *
- * Each key is a hash algorithm, each value is a preference weight (0-10).
- * Weight 0 means "explicitly unwanted." If the header is absent or contains
- * `sha-256` with weight > 0, we emit the digest. If it only lists algorithms
- * we don't support (e.g. `sha-512=5`), we skip emission entirely.
+ * Each key is a hash algorithm, each value a preference weight (0-10);
+ * weight 0 means "explicitly unwanted". If the header is absent, the server
+ * MAY send unsolicited digests (Section 4), so this returns `true`. If the
+ * header is present but lists only algorithms we do not support
+ * (e.g. `sha-512=5`), emission is skipped entirely.
  *
- * We also check `Want-Content-Digest` since our Content-Digest uses the
- * same algorithm.
+ * `Want-Content-Digest` is evaluated separately by
+ * {@link clientWantsContentDigest}: each Want-* field expresses a preference
+ * for its corresponding response field only, so a client may decline
+ * `Content-Digest` while still receiving `Repr-Digest` (and vice versa).
  *
  * Exported so framework adapters apply the same negotiation the orchestrator
  * uses internally -- digest emission behaves identically at every layer.
  */
 export function clientWantsDigest(reqHeaders: { get(name: string): string | null }): boolean {
-  const want = reqHeaders.get("want-repr-digest") ?? reqHeaders.get("want-content-digest");
-  // No preference header: server MAY send unsolicited digests (RFC 9530 Section 4)
-  if (!want) return true;
+  return wantsSha256(reqHeaders.get("want-repr-digest")) ?? true;
+}
 
-  // Parse Structured Fields Dictionary: "sha-256=5, sha-512=3"
-  // Look for sha-256 with non-zero weight
+/**
+ * RFC 9530 Section 4: does `Want-Content-Digest` accept a `sha-256` digest?
+ * Companion to {@link clientWantsDigest} for the `Content-Digest` field,
+ * which is only emitted on full (200) GET responses. Absent header = `true`
+ * (unsolicited digests are permitted).
+ */
+export function clientWantsContentDigest(reqHeaders: { get(name: string): string | null }): boolean {
+  return wantsSha256(reqHeaders.get("want-content-digest")) ?? true;
+}
+
+/**
+ * Parse one Want-*-Digest field value and report the client's `sha-256`
+ * preference: `true` (wanted), `false` (declined, or the header lists only
+ * other algorithms), or `null` (header absent -- no preference expressed).
+ *
+ * Follows RFC 8941 Dictionary semantics where they matter on this field:
+ * when a key occurs more than once, the LAST occurrence wins (Section 3.2),
+ * and a bare key (`sha-256` with no `=value`) means the boolean value true.
+ * Structured Fields parameters (`;p=x`) are stripped. Values here are
+ * sf-integer weights per RFC 9530, so quoted-string members (which could
+ * embed commas) do not occur in conformant input.
+ */
+function wantsSha256(want: string | null): boolean | null {
+  if (!want) return null;
+
   const lower = want.toLowerCase();
+  let verdict: boolean | undefined;
+  let sawMember = false;
   for (const entry of lower.split(",")) {
     const trimmed = entry.trim();
-    if (!trimmed.startsWith("sha-256")) continue;
+    if (!trimmed) continue;
+    sawMember = true;
+    // Strip Structured Fields parameters before reading the value, so a
+    // bare key with parameters ("sha-256;x=1") still parses.
+    const member = trimmed.split(";")[0]!.trim();
+    if (!member.startsWith("sha-256")) continue;
     // Guard against matching hypothetical future algorithms like "sha-256-v2".
     // After the "sha-256" prefix, the next character must be '=' (weight),
-    // end-of-string (bare preference), or whitespace.
-    const nextChar = trimmed[7]; // "sha-256".length === 7
+    // end-of-member (bare key), or whitespace.
+    const nextChar = member[7]; // "sha-256".length === 7
     if (nextChar !== undefined && nextChar !== "=" && nextChar !== " ") continue;
-    // Extract weight: "sha-256=5" or just "sha-256"
-    const eqIdx = trimmed.indexOf("=");
-    if (eqIdx === -1) return true; // bare "sha-256" means wanted
-    // Strip any Structured Fields parameters (";q=...") before the weight.
-    const weightStr = trimmed.slice(eqIdx + 1).split(";")[0]!.trim();
-    const weight = Number(weightStr);
+    const eqIdx = member.indexOf("=");
+    if (eqIdx === -1) {
+      verdict = true; // bare key: RFC 8941 boolean true
+      continue;
+    }
+    const weight = Number(member.slice(eqIdx + 1).trim());
     // Weight 0 means explicitly unwanted
-    return !Number.isNaN(weight) && weight > 0;
+    verdict = !Number.isNaN(weight) && weight > 0;
   }
 
-  // Client sent Want-* but didn't list sha-256: they don't want our algorithm
-  return false;
+  if (verdict !== undefined) return verdict;
+  // Members were present but sha-256 was not among them: the client asked
+  // for algorithms we do not provide. An unparseable/empty field value is
+  // treated as no preference.
+  return sawMember ? false : null;
 }

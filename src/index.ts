@@ -42,7 +42,7 @@ export {
 } from "./kernel.js";
 
 // ─── Digest Negotiation (RFC 9530) ──────────────────────────────────────────
-export { clientWantsDigest } from "./kernel.js";
+export { clientWantsDigest, clientWantsContentDigest } from "./kernel.js";
 
 // ─── ETag Generation ────────────────────────────────────────────────────────
 export { generateETag } from "./kernel.js";

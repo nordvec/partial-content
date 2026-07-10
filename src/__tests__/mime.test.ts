@@ -60,3 +60,12 @@ describe("lookupMime", () => {
         expect(lookupMime("page.xhtml")).toBeUndefined();
     });
 });
+
+describe("lookupMime prototype safety", () => {
+    test("Object.prototype member names never resolve to a MIME", () => {
+        expect(lookupMime("file.constructor")).toBeUndefined();
+        expect(lookupMime("file.__proto__")).toBeUndefined();
+        expect(lookupMime("file.hasOwnProperty")).toBeUndefined();
+        expect(lookupMime("constructor")).toBeUndefined();
+    });
+});

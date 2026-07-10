@@ -210,10 +210,14 @@ export function fsStore(opts: FsStoreOptions): ObjectStore {
       if (key.includes(":")) {
         throw new ObjectNotFoundError(key);
       }
+      // Win32 path normalization strips trailing dots and spaces before
+      // resolving names, so "CON ", "con." and "con . ." all reach the
+      // device; strip them the same way before testing. COM/LPT also
+      // reserve the superscript digits U+00B9/U+00B2/U+00B3 ("COM¹").
       const base = key.slice(
         Math.max(key.lastIndexOf("/"), key.lastIndexOf("\\")) + 1,
-      );
-      if (/^(con|prn|aux|nul|com[0-9]|lpt[0-9])(\.|$)/i.test(base)) {
+      ).replace(/[. ]+$/, "");
+      if (/^(con|prn|aux|nul|com[0-9¹²³]|lpt[0-9¹²³])(\.|$)/i.test(base)) {
         throw new ObjectNotFoundError(key);
       }
     }
@@ -368,13 +372,25 @@ export function fsStore(opts: FsStoreOptions): ObjectStore {
           ? Buffer.allocUnsafeSlow(contentLength)
           : Buffer.allocUnsafe(contentLength);
         try {
-          const { bytesRead } = await handle.read(buffer, 0, contentLength, range?.start ?? 0);
-          // The handle's own stat promised these bytes; a short read means
-          // the file was truncated mid-request. Failing here (502, before
-          // headers) beats the streaming path's only option of a torn body.
-          if (bytesRead < contentLength) {
+          // Loop until filled: POSIX permits a read() to return fewer bytes
+          // than requested even before EOF (network filesystems, signals),
+          // so a single call would misreport a legitimate short read as
+          // truncation. Only bytesRead === 0 is a true EOF.
+          let filled = 0;
+          while (filled < contentLength) {
+            const { bytesRead } = await handle.read(
+              buffer, filled, contentLength - filled, (range?.start ?? 0) + filled,
+            );
+            if (bytesRead === 0) break; // EOF before the promised length
+            filled += bytesRead;
+          }
+          // The handle's own stat promised these bytes; EOF short of them
+          // means the file was truncated mid-request. Failing here (502,
+          // before headers) beats the streaming path's only option of a
+          // torn body.
+          if (filled < contentLength) {
             throw new Error(
-              `fsStore ${key}: file shrank during read (expected ${contentLength} bytes, got ${bytesRead})`,
+              `fsStore ${key}: file shrank during read (expected ${contentLength} bytes, got ${filled})`,
             );
           }
         } finally {

@@ -22,7 +22,7 @@ When your app proxies files from object storage, browsers expect your server to 
 | `range-parser` | Yes | -- | -- | -- | -- | Yes |
 | `fresh` | -- | 304 only | -- | -- | -- | Yes |
 | `content-disposition` | -- | -- | Yes | -- | -- | Yes |
-| `send` | Yes | Yes | Yes | -- | Yes | **No** (local fs only) |
+| `send` | Yes | Yes | -- | -- | Yes | **No** (local fs only) |
 
 `partial-content` is the **protocol layer without the I/O layer**. You bring the bytes from wherever they live, or use a built-in storage adapter.
 
@@ -93,9 +93,10 @@ const client = new S3Client({ region: "eu-central-1" });
 const store = s3Store({ client, bucket: "documents" });
 const handler = serveObject(store, { disposition: "inline" });
 
-// Next.js App Router
-export async function GET(req: Request, { params }: { params: { id: string } }) {
-  return handler(req, { key: params.id, mime: "application/pdf" });
+// Next.js App Router (route-handler params arrive as a Promise)
+export async function GET(req: Request, { params }: { params: Promise<{ id: string }> }) {
+  const { id } = await params;
+  return handler(req, { key: id, mime: "application/pdf" });
 }
 export const HEAD = GET;
 ```
@@ -112,7 +113,9 @@ const store = fsStore({ root: "/var/data/uploads" });
 // fsStore({ root, cache: { ttlMs: 1000 } })
 const app = express();
 
-app.get("/files/:key", serveObject(store, {
+// The type parameter makes framework fields (req.params) typecheck in the
+// extractors; plain JS callers just omit it.
+app.get("/files/:key", serveObject<express.Request>(store, {
   key: (req) => req.params.key,
   disposition: "inline",
 }));
@@ -138,11 +141,11 @@ if (status === 304 || status === 412 || status === 416) {
 }
 
 // `range` is a kernel-validated ParsedRange -- pass it straight to your store.
-const { stream } = range
+const { body } = range
   ? await store.getObject(key, { range })  // 206: only the requested slice
-  : await store.getObject(key);         // 200: the whole object
+  : await store.getObject(key);            // 200: the whole object
 
-return new Response(stream, { status, headers });
+return new Response(body, { status, headers });
 ```
 
 More recipes in **[docs/EXAMPLES.md](docs/EXAMPLES.md)**: Hono, Cloudflare Workers (R2 native), kernel-only Express, Content-Disposition, Repr-Digest, and the manual step-by-step primitives. Coming from `send` or `sirv`? **[docs/MIGRATION.md](docs/MIGRATION.md)** maps every option and event, and is honest about what has no equivalent.
@@ -193,16 +196,16 @@ This is the path behind `<video>`/`<audio>` seeking and PDF.js progressive loadi
 
 The full reference lives in **[docs/API.md](docs/API.md)**. The shape of the surface:
 
-- **Kernel** (`partial-content`): `evaluateConditionalRequest` / `evaluateConditionalWrite` (the one-call orchestrators), the step-by-step primitives (`parseRangeHeader`, `parseRanges`, `isConditionalFresh`, `isPreconditionFailure`, `isRangeFresh`, the `build*Headers` family), `generateETag`, `buildContentDisposition`, `clientWantsDigest`, `fromNodeHeaders`, `sanitizeHeaderValue`
+- **Kernel** (`partial-content`): `evaluateConditionalRequest` / `evaluateConditionalWrite` (the one-call orchestrators), the step-by-step primitives (`parseRangeHeader`, `parseRanges`, `isConditionalFresh`, `isPreconditionFailure`, `isRangeFresh`, the `build*Headers` family), `generateETag`, `buildContentDisposition`, `clientWantsDigest`, `clientWantsContentDigest`, `fromNodeHeaders`, `sanitizeHeaderValue`
 - **Serving** (`/web`, `/node`, `/hono`): `serveObject` handlers with `disposition`, `cacheControl` (verbatim passthrough), security headers, `onServe` / `onTransfer` / `onError` / `onTiming` observability hooks, `maxRanges`, and a slow-read stall bound on the Node pump
 - **Stores** (`/s3`, `/r2`, `/gcs`, `/azure`, `/fs`, `/http`, `/memory`): ready-made `ObjectStore` implementations with pinned reads and truthful error mapping (404 / retryable 503 + `Retry-After` / 502)
 - **Custom adapters**: the published `ObjectStore` contract plus the primitives the built-ins are made of (`classifyStoreRead`, `nodeStreamToWeb`, `guardStreamLength`, `resolveServedRange`)
 
 ## Design Decisions
 
-**Multi-range is served as `multipart/byteranges`.** Overlapping and adjacent ranges are coalesced, and a range-amplification defense (`maxRanges`, default 50; plus a "ranges cover the whole file" check) degrades pathological requests to a full 200. The single-range fast path is untouched.
+**Multi-range is served as `multipart/byteranges`.** Overlapping, adjacent, and near-adjacent ranges are coalesced (gaps smaller than the ~80-byte part framing overhead are bridged, which RFC 9110 15.3.7.2 sanctions and which strictly shrinks the response), parts are emitted in the order the request asked for them, and a range-amplification cap (`maxRanges`, default 50) degrades pathological requests to a full 200. The single-range fast path is untouched. Cost model: each multipart part is one ranged `getObject` against your store, so one request can drive up to `maxRanges` backend reads; lower `maxRanges` (even to 1) if your backend bills per request.
 
-**Weak ETag matching.** Storage providers (S3, R2, GCS) emit `W/` prefixes inconsistently. We strip `W/` for pragmatic matching to avoid false 412s.
+**Validator comparison follows the RFC strength rules.** `If-None-Match` uses weak comparison (`W/` is stripped, as RFC 9110 8.8.3.2 directs for freshness checks), while `If-Match` and `If-Range` use strong comparison only: a weak validator can never authorize a write or a range resume, because it cannot assert byte equality. `If-Range` dates additionally require the Last-Modified second to have fully elapsed (RFC 9110 8.8.2.2) before the range is honored.
 
 **Sub-second timestamp flooring.** Storage backends return ISO-8601 with milliseconds. HTTP dates use whole seconds. All comparisons floor both sides to prevent permanent false-stale results.
 

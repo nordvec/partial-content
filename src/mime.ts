@@ -45,7 +45,11 @@
  *   disposition already protect the built-in serve path; the warning
  *   matters when a caller overrides `disposition: "inline"`.
  */
-const MIME_TYPES: Record<string, string> = {
+// Null prototype: the lookup key is attacker-influenced (filenames, storage
+// keys), and on a plain object `lookupMime("file.constructor")` would return
+// Object.prototype members (a function, not a string), breaking the declared
+// contract and crashing downstream header building.
+const MIME_TYPES: Record<string, string> = Object.assign(Object.create(null), {
   // Documents
   pdf: "application/pdf",
   txt: "text/plain",
@@ -120,7 +124,7 @@ const MIME_TYPES: Record<string, string> = {
   mjs: "text/javascript",
   css: "text/css",
   wasm: "application/wasm",
-};
+});
 
 // ─── Public API ─────────────────────────────────────────────────────────────
 

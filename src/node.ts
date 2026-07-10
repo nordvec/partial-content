@@ -15,7 +15,9 @@
  * const store = fsStore({ root: "./uploads" });
  * const app = express();
  *
- * app.get("/files/:key", serveObject(store, {
+ * // The type parameter makes framework fields (req.params) typecheck in
+ * // the extractors; plain JS callers just omit it.
+ * app.get("/files/:key", serveObject<express.Request>(store, {
  *   key: (req) => req.params.key,
  *   disposition: "inline",
  * }));
@@ -44,25 +46,27 @@ import type { ObjectStore } from "./index.js";
 
 // ─── Options ────────────────────────────────────────────────────────────────
 
-export interface NodeServeOptions extends ServeObjectOptions {
+export interface NodeServeOptions<Req extends IncomingMessage = IncomingMessage> extends ServeObjectOptions {
   /**
    * Extract the storage key from the incoming request.
-   * The request object is the raw Node.js IncomingMessage, so you have
-   * access to URL, params (if using Express/Fastify), headers, etc.
+   *
+   * `Req` defaults to the raw Node.js IncomingMessage; pass your
+   * framework's request type (e.g. `serveObject<express.Request>`) so
+   * framework fields like `req.params` typecheck in the extractors.
    */
-  key: (req: IncomingMessage) => string | Promise<string>;
+  key: (req: Req) => string | Promise<string>;
 
   /**
    * Extract the MIME type from the request.
    * When omitted, defaults to "application/octet-stream".
    */
-  mime?: (req: IncomingMessage) => string | undefined;
+  mime?: (req: Req) => string | undefined;
 
   /**
    * Extract the filename from the request (for Content-Disposition).
    * When omitted, no filename is set.
    */
-  filename?: (req: IncomingMessage) => string | undefined;
+  filename?: (req: Req) => string | undefined;
 
   /**
    * Max milliseconds to wait for a single backpressure `drain` while streaming
@@ -93,16 +97,16 @@ const DEFAULT_WRITE_STALL_MS = 60_000;
  * web adapter's `serveObject`, then writes the Fetch `Response` back to the
  * Node.js `ServerResponse`.
  */
-export function serveObject(
+export function serveObject<Req extends IncomingMessage = IncomingMessage>(
   store: ObjectStore,
-  opts: NodeServeOptions,
+  opts: NodeServeOptions<Req>,
 ) {
   const { key: keyFn, mime: mimeFn, filename: filenameFn, writeStallTimeoutMs, ...serveOpts } = opts;
   const handler = serveObjectRaw(store, serveOpts);
   const stallMs = writeStallTimeoutMs ?? DEFAULT_WRITE_STALL_MS;
 
   return async function handleNodeServe(
-    req: IncomingMessage,
+    req: Req,
     res: ServerResponse,
   ): Promise<void> {
     // Wire up client-disconnect detection: when the Node.js request closes
@@ -149,13 +153,19 @@ export function serveObject(
         filename: filenameFn?.(req),
       };
       parts = await handler(fetchRequest, ctx);
-    } catch {
+    } catch (err) {
+      // A throwing extractor is consumer code failing: surface it to the
+      // consumer's telemetry (the response body stays generic), with the
+      // same error-hygiene headers every other error response carries.
+      serveOpts.onError?.(err, { key: "", operation: "context" });
       if (!res.headersSent) {
         const body = "Internal Server Error";
         res.writeHead(500, {
           "Content-Type": "text/plain; charset=utf-8",
           "Content-Length": String(body.length),
           "X-Content-Type-Options": "nosniff",
+          "Cache-Control": "no-store",
+          "Content-Security-Policy": "default-src 'none'",
         });
         res.end(body);
       } else if (!res.destroyed) {

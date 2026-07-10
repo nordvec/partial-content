@@ -1,6 +1,6 @@
 {
   "name": "partial-content",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "RFC-compliant HTTP file serving for any storage backend. Range requests (206), conditional caching (304/412), Content-Disposition, and ETag generation. Zero dependencies.",
   "type": "module",
   "main": "./dist/index.js",
@@ -80,7 +80,8 @@
   ],
   "publishConfig": {
     "registry": "https://registry.npmjs.org",
-    "access": "public"
+    "access": "public",
+    "provenance": true
   },
   "sideEffects": false,
   "keywords": [
@@ -147,9 +148,9 @@
   "peerDependencies": {
     "@aws-sdk/client-s3": "^3.400.0",
     "@aws-sdk/s3-request-presigner": "^3.400.0",
-    "@google-cloud/storage": "^7.0.0",
-    "@azure/storage-blob": "^12.0.0",
-    "hono": "^4.0.0"
+    "@google-cloud/storage": ">=7.0.0",
+    "@azure/storage-blob": ">=12.0.0",
+    "hono": ">=4.0.0"
   },
   "peerDependenciesMeta": {
     "@aws-sdk/client-s3": {
@@ -172,14 +173,14 @@
     "@arethetypeswrong/cli": "^0.18.4",
     "@aws-sdk/client-s3": "^3.1075.0",
     "@aws-sdk/s3-request-presigner": "^3.1075.0",
-    "@size-limit/preset-small-lib": "^12.1.0",
     "@stryker-mutator/core": "^9.6.1",
-    "@types/node": "^26.1.0",
+    "@types/node": "^25.9.3",
     "autocannon": "^8.0.0",
     "fast-check": "^4.8.0",
     "send": "^1.2.1",
     "sirv": "^3.0.2",
+    "typescript": "^6.0.3",
     "size-limit": "^12.1.0",
-    "typescript": "^6.0.3"
+    "@size-limit/preset-small-lib": "^12.1.0"
   }
 }

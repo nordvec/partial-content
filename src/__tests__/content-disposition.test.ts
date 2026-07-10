@@ -78,16 +78,21 @@ describe("buildContentDisposition token optimization", () => {
 // ─── RFC 2616 Quoted-String Escaping ────────────────────────────────────────
 
 describe("buildContentDisposition RFC 2616 quoting", () => {
-    test("double-quote is escaped with backslash", () => {
-        // RFC 2616 Section 2.2: quoted-pair = "\" CHAR
-        // Unlike old implementation (replaced " with _), we properly escape.
+    test("double-quote is escaped with backslash AND gets a filename* companion", () => {
+        // RFC 2616 Section 2.2: quoted-pair = "\" CHAR. RFC 6266 Appendix D
+        // advises not to rely on quoted-pair alone (user agents mishandle
+        // `\"`), so a filename* parameter carries the quote unambiguously.
         const result = buildContentDisposition('the "plans".pdf');
-        expect(result).toBe('attachment; filename="the \\"plans\\".pdf"');
+        expect(result).toBe(
+            'attachment; filename="the \\"plans\\".pdf"; filename*=UTF-8\'\'the%20%22plans%22.pdf',
+        );
     });
 
-    test("multiple double-quotes are all escaped", () => {
+    test("multiple double-quotes are all escaped, with filename* companion", () => {
         const result = buildContentDisposition('"a" and "b".pdf');
-        expect(result).toBe('attachment; filename="\\"a\\" and \\"b\\".pdf"');
+        expect(result).toBe(
+            'attachment; filename="\\"a\\" and \\"b\\".pdf"; filename*=UTF-8\'\'%22a%22%20and%20%22b%22.pdf',
+        );
     });
 
     test("single-quote is a valid token character (no quoting needed)", () => {
@@ -122,10 +127,13 @@ describe("buildContentDisposition backslash handling", () => {
         expect(result).toBe("attachment; filename=document");
     });
 
-    test("backslash + double-quote: basename gets quote-escaped", () => {
-        // path\to\"file".pdf -> basename is '"file".pdf' -> quotes escaped
+    test("backslash + double-quote: basename gets quote-escaped + filename*", () => {
+        // path\to\"file".pdf -> basename is '"file".pdf' -> quotes escaped,
+        // plus the unambiguous filename* form for the embedded quotes.
         const result = buildContentDisposition('path\\to\\"file".pdf');
-        expect(result).toBe('attachment; filename="\\"file\\".pdf"');
+        expect(result).toBe(
+            'attachment; filename="\\"file\\".pdf"; filename*=UTF-8\'\'%22file%22.pdf',
+        );
     });
 });
 
@@ -134,15 +142,15 @@ describe("buildContentDisposition backslash handling", () => {
 describe("buildContentDisposition RFC 8187 encoding", () => {
     test("Danish filename (Å -> %C3%85)", () => {
         const result = buildContentDisposition("Årlig_Rapport.pdf");
-        // ASCII fallback with ? replacement
-        expect(result).toContain('filename="?rlig_Rapport.pdf"');
+        // ASCII fallback folds Å to its NFKD base letter A (readable, token-safe)
+        expect(result).toContain("filename=Arlig_Rapport.pdf");
         // RFC 8187 encoded version
         expect(result).toContain("filename*=UTF-8''%C3%85rlig_Rapport.pdf");
     });
 
     test("German filename (ä -> %C3%A4)", () => {
         const result = buildContentDisposition("foo-ä.html");
-        expect(result).toContain('filename="foo-?.html"');
+        expect(result).toContain("filename=foo-a.html");
         expect(result).toContain("filename*=UTF-8''foo-%C3%A4.html");
     });
 
@@ -470,5 +478,33 @@ describe("buildContentDisposition encoding boundary precision", () => {
         // leading non-ASCII "å" forces the filename* path.
         const result = buildContentDisposition("å*.pdf");
         expect(result).toContain("filename*=UTF-8''%C3%A5%2A.pdf");
+    });
+});
+
+describe("buildContentDisposition extended invisible-character stripping", () => {
+    test("bidi and invisible format characters outside the classic set are stripped", () => {
+        // U+061C ALM, U+FEFF ZWNBSP/BOM, U+2060 word joiner, U+00AD soft
+        // hyphen: all invisible, all usable for filename spoofing.
+        const result = buildContentDisposition("re؜port﻿⁠­.pdf");
+        expect(result).toBe("attachment; filename=report.pdf");
+    });
+
+    test("interlinear annotation and Mongolian vowel separator are stripped", () => {
+        const result = buildContentDisposition("a￹b￺c￻d᠎.txt");
+        expect(result).toBe("attachment; filename=abcd.txt");
+    });
+});
+
+describe("buildContentDisposition ASCII fallback transliteration", () => {
+    test("NFKD-decomposable letters fold to their base letters", () => {
+        expect(buildContentDisposition("café.txt")).toContain("filename=cafe.txt");
+        expect(buildContentDisposition("Ärlig_Söt.pdf")).toContain("filename=Arlig_Sot.pdf");
+    });
+
+    test("non-decomposable characters still degrade to ?", () => {
+        // Danish ø and æ have no NFKD decomposition to ASCII.
+        const result = buildContentDisposition("høj.pdf");
+        expect(result).toContain('filename="h?j.pdf"');
+        expect(result).toContain("filename*=UTF-8''h%C3%B8j.pdf");
     });
 });

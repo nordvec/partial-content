@@ -1,5 +1,6 @@
 import { describe, test, expect } from "bun:test";
 import { azureStore, ObjectNotFoundError, ObjectChangedError, StoreUnavailableError } from "../azure";
+import { OPEN_ENDED } from "../index";
 
 // ─── Mock Azure Container Client ────────────────────────────────────────────
 
@@ -108,8 +109,12 @@ function mockContainer(opts: MockAzureOpts = {}) {
                         throw restErrorMessageOnly("The condition specified using HTTP conditional header(s) is not met: ConditionNotMet");
                     }
 
-                    const isRanged = count !== undefined;
-                    const end = isRanged ? Math.min(offset! + count - 1, CONTENT.length - 1) : CONTENT.length - 1;
+                    // Azure answers 206 + Content-Range for ANY ranged download,
+                    // including offset-only (open-ended) reads.
+                    const isRanged = count !== undefined || (offset !== undefined && offset > 0);
+                    const end = count !== undefined
+                        ? Math.min(offset! + count - 1, CONTENT.length - 1)
+                        : CONTENT.length - 1;
                     const slice = CONTENT.subarray(offset ?? 0, end + 1);
                     const nodeStream = Object.assign(iterate(Buffer.from(slice)), {
                         destroy() { opts.onDestroy?.(); },
@@ -298,5 +303,20 @@ describe("azureStore: degenerate SDK responses", () => {
     test("response with no body at all fails loudly", async () => {
         const store = azureStore({ containerClient: mockContainer({ noBody: true }) });
         await expect(store.getObject("doc.pdf")).rejects.toThrow(/no body/);
+    });
+});
+
+describe("azureStore: OPEN_ENDED wire translation", () => {
+    test("an open-ended range downloads with offset and NO count", async () => {
+        const calls: Array<{ offset?: number; count?: number; ifMatch?: string }> = [];
+        const store = azureStore({ containerClient: mockContainer({ calls }) as never });
+
+        const result = await store.getObject("test.bin", { range: { start: 5, end: OPEN_ENDED } });
+
+        // The sentinel MUST NOT surface as a literal count.
+        expect(calls[0]?.offset).toBe(5);
+        expect(calls[0]?.count).toBeUndefined();
+        expect(result.range).toEqual({ start: 5, end: 19 });
+        expect(result.contentLength).toBe(15);
     });
 });

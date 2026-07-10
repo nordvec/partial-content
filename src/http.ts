@@ -43,6 +43,7 @@ import {
   resolveServedRange,
   parseRetryAfterSeconds,
   isOpenEndedRange,
+  guardStreamLength,
   type ObjectStore,
   type ObjectMetadata,
   type ObjectStream,
@@ -250,7 +251,13 @@ export function httpStore(opts: HttpStoreOptions): ObjectStore {
       }
 
       return {
-        body: response.body ?? emptyStream(),
+        // Same truncation guard every other streaming adapter has: an origin
+        // that ends the body cleanly but short of (or past) the Content-Length
+        // it declared must error the stream, not close it looking complete
+        // under the committed byte count.
+        body: response.body
+          ? guardStreamLength(response.body, contentLength)
+          : emptyStream(),
         contentLength,
         totalSize,
         range: served,
@@ -303,11 +310,28 @@ function parseRetryAfter(response: Response): number | undefined {
 /**
  * Extract the raw base64 SHA-256 from an RFC 9530 Repr-Digest header
  * (`sha-256=:BASE64:`), or undefined when absent / different algorithm.
+ *
+ * Linear manual scan rather than an unanchored `[A-Za-z0-9+/]+=*` regex:
+ * on a long hostile header the regex backtracks quadratically, and a header
+ * is attacker-influenced input when proxying arbitrary origins.
  */
 function extractSha256Digest(header: string | null): string | undefined {
   if (!header) return undefined;
-  const match = /sha-256=:([A-Za-z0-9+/]+=*):/i.exec(header);
-  return match ? match[1] : undefined;
+  const marker = "sha-256=:";
+  const start = header.toLowerCase().indexOf(marker);
+  if (start === -1) return undefined;
+  const from = start + marker.length;
+  let i = from;
+  while (i < header.length && isBase64Char(header.charCodeAt(i))) i++;
+  while (i < header.length && header[i] === "=") i++;
+  if (i === from || header[i] !== ":") return undefined;
+  return header.slice(from, i);
+}
+
+/** base64 alphabet: A-Z a-z 0-9 + / */
+function isBase64Char(c: number): boolean {
+  return (c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a)
+    || (c >= 0x30 && c <= 0x39) || c === 0x2b || c === 0x2f;
 }
 
 /**
@@ -342,8 +366,8 @@ async function drain(response: Response, maxBytes = 64 * 1024): Promise<void> {
 }
 
 /** A closed empty stream for bodyless 200s (zero-byte objects). */
-function emptyStream(): ReadableStream<Uint8Array> {
-  return new ReadableStream<Uint8Array>({
+function emptyStream(): ReadableStream<Uint8Array<ArrayBuffer>> {
+  return new ReadableStream<Uint8Array<ArrayBuffer>>({
     start(controller) {
       controller.close();
     },

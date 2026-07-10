@@ -1,5 +1,6 @@
 import { describe, test, expect } from "bun:test";
 import { r2Store, ObjectNotFoundError, ObjectChangedError } from "../r2";
+import { OPEN_ENDED } from "../index";
 
 // ─── Mock R2 Bucket ─────────────────────────────────────────────────────────
 
@@ -146,5 +147,26 @@ describe("r2Store: getObject", () => {
         await expect(
             store.getObject("test.bin", { ifMatch: "abc123etag" }),
         ).rejects.toBeInstanceOf(ObjectChangedError);
+    });
+});
+
+describe("r2Store: OPEN_ENDED wire translation", () => {
+    test("an open-ended range becomes an offset-only R2 read (no length field)", async () => {
+        const seen: Array<{ offset: number; length?: number } | undefined> = [];
+        const bucket = mockBucket();
+        const origGet = bucket.get.bind(bucket);
+        bucket.get = ((key: string, options?: { range?: { offset: number; length?: number } }) => {
+            seen.push(options?.range);
+            // R2 itself reads to end for an offset-only range.
+            return origGet(key, { ...options, range: { offset: 5, length: 15 } });
+        }) as typeof bucket.get;
+
+        const store = r2Store({ bucket });
+        const result = await store.getObject("test.bin", { range: { start: 5, end: OPEN_ENDED } });
+
+        // The sentinel MUST NOT surface as a 16-digit length.
+        expect(seen[0]).toEqual({ offset: 5 });
+        expect(result.range).toEqual({ start: 5, end: 19 });
+        expect(result.contentLength).toBe(15);
     });
 });

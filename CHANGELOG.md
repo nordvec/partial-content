@@ -1,5 +1,65 @@
 # Changelog
 
+## 1.1.0 (2026-07-10)
+
+RFC compliance sweep re-verified against the current spec texts (RFC 9110,
+9530, 8941, 6266/8187), plus hardening and observability parity.
+
+### Kernel
+- `evaluateConditionalRequest` accepts `opts.method`: `"HEAD"` ignores
+  `Range`/`If-Range` (RFC 9110 14.2) and suppresses `Content-Digest`
+  (RFC 9530 B.2: a HEAD transfers no content).
+- `If-Range` HTTP-dates now enforce the 13.1.5 step-1 strong-validator rule:
+  a Last-Modified whose second has not fully elapsed never authorizes a
+  range resume.
+- `parseRanges`: parts are returned in REQUEST order (15.3.7.2 SHOULD), gaps
+  smaller than the ~80-byte part overhead coalesce (15.3.7.2 MAY), and a
+  single coalesced range serves as a plain 206 instead of degrading to 200.
+- Digest layer: values that are not the raw base64 of a 32-byte SHA-256 are
+  never emitted; `Want-Repr-Digest` and `Want-Content-Digest` negotiate
+  independently (new `clientWantsContentDigest` export) with RFC 8941
+  last-wins duplicate keys.
+- `build416Headers` / `buildRangeResponseHeaders` validate bounds: `NaN`
+  totals and the `OPEN_ENDED` sentinel can no longer serialize into
+  `Content-Range`.
+- `fromNodeHeaders` uses a null-prototype map (a literal `__proto__` request
+  header cannot poison lookups).
+
+### Serving adapters
+- 304 responses carry the caller's `securityHeaders` output, so a caller-set
+  `Vary` satisfies the RFC 9110 15.4.5 MUST-generate list.
+- HEAD-to-GET validator drift guard: on stores that cannot pin reads, a
+  partial response whose GET validators disagree with the validating HEAD
+  re-validates once instead of splicing bytes across representations.
+- multipart/byteranges: honors `Want-Repr-Digest`, reports
+  `Server-Timing`/`onTiming`, and verifies each part's actual byte count
+  against the committed framing.
+- `supportsRange: false` stores without a signed URL now serve the full
+  representation with `Accept-Ranges: none` instead of failing 502;
+  signed-URL provider rejections and declines are reported to `onError`.
+- OPTIONS answers `204` + `Allow`; the disposition type is coerced on the
+  no-filename path; new `etag: false` option for deployments with unstable
+  derived validators; node adapter is generic over the request type
+  (`serveObject<express.Request>`) and reports extractor failures to
+  `onError` (`operation: "context"`).
+
+### Store adapters
+- `http`: bodies are guarded against silent truncation (`guardStreamLength`);
+  `Repr-Digest` extraction is a linear scan (no backtracking regex).
+- `fs`: Windows reserved-device check covers trailing dots/spaces and
+  superscript COM/LPT digits; the small-read path loops on legal short reads.
+- `s3`/`gcs`: throttle classifiers surface the backend's `Retry-After` hint.
+- `mime`: null-prototype lookup map (`lookupMime("x.constructor")` is
+  `undefined`, not a function).
+
+### Content-Disposition
+- Invisible-character stripping extended (U+00AD, U+061C, U+180E,
+  U+2060-2064, U+FEFF, U+FFF9-FFFB).
+- ASCII fallbacks fold NFKD-decomposable letters to base letters
+  ("Årlig" -> "Arlig") before `?`-replacement.
+- Filenames containing a double quote gain a `filename*` companion
+  (RFC 6266 Appendix D: quoted-pair alone is unreliable across clients).
+
 ## 1.0.1 (2026-07-06)
 
 Docs-only release, no code changes.

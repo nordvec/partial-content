@@ -1,10 +1,10 @@
-    # Design Notes
+# Design Notes
 
 Implementation details, RFC deviations, and architecture decisions for `partial-content`.
 
 ## Scope
 
-`partial-content` is the **protocol layer only**. It decides *what* status and headers a file request deserves; it never touches the bytes, the network, or your storage SDK.
+`partial-content` is the **protocol layer first**. The kernel decides *what* status and headers a file request deserves and never touches the bytes, the network, or a storage SDK; the optional subpath adapters (`/web`, `/node`, `/hono`, and the store adapters) layer the I/O on top for consumers who want the whole path handled.
 
 **In scope**
 
@@ -26,6 +26,11 @@ Implementation details, RFC deviations, and architecture decisions for `partial-
   ETag -- a correctness minefield with no payoff for documents and media,
   which are already compressed formats. Serve pre-compressed web assets from
   a CDN; serve documents through this library.
+- **Live / growing representations.** Range serving assumes a representation
+  whose length is fixed for the duration of a response (RFC 9110's model).
+  Indeterminate-length content (live logs, in-progress transcodes, RFC 8673
+  random access to live streams) is out of scope: the guards here treat a
+  length change mid-read as corruption, which for stored objects it is.
 - **Storage implementation.** `ObjectStore` is an interface; adapters are yours (or a thin wrapper over an SDK). Built-in adapters cover S3-compatible, R2, GCS, Azure, the local filesystem, any range-capable HTTP origin, and memory.
 
 ### When you need a protocol layer (and when you don't)
@@ -57,13 +62,21 @@ A `Range` with several parts (`bytes=0-100,200-300`) is served as a
 separate path that never touches the hot single-seek code. Two things make this
 safe rather than a DoS vector, informed by Go `net/http.ServeContent` and nginx:
 
-- **Coalescing.** Overlapping and adjacent (touching) ranges are merged before
-  serving, so a client cannot force redundant bytes by requesting the same
-  region many times.
+- **Coalescing.** Overlapping, adjacent, and near-adjacent ranges are merged
+  before serving: gaps smaller than the ~80-byte per-part framing overhead are
+  bridged, which RFC 9110 Section 15.3.7.2 sanctions and which strictly shrinks
+  the response. A client cannot force redundant bytes or framing by requesting
+  the same region many times, and a set that would tile the whole file merges
+  into a single plain 206 (no framing at all) -- which is why no separate
+  "covers the whole file" check exists.
 - **Amplification cap.** If the coalesced set still exceeds `maxRanges` distinct
-  parts (default 50), or already covers the whole representation, the ranges are
-  ignored and the full 200 is served, framing over the entire file is pure
-  overhead and the classic amplification vector.
+  parts (default 50), the ranges are ignored and the full 200 is served.
+  Cost model: each part is one ranged `getObject`, so a request can drive up
+  to `maxRanges` backend reads -- lower it (even to 1) when the backend bills
+  per request.
+- **Request order.** Parts are emitted in the order their range-specs appeared
+  in the request (a coalesced part inherits its earliest contributor's
+  position), honoring the Section 15.3.7.2 SHOULD.
 
 The `Content-Length` is computed exactly from the framing and range spans (never
 chunked). The first part is fetched eagerly so a pinned-read `ObjectChangedError`
@@ -90,15 +103,21 @@ actively dangerous: it could splice partial bytes from one representation onto a
 cached body from another. When either the client's `If-Range` or the server's\r
 ETag is weak-prefixed, we ignore the range and serve a full 200.
 
-**If-Range date comparison is exact match.** RFC 9110 Section 13.1.5 requires
-exact match for If-Range HTTP-date comparison (unlike If-Unmodified-Since which
-uses `<=`), and Go stdlib enforces the same equality. The failure modes are
-asymmetric: a strict mismatch costs at worst one full 200 re-download, while a
-lenient `<=` would honor the range precisely when the dates differ -- the one
-case where byte identity cannot be guaranteed -- splicing mismatched bytes onto
-the client's cached body. Both sides are floored to whole seconds first, and a
-well-behaved client echoes our emitted IMF-fixdate verbatim, so exact match
-never misfires for correct revalidation.
+**If-Range date comparison is exact match, plus the strong-validator rule.**
+RFC 9110 Section 13.1.5 requires exact match for If-Range HTTP-date comparison
+(unlike If-Unmodified-Since which uses `<=`), and Go stdlib enforces the same
+equality. The failure modes are asymmetric: a strict mismatch costs at worst
+one full 200 re-download, while a lenient `<=` would honor the range precisely
+when the dates differ -- the one case where byte identity cannot be
+guaranteed -- splicing mismatched bytes onto the client's cached body. Both
+sides are floored to whole seconds first, and a well-behaved client echoes our
+emitted IMF-fixdate verbatim, so exact match never misfires for correct
+revalidation. Step 1 of the 13.1.5 evaluation is enforced too: a Last-Modified
+whose second has not yet fully elapsed is not a strong validator (Section
+8.8.2.2 -- the representation could have been written twice within that
+second), so the range is ignored until the second passes. Go stdlib skips this
+step; the cost of honoring it is at worst one full 200 for a file modified
+under a second ago.
 
 **Case-insensitive range units.** Per RFC 9110 Section 14.1, range units are
 compared case-insensitively. `Bytes=0-499` and `BYTES=0-499` are both valid.
@@ -166,9 +185,13 @@ Some legacy middleware treats request `no-cache` as "force 200"; that behavior
 silently disables revalidation for exactly the clients that follow the fetch
 spec, so we do not reproduce it.
 
-**HEAD masks `Range` and `If-Range`.** RFC 9110 Section 14.2 defines range
+**HEAD ignores `Range` and `If-Range`.** RFC 9110 Section 14.2 defines range
 handling for GET only, so a HEAD never yields 206 or 416; conditionals
-(304/412) still apply to HEAD exactly as to GET per Section 13.1.
+(304/412) still apply to HEAD exactly as to GET per Section 13.1. The kernel
+is method-aware: pass `{ method: "HEAD" }` as the third argument to
+`evaluateConditionalRequest` (the bundled adapters do) and it also suppresses
+`Content-Digest`, whose representation value would be false over a HEAD's
+empty message content.
 
 **Oversized range values are capped, not rejected.** Range positions beyond
 `Number.MAX_SAFE_INTEGER` (attackers probing 64-bit parsers) are clamped to
@@ -189,10 +212,15 @@ zero-size representation as "not a range request" and serves the empty 200.
 
 **`Want-Repr-Digest` negotiation is parsed for `sha-256`, not as a full
 Structured Fields document.** RFC 9530 digest negotiation is read with a
-purpose-built parser that finds `sha-256` and its preference weight (and
-ignores any parameters); it is not a general RFC 8941 parser, because the only
-algorithm we emit is `sha-256`. Any other `Want-*` member is ignored, which is
-the correct outcome (we cannot honor an algorithm we do not produce).
+purpose-built parser that finds `sha-256` and its preference weight (ignoring
+Structured Fields parameters, honoring RFC 8941's last-occurrence-wins rule
+for duplicate keys, and treating a bare `sha-256` key as wanted); it is not a
+general RFC 8941 parser, because the only algorithm we emit is `sha-256`. Any
+other `Want-*` member is ignored, which is the correct outcome (we cannot
+honor an algorithm we do not produce). `Want-Repr-Digest` and
+`Want-Content-Digest` are evaluated independently -- each expresses a
+preference for its own response field -- via `clientWantsDigest()` and
+`clientWantsContentDigest()`.
 
 **Unknown totals in backend `Content-Range` are passed through as `*`.**
 When an origin answers `bytes a-b/*` (RFC 7233 Section 4.2 -- a streaming
@@ -232,20 +260,33 @@ never generates cache directives on its own.
 Returning the current ETag on a 412 lets OCC clients resync without a follow-up
 GET. The standalone `build412Headers()` omits it (callers add it themselves).
 
-⁴ RFC 9530 `Repr-Digest`. Emitted when `meta.digest` (raw base64 SHA-256) is
-provided. Uses Structured Fields Dictionary syntax: `sha-256=:<base64>:`.
-Covers the full representation (independent of Content-Range or Content-Encoding),
-so it remains stable across range requests. Storage backends provide the source:
-S3 via `x-amz-checksum-sha256`, GCS via `x-goog-hash`.
+⁴ RFC 9530 `Repr-Digest`. Emitted when `meta.digest` is the raw base64 of a
+32-byte SHA-256; any other value is dropped rather than framed as a false
+integrity assertion. Uses Structured Fields Dictionary syntax:
+`sha-256=:<base64>:`. Covers the full representation (independent of
+Content-Range or Content-Encoding), so it remains stable across range
+requests. Source it from a backend field that IS a SHA-256 of the bytes: S3
+`x-amz-checksum-sha256` (uploads with checksums enabled). GCS `x-goog-hash`
+carries only `crc32c` and `md5` and cannot be used; store your own SHA-256 as
+object metadata there.
 
-⁵ RFC 9530 `Content-Digest`. Identical to `Repr-Digest` on 200 responses
-(content equals full representation). Omitted on 206 because computing a hash
-of the range slice would require streaming through crypto, violating the
-zero-I/O kernel contract.
+⁵ RFC 9530 `Content-Digest`. Identical to `Repr-Digest` on full 200 GET
+responses (content equals full representation). Omitted on 206 because a
+range-slice hash would require streaming through crypto (violating the
+zero-I/O kernel contract), on HEAD because the message transfers no content
+(RFC 9530 Appendix B.2 computes a HEAD `Content-Digest` over empty content),
+and when the client declined it via `Want-Content-Digest`.
 
-⁶ Omitted on 304 whenever an `ETag` is emitted: RFC 7232 Section 4.1 lists
-`Last-Modified` among headers to send only "unless the reason for sending is
-the entity-tag"; one strong validator suffices and this matches Go stdlib.
+⁶ Omitted on 304 whenever an `ETag` is emitted: RFC 9110 Section 15.4.5 has a
+304 sender generate representation metadata beyond the listed fields only for
+cache-update purposes and names `Last-Modified` as useful when there is no
+ETag; one strong validator suffices and this matches Go stdlib. Of the
+Section 15.4.5 MUST-generate list (`Content-Location`, `Date`, `ETag`,
+`Vary`, `Cache-Control`, `Expires`): `ETag` and `Cache-Control` are the
+library's job, `Date` is the server runtime's, and `Vary` /
+`Content-Location` / `Expires` are the caller's -- the web adapter forwards
+its `securityHeaders` output onto 304 responses precisely so a caller-set
+`Vary` satisfies the MUST.
 
 The following headers are **not** generated because they are the responsibility
 of the HTTP runtime or application layer:
@@ -291,21 +332,29 @@ Key properties:
 - **Repr-Digest** covers the *full representation*, not the transmitted bytes.
   This means the same digest value appears on both full (200) and partial (206)
   responses, allowing clients to verify integrity regardless of transfer strategy.
-- **Content-Digest** is identical to `Repr-Digest` on 200 responses (content
-  equals the full representation). On 206, Content-Digest is omitted because
-  computing a hash of the range slice would require streaming through crypto,
-  violating the zero-I/O kernel contract. This is correct per RFC 9530 Section 2.
+- **Content-Digest** is identical to `Repr-Digest` on full 200 GET responses
+  (content equals the full representation). On 206 it is omitted because a
+  range-slice hash would require streaming through crypto, violating the
+  zero-I/O kernel contract; on HEAD it is omitted because the message content
+  is empty (RFC 9530 Appendix B.2). This is correct per RFC 9530 Section 2.
 - **Want-Repr-Digest / Want-Content-Digest** request header parsing (RFC 9530
   Section 4). The kernel respects client algorithm preferences: if the client
   only wants `sha-512`, we omit our `sha-256` digest rather than sending an
-  unwanted algorithm. Weight 0 means explicitly unwanted. The negotiation is
-  exported as `clientWantsDigest()` and applied identically by the kernel
-  orchestrator and the web adapter, so suppression works at every layer.
+  unwanted algorithm. Weight 0 means explicitly unwanted, duplicate keys
+  resolve last-wins (RFC 8941), and each Want-* field gates only its own
+  response field. The negotiation is exported as `clientWantsDigest()` /
+  `clientWantsContentDigest()` and applied identically by the kernel
+  orchestrator and the web adapter (single-range AND multipart), so
+  suppression works at every layer.
 - Uses **Structured Fields Dictionary** syntax per RFC 8941: `sha-256=:<base64>:`
-- **Not emitted** on 304 (no body) or 412 (precondition failure).
+- **Not emitted** on 304 (no body), on 412 (precondition failure), or when the
+  provided digest is not the raw base64 of a 32-byte SHA-256 (a malformed or
+  wrong-algorithm value would be a false integrity assertion).
 - The library **never computes** digests itself (zero dependencies, no crypto).
-  It relies on the storage backend to provide the hash, which S3 and GCS already
-  compute at upload time.
+  It relies on the storage backend to provide the hash: S3 computes
+  `x-amz-checksum-sha256` at upload time when checksums are enabled; on
+  backends without a native SHA-256 (GCS exposes only crc32c/md5), store one
+  as object metadata at upload.
 
 Enterprise use case: SOC 2 / ISO 27001 compliance audits can verify that the
 file delivered to the browser matches the file stored in object storage, using
@@ -318,9 +367,11 @@ conditional headers and no `If-Range` needs nothing from a HEAD: on stores
 declaring `authoritativeRange` (S3, Azure, R2, http -- their 206
 bounds/total are parsed from the backend's actual `Content-Range`), the
 orchestrator issues a single GET. `bytes=a-b` and `bytes=a-` qualify (an
-open end is sent as a large last-byte-pos, which RFC 9110 Section 14.1.2
-lets the server clamp); suffix, multi-range, and malformed specs fall back
-to the validating HEAD path. Validators, bounds, and digest all come from
+open end travels through the adapters as the `OPEN_ENDED` sentinel and is
+emitted in each backend's idiomatic open form -- `bytes=a-` on the wire, an
+offset-only read for R2, offset-without-count for Azure -- never as a
+literal 16-digit last-byte-pos); suffix, multi-range, and malformed specs
+fall back to the validating HEAD path. Validators, bounds, and digest all come from
 the GET response itself, so the fast path is inherently TOCTOU-atomic. If
 the backend rejects the range natively (start beyond EOF) the request
 falls back to the HEAD path, which produces the correct 416 with real
@@ -424,3 +475,34 @@ where legacy browsers auto-detect charset when none is declared, allowing
 `+ADw-script+AD4-` to execute as JavaScript.
 
 Controlled via `enforceCharset: false` for consumers who need raw MIME types.
+
+## Shared Caches and 206 Responses
+
+Two properties matter when a CDN or shared cache sits in front of a
+range-serving origin (RFC 9111 Section 3.3-3.4):
+
+- A cache may only **combine** stored 206 ranges (or a 206 with a stored 200)
+  when the responses share the same STRONG validator. The fs store's weak
+  `W/"size-mtime"` ETag can never satisfy that, so caches will store ranges
+  but re-fetch rather than assemble them; content-hash ETags (S3 digests)
+  enable full range reuse.
+- Error responses here always carry `Cache-Control: no-store`, so a transient
+  404/502/503 can never be heuristically cached into a persistent outage
+  (RFC 9111 Section 4.2.2 makes 404s heuristically cacheable by default).
+
+## Runtime Notes
+
+Behaviors owned by the HTTP runtime, observable when serving through
+`Response` objects; none can be changed from library code:
+
+- **Bun.serve chunks stream bodies.** A `ReadableStream` body is sent with
+  `Transfer-Encoding: chunked` even when a `Content-Length` header was set;
+  byte bodies (`Uint8Array`, small fs reads, memory store) keep the exact
+  precomputed length. Correctness is unaffected (framing is the runtime's
+  job); byte accounting on the wire differs from Node, where the pump writes
+  under the declared `Content-Length`.
+- **Bun adds `Content-Length: 0` to bodyless 304s.** RFC 9110 Section 8.6
+  allows a 304 `Content-Length` only when it equals the 200's length; the
+  header is injected by the runtime after the handler returns.
+- **`Date` headers** are added by Node, Bun, Deno, and Workers automatically;
+  the library never generates them.

@@ -100,7 +100,7 @@ describe("node adapter over real HTTP", () => {
     test("POST returns 405 with Allow", async () => {
         const res = await fetch(`${baseUrl}/hello.txt`, { method: "POST" });
         expect(res.status).toBe(405);
-        expect(res.headers.get("allow")).toBe("GET, HEAD");
+        expect(res.headers.get("allow")).toBe("GET, HEAD, OPTIONS");
     });
 });
 

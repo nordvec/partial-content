@@ -656,6 +656,11 @@ export interface ObjectStore {
   /**
    * Optional degradation path for backends that cannot stream ranges through
    * the origin. Returns a short-lived URL the client is redirected to.
+   *
+   * `downloadFilename` is RAW untrusted input (the consumer's
+   * ServeContext.filename, verbatim). Implementations that embed it in a
+   * response-content-disposition query parameter or similar MUST sanitize it
+   * (e.g. via `buildContentDisposition`), exactly as the streaming path does.
    */
   createSignedUrl?(
     key: string,

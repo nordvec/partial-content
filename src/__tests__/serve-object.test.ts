@@ -285,17 +285,38 @@ describe("serveObject", () => {
         expect(response.headers.get("Location")).toBe("https://cdn.example.com/signed?token=abc");
     });
 
-    test("returns 502 when store does not support ranges and has no signed URL", async () => {
+    test("range-incapable store without signed URL serves the full content rangeless", async () => {
         const noRangeStore = createMockStore({
             supportsRange: false,
             createSignedUrl: undefined,
         });
         const handler = serveObject(noRangeStore);
 
-        const response = await handler(mockRequest(), defaultCtx());
+        // A Range request against a store that cannot seek: RFC 9110 14.2
+        // lets the server ignore Range, so the client gets the full 200 and
+        // an honest Accept-Ranges: none instead of a hard 502.
+        const response = await handler(
+            mockRequest({ Range: "bytes=0-4" }),
+            defaultCtx(),
+        );
 
-        expect(response.status).toBe(502);
-        expect(response.headers.get("X-Content-Type-Options")).toBe("nosniff");
+        expect(response.status).toBe(200);
+        expect(response.headers.get("Accept-Ranges")).toBe("none");
+        expect(response.headers.get("Content-Range")).toBeNull();
+    });
+
+    test("range-incapable store without signed URL still answers conditionals", async () => {
+        const noRangeStore = createMockStore({
+            supportsRange: false,
+            createSignedUrl: undefined,
+        });
+        const handler = serveObject(noRangeStore);
+
+        const response = await handler(
+            mockRequest({ "If-None-Match": '"abc123"' }),
+            defaultCtx(),
+        );
+        expect(response.status).toBe(304);
     });
 
     test("redirect response includes Accept-Ranges: none", async () => {
@@ -430,8 +451,20 @@ describe("serveObject", () => {
 
         expect(response.status).toBe(405);
         expect(response.statusText).toBe("Method Not Allowed");
-        expect(response.headers.get("Allow")).toBe("GET, HEAD");
+        expect(response.headers.get("Allow")).toBe("GET, HEAD, OPTIONS");
         expect(response.headers.get("Content-Length")).toBe("0");
+    });
+
+    test("answers OPTIONS with 204 and the Allow surface", async () => {
+        const store = createMockStore();
+        const handler = serveObject(store);
+
+        const req = new Request("http://localhost/stream", { method: "OPTIONS" });
+        const response = await handler(req, defaultCtx());
+
+        expect(response.status).toBe(204);
+        expect(response.headers.get("Allow")).toBe("GET, HEAD, OPTIONS");
+        expect(response.body).toBeNull();
     });
 
     test("returns 405 for DELETE method", async () => {
@@ -678,12 +711,13 @@ describe("serveObject", () => {
         const r404 = await serveObject(notFoundStore)(mockRequest(), defaultCtx());
         expect(r404.headers.get("Content-Security-Policy")).toBe(CSP);
 
-        // 502 no-streaming fallback
+        // 502 declined signed URL (range-incapable store whose provider says no)
         const noStreamStore = createMockStore({
             supportsRange: false,
-            createSignedUrl: undefined,
+            createSignedUrl: mock(async () => ({ ok: false as const, error: "denied" })),
         });
         const r502ns = await serveObject(noStreamStore)(mockRequest(), defaultCtx());
+        expect(r502ns.status).toBe(502);
         expect(r502ns.headers.get("Content-Security-Policy")).toBe(CSP);
     });
 
@@ -720,7 +754,7 @@ describe("serveObject", () => {
                 contentLength: 10000,
                 etag: '"abc123"',
                 lastModified: "Sat, 28 Jun 2025 12:00:00 GMT",
-                digest: "dGVzdGhhc2g=",
+                digest: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
             })),
         });
         const handler = serveObject(storeWithDigest);
@@ -731,7 +765,7 @@ describe("serveObject", () => {
             defaultCtx(),
         );
         expect(r200.status).toBe(200);
-        expect(r200.headers.get("Repr-Digest")).toBe("sha-256=:dGVzdGhhc2g=:");
+        expect(r200.headers.get("Repr-Digest")).toBe("sha-256=:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=:");
     });
 
     test("RFC 9530 Repr-Digest: not emitted when store has no digest", async () => {
@@ -990,14 +1024,14 @@ describe("serveObject", () => {
                 totalSize: 3,
                 etag: '"abc123"',
                 lastModified: "Sat, 28 Jun 2025 12:00:00 GMT",
-                digest: "dGVzdGRpZ2VzdA==",
+                digest: "LPJNul+wow4m6DsqxbninhsWHlwfp0JecwQzYpOLmCQ=",
             })),
         });
         const handler = serveObject(store);
         // Path C: no conditional headers, no range, no HEAD needed
         const res = await handler(mockRequest(), defaultCtx());
         expect(res.status).toBe(200);
-        expect(res.headers.get("Repr-Digest")).toBe("sha-256=:dGVzdGRpZ2VzdA==:");
+        expect(res.headers.get("Repr-Digest")).toBe("sha-256=:LPJNul+wow4m6DsqxbninhsWHlwfp0JecwQzYpOLmCQ=:");
     });
 
     // ── CSP on Error Responses ────────────────────────────────────────

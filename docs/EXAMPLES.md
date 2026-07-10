@@ -146,3 +146,77 @@ const { status, headers } = buildRangeResponseHeaders({
   cacheControl: "private, no-cache",
 });
 ```
+
+## Write-side OCC (evaluateConditionalWrite)
+
+Optimistic concurrency for PUT/PATCH/DELETE: the client echoes the ETag it
+last saw via `If-Match`, and a mismatch means someone else wrote first.
+
+```typescript
+import { evaluateConditionalWrite } from "partial-content";
+
+export async function PUT(req: Request) {
+  const current = await db.getDocumentMeta(id); // { etag, updatedAt } or null
+
+  const verdict = evaluateConditionalWrite(req.headers, {
+    etag: current?.etag,               // strong validator required for If-Match
+    lastModified: current?.updatedAt,
+    exists: current !== null,          // enables If-None-Match: * (create-only)
+  });
+  if (!verdict.proceed) {
+    // 412; headers include the CURRENT ETag so the client can resync
+    return new Response(null, { status: verdict.status, headers: verdict.headers });
+  }
+
+  await db.saveDocument(id, await req.json());
+  return new Response(null, { status: 204 });
+}
+```
+
+`If-None-Match: *` makes the write create-only (fails 412 if the resource
+exists); `exists` must be passed explicitly for that pattern, or the kernel
+throws rather than guess and overwrite.
+
+## Multi-range (multipart/byteranges)
+
+Nothing to wire: `serveObject` serves `Range: bytes=0-99,5000-5099` as a
+`multipart/byteranges` 206 with an exact precomputed `Content-Length`, parts
+in request order, gap/overlap coalescing, and the `maxRanges` amplification
+cap. Each part costs one ranged `getObject`, so tune the cap to your backend:
+
+```typescript
+const handler = serveObject(store, {
+  maxRanges: 5,   // at most 5 backend reads per request (default 50)
+});
+// maxRanges: 1 disables multipart entirely: multi-range requests degrade to
+// a full 200 and every request costs at most one backend read.
+```
+
+Kernel-only consumers: `parseRanges()` + `buildMultipartHeaders()` +
+`buildMultipartPartHeader()` / `multipartEpilogue()` are the framing
+primitives (see Advanced: manual primitives).
+
+## Digest negotiation (Want-Repr-Digest / Want-Content-Digest)
+
+A client that wants integrity metadata asks for it; one that cannot use it
+declines. Both fields negotiate independently:
+
+```
+GET /file HTTP/1.1
+Want-Repr-Digest: sha-256=5        -> Repr-Digest: sha-256=:<base64>:
+Want-Repr-Digest: sha-256=0        -> no digest headers at all
+Want-Content-Digest: sha-256=0     -> Repr-Digest only, no Content-Digest
+(no Want-* header)                 -> both emitted on a full 200 GET
+```
+
+The negotiation is exported for kernel-only consumers:
+
+```typescript
+import { clientWantsDigest, clientWantsContentDigest } from "partial-content";
+
+const meta = {
+  totalSize, etag, lastModified,
+  digest: clientWantsDigest(req.headers) ? storedSha256 : undefined,
+  contentDigest: clientWantsContentDigest(req.headers),
+};
+```

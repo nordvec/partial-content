@@ -21,6 +21,7 @@ import {
   StoreUnavailableError,
   classifyStoreRead,
   nodeStreamToWeb,
+  parseRetryAfterSeconds,
   type ObjectStore,
   type ObjectMetadata,
   type ObjectStream,
@@ -271,10 +272,15 @@ function isGcsNotFound(err: unknown): boolean {
  * (mapped to a 503, not a 502). The Cloud Storage client surfaces the HTTP
  * status on `err.code`: 429 (rate limit) or 503 (backend unavailable).
  */
-function isGcsThrottled(err: unknown): boolean {
+function isGcsThrottled(err: unknown): boolean | { retryAfterSeconds: number } {
   if (typeof err === "object" && err !== null && "code" in err) {
     const code = (err as { code: unknown }).code;
-    return code === 429 || code === 503;
+    if (code !== 429 && code !== 503) return false;
+    // Surface the backend's advised back-off when the client library kept
+    // the raw response, so the resulting 503 echoes it as Retry-After.
+    const headers = (err as { response?: { headers?: Record<string, string> } }).response?.headers;
+    const hint = parseRetryAfterSeconds(headers?.["retry-after"], { allowHttpDate: true });
+    return hint !== undefined ? { retryAfterSeconds: hint } : true;
   }
   return false;
 }

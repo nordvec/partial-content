@@ -166,13 +166,18 @@ function sanitizeFilename(raw: string): string {
     // 1. Strip control characters and Unicode formatting controls.
     //    C0 controls (\x00-\x1F), DEL (\x7F): prevents CRLF header injection.
     //    C1 controls (\x80-\x9F): invisible formatting, no valid use in filenames.
-    //    Bidi overrides (U+202A-202E, U+2066-2069): prevents RLO filename
-    //    spoofing where "report\u202Efdp.exe" renders as "reportexe.pdf".
-    //    Zero-width chars (U+200B-200F): invisible joiners/marks, strips
-    //    directional marks that could confuse filename display.
-    //    NBSP (U+00A0): often mistaken for regular space, normalize away.
+    //    Bidi controls (U+061C ALM, U+202A-202E, U+2066-2069): prevents RLO
+    //    filename spoofing where "report\u202Efdp.exe" renders as
+    //    "reportexe.pdf" -- the full Unicode bidi-control set, not only the
+    //    LRE..RLO block.
+    //    Zero-width and invisible format chars (U+200B-200F, U+2060-2064 word
+    //    joiner + invisible operators, U+FEFF ZWNBSP/BOM, U+180E Mongolian
+    //    vowel separator, U+FFF9-FFFB interlinear annotation): invisible
+    //    joiners/marks that can hide or reorder what the user sees.
+    //    Soft hyphen (U+00AD): invisible except at line breaks, same spoofing
+    //    class. NBSP (U+00A0): often mistaken for a regular space.
     const noControls = raw.replace(
-        /[\r\n\x00-\x1F\x7F\x80-\x9F\u00A0\u200B-\u200F\u2028\u2029\u202A-\u202E\u2066-\u2069]/g,
+        /[\r\n\x00-\x1F\x7F\x80-\x9F\u00A0\u00AD\u061C\u180E\u200B-\u200F\u2028\u2029\u202A-\u202E\u2060-\u2064\u2066-\u2069\uFEFF\uFFF9-\uFFFB]/g,
         "",
     );
 
@@ -207,8 +212,15 @@ function sanitizeFilename(raw: string): string {
 function buildFilenameParams(filename: string): string {
     // Case 1: Pure ASCII that fits in a token -- emit unquoted.
     // Also reject filenames with hex-encoded sequences (%20) which could
-    // be decoded by legacy clients.
-    if (ASCII_TEXT_REGEXP.test(filename) && !HEX_ESCAPE_REGEXP.test(filename)) {
+    // be decoded by legacy clients, and filenames containing a double
+    // quote: RFC 6266 Appendix D advises against relying on quoted-pair
+    // escaping (many user agents mishandle `\"`), so those get a
+    // filename* companion below, which encodes the quote unambiguously.
+    if (
+        ASCII_TEXT_REGEXP.test(filename)
+        && !HEX_ESCAPE_REGEXP.test(filename)
+        && !filename.includes('"')
+    ) {
         if (TOKEN_REGEXP.test(filename)) {
             return `; filename=${filename}`;
         }
@@ -252,12 +264,19 @@ function quoteString(str: string): string {
 /**
  * Generate a US-ASCII fallback for non-ASCII filenames.
  *
- * Replaces non-ASCII characters with `?`. This is more honest than `_` --
- * it signals to the user that characters were lost in translation, rather
- * than suggesting underscores were in the original.
+ * First folds compatibility-decomposable characters to their base letters
+ * (NFKD + combining-mark strip), so accented Latin degrades readably:
+ * "Årlig Rapport.pdf" -> "Arlig Rapport.pdf", "café.txt" -> "cafe.txt".
+ * Characters with no ASCII decomposition (CJK, ø, æ, emoji) are replaced
+ * with `?` -- more honest than `_`, since it signals characters were lost
+ * rather than suggesting underscores were in the original. Modern clients
+ * use the lossless `filename*` parameter instead.
  */
 function toAsciiFallback(filename: string): string {
-    return filename.replace(NON_ASCII_REGEXP, "?");
+    return filename
+        .normalize("NFKD")
+        .replace(/\p{M}/gu, "")
+        .replace(NON_ASCII_REGEXP, "?");
 }
 
 /**

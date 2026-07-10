@@ -159,7 +159,7 @@ describe("parseRanges properties", () => {
         })
         .map((pairs) => "bytes=" + pairs.map(([a, b]) => `${a}-${b}`).join(","));
 
-    test("never throws; a satisfiable set is in-bounds, coalesced, capped, and sub-total", () => {
+    test("never throws; a satisfiable set is in-bounds, gap-coalesced, and capped", () => {
         fc.assert(
             fc.property(safeTotal, fc.oneof(arbitraryText, byteRangeHeader), (total, header) => {
                 const r = parseRanges(header, total);
@@ -168,20 +168,24 @@ describe("parseRanges properties", () => {
                 expect(r.ranges.length).toBeGreaterThanOrEqual(1);
                 expect(r.ranges.length).toBeLessThanOrEqual(MAX_RANGES_DEFAULT);
 
-                let prevEnd = -2; // first part only needs start >= 0
-                let covered = 0;
                 for (const rg of r.ranges) {
                     expect(rg.start).toBeGreaterThanOrEqual(0);
                     expect(rg.end).toBeGreaterThanOrEqual(rg.start);
                     expect(rg.end).toBeLessThan(total);
-                    // Coalesced + ascending: a distinct part starts at least 2 past
-                    // the previous end (touching/overlapping parts were merged).
-                    expect(rg.start).toBeGreaterThan(prevEnd + 1);
-                    prevEnd = rg.end;
-                    covered += rg.end - rg.start + 1;
                 }
-                // Amplification defense: a satisfiable set never covers the whole file.
-                expect(covered).toBeLessThan(total);
+                // Gap-coalesced: DISTINCT parts are separated by more than the
+                // 80-byte framing overhead (checked pairwise in byte order;
+                // parts are emitted in REQUEST order, not ascending order).
+                const byStart = [...r.ranges].sort((a, b) => a.start - b.start);
+                for (let i = 1; i < byStart.length; i++) {
+                    expect(byStart[i]!.start).toBeGreaterThan(byStart[i - 1]!.end + 81);
+                }
+                // Multi-part sets can therefore never tile the whole file: the
+                // inter-part gaps alone leave uncovered bytes.
+                if (r.ranges.length > 1) {
+                    const covered = r.ranges.reduce((n, rg) => n + (rg.end - rg.start + 1), 0);
+                    expect(covered).toBeLessThan(total);
+                }
             }),
             { numRuns: 500 },
         );

@@ -398,7 +398,7 @@ describe("serveObject: error handling", () => {
         const res = await handler(req({}, "POST"), { key: KEY });
 
         expect(res.status).toBe(405);
-        expect(res.headers.get("Allow")).toBe("GET, HEAD");
+        expect(res.headers.get("Allow")).toBe("GET, HEAD, OPTIONS");
     });
 
     test("corrupt store metadata (NaN size) returns 502, never throws", async () => {
@@ -756,14 +756,52 @@ describe("serveObject: never-throw contract (Path C)", () => {
         expect(failures).toEqual([{ key: KEY, operation: "audit" }]);
     });
 
-    test("supportsRange: false without createSignedUrl returns 502", async () => {
+    test("supportsRange: false without createSignedUrl serves the full content rangeless", async () => {
         const store = memoryStore({ etag: ETAG });
         (store as { supportsRange: boolean }).supportsRange = false;
         const handler = serveObject(store);
+
+        // Even with a Range header: RFC 9110 14.2 lets the server ignore
+        // Range, and the honest advertisement is Accept-Ranges: none.
+        const res = await handler(req({ Range: "bytes=0-3" }), { key: KEY });
+        expect(res.status).toBe(200);
+        expect(await res.text()).toBe("0123456789abcdefghij");
+        expect(res.headers.get("Accept-Ranges")).toBe("none");
+        expect(res.headers.get("Content-Range")).toBeNull();
+
+        // Conditionals still work: they need no byte seeking.
+        const r304 = await handler(req({ "If-None-Match": ETAG }), { key: KEY });
+        expect(r304.status).toBe(304);
+    });
+
+    test("supportsRange: false with a rejecting createSignedUrl returns a reported 502", async () => {
+        const errors: { op: string }[] = [];
+        const store = memoryStore({ etag: ETAG });
+        (store as { supportsRange: boolean }).supportsRange = false;
+        (store as unknown as { createSignedUrl: unknown }).createSignedUrl =
+            async () => { throw new Error("provider exploded"); };
+        const handler = serveObject(store, {
+            onError: (_err, ctx) => errors.push({ op: ctx.operation }),
+        });
         const res = await handler(req(), { key: KEY });
 
         expect(res.status).toBe(502);
         expect(res.headers.get("Cache-Control")).toBe("no-store");
+        expect(errors).toEqual([{ op: "get" }]);
+    });
+
+    test("supportsRange: false with a declining createSignedUrl returns a reported 502", async () => {
+        const errors: unknown[] = [];
+        const store = memoryStore({ etag: ETAG });
+        (store as { supportsRange: boolean }).supportsRange = false;
+        (store as unknown as { createSignedUrl: unknown }).createSignedUrl =
+            async () => ({ ok: false as const, error: "bucket policy denies presign" });
+        const handler = serveObject(store, { onError: (err) => errors.push(err) });
+        const res = await handler(req(), { key: KEY });
+
+        expect(res.status).toBe(502);
+        expect(errors).toHaveLength(1);
+        expect(String(errors[0])).toContain("bucket policy denies presign");
     });
 });
 
@@ -1118,9 +1156,13 @@ describe("multi-range serving (multipart/byteranges)", () => {
         return [...body.matchAll(/Content-Range: (bytes \d+-\d+\/\d+)/g)].map((m) => m[1]!);
     }
 
+    // Multipart needs parts separated by MORE than the 80-byte coalescing
+    // gap, so these tests use a 200-byte object (the 20-byte pattern x10).
+    const BIG = "0123456789abcdefghij".repeat(10);
+
     test("two disjoint ranges are served as multipart/byteranges with an exact Content-Length", async () => {
-        const handler = serveObject(memoryStore({ etag: ETAG }));
-        const res = await handler(req({ Range: "bytes=0-4,10-14" }), { key: KEY, mime: "text/plain" });
+        const handler = serveObject(memoryStore({ etag: ETAG, content: BIG }));
+        const res = await handler(req({ Range: "bytes=0-4,110-114" }), { key: KEY, mime: "text/plain" });
 
         expect(res.status).toBe(206);
         const ctype = res.headers.get("Content-Type") ?? "";
@@ -1131,7 +1173,7 @@ describe("multi-range serving (multipart/byteranges)", () => {
         expect(res.headers.get("Content-Length")).toBe(String(buf.byteLength));
 
         const bodyText = new TextDecoder().decode(buf);
-        expect(partRanges(bodyText)).toEqual(["bytes 0-4/20", "bytes 10-14/20"]);
+        expect(partRanges(bodyText)).toEqual(["bytes 0-4/200", "bytes 110-114/200"]);
         // Each part's Content-Type is the representation MIME (with charset).
         expect(bodyText).toContain("Content-Type: text/plain; charset=utf-8");
         // The actual sliced bytes appear in the body.
@@ -1140,6 +1182,25 @@ describe("multi-range serving (multipart/byteranges)", () => {
         // The body ends with the closing boundary delimiter.
         const boundary = ctype.split("boundary=")[1]!;
         expect(bodyText.endsWith(`--${boundary}--\r\n`)).toBe(true);
+    });
+
+    test("parts are emitted in REQUEST order (RFC 9110 15.3.7.2 SHOULD)", async () => {
+        const handler = serveObject(memoryStore({ etag: ETAG, content: BIG }));
+        const res = await handler(req({ Range: "bytes=110-114,0-4" }), { key: KEY, mime: "text/plain" });
+
+        expect(res.status).toBe(206);
+        const bodyText = await res.text();
+        expect(partRanges(bodyText)).toEqual(["bytes 110-114/200", "bytes 0-4/200"]);
+    });
+
+    test("ranges separated by less than the part overhead coalesce to one 206", async () => {
+        const handler = serveObject(memoryStore({ etag: ETAG, content: BIG }));
+        // 45-byte gap < 80-byte framing overhead: bridged into one range.
+        const res = await handler(req({ Range: "bytes=0-4,50-54" }), { key: KEY });
+
+        expect(res.status).toBe(206);
+        expect(res.headers.get("Content-Type")).not.toContain("multipart");
+        expect(res.headers.get("Content-Range")).toBe("bytes 0-54/200");
     });
 
     test("overlapping ranges coalesce to a single normal 206 (not multipart)", async () => {
@@ -1161,19 +1222,23 @@ describe("multi-range serving (multipart/byteranges)", () => {
     });
 
     test("range-amplification (too many parts) degrades to a full 200", async () => {
-        const handler = serveObject(memoryStore({ etag: ETAG }), { maxRanges: 2 });
-        const res = await handler(req({ Range: "bytes=0-0,2-2,4-4" }), { key: KEY });
+        const handler = serveObject(memoryStore({ etag: ETAG, content: BIG }), { maxRanges: 2 });
+        const res = await handler(req({ Range: "bytes=0-0,100-100,199-199" }), { key: KEY });
 
         expect(res.status).toBe(200);
-        expect(await res.text()).toBe("0123456789abcdefghij");
+        expect((await res.text()).length).toBe(200);
     });
 
-    test("ranges covering the whole file degrade to a full 200", async () => {
+    test("ranges tiling the whole file coalesce to a single full-span 206", async () => {
         const handler = serveObject(memoryStore({ etag: ETAG }));
         const res = await handler(req({ Range: "bytes=0-9,10-19" }), { key: KEY });
 
-        expect(res.status).toBe(200);
-        expect((await res.text()).length).toBe(20);
+        // Adjacent ranges merge into one range covering the whole object:
+        // a plain 206 with no multipart framing, same bytes as a 200.
+        expect(res.status).toBe(206);
+        expect(res.headers.get("Content-Type")).not.toContain("multipart");
+        expect(res.headers.get("Content-Range")).toBe("bytes 0-19/20");
+        expect(await res.text()).toBe("0123456789abcdefghij");
     });
 
     test("conditionals still win: If-None-Match on a multi-range yields 304", async () => {
@@ -1201,7 +1266,7 @@ describe("multi-range serving (multipart/byteranges)", () => {
         // exactly what a concurrent overwrite looks like. The per-part guard
         // must reject it rather than emit a body that violates the committed
         // multipart Content-Length.
-        const data = bytesOf("0123456789abcdefghij");
+        const data = bytesOf(BIG);
         const store: ObjectStore = {
             supportsRange: true,
             async headObject(): Promise<ObjectMetadata> {
@@ -1218,7 +1283,7 @@ describe("multi-range serving (multipart/byteranges)", () => {
             },
         };
         const handler = serveObject(store);
-        const res = await handler(req({ Range: "bytes=0-4,10-14" }), { key: KEY });
+        const res = await handler(req({ Range: "bytes=0-4,110-114" }), { key: KEY });
 
         // The eager first-part guard throws ObjectChangedError; after the single
         // re-validation still fails, the orchestrator returns 502 -- never a 206
@@ -1232,7 +1297,7 @@ describe("multi-range serving (multipart/byteranges)", () => {
         // returning and the runtime's first pull, gen.return() runs no finally,
         // so the outer cancel must release firstStream itself -- otherwise a
         // stream part's file handle/socket leaks.
-        const data = bytesOf("0123456789abcdefghij");
+        const data = bytesOf(BIG);
         let getCalls = 0;
         let firstCancelled = false;
         const store: ObjectStore = {
@@ -1252,7 +1317,7 @@ describe("multi-range serving (multipart/byteranges)", () => {
             },
         };
         const handler = serveObject(store);
-        const res = await handler(req({ Range: "bytes=0-4,10-14" }), { key: KEY });
+        const res = await handler(req({ Range: "bytes=0-4,110-114" }), { key: KEY });
         expect(res.status).toBe(206);
 
         // Only the eager first part was fetched; cancel before ANY pull.
@@ -1266,7 +1331,7 @@ describe("multi-range serving (multipart/byteranges)", () => {
         // count, different bytes). Comparing each part's validator against the
         // first catches it: the second part reports a new ETag, so the stream
         // must error rather than splice bytes from a changed representation.
-        const data = bytesOf("0123456789abcdefghij");
+        const data = bytesOf(BIG);
         let call = 0;
         const store: ObjectStore = {
             supportsRange: true,
@@ -1281,7 +1346,7 @@ describe("multi-range serving (multipart/byteranges)", () => {
             },
         };
         const handler = serveObject(store);
-        const res = await handler(req({ Range: "bytes=0-4,10-14" }), { key: KEY });
+        const res = await handler(req({ Range: "bytes=0-4,110-114" }), { key: KEY });
         // Headers already committed (first part validated), so status is 206...
         expect(res.status).toBe(206);
         // ...but draining must fail loudly rather than deliver spliced bytes.
@@ -1293,7 +1358,7 @@ describe("multi-range serving (multipart/byteranges)", () => {
     test("onTransfer meters the whole multipart body", async () => {
         const events: TransferEvent[] = [];
         const handler = serveObject(memoryStore({ etag: ETAG }), { onTransfer: (e) => events.push(e) });
-        const res = await handler(req({ Range: "bytes=0-4,10-14" }), { key: KEY, mime: "text/plain" });
+        const res = await handler(req({ Range: "bytes=0-4,110-114" }), { key: KEY, mime: "text/plain" });
 
         const buf = await res.arrayBuffer();
         expect(events).toHaveLength(1);
@@ -1301,5 +1366,127 @@ describe("multi-range serving (multipart/byteranges)", () => {
             status: 206, completed: true,
             bytesExpected: buf.byteLength, bytesTransferred: buf.byteLength,
         });
+    });
+});
+
+// ─── Hardening additions (RFC re-audit) ─────────────────────────────────────
+
+describe("etag: false option", () => {
+    test("suppresses ETag on 200 and disables If-None-Match matching", async () => {
+        const handler = serveObject(memoryStore({ etag: ETAG, lastModified: LAST_MODIFIED }), { etag: false });
+
+        const r200 = await handler(req(), { key: KEY });
+        expect(r200.status).toBe(200);
+        expect(r200.headers.get("ETag")).toBeNull();
+        // Last-Modified still flows: date-based revalidation is unaffected.
+        expect(r200.headers.get("Last-Modified")).toBe(LAST_MODIFIED);
+
+        // Without a served ETag there is nothing an If-None-Match can match.
+        const rInm = await handler(req({ "If-None-Match": ETAG }), { key: KEY });
+        expect(rInm.status).toBe(200);
+
+        // If-Modified-Since revalidation still yields 304.
+        const rIms = await handler(req({ "If-Modified-Since": LAST_MODIFIED }), { key: KEY });
+        expect(rIms.status).toBe(304);
+    });
+});
+
+describe("304 header parity (RFC 9110 15.4.5)", () => {
+    test("caller extraHeaders (Vary) ride the 304 exactly as the 200", async () => {
+        const handler = serveObject(memoryStore({ etag: ETAG }), {
+            securityHeaders: () => ({ Vary: "Accept-Encoding" }),
+        });
+
+        const r200 = await handler(req(), { key: KEY });
+        expect(r200.headers.get("Vary")).toBe("Accept-Encoding");
+
+        const r304 = await handler(req({ "If-None-Match": ETAG }), { key: KEY });
+        expect(r304.status).toBe(304);
+        expect(r304.headers.get("Vary")).toBe("Accept-Encoding");
+        expect(r304.headers.get("ETag")).toBe(ETAG);
+    });
+});
+
+describe("HEAD digest semantics (RFC 9530 Appendix B.2)", () => {
+    const DIGEST = "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=";
+
+    test("HEAD carries Repr-Digest but never a representation-valued Content-Digest", async () => {
+        const handler = serveObject(memoryStore({ etag: ETAG, digest: DIGEST }));
+        const res = await handler(req({}, "HEAD"), { key: KEY });
+
+        expect(res.status).toBe(200);
+        expect(res.headers.get("Repr-Digest")).toBe(`sha-256=:${DIGEST}:`);
+        expect(res.headers.get("Content-Digest")).toBeNull();
+    });
+
+    test("GET still carries both on a full response", async () => {
+        const handler = serveObject(memoryStore({ etag: ETAG, digest: DIGEST }));
+        const res = await handler(req(), { key: KEY });
+        expect(res.headers.get("Repr-Digest")).toBe(`sha-256=:${DIGEST}:`);
+        expect(res.headers.get("Content-Digest")).toBe(`sha-256=:${DIGEST}:`);
+    });
+
+    test("Want-Content-Digest: sha-256=0 suppresses only Content-Digest", async () => {
+        const handler = serveObject(memoryStore({ etag: ETAG, digest: DIGEST }));
+        const res = await handler(req({ "Want-Content-Digest": "sha-256=0" }), { key: KEY });
+        expect(res.headers.get("Repr-Digest")).toBe(`sha-256=:${DIGEST}:`);
+        expect(res.headers.get("Content-Digest")).toBeNull();
+    });
+
+    test("an invalid store digest is never emitted", async () => {
+        const handler = serveObject(memoryStore({ etag: ETAG, digest: "not-base64!!" }));
+        const res = await handler(req(), { key: KEY });
+        expect(res.headers.get("Repr-Digest")).toBeNull();
+        expect(res.headers.get("Content-Digest")).toBeNull();
+    });
+});
+
+describe("HEAD-to-GET validator drift guard (non-pinning stores)", () => {
+    /** A store that cannot pin: HEAD sees v1, every GET serves v2 bytes. */
+    function driftingStore(headCalls: { n: number }): ObjectStore {
+        const v2 = bytesOf("XXXXXXXXXXXXXXXXXXXX"); // same size, new bytes
+        return {
+            supportsRange: true,
+            async headObject(): Promise<ObjectMetadata> {
+                headCalls.n++;
+                // First HEAD sees the old representation; the re-validation
+                // HEAD sees the new one, converging with what GET serves.
+                return {
+                    contentLength: 20,
+                    etag: headCalls.n === 1 ? '"v1"' : '"v2"',
+                    lastModified: LAST_MODIFIED,
+                };
+            },
+            async getObject(_key: string, getOpts?: { range?: ParsedRange }): Promise<ObjectStream> {
+                const range = getOpts?.range;
+                const slice = range ? v2.subarray(range.start, range.end + 1) : v2;
+                return {
+                    body: streamOf(slice),
+                    contentLength: slice.length,
+                    totalSize: 20,
+                    range: range ? { start: range.start, end: range.end } : undefined,
+                    etag: '"v2"',
+                    lastModified: LAST_MODIFIED,
+                };
+            },
+        };
+    }
+
+    test("a stale If-Range against a drifted object serves the NEW full 200, never a spliced 206", async () => {
+        const headCalls = { n: 0 };
+        const handler = serveObject(driftingStore(headCalls));
+        // Client validated against v1; object is v2 by the time GET runs.
+        const res = await handler(
+            req({ Range: "bytes=0-9", "If-Range": '"v1"' }),
+            { key: KEY },
+        );
+
+        // First attempt: If-Range fresh vs HEAD(v1) -> range honored -> GET
+        // returns v2 validators -> drift detected -> ONE re-validation.
+        // Second attempt: If-Range "v1" vs HEAD(v2) is stale -> full 200 of v2.
+        expect(headCalls.n).toBe(2);
+        expect(res.status).toBe(200);
+        expect(await res.text()).toBe("XXXXXXXXXXXXXXXXXXXX");
+        expect(res.headers.get("ETag")).toBe('"v2"');
     });
 });

@@ -1,5 +1,6 @@
-import { describe, test, expect } from "bun:test";
+import { describe, test, expect, setSystemTime } from "bun:test";
 import {
+    OPEN_ENDED,
     parseRangeHeader,
     parseRanges,
     buildRangeResponseHeaders,
@@ -344,19 +345,19 @@ describe("buildRangeResponseHeaders", () => {
     test("emits Repr-Digest and Content-Digest on 200 when digest provided", () => {
         const { headers } = buildRangeResponseHeaders({
             totalSize: 1000, range: null, contentType: "application/pdf",
-            etag: undefined, lastModified: undefined, digest: "dGVzdGhhc2g=",
+            etag: undefined, lastModified: undefined, digest: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
         });
-        expect(headers["Repr-Digest"]).toBe("sha-256=:dGVzdGhhc2g=:");
-        expect(headers["Content-Digest"]).toBe("sha-256=:dGVzdGhhc2g=:");
+        expect(headers["Repr-Digest"]).toBe("sha-256=:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=:");
+        expect(headers["Content-Digest"]).toBe("sha-256=:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=:");
     });
 
     test("emits Repr-Digest but omits Content-Digest on 206", () => {
         const { headers } = buildRangeResponseHeaders({
             totalSize: 1000, range: { start: 0, end: 499 },
             contentType: "application/pdf",
-            etag: undefined, lastModified: undefined, digest: "dGVzdGhhc2g=",
+            etag: undefined, lastModified: undefined, digest: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
         });
-        expect(headers["Repr-Digest"]).toBe("sha-256=:dGVzdGhhc2g=:");
+        expect(headers["Repr-Digest"]).toBe("sha-256=:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=:");
         expect(headers["Content-Digest"]).toBeUndefined();
     });
 
@@ -2228,7 +2229,11 @@ describe("evaluateConditionalRequest header values", () => {
         expect(result.headers["Content-Type"]).toBe("text/plain; charset=utf-8");
         expect(result.headers["ETag"]).toBe('"abcdef"');
         expect(result.headers["Last-Modified"]).toBe("baddate");
-        expect(result.headers["Repr-Digest"]).toBe("sha-256=:hashvalue:");
+        // A digest that is not the raw base64 of a 32-byte SHA-256 is never
+        // emitted: a sanitized-but-wrong value framed as sha-256=:...: would
+        // be a false integrity assertion, worse than none.
+        expect(result.headers["Repr-Digest"]).toBeUndefined();
+        expect(result.headers["Content-Digest"]).toBeUndefined();
     });
 
     test("passes IMF-fixdate through unchanged", () => {
@@ -2262,11 +2267,11 @@ describe("evaluateConditionalRequest Repr-Digest", () => {
             mockHeaders({}),
             {
                 totalSize: 1000,
-                digest: "dGVzdGhhc2g=",
+                digest: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
             },
         );
         expect(result.status).toBe(200);
-        expect(result.headers["Repr-Digest"]).toBe("sha-256=:dGVzdGhhc2g=:");
+        expect(result.headers["Repr-Digest"]).toBe("sha-256=:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=:");
     });
 
     test("emits Repr-Digest on 206 (stable across ranges)", () => {
@@ -2274,12 +2279,12 @@ describe("evaluateConditionalRequest Repr-Digest", () => {
             mockHeaders({ range: "bytes=0-99" }),
             {
                 totalSize: 1000,
-                digest: "YWJjZGVm",
+                digest: "LPJNul+wow4m6DsqxbninhsWHlwfp0JecwQzYpOLmCQ=",
             },
         );
         expect(result.status).toBe(206);
         // Repr-Digest covers the full representation, not the range
-        expect(result.headers["Repr-Digest"]).toBe("sha-256=:YWJjZGVm:");
+        expect(result.headers["Repr-Digest"]).toBe("sha-256=:LPJNul+wow4m6DsqxbninhsWHlwfp0JecwQzYpOLmCQ=:");
     });
 
     test("omits Repr-Digest when not provided", () => {
@@ -2298,7 +2303,7 @@ describe("evaluateConditionalRequest Repr-Digest", () => {
             {
                 totalSize: 1000,
                 etag: '"abc"',
-                digest: "dGVzdGhhc2g=",
+                digest: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
             },
         );
         expect(result.status).toBe(304);
@@ -2311,7 +2316,7 @@ describe("evaluateConditionalRequest Repr-Digest", () => {
             {
                 totalSize: 1000,
                 etag: '"right"',
-                digest: "dGVzdGhhc2g=",
+                digest: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
             },
         );
         expect(result.status).toBe(412);
@@ -2325,11 +2330,11 @@ describe("evaluateConditionalRequest Repr-Digest", () => {
             mockHeaders({}),
             {
                 totalSize: 1000,
-                digest: "dGVzdGhhc2g=",
+                digest: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
             },
         );
         expect(result.status).toBe(200);
-        expect(result.headers["Content-Digest"]).toBe("sha-256=:dGVzdGhhc2g=:");
+        expect(result.headers["Content-Digest"]).toBe("sha-256=:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=:");
         expect(result.headers["Content-Digest"]).toBe(result.headers["Repr-Digest"]);
     });
 
@@ -2338,11 +2343,11 @@ describe("evaluateConditionalRequest Repr-Digest", () => {
             mockHeaders({ range: "bytes=0-99" }),
             {
                 totalSize: 1000,
-                digest: "YWJjZGVm",
+                digest: "LPJNul+wow4m6DsqxbninhsWHlwfp0JecwQzYpOLmCQ=",
             },
         );
         expect(result.status).toBe(206);
-        expect(result.headers["Repr-Digest"]).toBe("sha-256=:YWJjZGVm:");
+        expect(result.headers["Repr-Digest"]).toBe("sha-256=:LPJNul+wow4m6DsqxbninhsWHlwfp0JecwQzYpOLmCQ=:");
         expect(result.headers["Content-Digest"]).toBeUndefined();
     });
 
@@ -2353,10 +2358,10 @@ describe("evaluateConditionalRequest Repr-Digest", () => {
             mockHeaders({ "want-repr-digest": "sha-256=5, sha-512=3" }),
             {
                 totalSize: 1000,
-                digest: "dGVzdGhhc2g=",
+                digest: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
             },
         );
-        expect(result.headers["Repr-Digest"]).toBe("sha-256=:dGVzdGhhc2g=:");
+        expect(result.headers["Repr-Digest"]).toBe("sha-256=:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=:");
     });
 
     test("omits digest when Want-Repr-Digest excludes sha-256", () => {
@@ -2364,7 +2369,7 @@ describe("evaluateConditionalRequest Repr-Digest", () => {
             mockHeaders({ "want-repr-digest": "sha-512=5" }),
             {
                 totalSize: 1000,
-                digest: "dGVzdGhhc2g=",
+                digest: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
             },
         );
         expect(result.headers["Repr-Digest"]).toBeUndefined();
@@ -2376,7 +2381,7 @@ describe("evaluateConditionalRequest Repr-Digest", () => {
             mockHeaders({ "want-repr-digest": "sha-256=0" }),
             {
                 totalSize: 1000,
-                digest: "dGVzdGhhc2g=",
+                digest: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
             },
         );
         expect(result.headers["Repr-Digest"]).toBeUndefined();
@@ -2387,22 +2392,85 @@ describe("evaluateConditionalRequest Repr-Digest", () => {
             mockHeaders({}),
             {
                 totalSize: 1000,
-                digest: "dGVzdGhhc2g=",
+                digest: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
             },
         );
-        expect(result.headers["Repr-Digest"]).toBe("sha-256=:dGVzdGhhc2g=:");
+        expect(result.headers["Repr-Digest"]).toBe("sha-256=:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=:");
     });
 
-    test("honors Want-Content-Digest as fallback for digest negotiation", () => {
+    test("Want-Content-Digest gates only Content-Digest, not Repr-Digest", () => {
+        // Each Want-* field expresses a preference for its corresponding
+        // response field (RFC 9530 Section 4): declining Content-Digest must
+        // not suppress Repr-Digest.
         const result = evaluateConditionalRequest(
             mockHeaders({ "want-content-digest": "sha-512=5" }),
             {
                 totalSize: 1000,
-                digest: "dGVzdGhhc2g=",
+                digest: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
             },
         );
-        // Client only wants sha-512, we only support sha-256
-        expect(result.headers["Repr-Digest"]).toBeUndefined();
+        expect(result.headers["Repr-Digest"]).toBe("sha-256=:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=:");
+        expect(result.headers["Content-Digest"]).toBeUndefined();
+    });
+
+    test("Want-Content-Digest: sha-256=0 suppresses Content-Digest on a full 200", () => {
+        const result = evaluateConditionalRequest(
+            mockHeaders({ "want-content-digest": "sha-256=0" }),
+            {
+                totalSize: 1000,
+                digest: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
+            },
+        );
+        expect(result.headers["Repr-Digest"]).toBe("sha-256=:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=:");
+        expect(result.headers["Content-Digest"]).toBeUndefined();
+    });
+
+    test("duplicate Want-Repr-Digest keys: the LAST occurrence wins (RFC 8941 3.2)", () => {
+        const suppressed = evaluateConditionalRequest(
+            mockHeaders({ "want-repr-digest": "sha-256=5, sha-256=0" }),
+            { totalSize: 1000, digest: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=" },
+        );
+        expect(suppressed.headers["Repr-Digest"]).toBeUndefined();
+
+        const wanted = evaluateConditionalRequest(
+            mockHeaders({ "want-repr-digest": "sha-256=0, sha-256=5" }),
+            { totalSize: 1000, digest: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=" },
+        );
+        expect(wanted.headers["Repr-Digest"]).toBe("sha-256=:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=:");
+    });
+
+    test("bare sha-256 key with Structured Fields parameters still counts as wanted", () => {
+        const result = evaluateConditionalRequest(
+            mockHeaders({ "want-repr-digest": "sha-256;x=1" }),
+            { totalSize: 1000, digest: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=" },
+        );
+        expect(result.headers["Repr-Digest"]).toBe("sha-256=:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=:");
+    });
+
+    test("HEAD evaluation emits Repr-Digest but never Content-Digest (RFC 9530 B.2)", () => {
+        // A HEAD response transfers no content, so a representation-valued
+        // Content-Digest would fail any conformant verifier.
+        const result = evaluateConditionalRequest(
+            mockHeaders({}),
+            { totalSize: 1000, digest: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=" },
+            { method: "HEAD" },
+        );
+        expect(result.status).toBe(200);
+        expect(result.headers["Repr-Digest"]).toBe("sha-256=:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=:");
+        expect(result.headers["Content-Digest"]).toBeUndefined();
+    });
+
+    test("HEAD evaluation ignores Range and If-Range (RFC 9110 14.2)", () => {
+        const result = evaluateConditionalRequest(
+            mockHeaders({ range: "bytes=0-99", "if-range": '"whatever"' }),
+            { totalSize: 1000, etag: '"v1"' },
+            { method: "HEAD" },
+        );
+        // Never 206/416 for HEAD: the headers mirror the 200 a GET would get.
+        expect(result.status).toBe(200);
+        expect(result.range).toBeNull();
+        expect(result.headers["Content-Length"]).toBe("1000");
+        expect(result.headers["Content-Range"]).toBeUndefined();
     });
 
     test("does not match sha-256-v2 algorithm name (false positive guard)", () => {
@@ -2411,7 +2479,7 @@ describe("evaluateConditionalRequest Repr-Digest", () => {
             mockHeaders({ "want-repr-digest": "sha-256-v2=5" }),
             {
                 totalSize: 1000,
-                digest: "dGVzdGhhc2g=",
+                digest: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
             },
         );
         // Client wants an algorithm we don't support
@@ -2986,24 +3054,40 @@ describe("parseRanges", () => {
         expect(r).toEqual({ ranges: [{ start: 0, end: 9 }] });
     });
 
-    test("two disjoint ranges are returned sorted", () => {
-        const r = parseRanges("bytes=50-59,0-9", 100);
-        expect(r).toEqual({ ranges: [{ start: 0, end: 9 }, { start: 50, end: 59 }] });
+    test("disjoint ranges are returned in REQUEST order (RFC 9110 15.3.7.2 SHOULD)", () => {
+        const r = parseRanges("bytes=500-509,0-9", 1000);
+        expect(r).toEqual({ ranges: [{ start: 500, end: 509 }, { start: 0, end: 9 }] });
     });
 
     test("overlapping ranges are coalesced", () => {
-        const r = parseRanges("bytes=0-4,2-8", 100);
+        const r = parseRanges("bytes=0-4,2-8", 1000);
         expect(r).toEqual({ ranges: [{ start: 0, end: 8 }] });
     });
 
     test("adjacent ranges (touching) are coalesced", () => {
-        const r = parseRanges("bytes=0-9,10-19", 100);
+        const r = parseRanges("bytes=0-9,10-19", 1000);
         expect(r).toEqual({ ranges: [{ start: 0, end: 19 }] });
     });
 
-    test("a one-byte gap is NOT bridged", () => {
-        const r = parseRanges("bytes=0-9,11-19", 100);
-        expect(r).toEqual({ ranges: [{ start: 0, end: 9 }, { start: 11, end: 19 }] });
+    test("a gap smaller than the part overhead IS bridged (RFC 9110 15.3.7.2)", () => {
+        // 70-byte gap < 80-byte framing overhead: the merged part is smaller
+        // than two framed parts, so coalescing strictly shrinks the response.
+        const r = parseRanges("bytes=0-9,80-89", 1000);
+        expect(r).toEqual({ ranges: [{ start: 0, end: 89 }] });
+    });
+
+    test("a gap of exactly the 80-byte overhead is bridged; 81 is not", () => {
+        expect(parseRanges("bytes=0-9,90-99", 1000))
+            .toEqual({ ranges: [{ start: 0, end: 99 }] });
+        expect(parseRanges("bytes=0-9,91-99", 1000))
+            .toEqual({ ranges: [{ start: 0, end: 9 }, { start: 91, end: 99 }] });
+    });
+
+    test("a coalesced part inherits its earliest contributor's request position", () => {
+        // 500-509 appears first; 0-9 and 80-89 (later specs) merge into 0-89,
+        // whose position is that of 0-9 (second spec) -> after 500-509.
+        const r = parseRanges("bytes=500-509,0-9,80-89", 1000);
+        expect(r).toEqual({ ranges: [{ start: 500, end: 509 }, { start: 0, end: 89 }] });
     });
 
     test("all-unsatisfiable ranges yield 416", () => {
@@ -3020,18 +3104,29 @@ describe("parseRanges", () => {
     });
 
     test("empty list elements are skipped per the RFC list rule", () => {
-        const r = parseRanges("bytes=0-9,,50-59", 100);
-        expect(r).toEqual({ ranges: [{ start: 0, end: 9 }, { start: 50, end: 59 }] });
+        const r = parseRanges("bytes=0-9,,200-209", 1000);
+        expect(r).toEqual({ ranges: [{ start: 0, end: 9 }, { start: 200, end: 209 }] });
     });
 
     test("amplification: more coalesced parts than maxRanges degrades to 200", () => {
-        // Three disjoint 1-byte ranges, cap of 2 -> serve full 200 (null).
-        expect(parseRanges("bytes=0-0,2-2,4-4", 100, 2)).toBeNull();
+        // Three disjoint 1-byte ranges beyond bridging distance, cap of 2
+        // -> serve full 200 (null).
+        expect(parseRanges("bytes=0-0,200-200,400-400", 1000, 2)).toBeNull();
     });
 
-    test("ranges covering the whole representation degrade to 200", () => {
-        // 0-9 + 10-19 coalesce to 0-19 which is the entire 20-byte object.
-        expect(parseRanges("bytes=0-9,10-19", 20)).toBeNull();
+    test("ranges tiling the whole representation coalesce to a single full-span 206", () => {
+        // 0-9 + 10-19 merge into 0-19, the entire 20-byte object: served as a
+        // plain single 206 (no multipart framing), never degraded to 200 --
+        // consistent with how parseRangeHeader treats "bytes=0-".
+        expect(parseRanges("bytes=0-9,10-19", 20))
+            .toEqual({ ranges: [{ start: 0, end: 19 }] });
+    });
+
+    test("a single satisfiable range behaves exactly like parseRangeHeader", () => {
+        // Trailing comma routes "bytes=0-" through the multi-range parser;
+        // it must still yield the same open-ended seek, not degrade to 200.
+        expect(parseRanges("bytes=0-,", 100))
+            .toEqual({ ranges: [{ start: 0, end: 99 }] });
     });
 
     test("non-bytes unit is ignored (serve 200)", () => {
@@ -3121,9 +3216,9 @@ describe("multipart/byteranges builders", () => {
     test("Repr-Digest is emitted but Content-Digest is not (partial response)", () => {
         const { headers } = buildMultipartHeaders({
             boundary: "B", ranges: [{ start: 0, end: 4 }], totalSize: 100,
-            contentType: "application/pdf", digest: "abc123",
+            contentType: "application/pdf", digest: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
         });
-        expect(headers["Repr-Digest"]).toBe("sha-256=:abc123:");
+        expect(headers["Repr-Digest"]).toBe("sha-256=:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=:");
         expect(headers["Content-Digest"]).toBeUndefined();
     });
 
@@ -3146,5 +3241,136 @@ describe("multipart/byteranges builders", () => {
         expect(() => buildMultipartHeaders({
             boundary: "B", ranges: [{ start: 0, end: 4 }], totalSize: -1, contentType: "text/plain",
         })).toThrow(RangeError);
+    });
+});
+
+// ─── Hardening additions (RFC re-audit) ─────────────────────────────────────
+
+describe("fromNodeHeaders prototype safety", () => {
+    test("get('constructor') returns null, not Object.prototype members", () => {
+        const h = fromNodeHeaders({ "x-real": "yes" });
+        expect(h.get("constructor")).toBeNull();
+        expect(h.get("__proto__")).toBeNull();
+        expect(h.get("toString")).toBeNull();
+        expect(h.get("x-real")).toBe("yes");
+    });
+
+    test("a literal __proto__ header name cannot poison the map", () => {
+        // "__proto__" is a legal HTTP field name; on a plain object the
+        // assignment would hit the prototype setter instead of storing.
+        const h = fromNodeHeaders(JSON.parse('{"__proto__":"evil","range":"bytes=0-1"}') as Record<string, string>);
+        expect(h.get("range")).toBe("bytes=0-1");
+        expect(h.get("__proto__")).toBe("evil");
+        expect(({} as Record<string, unknown>)["evil"]).toBeUndefined();
+    });
+});
+
+describe("If-Range date strong-validator rule (RFC 9110 13.1.5 step 1)", () => {
+    test("a Last-Modified in the current second is weak: range must be ignored", () => {
+        setSystemTime(new Date("2025-06-28T12:00:00.500Z"));
+        try {
+            const date = "Sat, 28 Jun 2025 12:00:00 GMT";
+            expect(isRangeFresh(mockHeaders({ "if-range": date }), undefined, date)).toBe(false);
+        } finally {
+            setSystemTime();
+        }
+    });
+
+    test("a Last-Modified whose second has fully elapsed is strong: range honored", () => {
+        setSystemTime(new Date("2025-06-28T12:00:05.000Z"));
+        try {
+            const date = "Sat, 28 Jun 2025 12:00:00 GMT";
+            expect(isRangeFresh(mockHeaders({ "if-range": date }), undefined, date)).toBe(true);
+        } finally {
+            setSystemTime();
+        }
+    });
+});
+
+describe("builder input validation (grammar-invalid Content-Range prevention)", () => {
+    test("build416Headers rejects NaN / negative / fractional totalSize", () => {
+        expect(() => build416Headers(NaN)).toThrow(RangeError);
+        expect(() => build416Headers(-1)).toThrow(RangeError);
+        expect(() => build416Headers(10.5)).toThrow(RangeError);
+    });
+
+    test("buildRangeResponseHeaders rejects the OPEN_ENDED sentinel as a literal bound", () => {
+        expect(() =>
+            buildRangeResponseHeaders({
+                totalSize: undefined,
+                range: { start: 0, end: OPEN_ENDED },
+                contentType: undefined, etag: undefined, lastModified: undefined,
+            }),
+        ).toThrow(RangeError);
+    });
+
+    test("buildRangeResponseHeaders rejects an end at or past a known total", () => {
+        expect(() =>
+            buildRangeResponseHeaders({
+                totalSize: 100,
+                range: { start: 0, end: 100 },
+                contentType: undefined, etag: undefined, lastModified: undefined,
+            }),
+        ).toThrow(RangeError);
+    });
+
+    test("buildRangeResponseHeaders rejects inverted or negative bounds", () => {
+        expect(() =>
+            buildRangeResponseHeaders({
+                totalSize: 100,
+                range: { start: 10, end: 5 },
+                contentType: undefined, etag: undefined, lastModified: undefined,
+            }),
+        ).toThrow(RangeError);
+        expect(() =>
+            buildRangeResponseHeaders({
+                totalSize: 100,
+                range: { start: -1, end: 5 },
+                contentType: undefined, etag: undefined, lastModified: undefined,
+            }),
+        ).toThrow(RangeError);
+    });
+});
+
+describe("asctime If-Modified-Since (space-padded single-digit day)", () => {
+    test("matches its IMF-fixdate equivalent and yields freshness", () => {
+        // ANSI C asctime pads days 1-9 with a SPACE; the date must parse to
+        // exactly the same instant as the IMF form, not fail silently.
+        const lastModified = "Sun, 06 Jul 2025 12:00:00 GMT";
+        const fresh = isConditionalFresh(
+            mockHeaders({ "if-modified-since": "Sun Jul  6 12:00:00 2025" }),
+            undefined,
+            lastModified,
+        );
+        expect(fresh).toBe(true);
+    });
+});
+
+describe("buildMultipartHeaders top-level metadata", () => {
+    test("normalizes ISO Last-Modified to IMF-fixdate and emits Cache-Control", () => {
+        const { headers } = buildMultipartHeaders({
+            boundary: "B",
+            ranges: [{ start: 0, end: 4 }, { start: 100, end: 104 }],
+            totalSize: 200,
+            contentType: "application/pdf",
+            lastModified: "2025-06-28T12:00:00.500Z",
+            cacheControl: "private, max-age=60",
+        });
+        expect(headers["Last-Modified"]).toBe("Sat, 28 Jun 2025 12:00:00 GMT");
+        expect(headers["Cache-Control"]).toBe("private, max-age=60");
+    });
+});
+
+describe("generateMultipartBoundary fallback (no crypto.randomUUID)", () => {
+    test("derives a hyphen-free random token from getRandomValues", () => {
+        const original = globalThis.crypto.randomUUID;
+        try {
+            Object.defineProperty(globalThis.crypto, "randomUUID", { value: undefined, configurable: true });
+            const boundary = generateMultipartBoundary();
+            expect(boundary).toMatch(/^partialcontent[0-9a-f]{32}$/);
+            expect(boundary).not.toContain("-");
+        } finally {
+            Object.defineProperty(globalThis.crypto, "randomUUID", { value: original, configurable: true });
+        }
     });
 });

@@ -1,6 +1,7 @@
 import { describe, test, expect, mock, beforeEach } from "bun:test";
 import { s3Store, ObjectChangedError, StoreUnavailableError } from "../s3";
 import { nodeStreamToWeb } from "../object-store";
+import { OPEN_ENDED } from "../index";
 import type { ObjectStore } from "../index";
 
 // ─── Mock S3Client ──────────────────────────────────────────────────────────
@@ -121,6 +122,25 @@ describe("s3Store", () => {
         expect((sentCommands[0].input as Record<string, unknown>).Range).toBe("bytes=0-499");
         expect(result.contentLength).toBe(500);
         expect(result.range).toEqual({ start: 0, end: 499 });
+    });
+
+    test("getObject with an OPEN_ENDED range emits the bare open form on the wire", async () => {
+        // The fast path hands adapters `end: OPEN_ENDED`; the wire form MUST
+        // be `bytes=500-`, never a literal 16-digit last-byte-pos that a
+        // strict proxy or backend may reject.
+        const { client, sentCommands } = createMockS3Client({
+            get: {
+                ContentLength: 9500,
+                ContentRange: "bytes 500-9999/10000",
+            },
+        });
+        const store = s3Store({ client, bucket: "docs" });
+
+        const result = await store.getObject("file.pdf", { range: { start: 500, end: OPEN_ENDED } });
+
+        expect((sentCommands[0].input as Record<string, unknown>).Range).toBe("bytes=500-");
+        expect(result.range).toEqual({ start: 500, end: 9999 });
+        expect(result.totalSize).toBe(10000);
     });
 
     test("getObject parses totalSize from ContentRange when available", async () => {

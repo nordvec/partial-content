@@ -37,6 +37,7 @@ import {
   nodeStreamToWeb,
   guardStreamLength,
   resolveServedRange,
+  parseRetryAfterSeconds,
   buildContentDisposition,
   isOpenEndedRange,
   type ObjectStore,
@@ -298,22 +299,33 @@ function isPreconditionFailedError(err: unknown): boolean {
  *   - the named throttle errors S3-compatible backends raise without setting
  *     an HTTP status code
  */
-function isThrottledError(err: unknown): boolean {
-  if ((err as { $retryable?: { throttling?: boolean } }).$retryable?.throttling === true) return true;
-  const meta = (err as { $metadata?: { httpStatusCode?: number } }).$metadata;
-  if (meta?.httpStatusCode === 503 || meta?.httpStatusCode === 429) return true;
-  if (err instanceof Error) {
-    const name = err.name;
-    return (
-      name === "SlowDown" ||
-      name === "ThrottlingException" ||
-      name === "TooManyRequestsException" ||
-      name === "RequestThrottled" ||
-      name === "RequestThrottledException" ||
-      name === "ProvisionedThroughputExceededException"
-    );
+function isThrottledError(err: unknown): boolean | { retryAfterSeconds: number } {
+  let throttled = false;
+  if ((err as { $retryable?: { throttling?: boolean } }).$retryable?.throttling === true) {
+    throttled = true;
+  } else {
+    const meta = (err as { $metadata?: { httpStatusCode?: number } }).$metadata;
+    if (meta?.httpStatusCode === 503 || meta?.httpStatusCode === 429) {
+      throttled = true;
+    } else if (err instanceof Error) {
+      const name = err.name;
+      throttled =
+        name === "SlowDown" ||
+        name === "ThrottlingException" ||
+        name === "TooManyRequestsException" ||
+        name === "RequestThrottled" ||
+        name === "RequestThrottledException" ||
+        name === "ProvisionedThroughputExceededException";
+    }
   }
-  return false;
+  if (!throttled) return false;
+  // Surface the backend's advised back-off when the SDK kept the raw
+  // response: the resulting 503 echoes it as Retry-After so clients and
+  // shared caches wait the advised interval instead of hammering an origin
+  // that is already shedding load.
+  const headers = (err as { $response?: { headers?: Record<string, string> } }).$response?.headers;
+  const hint = parseRetryAfterSeconds(headers?.["retry-after"], { allowHttpDate: true });
+  return hint !== undefined ? { retryAfterSeconds: hint } : true;
 }
 
 /** The ordered error-classification set shared by headObject and getObject. */
