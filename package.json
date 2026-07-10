@@ -144,7 +144,7 @@
     "check:exports": "npm run build && attw --pack . --profile esm-only",
     "check:consumer-types": "npm run build && tsc --noEmit -p smoke/tsconfig.consumer.json",
     "test:live": "bun test src/__tests__/s3-live.test.ts",
-    "size": "size-limit"
+    "size": "npm run build && size-limit"
   },
   "license": "MIT",
   "author": "Nordvec <oss@nordvec.com>",

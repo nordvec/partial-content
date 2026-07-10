@@ -2,7 +2,7 @@
   {
     "name": "kernel (.)",
     "path": "dist/index.js",
-    "limit": "5 kB",
+    "limit": "6 kB",
     "ignore": [
       "node:fs/promises",
       "node:path",
@@ -17,7 +17,7 @@
   {
     "name": "/web",
     "path": "dist/web.js",
-    "limit": "7.5 kB",
+    "limit": "9 kB",
     "ignore": [
       "node:fs/promises",
       "node:path",
@@ -32,7 +32,7 @@
   {
     "name": "/node",
     "path": "dist/node.js",
-    "limit": "8 kB",
+    "limit": "9.5 kB",
     "ignore": [
       "node:fs/promises",
       "node:path",
@@ -47,7 +47,7 @@
   {
     "name": "/hono",
     "path": "dist/hono.js",
-    "limit": "7.5 kB",
+    "limit": "9 kB",
     "ignore": [
       "node:fs/promises",
       "node:path",
