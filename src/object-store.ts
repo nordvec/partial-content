@@ -654,17 +654,37 @@ export interface ObjectStore {
   readonly authoritativeRange?: boolean;
 
   /**
-   * Optional degradation path for backends that cannot stream ranges through
-   * the origin. Returns a short-lived URL the client is redirected to.
+   * Optional egress-offload path: returns a short-lived URL the client is
+   * redirected to. Used for backends that cannot stream ranges through the
+   * origin, and by the web adapter's `preferSignedUrl` per-request offload.
    *
    * `downloadFilename` is RAW untrusted input (the consumer's
    * ServeContext.filename, verbatim). Implementations that embed it in a
    * response-content-disposition query parameter or similar MUST sanitize it
    * (e.g. via `buildContentDisposition`), exactly as the streaming path does.
+   *
+   * `cacheControl`, when provided, SHOULD override the Cache-Control of the
+   * signed response (S3 `response-cache-control` and equivalents). Without
+   * it, the redirect target serves whatever Cache-Control was baked into the
+   * object at upload -- a private document stored with a public/immutable
+   * value would be cached by any CDN in front of the bucket.
+   *
+   * Two adapter-author traps this contract documents:
+   * - **Temporary credentials cap expiry.** A URL presigned under STS/role
+   *   credentials (Lambda, ECS task roles) dies when the SESSION TOKEN
+   *   expires, regardless of `expiresInSeconds`. Effective lifetime is
+   *   `min(expiresInSeconds, credential lifetime remaining)`; long-lived
+   *   links need long-term credentials or a stable re-signing endpoint that
+   *   302s per fetch.
+   * - **CloudFront canned policies break on RFC 8187 dispositions.** A
+   *   sanitized disposition carries `filename*=UTF-8''...`; browsers
+   *   re-encode the apostrophes to `%27`, which no longer matches a
+   *   canned-policy signature (AccessDenied). CloudFront signers must use a
+   *   custom policy with a wildcard query (`...?*`).
    */
   createSignedUrl?(
     key: string,
-    opts: { expiresInSeconds: number; downloadFilename?: string },
+    opts: { expiresInSeconds: number; downloadFilename?: string; cacheControl?: string },
   ): Promise<{ ok: true; url: string } | { ok: false; error: string }>;
 }
 

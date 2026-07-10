@@ -71,6 +71,10 @@ Cloud SDKs are **optional peer dependencies**: `@aws-sdk/client-s3` for `/s3` (p
 - **Built-in storage adapters**: S3-compatible (AWS, R2 S3-mode, Hetzner, MinIO, Backblaze, Wasabi), R2 native, GCS, Azure, local filesystem, any range-capable HTTP origin, in-memory
 - **Built-in framework adapters**: Fetch API (Next.js, SvelteKit, Remix, Nuxt, Astro, Workers, Bun.serve, Deno.serve), Node.js (Express/Fastify/Koa/raw http), Hono
 - Range requests (206, 416), including multi-range `multipart/byteranges` with overlapping/adjacent-range coalescing and range-amplification defense (`maxRanges`)
+- **Precompressed variant negotiation** (`precompressed: true`): serves `<key>.br`/`<key>.zst`/`<key>.gz` siblings via Accept-Encoding (RFC 9110 12.5.3) with `Content-Encoding` + `Vary`, the variant's OWN validators and digest, and byte ranges computed against the encoded bytes -- the correctness detail naive precompressed serving gets wrong
+- **Per-request egress offload** (`preferSignedUrl`): split one route by request shape -- proxy ranges and revalidations, 302 large full-file downloads to a signed URL that carries your `Cache-Control` (S3 `response-cache-control`)
+- **Inline active-content lockdown**: SVG/HTML/XML served `inline` automatically gets `Content-Security-Policy: sandbox` (caller-overridable), so a stored `image/svg+xml` cannot execute script from your origin
+- **`buildCacheControl()`**: typed Cache-Control composer (visibility, max-age, immutable, RFC 5861 stale-while-revalidate/stale-if-error) that defaults `no-transform` on, because intermediary transforms corrupt byte ranges, digests, and strong validators
 - Conditional requests (304, 412) with sub-second timestamp flooring
 - ETag generation from storage metadata (strong for content hash, weak for size+mtime, safe undefined fallback)
 - Content-Disposition with non-ASCII filename encoding, CRLF injection prevention, path traversal protection, and bidi spoofing defense

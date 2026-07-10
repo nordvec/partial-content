@@ -490,6 +490,31 @@ range-serving origin (RFC 9111 Section 3.3-3.4):
   404/502/503 can never be heuristically cached into a persistent outage
   (RFC 9111 Section 4.2.2 makes 404s heuristically cacheable by default).
 
+## Precompressed Variants and Content-Encoding
+
+Encoding negotiation (`precompressed`) selects a stored sibling object; it
+never compresses at serve time. That boundary is what keeps the rest of the
+protocol honest:
+
+- **The variant is the representation.** RFC 9110 makes `Content-Encoding`
+  representation metadata, so once `report.json.br` is selected, ITS ETag
+  answers `If-None-Match`/`If-Range`, ITS length bounds `Range`, and
+  `Content-Range` describes the encoded bytes. A resumed `.br` download is
+  byte-correct where naive precompressed servers (which reuse the identity
+  file's size or ETag) corrupt caches.
+- **`Vary: Accept-Encoding` on every success response for the type** --
+  variant hits, identity fallbacks, 304s, and HEAD -- so shared caches key
+  compressible objects on the request coding. A caller-supplied `Vary`
+  (via `securityHeaders`) is extended, never clobbered.
+- **Multi-range requests serve identity.** `multipart/byteranges` over an
+  encoded representation has no interoperable framing story, so comma
+  ranges skip negotiation entirely rather than emit something undefined.
+- **`no-transform` guidance.** If a proxy or CDN re-compresses a response,
+  every byte-exact promise (ranges, `Repr-Digest`, strong validators) breaks
+  silently. `buildCacheControl()` therefore defaults `no-transform` on; if
+  you hand-write `cacheControl` strings for digest- or range-heavy routes,
+  add it yourself.
+
 ## Runtime Notes
 
 Behaviors owned by the HTTP runtime, observable when serving through

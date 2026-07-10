@@ -1992,7 +1992,9 @@ describe("RFC 9110 coverage completion", () => {
     });
 });
 
-// ── Sub-second Timestamp Precision (R491 Regression) ────────────────────────
+// ── Sub-second Timestamp Precision ──────────────────────────────────────────
+// Regression: conditional-date comparisons must preserve millisecond precision
+// (see the sub-second cases below), not truncate to whole seconds.
 
 describe("sub-second timestamp precision", () => {
     // Storage backends (Postgres, S3) return ISO-8601 with milliseconds.

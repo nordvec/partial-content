@@ -486,6 +486,28 @@ describe("s3Store: createSignedUrl", () => {
         expect(String(seen[0]?.input.ResponseContentDisposition)).toContain("attachment");
     });
 
+    test("cacheControl override rides the signed response, absent when unset", async () => {
+        const seen: Array<{ input: Record<string, unknown> }> = [];
+        mock.module("@aws-sdk/s3-request-presigner", () => ({
+            getSignedUrl: async (_client: unknown, command: { input: Record<string, unknown> }) => {
+                seen.push({ input: command.input });
+                return "https://bucket.s3.example/doc?signature=abc";
+            },
+        }));
+
+        const client = createMockS3Client({});
+        const store = s3Store({ client: client.client, bucket: "b" });
+
+        await store.createSignedUrl!("doc.pdf", {
+            expiresInSeconds: 60,
+            cacheControl: "private, no-cache",
+        });
+        expect(seen[0]?.input.ResponseCacheControl).toBe("private, no-cache");
+
+        await store.createSignedUrl!("doc.pdf", { expiresInSeconds: 60 });
+        expect("ResponseCacheControl" in (seen[1]?.input ?? {})).toBe(false);
+    });
+
     test("presigner failure returns ok: false with the message (never throws)", async () => {
         mock.module("@aws-sdk/s3-request-presigner", () => ({
             getSignedUrl: async () => { throw new Error("credentials expired"); },

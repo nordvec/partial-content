@@ -203,6 +203,27 @@ describe("httpStore: unit (stub fetch)", () => {
         expect(result.range).toEqual({ start: 5, end: 14 });
     });
 
+    test("chunked 206 that ends short of its Content-Range span errors the stream instead of closing clean", async () => {
+        // An origin that terminates its chunked body cleanly (0-chunk) short of
+        // the span it committed to would otherwise deliver a truncated body
+        // that looks complete under the derived Content-Length.
+        const store = httpStore({
+            url: (key) => `https://origin.example/${key}`,
+            fetch: stubFetch(() => {
+                const res = new Response("0123", {
+                    status: 206,
+                    headers: { "Content-Range": "bytes 0-9/100" },
+                });
+                res.headers.delete("content-length");
+                return res;
+            }),
+        });
+        const result = await store.getObject("doc.pdf", { range: { start: 0, end: 9 } });
+
+        expect(result.contentLength).toBe(10);
+        await expect(new Response(result.body).arrayBuffer()).rejects.toThrow(/10 bytes|expected/i);
+    });
+
     test("206 with unknown total (bytes a-b/*) yields totalSize undefined", async () => {
         // A proxied streaming origin that does not know its full length answers
         // `bytes a-b/*`. The adapter must NOT fabricate a total; it propagates

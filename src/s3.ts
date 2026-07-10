@@ -223,6 +223,11 @@ export function s3Store(opts: S3StoreOptions): ObjectStore {
             signOpts.downloadFilename ?? "download",
             { type: "attachment" },
           ),
+          // Response-header override, not an object mutation: keeps a private
+          // document's caching policy authoritative even when the object was
+          // uploaded with a public Cache-Control (the CDN-caches-your-private
+          // -file footgun).
+          ...(signOpts.cacheControl ? { ResponseCacheControl: signOpts.cacheControl } : {}),
         });
 
         // Lazy import: the presigner is an optional peer needed ONLY for

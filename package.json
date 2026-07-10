@@ -1,6 +1,6 @@
 {
   "name": "partial-content",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "RFC-compliant HTTP file serving for any storage backend. Range requests (206), conditional caching (304/412), Content-Disposition, and ETag generation. Zero dependencies.",
   "type": "module",
   "main": "./dist/index.js",
@@ -8,61 +8,73 @@
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
+      "bun": "./src/index.ts",
       "import": "./dist/index.js",
       "default": "./dist/index.js"
     },
     "./s3": {
       "types": "./dist/s3.d.ts",
+      "bun": "./src/s3.ts",
       "import": "./dist/s3.js",
       "default": "./dist/s3.js"
     },
     "./web": {
       "types": "./dist/web.d.ts",
+      "bun": "./src/web.ts",
       "import": "./dist/web.js",
       "default": "./dist/web.js"
     },
     "./fs": {
       "types": "./dist/fs.d.ts",
+      "bun": "./src/fs.ts",
       "import": "./dist/fs.js",
       "default": "./dist/fs.js"
     },
     "./node": {
       "types": "./dist/node.d.ts",
+      "bun": "./src/node.ts",
       "import": "./dist/node.js",
       "default": "./dist/node.js"
     },
     "./hono": {
       "types": "./dist/hono.d.ts",
+      "bun": "./src/hono.ts",
       "import": "./dist/hono.js",
       "default": "./dist/hono.js"
     },
     "./gcs": {
       "types": "./dist/gcs.d.ts",
+      "bun": "./src/gcs.ts",
       "import": "./dist/gcs.js",
       "default": "./dist/gcs.js"
     },
     "./azure": {
       "types": "./dist/azure.d.ts",
+      "bun": "./src/azure.ts",
       "import": "./dist/azure.js",
       "default": "./dist/azure.js"
     },
     "./r2": {
       "types": "./dist/r2.d.ts",
+      "bun": "./src/r2.ts",
       "import": "./dist/r2.js",
       "default": "./dist/r2.js"
     },
     "./mime": {
       "types": "./dist/mime.d.ts",
+      "bun": "./src/mime.ts",
       "import": "./dist/mime.js",
       "default": "./dist/mime.js"
     },
     "./http": {
       "types": "./dist/http.d.ts",
+      "bun": "./src/http.ts",
       "import": "./dist/http.js",
       "default": "./dist/http.js"
     },
     "./memory": {
       "types": "./dist/memory.d.ts",
+      "bun": "./src/memory.ts",
       "import": "./dist/memory.js",
       "default": "./dist/memory.js"
     },

@@ -2,6 +2,7 @@ import { describe, test, expect } from "bun:test";
 import { serveObject, serveObjectRaw, type ServeAuditEvent, type TransferEvent } from "../web";
 import { OPEN_ENDED, ObjectNotFoundError, StoreUnavailableError } from "../index";
 import type { ObjectStore, ObjectMetadata, ObjectStream, ParsedRange } from "../index";
+import { memoryStore as kvStore } from "../memory";
 
 // ─── In-Memory Store ────────────────────────────────────────────────────────
 
@@ -1203,6 +1204,22 @@ describe("multi-range serving (multipart/byteranges)", () => {
         expect(res.headers.get("Content-Range")).toBe("bytes 0-54/200");
     });
 
+    test("multipart Repr-Digest follows Want-Repr-Digest negotiation like single-range (RFC 9530 Section 4)", async () => {
+        const digest = "MV9b23bQeMQ7isAGTkoBZGErH853yGk0W/yUx1iU7dM=";
+        const handler = serveObject(memoryStore({ etag: ETAG, digest }));
+
+        const wanted = await handler(req({ Range: "bytes=0-4,10-14" }), { key: KEY });
+        expect(wanted.status).toBe(206);
+        expect(wanted.headers.get("Repr-Digest")).toBe(`sha-256=:${digest}:`);
+
+        const suppressed = await handler(
+            req({ Range: "bytes=0-4,10-14", "Want-Repr-Digest": "sha-256=0" }),
+            { key: KEY },
+        );
+        expect(suppressed.status).toBe(206);
+        expect(suppressed.headers.get("Repr-Digest")).toBeNull();
+    });
+
     test("overlapping ranges coalesce to a single normal 206 (not multipart)", async () => {
         const handler = serveObject(memoryStore({ etag: ETAG }));
         const res = await handler(req({ Range: "bytes=0-4,2-8" }), { key: KEY, mime: "text/plain" });
@@ -1488,5 +1505,296 @@ describe("HEAD-to-GET validator drift guard (non-pinning stores)", () => {
         expect(res.status).toBe(200);
         expect(await res.text()).toBe("XXXXXXXXXXXXXXXXXXXX");
         expect(res.headers.get("ETag")).toBe('"v2"');
+    });
+});
+
+// ─── Precompressed Variant Negotiation (RFC 9110 Section 12.5.3) ────────────
+
+describe("precompressed variant negotiation", () => {
+    // Distinct bodies + validators per representation so a test can prove
+    // WHICH representation was served from body, size, and ETag alone.
+    function tripleStore(overrides: { omitBr?: boolean } = {}) {
+        const objects: Record<string, { body: string; etag: string; lastModified: string }> = {
+            "data.json": { body: "i".repeat(40), etag: '"id-v1"', lastModified: "Mon, 01 Jan 2024 00:00:00 GMT" },
+            "data.json.zst": { body: "z".repeat(15), etag: '"zst-v1"', lastModified: "Mon, 01 Jan 2024 00:00:00 GMT" },
+            "data.json.gz": { body: "g".repeat(20), etag: '"gz-v1"', lastModified: "Mon, 01 Jan 2024 00:00:00 GMT" },
+        };
+        if (!overrides.omitBr) {
+            objects["data.json.br"] = { body: "b".repeat(10), etag: '"br-v1"', lastModified: "Mon, 01 Jan 2024 00:00:00 GMT" };
+        }
+        return kvStore({ objects });
+    }
+    const CTX = { key: "data.json", mime: "application/json" };
+
+    test("serves the br variant with Content-Encoding, Vary, and the variant's validators", async () => {
+        const handler = serveObject(tripleStore(), { precompressed: true });
+        const res = await handler(req({ "Accept-Encoding": "gzip, deflate, br, zstd" }), CTX);
+
+        expect(res.status).toBe(200);
+        expect(await res.text()).toBe("b".repeat(10));
+        expect(res.headers.get("Content-Encoding")).toBe("br");
+        expect(res.headers.get("Vary")).toBe("Accept-Encoding");
+        expect(res.headers.get("Content-Length")).toBe("10");
+        expect(res.headers.get("ETag")).toBe('"br-v1"');
+        expect(res.headers.get("Content-Type")).toBe("application/json; charset=utf-8");
+    });
+
+    test("falls through to the next accepted coding when a sibling is missing", async () => {
+        const handler = serveObject(tripleStore({ omitBr: true }), { precompressed: true });
+        const res = await handler(req({ "Accept-Encoding": "br, zstd, gzip" }), CTX);
+
+        expect(res.headers.get("Content-Encoding")).toBe("zstd");
+        expect(await res.text()).toBe("z".repeat(15));
+    });
+
+    test("client quality outranks server preference", async () => {
+        const handler = serveObject(tripleStore(), { precompressed: true });
+        const res = await handler(req({ "Accept-Encoding": "br;q=0.5, gzip;q=0.9" }), CTX);
+
+        expect(res.headers.get("Content-Encoding")).toBe("gzip");
+        expect(await res.text()).toBe("g".repeat(20));
+    });
+
+    test("no Accept-Encoding serves identity but still varies", async () => {
+        const handler = serveObject(tripleStore(), { precompressed: true });
+        const res = await handler(req(), CTX);
+
+        expect(res.status).toBe(200);
+        expect(await res.text()).toBe("i".repeat(40));
+        expect(res.headers.get("Content-Encoding")).toBeNull();
+        expect(res.headers.get("Vary")).toBe("Accept-Encoding");
+        expect(res.headers.get("ETag")).toBe('"id-v1"');
+    });
+
+    test("identity preferred by q beats an available variant", async () => {
+        const handler = serveObject(tripleStore(), { precompressed: true });
+        const res = await handler(req({ "Accept-Encoding": "identity, br;q=0.5" }), CTX);
+
+        expect(res.headers.get("Content-Encoding")).toBeNull();
+        expect(await res.text()).toBe("i".repeat(40));
+    });
+
+    test("non-compressible MIME never negotiates (no Vary, no probes)", async () => {
+        const heads: string[] = [];
+        const base = tripleStore();
+        const probing: ObjectStore = {
+            ...base,
+            headObject: async (key, o) => { heads.push(key); return base.headObject(key, o); },
+        };
+        const handler = serveObject(probing, { precompressed: true });
+        const res = await handler(
+            req({ "Accept-Encoding": "br", Range: "bytes=0-3" }),
+            { key: "data.json", mime: "application/pdf" },
+        );
+
+        expect(res.status).toBe(206);
+        expect(res.headers.get("Vary")).toBeNull();
+        expect(res.headers.get("Content-Encoding")).toBeNull();
+        expect(heads).toEqual(["data.json"]);
+    });
+
+    test("byte ranges address the ENCODED representation", async () => {
+        const handler = serveObject(tripleStore(), { precompressed: true });
+        const res = await handler(req({ "Accept-Encoding": "br", Range: "bytes=0-3" }), CTX);
+
+        expect(res.status).toBe(206);
+        expect(await res.text()).toBe("bbbb");
+        expect(res.headers.get("Content-Range")).toBe("bytes 0-3/10");
+        expect(res.headers.get("Content-Encoding")).toBe("br");
+        expect(res.headers.get("Vary")).toBe("Accept-Encoding");
+    });
+
+    test("out-of-bounds range 416s against the VARIANT size, not identity size", async () => {
+        // Bytes 20-30 exist in the 40-byte identity object but not in the
+        // 10-byte br variant the negotiation selected.
+        const handler = serveObject(tripleStore(), { precompressed: true });
+        const res = await handler(req({ "Accept-Encoding": "br", Range: "bytes=20-30" }), CTX);
+
+        expect(res.status).toBe(416);
+        expect(res.headers.get("Content-Range")).toBe("bytes */10");
+    });
+
+    test("revalidation is per-representation: variant ETag 304s, identity ETag misses", async () => {
+        const handler = serveObject(tripleStore(), { precompressed: true });
+
+        const hit = await handler(
+            req({ "Accept-Encoding": "br", "If-None-Match": '"br-v1"' }), CTX,
+        );
+        expect(hit.status).toBe(304);
+        expect(hit.headers.get("Vary")).toBe("Accept-Encoding");
+
+        const miss = await handler(
+            req({ "Accept-Encoding": "br", "If-None-Match": '"id-v1"' }), CTX,
+        );
+        expect(miss.status).toBe(200);
+        expect(await miss.text()).toBe("b".repeat(10));
+    });
+
+    test("HEAD describes the negotiated variant", async () => {
+        const handler = serveObject(tripleStore(), { precompressed: true });
+        const res = await handler(req({ "Accept-Encoding": "br" }, "HEAD"), CTX);
+
+        expect(res.status).toBe(200);
+        expect(res.headers.get("Content-Length")).toBe("10");
+        expect(res.headers.get("Content-Encoding")).toBe("br");
+        expect(res.headers.get("Vary")).toBe("Accept-Encoding");
+        expect(await res.text()).toBe("");
+    });
+
+    test("multi-range requests serve the identity representation", async () => {
+        const handler = serveObject(tripleStore(), { precompressed: true });
+        // Gap under the coalescing threshold: collapses to one identity 206.
+        const res = await handler(
+            req({ "Accept-Encoding": "br", Range: "bytes=0-1,20-21" }), CTX,
+        );
+
+        expect(res.status).toBe(206);
+        expect(res.headers.get("Content-Encoding")).toBeNull();
+        expect(res.headers.get("Content-Range")).toBe("bytes 0-21/40");
+        expect(await res.text()).toBe("i".repeat(22));
+        expect(res.headers.get("Vary")).toBe("Accept-Encoding");
+    });
+
+    test("a non-404 probe failure falls back to identity and reports onError", async () => {
+        const base = tripleStore();
+        const flaky: ObjectStore = {
+            ...base,
+            headObject: async (key, o) => {
+                if (key.endsWith(".br") || key.endsWith(".zst") || key.endsWith(".gz")) {
+                    throw new StoreUnavailableError(key);
+                }
+                return base.headObject(key, o);
+            },
+        };
+        const errors: string[] = [];
+        const handler = serveObject(flaky, {
+            precompressed: true,
+            onError: (_e, c) => errors.push(`${c.operation}:${c.key}`),
+        });
+        const res = await handler(req({ "Accept-Encoding": "br, gzip" }), CTX);
+
+        expect(res.status).toBe(200);
+        expect(await res.text()).toBe("i".repeat(40));
+        // One probe reported, then probing stopped (no gzip probe pile-on).
+        expect(errors).toEqual(["head:data.json.br"]);
+    });
+
+    test("caller Vary is extended, never clobbered", async () => {
+        const handler = serveObject(tripleStore(), {
+            precompressed: true,
+            securityHeaders: () => ({ Vary: "Origin" }),
+        });
+        const res = await handler(req({ "Accept-Encoding": "br" }), CTX);
+
+        expect(res.headers.get("Vary")).toBe("Origin, Accept-Encoding");
+    });
+
+    test("unknown coding in the option throws at setup", () => {
+        expect(() => serveObject(tripleStore(), {
+            precompressed: ["deflate" as never],
+        })).toThrow(TypeError);
+    });
+});
+
+// ─── Inline Active-Content CSP ───────────────────────────────────────────────
+
+describe("inline active-content CSP", () => {
+    test("inline SVG gets a sandbox CSP by default", async () => {
+        const handler = serveObject(memoryStore({ etag: ETAG }), { disposition: "inline" });
+        const res = await handler(req(), { key: KEY, mime: "image/svg+xml" });
+
+        expect(res.headers.get("Content-Security-Policy")).toBe("sandbox");
+        expect(res.headers.get("Content-Disposition")).toBe("inline");
+    });
+
+    test("attachment SVG needs no CSP (it never renders)", async () => {
+        const handler = serveObject(memoryStore({ etag: ETAG }));
+        const res = await handler(req(), { key: KEY, mime: "image/svg+xml" });
+
+        expect(res.headers.get("Content-Security-Policy")).toBeNull();
+    });
+
+    test("passive types (PDF, images) are unaffected inline", async () => {
+        const handler = serveObject(memoryStore({ etag: ETAG }), { disposition: "inline" });
+        const pdf = await handler(req(), { key: KEY, mime: "application/pdf" });
+        const png = await handler(req(), { key: KEY, mime: "image/png" });
+
+        expect(pdf.headers.get("Content-Security-Policy")).toBeNull();
+        expect(png.headers.get("Content-Security-Policy")).toBeNull();
+    });
+
+    test("caller securityHeaders override the default", async () => {
+        const handler = serveObject(memoryStore({ etag: ETAG }), {
+            disposition: "inline",
+            securityHeaders: () => ({ "Content-Security-Policy": "script-src 'none'" }),
+        });
+        const res = await handler(req(), { key: KEY, mime: "text/html" });
+
+        expect(res.headers.get("Content-Security-Policy")).toBe("script-src 'none'");
+    });
+});
+
+// ─── Per-Request Signed-URL Offload (preferSignedUrl) ───────────────────────
+
+describe("preferSignedUrl offload", () => {
+    function offloadStore(signedOpts: unknown[]): ObjectStore {
+        const base = memoryStore({ etag: ETAG });
+        return {
+            ...base,
+            createSignedUrl: async (_key, opts) => {
+                signedOpts.push(opts);
+                return { ok: true, url: "https://bucket.example/signed" };
+            },
+        };
+    }
+
+    test("full-file GETs redirect; range requests stream through the origin", async () => {
+        const signedOpts: unknown[] = [];
+        const handler = serveObject(offloadStore(signedOpts), {
+            preferSignedUrl: ({ isRange, isConditional }) => !isRange && !isConditional,
+        });
+
+        const full = await handler(req(), { key: KEY });
+        expect(full.status).toBe(302);
+        expect(full.headers.get("Location")).toBe("https://bucket.example/signed");
+        expect(full.headers.get("Cache-Control")).toBe("no-store, no-cache");
+
+        const ranged = await handler(req({ Range: "bytes=0-3" }), { key: KEY });
+        expect(ranged.status).toBe(206);
+        expect(await ranged.text()).toBe("0123");
+    });
+
+    test("conditional revalidations stay on the origin (bodyless 304)", async () => {
+        const signedOpts: unknown[] = [];
+        const handler = serveObject(offloadStore(signedOpts), {
+            preferSignedUrl: ({ isRange, isConditional }) => !isRange && !isConditional,
+        });
+        const res = await handler(req({ "If-None-Match": '"abc123"' }), { key: KEY });
+
+        expect(res.status).toBe(304);
+        expect(signedOpts).toHaveLength(0);
+    });
+
+    test("signed URL receives the route's Cache-Control and configured expiry", async () => {
+        const signedOpts: Array<{ expiresInSeconds: number; cacheControl?: string }> = [];
+        const handler = serveObject(offloadStore(signedOpts as unknown[]), {
+            preferSignedUrl: () => true,
+            signedUrlExpiresSeconds: 300,
+            cacheControl: "private, max-age=60",
+        });
+        await handler(req(), { key: KEY });
+
+        expect(signedOpts[0]!.expiresInSeconds).toBe(300);
+        expect(signedOpts[0]!.cacheControl).toBe("private, max-age=60");
+    });
+
+    test("stores without createSignedUrl ignore the predicate and serve bytes", async () => {
+        const handler = serveObject(memoryStore({ etag: ETAG }), {
+            preferSignedUrl: () => true,
+        });
+        const res = await handler(req(), { key: KEY });
+
+        expect(res.status).toBe(200);
+        expect(await res.text()).toBe("0123456789abcdefghij");
     });
 });

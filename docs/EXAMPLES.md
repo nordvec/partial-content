@@ -220,3 +220,38 @@ const meta = {
   contentDigest: clientWantsContentDigest(req.headers),
 };
 ```
+
+## Precompressed variants (brotli/zstd/gzip siblings)
+
+Upload encoded siblings at build or ingest time, then let negotiation pick:
+
+```bash
+# alongside dist/app.js, produce dist/app.js.br and dist/app.js.gz
+brotli -k dist/app.js && gzip -k dist/app.js
+```
+
+```typescript
+import { serveObject } from "partial-content/web";
+import { s3Store } from "partial-content/s3";
+
+const handler = serveObject(s3Store({ client, bucket: "assets" }), {
+  precompressed: true, // probes <key>.br, <key>.zst, <key>.gz
+  cacheControl: "public, max-age=31536000, immutable, no-transform",
+});
+// A browser sending `Accept-Encoding: gzip, br` gets app.js.br with
+// Content-Encoding: br, Vary: Accept-Encoding, the .br object's ETag,
+// and Range support over the encoded bytes.
+```
+
+## Split proxy/redirect on one route (preferSignedUrl)
+
+Proxy the requests where the protocol layer earns its keep (ranges,
+revalidations), offload bulk full-file egress to the bucket:
+
+```typescript
+const handler = serveObject(store, {
+  preferSignedUrl: ({ isRange, isConditional }) => !isRange && !isConditional,
+  signedUrlExpiresSeconds: 120,
+  cacheControl: "private, no-cache", // rides the signed response too
+});
+```

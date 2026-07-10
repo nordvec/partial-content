@@ -44,6 +44,14 @@ export {
 // ─── Digest Negotiation (RFC 9530) ──────────────────────────────────────────
 export { clientWantsDigest, clientWantsContentDigest } from "./kernel.js";
 
+// ─── Content-Coding Negotiation (RFC 9110 Section 12.5.3) ───────────────────
+export { parseAcceptEncoding, negotiateEncoding, isCompressibleMime } from "./encoding.js";
+export type { AcceptEncodingEntry } from "./encoding.js";
+
+// ─── Cache-Control Composition (RFC 9111 / RFC 5861) ────────────────────────
+export { buildCacheControl } from "./cache-control.js";
+export type { CacheControlPolicy } from "./cache-control.js";
+
 // ─── ETag Generation ────────────────────────────────────────────────────────
 export { generateETag } from "./kernel.js";
 

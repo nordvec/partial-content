@@ -49,6 +49,8 @@ import {
   MAX_RANGES_DEFAULT,
   OPEN_ENDED,
   parseRetryAfterSeconds,
+  negotiateEncoding,
+  isCompressibleMime,
   type ObjectStore,
   type ObjectMetadata,
   type ParsedRange,
@@ -84,6 +86,23 @@ const STATUS_TEXT: Record<number, string> = {
   499: "Client Closed Request",
   502: "Bad Gateway",
 };
+
+/**
+ * Content codings the `precompressed` option can negotiate, mapped to the
+ * sibling-key suffix probed in the store (`report.json` -> `report.json.br`).
+ * The suffixes match what every build tool and CDN convention emits.
+ */
+const PRECOMPRESSED_SUFFIX = {
+  br: ".br",
+  zstd: ".zst",
+  gzip: ".gz",
+} as const;
+
+/** A content coding servable from a precompressed sibling object. */
+export type PrecompressedCoding = keyof typeof PRECOMPRESSED_SUFFIX;
+
+/** Default server preference: best ratio first (RFC 9110 lets ties go to us). */
+const DEFAULT_PRECOMPRESSED: readonly PrecompressedCoding[] = ["br", "zstd", "gzip"];
 
 // ─── Options ────────────────────────────────────────────────────────────────
 
@@ -320,6 +339,69 @@ export interface ServeObjectOptions {
    * @default true
    */
   enforceCharset?: boolean;
+
+  /**
+   * Serve precompressed sibling objects negotiated via `Accept-Encoding`
+   * (RFC 9110 Section 12.5.3).
+   *
+   * When enabled and the resolved MIME is compressible, the handler probes
+   * for `<key>.br` / `<key>.zst` / `<key>.gz` (in the order given; `true`
+   * means `["br", "zstd", "gzip"]`) and serves the first variant the client
+   * accepts, with `Content-Encoding` and `Vary: Accept-Encoding`. The
+   * variant is a distinct representation: its OWN validators, digest, and
+   * size drive conditionals, `If-Range`, and byte ranges -- `Content-Range`
+   * describes the encoded bytes, which is what makes resumed downloads of a
+   * `.br` variant byte-correct (a naive fs server computes ranges against
+   * the identity size and corrupts them).
+   *
+   * Scope and cost:
+   * - Selection only, never on-the-fly compression (transforming at serve
+   *   time breaks byte-exact ranges and digests). You upload the variants.
+   * - One extra `headObject` probe per acceptable coding until a hit; probes
+   *   are skipped entirely for non-compressible types (media, archives) and
+   *   for multi-range requests (multipart of an encoded representation has
+   *   no interoperable framing, so those serve the identity bytes).
+   * - A probe failure other than not-found falls back to identity and is
+   *   reported to `onError` -- a missing optimization never fails a serve.
+   *
+   * @default false
+   */
+  precompressed?: boolean | readonly PrecompressedCoding[];
+
+  /**
+   * Per-request egress offload: when this predicate returns `true` and the
+   * store implements `createSignedUrl`, the handler answers a 302 to a
+   * short-lived signed URL instead of proxying bytes through the origin.
+   *
+   * Lets one route split traffic by shape: proxy Range requests and
+   * conditional revalidations (where this library's protocol handling is
+   * the point), but redirect large full-file downloads straight to the
+   * storage backend. The redirect carries `Cache-Control: no-store` so the
+   * expiring URL is never cached.
+   *
+   * @example
+   * ```ts
+   * preferSignedUrl: ({ isRange, isConditional }) => !isRange && !isConditional
+   * ```
+   */
+  preferSignedUrl?: (info: {
+    key: string;
+    mime: string;
+    method: "GET" | "HEAD";
+    isRange: boolean;
+    isConditional: boolean;
+  }) => boolean;
+
+  /**
+   * Lifetime handed to `createSignedUrl` for redirect responses.
+   *
+   * Note the adapter contract: backends running under TEMPORARY credentials
+   * (STS/Lambda roles) silently cap a presigned URL's life at the
+   * credential's remaining lifetime, whatever expiry you request.
+   *
+   * @default 60
+   */
+  signedUrlExpiresSeconds?: number;
 }
 
 /** Structured audit event for compliance logging. */
@@ -469,7 +551,17 @@ export function serveObjectRaw(
     onTransfer: rawOnTransfer,
     maxRanges = MAX_RANGES_DEFAULT,
     enforceCharset = true,
+    precompressed = false,
+    preferSignedUrl,
+    signedUrlExpiresSeconds = 60,
   } = opts;
+
+  // Resolve and validate the precompressed coding list ONCE. An unknown
+  // coding is a configuration bug: fail at setup, not per-request.
+  const precompressedCodings: readonly PrecompressedCoding[] | null =
+    precompressed === true ? DEFAULT_PRECOMPRESSED
+    : precompressed === false ? null
+    : resolvePrecompressedList(precompressed);
 
   // A consumer's audit hook must never break the never-throw contract: the
   // bodyless emissions (302/304/412/416/HEAD) fire outside any guard, so a
@@ -556,62 +648,32 @@ export function serveObjectRaw(
       ? buildContentDisposition(ctx.filename, { type: safeDisposition, fallback: fallbackFilename })
       : safeDisposition;
 
-    // Extra caller headers for success responses (200/206/304)
-    const extraHeaders = securityHeaders ? securityHeaders(mime) : {};
+    // Active content rendered inline (SVG, HTML, XSLT-capable XML) executes
+    // in the serving origin when a user opens it as a top-level document --
+    // `nosniff` does not stop a genuine `image/svg+xml` from running its
+    // embedded scripts. Default a sandbox CSP onto exactly that combination;
+    // a caller's securityHeaders can override it (spread order below).
+    // Attachment responses and passive types (images, video, PDF) are
+    // unaffected.
+    const activeInlineCsp = safeDisposition === "inline" && isActiveContentMime(mime)
+      ? { "Content-Security-Policy": "sandbox" }
+      : undefined;
 
-    // Response-building context shared by all response paths
-    const rctx: ResponseContext = {
-      mime, disposition, extraHeaders,
-      cacheControl: ctx.cacheControl ?? cacheControl,
-      crossOriginResourcePolicy, timingAllowOrigin, enforceCharset,
-      digestWanted: clientWantsDigest(req.headers),
-      contentDigestWanted: clientWantsContentDigest(req.headers),
-      emitETag: etagEnabled,
-      isHead,
-      // A range-incapable store is served rangeless: advertise it.
-      acceptRanges: store.supportsRange === false ? "none" : "bytes",
-    };
+    // Extra caller headers for success responses (200/206/304)
+    const extraHeaders = activeInlineCsp
+      ? { ...activeInlineCsp, ...(securityHeaders ? securityHeaders(mime) : {}) }
+      : securityHeaders ? securityHeaders(mime) : {};
+
+    const effectiveCacheControl = ctx.cacheControl ?? cacheControl;
 
     // ── Range-incapable stores: signed-URL redirect when available ───────
     if (store.supportsRange === false && store.createSignedUrl) {
-      let result: Awaited<ReturnType<NonNullable<ObjectStore["createSignedUrl"]>>>;
-      try {
-        result = await store.createSignedUrl(key, {
-          expiresInSeconds: 60,
-          downloadFilename: ctx.filename,
-        });
-      } catch (err) {
-        // Never-throw contract: a rejecting signed-URL provider becomes a
-        // reported 502, never an escaped rejection (which crashes Express 4).
-        onError?.(err, { key, operation: "get" });
-        return plainTextError(502, "Bad Gateway", "Storage backend error");
-      }
-      if ("url" in result) {
-        // A signed-URL redirect grants file access: audit it like a serve.
-        onServe?.({ key, method: isHead ? "HEAD" : "GET", status: 302, mime, bytesServed: 0 });
-        return {
-          status: 302,
-          statusText: "Found",
-          headers: {
-            // The signed URL is backend-derived: sanitize it like every
-            // other metadata-sourced header so a malformed provider
-            // response cannot inject a header or crash the writer.
-            Location: sanitizeHeaderValue(result.url),
-            "Cache-Control": "no-store, no-cache",
-            "Accept-Ranges": "none",
-            "Content-Length": "0",
-          },
-          body: null,
-        };
-      }
-      // The provider declined ({ ok: false }): surface the reason to the
-      // consumer's telemetry (it never reaches the client) and answer an
-      // honest 502.
-      onError?.(
-        new Error(`createSignedUrl declined for ${key}: ${result.error}`),
-        { key, operation: "get" },
-      );
-      return plainTextError(502, "Bad Gateway", "Storage backend error");
+      return signedUrlRedirect({
+        store, key, filename: ctx.filename,
+        expiresInSeconds: signedUrlExpiresSeconds,
+        cacheControl: effectiveCacheControl,
+        isHead, mime, onServe, onError,
+      });
     }
     // supportsRange === false with no signed-URL path: serve the FULL
     // representation through the origin instead of failing. Range and
@@ -638,6 +700,76 @@ export function serveObjectRaw(
     // totalSize to clamp bounds and detect unsatisfiable ranges.
     const needsHead = hasConditional || hasIfRange || isHead || Boolean(rangeHeader);
 
+    // ── Per-request egress offload (preferSignedUrl) ─────────────────────
+    if (
+      preferSignedUrl && store.createSignedUrl
+      && preferSignedUrl({
+        key, mime,
+        method: isHead ? "HEAD" : "GET",
+        isRange: Boolean(rangeHeader),
+        isConditional: hasConditional || hasIfRange,
+      })
+    ) {
+      return signedUrlRedirect({
+        store, key, filename: ctx.filename,
+        expiresInSeconds: signedUrlExpiresSeconds,
+        cacheControl: effectiveCacheControl,
+        isHead, mime, onServe, onError,
+      });
+    }
+
+    // ── Precompressed variant negotiation (RFC 9110 Section 12.5.3) ──────
+    // The negotiated sibling (`<key>.br`) is a DISTINCT representation: from
+    // here down, its key, size, validators, and digest drive the entire
+    // pipeline, so conditionals, If-Range, byte ranges, pinning, and the
+    // drift guard are all evaluated against the encoded bytes. Multi-range
+    // requests are excluded (multipart framing of an encoded representation
+    // has no interoperable definition) and serve the identity object.
+    let effectiveKey = key;
+    let contentEncoding: string | undefined;
+    let variantMeta: ObjectMetadata | undefined;
+    const negotiating = precompressedCodings !== null && isCompressibleMime(mime);
+    if (negotiating && !isMultiRange) {
+      const candidates = negotiateEncoding(headers.get("accept-encoding"), precompressedCodings);
+      for (const coding of candidates) {
+        const variantKey = key + PRECOMPRESSED_SUFFIX[coding as PrecompressedCoding];
+        try {
+          variantMeta = await store.headObject(variantKey, { signal: req.signal });
+          effectiveKey = variantKey;
+          contentEncoding = coding;
+          break;
+        } catch (err) {
+          if (isAbortError(err)) return clientClosed();
+          if (isNotFoundStoreError(err)) continue; // no such variant: next coding
+          // Any other probe failure (throttle, outage) must not fail the
+          // request -- the identity representation is always servable.
+          // Surface it for telemetry and stop probing: an unhealthy backend
+          // does not need more speculative HEADs.
+          onError?.(err, { key: variantKey, operation: "head" });
+          break;
+        }
+      }
+    }
+
+    // Response-building context shared by all response paths
+    const rctx: ResponseContext = {
+      mime, disposition, extraHeaders,
+      cacheControl: effectiveCacheControl,
+      crossOriginResourcePolicy, timingAllowOrigin, enforceCharset,
+      digestWanted: clientWantsDigest(req.headers),
+      contentDigestWanted: clientWantsContentDigest(req.headers),
+      emitETag: etagEnabled,
+      isHead,
+      // A range-incapable store is served rangeless: advertise it.
+      acceptRanges: store.supportsRange === false ? "none" : "bytes",
+      contentEncoding,
+      // The response is encoding-negotiated whenever probing is CONFIGURED
+      // for this type -- also when identity was chosen (the variant may
+      // appear later) and on multi-range identity responses -- so shared
+      // caches always key compressible objects on Accept-Encoding.
+      varyAcceptEncoding: negotiating,
+    };
+
     // ── Path B: plain range on an authoritative-range store ──────────────
     // A range GET with no conditionals and no If-Range needs nothing from a
     // HEAD: stores whose 206 bounds/total come from the backend's actual
@@ -647,7 +779,7 @@ export function serveObjectRaw(
     // (video seeking, PDF.js chunked loading). Suffix ranges (`bytes=-N`)
     // and anything the strict parser rejects fall through to Path A, whose
     // HEAD-resolved evaluation handles them.
-    if (rangeHeader && !hasConditional && !hasIfRange && !isHead && store.authoritativeRange) {
+    if (rangeHeader && !hasConditional && !hasIfRange && !isHead && store.authoritativeRange && !variantMeta) {
       const fastRange = parseFastRange(rangeHeader);
       if (fastRange) {
         let parts: RawResponseParts | null = null;
@@ -702,12 +834,19 @@ export function serveObjectRaw(
     for (let attempt = 0; needsHead; attempt++) {
       let meta: ObjectMetadata;
       const t0 = timingEnabled ? performance.now() : 0;
-      try {
-        meta = await store.headObject(key, { signal: req.signal });
-      } catch (err) {
-        if (isAbortError(err)) return clientClosed();
-        onError?.(err, { key, operation: "head" });
-        return storeErrorResponse(err);
+      if (attempt === 0 && variantMeta) {
+        // The negotiation probe already fetched this representation's
+        // metadata; a second HEAD would race it for no benefit. Retries
+        // (attempt > 0) re-fetch: the variant changed under a pinned read.
+        meta = variantMeta;
+      } else {
+        try {
+          meta = await store.headObject(effectiveKey, { signal: req.signal });
+        } catch (err) {
+          if (isAbortError(err)) return clientClosed();
+          onError?.(err, { key: effectiveKey, operation: "head" });
+          return storeErrorResponse(err);
+        }
       }
       const storeMs = timingEnabled ? performance.now() - t0 : 0;
       const etag = etagEnabled ? deriveETag(meta) : undefined;
@@ -740,15 +879,18 @@ export function serveObjectRaw(
 
       // Early exits: 412, 304, 416
       if (evaluation.status === 304) {
-        onServe?.({ key, method: isHead ? "HEAD" : "GET", status: 304, mime, bytesServed: 0, etag });
+        onServe?.({ key: effectiveKey, method: isHead ? "HEAD" : "GET", status: 304, mime, bytesServed: 0, etag });
+        // Caller extraHeaders ride the 304: RFC 9110 Section 15.4.5
+        // requires any Vary (and Cache-Control/Expires) that the 200
+        // would have carried to be generated on the 304 too, and
+        // securityHeaders is the mechanism that adds Vary to the 200.
+        // Negotiated responses add their own Vary member the same way.
+        const headers304: Record<string, string> = { ...evaluation.headers, ...rctx.extraHeaders };
+        if (rctx.varyAcceptEncoding) headers304["Vary"] = appendVaryAcceptEncoding(headers304["Vary"]);
         return {
           status: 304,
           statusText: STATUS_TEXT[304],
-          // Caller extraHeaders ride the 304: RFC 9110 Section 15.4.5
-          // requires any Vary (and Cache-Control/Expires) that the 200
-          // would have carried to be generated on the 304 too, and
-          // securityHeaders is the mechanism that adds Vary to the 200.
-          headers: { ...evaluation.headers, ...rctx.extraHeaders },
+          headers: headers304,
           body: null,
         };
       }
@@ -756,7 +898,7 @@ export function serveObjectRaw(
         // Denials are audit events too: a 412 is an optimistic-concurrency
         // conflict (failed If-Match), exactly what SOC 2 change-control
         // trails want captured alongside grants.
-        onServe?.({ key, method: isHead ? "HEAD" : "GET", status: 412, mime, bytesServed: 0, etag });
+        onServe?.({ key: effectiveKey, method: isHead ? "HEAD" : "GET", status: 412, mime, bytesServed: 0, etag });
         return {
           status: 412,
           statusText: STATUS_TEXT[412],
@@ -769,7 +911,7 @@ export function serveObjectRaw(
       }
 
       if (evaluation.status === 416) {
-        onServe?.({ key, method: "GET", status: 416, mime, bytesServed: 0, etag });
+        onServe?.({ key: effectiveKey, method: "GET", status: 416, mime, bytesServed: 0, etag });
         return {
           status: evaluation.status,
           statusText: "Range Not Satisfiable",
@@ -784,7 +926,7 @@ export function serveObjectRaw(
       // HEAD method: preconditions passed -- return headers only, no body
       // (PDF.js size probing, cache priming).
       if (isHead) {
-        onServe?.({ key, method: "HEAD", status: 200, mime, bytesServed: 0, etag });
+        onServe?.({ key: effectiveKey, method: "HEAD", status: 200, mime, bytesServed: 0, etag });
         return buildHeadResponse(meta, etag, rctx);
       }
 
@@ -806,7 +948,7 @@ export function serveObjectRaw(
       if (isMultiRange && isRangeFresh(headers, etag, meta.lastModified)) {
         const set = parseRanges(rangeHeader, meta.contentLength, maxRanges);
         if (set === "unsatisfiable") {
-          onServe?.({ key, method: "GET", status: 416, mime, bytesServed: 0, etag });
+          onServe?.({ key: effectiveKey, method: "GET", status: 416, mime, bytesServed: 0, etag });
           return {
             status: 416,
             statusText: "Range Not Satisfiable",
@@ -822,7 +964,7 @@ export function serveObjectRaw(
             if (set.ranges.length === 1) {
               // Overlapping ranges coalesced to one: a normal single 206.
               return await streamFromStore({
-                store, key, range: set.ranges[0],
+                store, key: effectiveKey, range: set.ranges[0],
                 ifMatch: pinEtag, pin: meta.pin,
                 headEtag: etag, headLastModified: meta.lastModified,
                 reprDigest: meta.digest, ctx: rctx, signal: req.signal, onError,
@@ -832,7 +974,7 @@ export function serveObjectRaw(
               });
             }
             return await serveMultipart({
-              store, key, ranges: set.ranges, totalSize: meta.contentLength,
+              store, key: effectiveKey, ranges: set.ranges, totalSize: meta.contentLength,
               mime, etag, lastModified: meta.lastModified,
               // Same RFC 9530 Section 4 negotiation as every other path: a
               // client that declined sha-256 gets no digest on multipart.
@@ -845,7 +987,7 @@ export function serveObjectRaw(
             // A pinned first-part read lost its race: re-validate once, exactly
             // like single-range serving.
             if (isObjectChangedError(err) && attempt === 0) continue;
-            onError?.(err, { key, operation: "get" });
+            onError?.(err, { key: effectiveKey, operation: "get" });
             return storeErrorResponse(err);
           }
         }
@@ -854,7 +996,7 @@ export function serveObjectRaw(
 
       try {
         return await streamFromStore({
-          store, key, range: evaluation.range ?? undefined,
+          store, key: effectiveKey, range: evaluation.range ?? undefined,
           ifMatch: pinEtag, pin: meta.pin,
           headEtag: etag, headLastModified: meta.lastModified,
           reprDigest: meta.digest, ctx: rctx, signal: req.signal, onError,
@@ -869,7 +1011,7 @@ export function serveObjectRaw(
         // a HEAD+GET and drops the first failure from onError. Report it now.
         // Mirrors the multipart catch above.
         if (isObjectChangedError(err) && attempt === 0) continue;
-        onError?.(err, { key, operation: "get" });
+        onError?.(err, { key: effectiveKey, operation: "get" });
         return storeErrorResponse(err);
       }
     }
@@ -881,13 +1023,13 @@ export function serveObjectRaw(
     // handler (which crashes Express 4 processes).
     try {
       return await streamFromStore({
-        store, key, ctx: rctx, signal: req.signal, onError,
+        store, key: effectiveKey, ctx: rctx, signal: req.signal, onError,
         timingCtx: timingEnabled ? { storeMs: 0, evaluateMs: 0, onTiming } : undefined,
         auditCtx: onServe ? { onServe, mime } : undefined,
         onTransfer,
       });
     } catch (err) {
-      onError?.(err, { key, operation: "get" });
+      onError?.(err, { key: effectiveKey, operation: "get" });
       return storeErrorResponse(err);
     }
   };
@@ -913,6 +1055,119 @@ function withoutRangeHeaders(
       return headers.get(lower);
     },
   };
+}
+
+/** Validate a caller-supplied precompressed coding list at setup time. */
+function resolvePrecompressedList(
+  codings: readonly PrecompressedCoding[],
+): readonly PrecompressedCoding[] | null {
+  if (codings.length === 0) return null;
+  for (const coding of codings) {
+    if (!(coding in PRECOMPRESSED_SUFFIX)) {
+      throw new TypeError(
+        `serveObject: unknown precompressed coding "${coding}" (supported: ${Object.keys(PRECOMPRESSED_SUFFIX).join(", ")})`,
+      );
+    }
+  }
+  return codings;
+}
+
+/**
+ * Active content types that can execute script or make outbound requests
+ * when rendered inline as a top-level document from the serving origin.
+ * XML is included for its XSLT processing instruction, which several
+ * browsers still execute.
+ */
+const ACTIVE_CONTENT_MIMES = new Set([
+  "image/svg+xml",
+  "text/html",
+  "application/xhtml+xml",
+  "text/xml",
+  "application/xml",
+]);
+
+/** True when a MIME's essence is active content ({@link ACTIVE_CONTENT_MIMES}). */
+function isActiveContentMime(mime: string): boolean {
+  const semi = mime.indexOf(";");
+  const essence = (semi === -1 ? mime : mime.slice(0, semi)).trim().toLowerCase();
+  return ACTIVE_CONTENT_MIMES.has(essence);
+}
+
+/**
+ * Append `Accept-Encoding` to a Vary field value without duplicating it.
+ * `Vary: *` already covers every header and is left untouched.
+ */
+function appendVaryAcceptEncoding(existing: string | undefined): string {
+  if (!existing) return "Accept-Encoding";
+  const members = existing.split(",").map((m) => m.trim().toLowerCase());
+  if (members.includes("*") || members.includes("accept-encoding")) return existing;
+  return `${existing}, Accept-Encoding`;
+}
+
+/** Arguments for {@link signedUrlRedirect}. */
+interface SignedUrlRedirectArgs {
+  store: ObjectStore;
+  key: string;
+  filename?: string;
+  expiresInSeconds: number;
+  cacheControl: string;
+  isHead: boolean;
+  mime: string;
+  onServe?: (event: ServeAuditEvent) => void;
+  onError?: ServeObjectOptions["onError"];
+}
+
+/**
+ * Mint a signed URL and answer a 302, sharing one implementation between the
+ * range-incapable degradation path and the `preferSignedUrl` offload hook.
+ *
+ * The `cacheControl` handed to the provider rides the SIGNED response (S3
+ * `response-cache-control`): without it, a private document served off the
+ * bucket origin inherits whatever Cache-Control was baked into the object at
+ * upload -- the classic footgun being a public/immutable value that a CDN
+ * then caches for a year.
+ */
+async function signedUrlRedirect(args: SignedUrlRedirectArgs): Promise<RawResponseParts> {
+  const { store, key, filename, expiresInSeconds, cacheControl, isHead, mime, onServe, onError } = args;
+  let result: Awaited<ReturnType<NonNullable<ObjectStore["createSignedUrl"]>>>;
+  try {
+    result = await store.createSignedUrl!(key, {
+      expiresInSeconds,
+      downloadFilename: filename,
+      cacheControl,
+    });
+  } catch (err) {
+    // Never-throw contract: a rejecting signed-URL provider becomes a
+    // reported 502, never an escaped rejection (which crashes Express 4).
+    onError?.(err, { key, operation: "get" });
+    return plainTextError(502, "Bad Gateway", "Storage backend error");
+  }
+  if ("url" in result) {
+    // A signed-URL redirect grants file access: audit it like a serve.
+    onServe?.({ key, method: isHead ? "HEAD" : "GET", status: 302, mime, bytesServed: 0 });
+    return {
+      status: 302,
+      statusText: "Found",
+      headers: {
+        // The signed URL is backend-derived: sanitize it like every
+        // other metadata-sourced header so a malformed provider
+        // response cannot inject a header or crash the writer.
+        Location: sanitizeHeaderValue(result.url),
+        "Cache-Control": "no-store, no-cache",
+        "Accept-Ranges": "none",
+        "Content-Length": "0",
+      },
+      body: null,
+    };
+  }
+  // The provider declined ({ ok: false }): surface the reason to the
+  // consumer's telemetry (it never reaches the client) and answer an
+  // honest 502.
+  onError?.(
+    new Error(`createSignedUrl declined for ${key}: ${result.error}`),
+    { key, operation: "get" },
+  );
+  return plainTextError(502, "Bad Gateway", "Storage backend error");
 }
 
 /**
@@ -961,6 +1216,14 @@ interface ResponseContext {
   readonly isHead: boolean;
   /** "none" for range-incapable stores served rangeless. */
   readonly acceptRanges: "bytes" | "none";
+  /** Negotiated content coding of the served variant (`Content-Encoding`). */
+  readonly contentEncoding?: string;
+  /**
+   * Encoding negotiation is configured for this representation: every
+   * success response (200/206/304/HEAD, variant or identity) must carry
+   * `Vary: Accept-Encoding` so shared caches key on the request coding.
+   */
+  readonly varyAcceptEncoding: boolean;
 }
 
 /** Protocol metadata for building response headers. */
@@ -1015,6 +1278,9 @@ function applyAdapterHeaders(base: Record<string, string>, ctx: ResponseContext)
   };
   if (ctx.crossOriginResourcePolicy) headers["Cross-Origin-Resource-Policy"] = ctx.crossOriginResourcePolicy;
   if (ctx.timingAllowOrigin) headers["Timing-Allow-Origin"] = ctx.timingAllowOrigin;
+  // Merged LAST so a caller-supplied Vary (extraHeaders) is extended, never
+  // clobbered, and vice versa.
+  if (ctx.varyAcceptEncoding) headers["Vary"] = appendVaryAcceptEncoding(headers["Vary"]);
   return headers;
 }
 
@@ -1045,6 +1311,10 @@ function buildHeaders(
   // Range-incapable stores advertise honestly instead of inviting 206s
   // the pipeline will never grant.
   if (ctx.acceptRanges === "none") protocol["Accept-Ranges"] = "none";
+  // A negotiated precompressed variant IS the representation: its coding is
+  // representation metadata, and the surrounding validators/digest/ranges
+  // already describe the encoded bytes.
+  if (ctx.contentEncoding) protocol["Content-Encoding"] = ctx.contentEncoding;
 
   const headers = applyAdapterHeaders(protocol, ctx);
   if (meta.serverTiming) headers["Server-Timing"] = meta.serverTiming;
@@ -1366,7 +1636,12 @@ async function serveMultipart(opts: MultipartOpts): Promise<RawResponseParts> {
 
   const multipart = buildMultipartHeaders({
     boundary, ranges, totalSize, contentType: partContentType,
-    etag, lastModified, digest, cacheControl: ctx.cacheControl,
+    etag, lastModified,
+    // RFC 9530 Section 4: respect Want-Repr-Digest negotiation exactly like
+    // buildHeaders does for single-range responses; weight 0 or an algorithm
+    // list without sha-256 means "do not send".
+    digest: ctx.digestWanted ? digest : undefined,
+    cacheControl: ctx.cacheControl,
   });
 
   // Ownership of the eagerly-fetched first part transfers to the generator the

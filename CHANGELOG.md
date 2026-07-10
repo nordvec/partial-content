@@ -1,5 +1,54 @@
 # Changelog
 
+## 1.2.0 (2026-07-10)
+
+Feature release: content-coding negotiation, per-request egress offload, and
+serving-policy primitives, informed by a sweep of production file-serving
+implementations.
+
+### Precompressed variant negotiation
+- `precompressed: true | ["br", "zstd", "gzip"]` on the serve options: probes
+  `<key>.br` / `<key>.zst` / `<key>.gz` siblings, negotiates via
+  `Accept-Encoding` (RFC 9110 12.5.3 with real qvalue handling, `*`, and
+  `identity` preference), and serves the variant with `Content-Encoding` +
+  `Vary: Accept-Encoding`.
+- The variant is treated as its own representation end to end: its validators
+  drive 304/If-Range, its size drives Range/416 bounds (`Content-Range`
+  describes the encoded bytes), its digest rides `Repr-Digest`, and the
+  TOCTOU pin + drift guard apply to it. Selection only -- the library never
+  compresses at serve time (that would corrupt ranges and digests).
+- Negotiation is gated on compressible MIME types (new `isCompressibleMime`)
+  and skipped for multi-range requests, which serve the identity bytes.
+  Probe failures other than not-found fall back to identity and report to
+  `onError`.
+- New kernel exports: `parseAcceptEncoding`, `negotiateEncoding`,
+  `isCompressibleMime`.
+
+### Serving policy
+- `preferSignedUrl` predicate: per-request 302 offload to `createSignedUrl`
+  for stores that support it (e.g. proxy ranges + revalidations, redirect
+  full-file downloads). `signedUrlExpiresSeconds` configures the lifetime.
+- `createSignedUrl` gains a `cacheControl` response-override, honored by the
+  S3 adapter (`response-cache-control`), so a private document redirected to
+  the bucket origin cannot be cached under the object's baked-in public
+  Cache-Control. The contract now documents the STS-credential expiry cap
+  and the CloudFront canned-policy `filename*` trap.
+- `buildCacheControl()`: typed Cache-Control composer (RFC 9111 + RFC 5861
+  `stale-while-revalidate`/`stale-if-error`) with validation and a
+  `no-transform` default -- intermediary transforms break byte-exact ranges,
+  digests, and strong validators.
+
+### Hardening
+- Active content served `inline` (`image/svg+xml`, `text/html`,
+  `application/xhtml+xml`, XML) automatically carries
+  `Content-Security-Policy: sandbox`; caller `securityHeaders` overrides.
+  `nosniff` never stopped a genuine SVG from executing its embedded script.
+
+### Monorepo/tooling
+- The `bun` export condition now points at the TypeScript source: Bun
+  runtimes (and Bun-workspace consumers) execute `src/` directly, so a stale
+  `dist/` build can never be served or tested.
+
 ## 1.1.0 (2026-07-10)
 
 RFC compliance sweep re-verified against the current spec texts (RFC 9110,
