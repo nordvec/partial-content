@@ -490,6 +490,75 @@ range-serving origin (RFC 9111 Section 3.3-3.4):
   404/502/503 can never be heuristically cached into a persistent outage
   (RFC 9111 Section 4.2.2 makes 404s heuristically cacheable by default).
 
+## Behind a CDN
+
+Verified against vendor documentation (July 2026); CDN behavior diverges
+sharply from a naive reading of RFC 9110/9111, in ways that change what this
+library's output does at the edge.
+
+- **Only CloudFront forwards client Range requests to the origin** (and
+  caches the returned ranges, sometimes widening them). Cloudflare, Fastly's
+  default readthrough cache, and Bunny all fetch the FULL object and slice
+  ranges from their own cache: your origin sees plain GETs, and the edge
+  synthesizes 206s. Multi-range `multipart/byteranges` responses therefore
+  rarely reach clients through a CDN at all (CloudFront passes them only for
+  ascending, non-overlapping viewer ranges; the slicing CDNs answer from
+  their own cache). None of this requires changes at the origin -- direct
+  clients and CloudFront still exercise the full protocol -- but do not
+  expect edge traffic to hit the multipart path.
+- **`Content-Length` is the edge's 206 permission slip.** Cloudflare returns
+  206 for a range over cached content only when the origin response carried
+  `Content-Length`; CloudFront returns the full object when the origin
+  responds `Transfer-Encoding: chunked`. This library always computes an
+  exact `Content-Length` -- but the RUNTIME can still discard it: Bun.serve
+  sends `ReadableStream` bodies chunked (see Runtime Notes), which silently
+  disables edge 206 slicing behind Cloudflare/CloudFront for stream bodies.
+  Behind those CDNs, prefer byte-body stores/paths for range-hot content or
+  front the route with a Node runtime.
+- **Encoding negotiation is normalized at the edge.** Cloudflare rewrites
+  the origin-bound `Accept-Encoding` to `gzip, br` by default (the visitor's
+  real value is forwarded only with "Respect Strong ETags"), and honors an
+  origin `Vary: Accept-Encoding` cache key only via the opt-in Cache Rules
+  Vary feature (shipped 2026-07). CloudFront normalizes to exactly `br,gzip`
+  or `identity`. Consequence: `.br`/`.gz` sibling variants negotiate fine
+  through both, but **`.zst` variants are unreachable through either CDN's
+  default path** -- zstd is edge-to-visitor only. Direct traffic and other
+  proxies still negotiate zstd.
+- **Cloudflare downgrades strong ETags to weak on any encoding mismatch**
+  between what the origin served and what the visitor accepts, even with
+  "Respect Strong ETags" enabled. A weak validator cannot authorize
+  `If-Range`, so ranged RESUME of encoded variants through Cloudflare can
+  silently degrade to full 200s. Not a correctness bug (the client re-fetches
+  cleanly); a throughput caveat to know about.
+- **RFC 5861 works at the edge where it is supported**: Fastly natively
+  honors `stale-while-revalidate` and `stale-if-error` from
+  `buildCacheControl()`.
+- **pdf.js requires the identity coding** (it checks
+  `Content-Encoding: identity`, `Accept-Ranges: bytes`, and an integer
+  `Content-Length` before enabling progressive range loading, and cannot ask
+  for identity itself -- `Accept-Encoding` is a forbidden Fetch header).
+  This library never negotiates a compressed variant for
+  `application/pdf` (`isCompressibleMime` excludes it by design), so pdf.js
+  range loading is unaffected by the `precompressed` option.
+
+## Cross-Origin Readers (CORS)
+
+Only seven response headers are CORS-safelisted (`Cache-Control`,
+`Content-Language`, `Content-Length`, `Content-Type`, `Expires`,
+`Last-Modified`, `Pragma`). Everything else this library's protocol depends
+on is INVISIBLE to cross-origin JavaScript until exposed. pdf.js silently
+falls back to full-file download when it cannot read `Accept-Ranges` and
+`Content-Length` cross-origin. For cross-origin range/conditional/digest
+workflows, emit:
+
+```
+Access-Control-Expose-Headers: Accept-Ranges, Content-Range, Content-Encoding,
+  ETag, Content-Disposition, Repr-Digest, Content-Digest, Server-Timing
+```
+
+(trim to what the reader actually consumes; `Server-Timing` additionally
+requires `Timing-Allow-Origin`, the `timingAllowOrigin` option).
+
 ## Precompressed Variants and Content-Encoding
 
 Encoding negotiation (`precompressed`) selects a stored sibling object; it
@@ -525,7 +594,10 @@ Behaviors owned by the HTTP runtime, observable when serving through
   byte bodies (`Uint8Array`, small fs reads, memory store) keep the exact
   precomputed length. Correctness is unaffected (framing is the runtime's
   job); byte accounting on the wire differs from Node, where the pump writes
-  under the declared `Content-Length`.
+  under the declared `Content-Length`. Edge interaction: chunked origin
+  responses disable Cloudflare's 206 slicing and CloudFront's range
+  passthrough (see Behind a CDN), so range-hot content served from Bun
+  behind those CDNs should come from byte-body paths.
 - **Bun adds `Content-Length: 0` to bodyless 304s.** RFC 9110 Section 8.6
   allows a 304 `Content-Length` only when it equals the 200's length; the
   header is injected by the runtime after the handler returns.

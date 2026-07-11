@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+Docs only: "Behind a CDN" interop guide (verified against vendor docs,
+July 2026) covering which CDNs forward ranges vs fetch-and-slice, the
+Content-Length requirement for edge 206s (and the Bun chunked-stream
+interaction), Accept-Encoding normalization (`.zst` unreachable through
+Cloudflare/CloudFront defaults), Cloudflare's strong-ETag downgrade on
+encoding mismatch, RFC 5861 support at Fastly, pdf.js identity-coding
+requirements, and the `Access-Control-Expose-Headers` list cross-origin
+range/digest readers need.
+
 ## 1.2.0 (2026-07-10)
 
 Feature release: content-coding negotiation, per-request egress offload, and
