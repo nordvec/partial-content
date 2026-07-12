@@ -1842,3 +1842,599 @@ describe("accessControlExposeHeaders", () => {
         expect(res.headers.get("Access-Control-Expose-Headers")).toBeNull();
     });
 });
+
+// ─── Mutation Hardening: Adapter Behavior Pins ───────────────────────────────
+// Each test pins an observable contract a surviving mutant proved untested:
+// negotiation gating, error taxonomy, byte-accounting guards, and the
+// never-throw contract on paths where no telemetry hook is installed.
+
+describe("precompressed gating (defaults and explicit lists)", () => {
+    function brStore(heads: string[]) {
+        const base = kvStore({
+            objects: {
+                "data.json": { body: "i".repeat(40), etag: '"id-v1"' },
+                "data.json.br": { body: "b".repeat(10), etag: '"br-v1"' },
+                "data.json.zst": { body: "z".repeat(15), etag: '"zst-v1"' },
+            },
+        });
+        return {
+            ...base,
+            headObject: async (key: string, o?: { signal?: AbortSignal }) => {
+                heads.push(key);
+                return base.headObject(key, o);
+            },
+        } satisfies ObjectStore;
+    }
+    const CTX = { key: "data.json", mime: "application/json" };
+
+    test("negotiation is OFF by default: sibling variants are never probed or served", async () => {
+        const heads: string[] = [];
+        const handler = serveObject(brStore(heads));
+        const res = await handler(req({ "Accept-Encoding": "br, zstd" }), CTX);
+
+        expect(res.status).toBe(200);
+        expect(await res.text()).toBe("i".repeat(40));
+        expect(res.headers.get("Content-Encoding")).toBeNull();
+        expect(res.headers.get("Vary")).toBeNull();
+        // Plain unconditional GET rides the speculative path: zero HEADs.
+        // A probe of any sibling variant here would betray negotiation ON.
+        expect(heads).toEqual([]);
+    });
+
+    test("an empty coding list disables negotiation entirely", async () => {
+        const heads: string[] = [];
+        const handler = serveObject(brStore(heads), { precompressed: [] });
+        const res = await handler(req({ "Accept-Encoding": "br" }), CTX);
+
+        expect(await res.text()).toBe("i".repeat(40));
+        expect(res.headers.get("Vary")).toBeNull();
+        expect(heads).toEqual([]);
+    });
+
+    test("an explicit list restricts which codings are offered", async () => {
+        const heads: string[] = [];
+        const handler = serveObject(brStore(heads), { precompressed: ["br"] });
+        // Client prefers zstd, but only br is configured: br wins.
+        const res = await handler(req({ "Accept-Encoding": "zstd;q=1, br;q=0.8" }), CTX);
+
+        expect(res.headers.get("Content-Encoding")).toBe("br");
+        expect(await res.text()).toBe("b".repeat(10));
+        expect(heads).toEqual(["data.json.br"]);
+    });
+
+    test("the winning probe's metadata is reused: exactly one HEAD per serve", async () => {
+        const heads: string[] = [];
+        const handler = serveObject(brStore(heads), { precompressed: true });
+        const res = await handler(req({ "Accept-Encoding": "br" }), CTX);
+
+        expect(res.headers.get("Content-Encoding")).toBe("br");
+        // The variant probe IS the validating HEAD; re-HEADing the variant
+        // (or the identity key) would double storage round-trips per request.
+        expect(heads).toEqual(["data.json.br"]);
+    });
+
+    test("probe failure without onError still falls back cleanly (never-throw)", async () => {
+        const heads: string[] = [];
+        const base = brStore(heads);
+        const flaky: ObjectStore = {
+            ...base,
+            headObject: async (key, o) => {
+                if (key.endsWith(".br") || key.endsWith(".zst")) throw new StoreUnavailableError(key);
+                return base.headObject(key, o);
+            },
+        };
+        const handler = serveObject(flaky, { precompressed: true });
+        const res = await handler(req({ "Accept-Encoding": "br" }), CTX);
+
+        expect(res.status).toBe(200);
+        expect(await res.text()).toBe("i".repeat(40));
+    });
+
+    test("caller Vary already naming Accept-Encoding (any case/spacing) is not duplicated", async () => {
+        const handler = serveObject(brStore([]), {
+            precompressed: true,
+            securityHeaders: () => ({ Vary: "origin , ACCEPT-ENCODING" }),
+        });
+        const res = await handler(req({ "Accept-Encoding": "br" }), CTX);
+        expect(res.headers.get("Vary")).toBe("origin , ACCEPT-ENCODING");
+    });
+
+    test("caller Vary * already covers everything and is left untouched", async () => {
+        const handler = serveObject(brStore([]), {
+            precompressed: true,
+            securityHeaders: () => ({ Vary: "*" }),
+        });
+        const res = await handler(req({ "Accept-Encoding": "br" }), CTX);
+        expect(res.headers.get("Vary")).toBe("*");
+    });
+
+    test("a 304 without negotiation carries no Vary: Accept-Encoding", async () => {
+        const handler = serveObject(memoryStore({ etag: ETAG }));
+        const res = await handler(req({ "If-None-Match": ETAG }), { key: KEY });
+        expect(res.status).toBe(304);
+        expect(res.headers.get("Vary")).toBeNull();
+    });
+});
+
+describe("charset enforcement across the textual MIME taxonomy", () => {
+    const textual = [
+        "application/xml",
+        "application/vnd.api+json",
+        "application/atom+xml",
+        "application/javascript",
+        "application/ecmascript",
+    ];
+    for (const mime of textual) {
+        test(`${mime} gets charset=utf-8`, async () => {
+            const handler = serveObject(memoryStore({ etag: ETAG }));
+            const res = await handler(req(), { key: KEY, mime });
+            expect(res.headers.get("Content-Type")).toBe(`${mime}; charset=utf-8`);
+        });
+    }
+
+    test("non-textual MIME is served without a charset", async () => {
+        const handler = serveObject(memoryStore({ etag: ETAG }));
+        const res = await handler(req(), { key: KEY, mime: "font/woff2" });
+        expect(res.headers.get("Content-Type")).toBe("font/woff2");
+    });
+});
+
+describe("inline active-content CSP: MIME essence parsing", () => {
+    test("parameters and surrounding whitespace do not defeat the sandbox", async () => {
+        const handler = serveObject(memoryStore({ etag: ETAG }), { disposition: "inline" });
+        const res = await handler(req(), { key: KEY, mime: "image/svg+xml ; charset=utf-8" });
+        expect(res.headers.get("Content-Security-Policy")).toBe("sandbox");
+    });
+});
+
+describe("store error taxonomy (status- and name-based classification)", () => {
+    async function serveWithError(error: unknown, opts: Parameters<typeof serveObject>[1] = {}) {
+        const handler = serveObject(memoryStore({ error }), opts);
+        return handler(req(), { key: KEY });
+    }
+
+    test("a duck-typed { status: 404 } maps to 404", async () => {
+        const res = await serveWithError({ status: 404 });
+        expect(res.status).toBe(404);
+    });
+
+    test("an Error named NotFound maps to 404", async () => {
+        const err = new Error("no such key");
+        err.name = "NotFound";
+        const res = await serveWithError(err);
+        expect(res.status).toBe(404);
+    });
+
+    test("an Error named StoreUnavailableError maps to 503 without importing the class", async () => {
+        const err = new Error("throttled");
+        err.name = "StoreUnavailableError";
+        const res = await serveWithError(err);
+        expect(res.status).toBe(503);
+    });
+
+    test("a duck-typed { status: 503, retryAfterSeconds } maps to 503 with Retry-After", async () => {
+        const res = await serveWithError({ status: 503, retryAfterSeconds: 7 });
+        expect(res.status).toBe(503);
+        expect(res.headers.get("Retry-After")).toBe("7");
+    });
+
+    test("a thrown primitive is an opaque 502 (classification never crashes on non-objects)", async () => {
+        const res = await serveWithError("connection reset");
+        expect(res.status).toBe(502);
+    });
+
+    test("a thrown null is an opaque 502", async () => {
+        // Bypass the fixture (null is falsy in its throw gate): a store whose
+        // rejection VALUE is null must not crash `in`-based classification.
+        const base = memoryStore({ etag: ETAG });
+        const store: ObjectStore = {
+            ...base,
+            headObject: async () => { throw null; },
+            getObject: async () => { throw null; },
+        };
+        const handler = serveObject(store);
+        const res = await handler(req(), { key: KEY });
+        expect(res.status).toBe(502);
+    });
+
+    test("head failure without onError installed still answers (never-throw)", async () => {
+        const res = await serveWithError(new Error("boom"));
+        expect(res.status).toBe(502);
+    });
+
+    test("get failure without onError installed still answers (never-throw)", async () => {
+        const base = memoryStore({ etag: ETAG });
+        const store: ObjectStore = {
+            ...base,
+            getObject: async () => { throw new Error("read failed"); },
+        };
+        const handler = serveObject(store);
+        const res = await handler(req(), { key: KEY });
+        expect(res.status).toBe(502);
+    });
+});
+
+describe("abort classification (client disconnect vs backend failure)", () => {
+    function getThrowingStore(err: unknown): ObjectStore {
+        const base = memoryStore({ etag: ETAG, content: "0123456789abcdefghij".repeat(10) });
+        return { ...base, getObject: async () => { throw err; } };
+    }
+
+    test("an Error named AbortError is a client disconnect: bodyless 499", async () => {
+        const err = new Error("aborted");
+        err.name = "AbortError";
+        const handler = serveObject(getThrowingStore(err));
+        const res = await handler(req(), { key: KEY });
+
+        expect(res.status).toBe(499);
+        expect(res.headers.get("Content-Length")).toBe("0");
+    });
+
+    test("a non-abort DOMException is a backend failure, reported to onError", async () => {
+        const reported: Array<{ key: string; operation: string }> = [];
+        const handler = serveObject(
+            getThrowingStore(new DOMException("timed out", "TimeoutError")),
+            { onError: (_e, ctx) => reported.push(ctx) },
+        );
+        const res = await handler(req(), { key: KEY });
+
+        expect(res.status).toBe(502);
+        expect(reported).toEqual([{ key: KEY, operation: "get" }]);
+    });
+
+    test("multipart first-part abort answers 499; non-abort answers 502 without onError", async () => {
+        const abortErr = new Error("gone");
+        abortErr.name = "AbortError";
+        const aborted = serveObject(getThrowingStore(abortErr));
+        const resAbort = await aborted(req({ Range: "bytes=0-4,150-154" }), { key: KEY });
+        expect(resAbort.status).toBe(499);
+
+        const failed = serveObject(getThrowingStore(new DOMException("t", "TimeoutError")));
+        const resFail = await failed(req({ Range: "bytes=0-4,150-154" }), { key: KEY });
+        expect(resFail.status).toBe(502);
+    });
+});
+
+describe("audit hooks never break the never-throw contract without onError", () => {
+    test("a throwing onServe with no onError leaves the response intact", async () => {
+        const handler = serveObject(memoryStore({ etag: ETAG }), {
+            onServe: () => { throw new Error("audit sink down"); },
+        });
+        const res = await handler(req(), { key: KEY });
+        expect(res.status).toBe(200);
+        expect(await res.text()).toBe("0123456789abcdefghij");
+    });
+
+    test("a throwing onTransfer with no onError leaves the body intact", async () => {
+        const handler = serveObject(memoryStore({ etag: ETAG }), {
+            onTransfer: () => { throw new Error("metrics sink down"); },
+        });
+        const res = await handler(req(), { key: KEY });
+        expect(await res.text()).toBe("0123456789abcdefghij");
+    });
+});
+
+describe("signed-url provider failures (offload path telemetry)", () => {
+    test("a rejecting provider without onError answers 502 (never-throw)", async () => {
+        const base = memoryStore({ etag: ETAG });
+        const store: ObjectStore = {
+            ...base,
+            createSignedUrl: async () => { throw new Error("STS outage"); },
+        };
+        const handler = serveObject(store, { preferSignedUrl: () => true });
+        const res = await handler(req(), { key: KEY });
+        expect(res.status).toBe(502);
+    });
+
+    test("a declining provider reports full onError context", async () => {
+        const reported: Array<{ key: string; operation: string }> = [];
+        const base = memoryStore({ etag: ETAG });
+        const store: ObjectStore = {
+            ...base,
+            createSignedUrl: async () => ({ ok: false as const, error: "bucket policy denies" }),
+        };
+        const handler = serveObject(store, {
+            preferSignedUrl: () => true,
+            onError: (_e, ctx) => reported.push(ctx),
+        });
+        const res = await handler(req(), { key: KEY });
+        expect(res.status).toBe(502);
+        expect(reported).toEqual([{ key: KEY, operation: "get" }]);
+    });
+});
+
+describe("served-range byte-accounting guard (hostile stores)", () => {
+    async function serveHostileRange(
+        rangeOverride: { start: number; end: number },
+        rangeHeader = "bytes=0-4",
+    ) {
+        const reported: Array<{ key: string; operation: string }> = [];
+        const handler = serveObject(memoryStore({ etag: ETAG, rangeOverride }), {
+            onError: (_e, ctx) => reported.push(ctx),
+        });
+        const res = await handler(req({ Range: rangeHeader }), { key: KEY });
+        return { res, reported };
+    }
+
+    test("served end at total size (off-by-one past EOF) is rejected", async () => {
+        const { res, reported } = await serveHostileRange({ start: 0, end: 20 });
+        expect(res.status).toBe(502);
+        expect(reported).toEqual([{ key: KEY, operation: "get" }]);
+    });
+
+    test("negative served start is rejected", async () => {
+        const { res } = await serveHostileRange({ start: -1, end: 4 });
+        expect(res.status).toBe(502);
+    });
+
+    test("inverted served bounds are rejected", async () => {
+        const { res } = await serveHostileRange({ start: 6, end: 5 }, "bytes=5-9");
+        expect(res.status).toBe(502);
+    });
+
+    test("NaN served bounds are rejected", async () => {
+        const { res } = await serveHostileRange({ start: Number.NaN, end: 4 });
+        expect(res.status).toBe(502);
+    });
+
+    test("a single-byte served range is legal (start === end)", async () => {
+        const handler = serveObject(memoryStore({ etag: ETAG }));
+        const res = await handler(req({ Range: "bytes=3-3" }), { key: KEY });
+        expect(res.status).toBe(206);
+        expect(await res.text()).toBe("3");
+        expect(res.headers.get("Content-Range")).toBe("bytes 3-3/20");
+    });
+
+    test("a FULL response with unknown total is an adapter bug: clean 502, never unsized 200", async () => {
+        // Unknown totals are only legal on ranged responses (bytes a-b/*). A
+        // full response cannot be sized without a total; the kernel refuses
+        // and the never-throw contract converts that into a clean 502.
+        const data = bytesOf("0123456789");
+        const store: ObjectStore = {
+            supportsRange: true,
+            async headObject() { return { contentLength: 10, etag: '"u1"' }; },
+            async getObject() {
+                return {
+                    body: streamOf(data), contentLength: 10,
+                    totalSize: undefined, etag: '"u1"',
+                };
+            },
+        };
+        const handler = serveObject(store);
+        const res = await handler(req(), { key: KEY });
+        expect(res.status).toBe(502);
+    });
+});
+
+describe("plain-range fast path: malformed headers fall back to validation", () => {
+    function fastStore(calls: string[]) {
+        const data = bytesOf("0123456789abcdefghij"); // 20 bytes
+        return {
+            supportsRange: true,
+            authoritativeRange: true,
+            async headObject(key: string): Promise<ObjectMetadata> {
+                calls.push(`head:${key}`);
+                return { contentLength: data.length, etag: '"fp-v1"' };
+            },
+            async getObject(key: string, getOpts?: { range?: ParsedRange }): Promise<ObjectStream> {
+                const range = getOpts?.range;
+                calls.push(`get:${key}:${range ? `${range.start}-${range.end}` : "full"}`);
+                if (range && range.start >= data.length) throw new Error("InvalidRange");
+                const end = range ? Math.min(range.end, data.length - 1) : data.length - 1;
+                const slice = range ? data.slice(range.start, end + 1) : data;
+                return {
+                    body: streamOf(slice),
+                    contentLength: slice.length,
+                    totalSize: data.length,
+                    range: range ? { start: range.start, end } : undefined,
+                    etag: '"fp-v1"',
+                };
+            },
+        } satisfies ObjectStore;
+    }
+
+    test("trailing garbage never reaches the backend as a range", async () => {
+        const calls: string[] = [];
+        const handler = serveObject(fastStore(calls));
+        const res = await handler(req({ Range: "bytes=0-4x" }), { key: KEY });
+        expect(res.status).toBe(200);
+        expect(await res.text()).toBe("0123456789abcdefghij");
+    });
+
+    test("leading garbage never reaches the backend as a range", async () => {
+        const calls: string[] = [];
+        const handler = serveObject(fastStore(calls));
+        const res = await handler(req({ Range: "xbytes=0-4" }), { key: KEY });
+        expect(res.status).toBe(200);
+        expect(await res.text()).toBe("0123456789abcdefghij");
+    });
+
+    test("inverted bounds are malformed: full 200, not a backend call with start > end", async () => {
+        const calls: string[] = [];
+        const handler = serveObject(fastStore(calls));
+        const res = await handler(req({ Range: "bytes=5-2" }), { key: KEY });
+        expect(res.status).toBe(200);
+        expect(await res.text()).toBe("0123456789abcdefghij");
+    });
+
+    test("a single-byte plain range rides the fast path (no validating HEAD)", async () => {
+        const calls: string[] = [];
+        const handler = serveObject(fastStore(calls));
+        const res = await handler(req({ Range: "bytes=5-5" }), { key: KEY });
+        expect(res.status).toBe(206);
+        expect(await res.text()).toBe("5");
+        expect(calls).toEqual([`get:${KEY}:5-5`]);
+    });
+
+    test("an unsafe-integer first-byte-pos falls back to the validating path", async () => {
+        const calls: string[] = [];
+        const handler = serveObject(fastStore(calls));
+        const res = await handler(req({ Range: "bytes=99999999999999999999-" }), { key: KEY });
+        // The fast path must never hand a lossy float to the backend; the
+        // validating path evaluates it against the real size (416: beyond EOF).
+        expect(calls[0]).toStartWith("head:");
+        expect(res.status).toBe(416);
+        expect(res.headers.get("Content-Range")).toBe("bytes */20");
+    });
+
+    test("an unsafe-integer last-byte-pos falls back to the validating path", async () => {
+        const calls: string[] = [];
+        const handler = serveObject(fastStore(calls));
+        const res = await handler(req({ Range: "bytes=0-99999999999999999999" }), { key: KEY });
+        expect(calls[0]).toStartWith("head:");
+        expect(res.status).toBe(206);
+        expect(res.headers.get("Content-Range")).toBe("bytes 0-19/20");
+    });
+});
+
+describe("pinned-read retry (ObjectChangedError by name)", () => {
+    test("a changed object on the first attempt re-validates once, then serves", async () => {
+        let gets = 0;
+        const base = memoryStore({ etag: ETAG });
+        const store: ObjectStore = {
+            ...base,
+            getObject: async (key, o) => {
+                gets++;
+                if (gets === 1) {
+                    const err = new Error("etag mismatch");
+                    err.name = "ObjectChangedError";
+                    throw err;
+                }
+                return base.getObject(key, o);
+            },
+        };
+        const handler = serveObject(store);
+        const res = await handler(req({ Range: "bytes=0-4" }), { key: KEY });
+
+        expect(res.status).toBe(206);
+        expect(await res.text()).toBe("01234");
+        expect(gets).toBe(2);
+    });
+});
+
+describe("weak/strong validator comparability in the drift guard", () => {
+    test("a weak HEAD ETag never drift-compares against a strong GET ETag", async () => {
+        let heads = 0;
+        const data = bytesOf("0123456789abcdefghij");
+        const store: ObjectStore = {
+            supportsRange: true,
+            async headObject(): Promise<ObjectMetadata> {
+                heads++;
+                return { contentLength: 20, etag: 'W/"v1"' };
+            },
+            async getObject(_key, getOpts?: { range?: ParsedRange }): Promise<ObjectStream> {
+                const range = getOpts?.range;
+                const slice = range ? data.slice(range.start, range.end + 1) : data;
+                return {
+                    body: streamOf(slice), contentLength: slice.length, totalSize: 20,
+                    range: range ? { start: range.start, end: range.end } : undefined,
+                    etag: '"v1"',
+                };
+            },
+        };
+        const handler = serveObject(store);
+        const res = await handler(req({ Range: "bytes=0-9" }), { key: KEY });
+
+        // RFC 9110 8.8.1: weak-vs-strong text equality is meaningless, so the
+        // pair is incomparable and must NOT trigger a re-validation round trip.
+        expect(res.status).toBe(206);
+        expect(heads).toBe(1);
+    });
+});
+
+describe("multipart per-part representation coherence", () => {
+    const BIG = "0123456789abcdefghij".repeat(10); // 200 bytes
+    const LM = "Mon, 01 Jan 2024 00:00:00 GMT";
+
+    function perPartStore(partMeta: (call: number) => { etag?: string; lastModified?: string }): ObjectStore {
+        const data = bytesOf(BIG);
+        let call = 0;
+        return {
+            supportsRange: true,
+            async headObject(): Promise<ObjectMetadata> {
+                return { contentLength: data.length, etag: partMeta(0).etag, lastModified: LM };
+            },
+            async getObject(_key, getOpts?: { range?: ParsedRange }): Promise<ObjectStream> {
+                call++;
+                const range = getOpts?.range!;
+                const slice = data.slice(range.start, range.end + 1);
+                return {
+                    body: streamOf(slice), contentLength: slice.length, totalSize: data.length,
+                    range: { start: range.start, end: range.end },
+                    ...partMeta(call),
+                };
+            },
+        };
+    }
+
+    test("one-sided ETag absence falls back to Last-Modified agreement: serves", async () => {
+        const store = perPartStore((call) =>
+            call <= 1 ? { etag: '"p1"', lastModified: LM } : { lastModified: LM });
+        const handler = serveObject(store);
+        const res = await handler(req({ Range: "bytes=0-4,150-154" }), { key: KEY });
+
+        expect(res.status).toBe(206);
+        const body = await res.text();
+        expect(body).toContain("bytes 0-4/200");
+        expect(body).toContain("bytes 150-154/200");
+    });
+
+    test("Last-Modified disagreement between parts (no ETags) errors the stream, never splices", async () => {
+        const store = perPartStore((call) =>
+            call <= 1 ? { lastModified: LM } : { lastModified: "Tue, 02 Jan 2024 00:00:00 GMT" });
+        const handler = serveObject(store);
+        const res = await handler(req({ Range: "bytes=0-4,150-154" }), { key: KEY });
+        // Lazy parts settle after the 206 commits: the divergence surfaces as
+        // a body reset (visible failure), not as spliced multipart framing.
+        expect(res.status).toBe(206);
+        await expect(res.arrayBuffer()).rejects.toThrow();
+    });
+
+    test("matching Last-Modified across parts (no ETags) serves", async () => {
+        const store = perPartStore(() => ({ lastModified: LM }));
+        const handler = serveObject(store);
+        const res = await handler(req({ Range: "bytes=0-4,150-154" }), { key: KEY });
+        expect(res.status).toBe(206);
+    });
+});
+
+describe("multipart byte-body length verification", () => {
+    const BIG = "0123456789abcdefghij".repeat(10); // 200 bytes
+
+    function shortByteStore(shortWhen: (range: ParsedRange) => boolean): ObjectStore {
+        const data = bytesOf(BIG);
+        return {
+            supportsRange: true,
+            async headObject(): Promise<ObjectMetadata> {
+                return { contentLength: data.length, etag: '"mb-v1"' };
+            },
+            async getObject(_key, getOpts?: { range?: ParsedRange }): Promise<ObjectStream> {
+                const range = getOpts?.range!;
+                const span = range.end - range.start + 1;
+                const slice = data.slice(range.start, range.end + 1);
+                // Claim the correct span but hand over truncated bytes.
+                const body = shortWhen(range) ? slice.slice(0, span - 1) : slice;
+                return {
+                    body, contentLength: span, totalSize: data.length,
+                    range: { start: range.start, end: range.end },
+                    etag: '"mb-v1"',
+                };
+            },
+        };
+    }
+
+    test("a persistently truncated FIRST part is caught before headers commit: clean 502", async () => {
+        // Persistent on purpose: the pre-commit catch grants ONE re-validation,
+        // so a store that stays short must exhaust it and answer 502.
+        const handler = serveObject(shortByteStore((r) => r.start === 0));
+        const res = await handler(req({ Range: "bytes=0-4,150-154" }), { key: KEY });
+        expect(res.status).toBe(502);
+    });
+
+    test("a truncated LATER part errors the stream instead of framing short bytes", async () => {
+        const handler = serveObject(shortByteStore((r) => r.start === 150));
+        const res = await handler(req({ Range: "bytes=0-4,150-154" }), { key: KEY });
+        expect(res.status).toBe(206);
+        await expect(res.arrayBuffer()).rejects.toThrow();
+    });
+});
