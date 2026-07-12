@@ -80,7 +80,7 @@ const store = httpStore({
 
 ## Memory Store (`partial-content/memory`)
 
-**`memoryStore({ objects })`** - A spec-faithful in-memory store for consumer test suites, demos, and small embedded assets. Fabricates correct Content-Range values, honors `ifMatch` pinning (mutate the map to simulate overwrites and exercise retry logic), and streams zero-byte objects correctly.
+**`memoryStore({ objects })`** - A spec-faithful in-memory store for consumer test suites, demos, and small embedded assets. Fabricates correct Content-Range values, honors `ifMatch` pinning (mutate the map to simulate overwrites and exercise retry logic), declares `authoritativeRange` (plain ranges serve in one round-trip), and streams zero-byte objects correctly.
 
 ## Cloud & Filesystem Stores
 
@@ -92,7 +92,7 @@ const store = httpStore({
 
 **`azureStore({ containerClient })`** (`partial-content/azure`) - Azure Blob Storage via `@azure/storage-blob`. Single-call `download()` (metadata and body are one response by construction); pinned reads via `conditions.ifMatch`.
 
-**`fsStore({ root, cache? })`** (`partial-content/fs`) - Local filesystem with path-traversal/null-byte/Windows-device-name hardening, nanosecond-mtime weak ETags, an fd-coherent stat+stream (no stat-then-reopen race), a single-read fast path for bodies <= 128 KiB, and an opt-in TTL/LRU hot-object cache (nginx `open_file_cache` semantics; see Benchmarks).
+**`fsStore({ root, cache? })`** (`partial-content/fs`) - Local filesystem with path-traversal/null-byte/Windows-device-name hardening, nanosecond-mtime weak ETags, an fd-coherent stat+stream (no stat-then-reopen race), `authoritativeRange` single-round-trip range serving (the one open handle stats, clamps, and reads, so bounds, validators, and bytes are coherent by construction), a single-read fast path for bodies <= 128 KiB, and an opt-in TTL/LRU hot-object cache (nginx `open_file_cache` semantics; see Benchmarks).
 
 The cloud SDKs are optional peer dependencies: install only the one your store uses.
 
@@ -130,7 +130,7 @@ Method surface: GET and HEAD are served (HEAD with identical headers and no body
 
 ## Storage Contract
 
-**`ObjectStore`** (interface) - Read-only storage backend abstraction. Implementations provide `headObject(key, opts?)` for metadata and `getObject(key, opts?)` for streaming, where `opts` carries `range`, `signal`, `ifMatch` (pinned reads), and `pin` (an opaque token issued by `headObject` for stores whose version identifier is not the ETag; GCS uses it to stream a pinned generation without re-fetching metadata). Optional `createSignedUrl(key, opts)` for backends that cannot stream ranges through the origin. Optional `authoritativeRange: true` declares that ranged responses report the backend's ACTUAL served bounds (parsed Content-Range) -- the web adapter then serves plain range requests in a single round-trip with no validating HEAD (S3, Azure, R2, and http set it; video seeking and PDF.js chunking hit this path constantly).
+**`ObjectStore`** (interface) - Read-only storage backend abstraction. Implementations provide `headObject(key, opts?)` for metadata and `getObject(key, opts?)` for streaming, where `opts` carries `range`, `signal`, `ifMatch` (pinned reads), and `pin` (an opaque token issued by `headObject` for stores whose version identifier is not the ETag; GCS uses it to stream a pinned generation without re-fetching metadata). Optional `createSignedUrl(key, opts)` for backends that cannot stream ranges through the origin. Optional `authoritativeRange: true` declares that ranged responses report the backend's ACTUAL served bounds (parsed Content-Range) -- the web adapter then serves plain range requests in a single round-trip with no validating HEAD (S3, Azure, R2, http, fs, and memory set it; video seeking and PDF.js chunking hit this path constantly).
 
 **`ObjectMetadata`** (type) - HEAD response shape: `contentLength`, `etag?`, `lastModified?`, `digest?`, `pin?`.
 

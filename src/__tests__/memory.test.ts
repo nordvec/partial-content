@@ -1,4 +1,5 @@
 import { describe, test, expect } from "bun:test";
+import { serveObject } from "../web";
 import { memoryStore, ObjectNotFoundError, ObjectChangedError } from "../memory";
 
 async function drain(body: ReadableStream<Uint8Array> | Uint8Array): Promise<string> {
@@ -124,5 +125,43 @@ describe("memoryStore contract edges", () => {
         expect(res.range).toEqual({ start: 2, end: 4 });
         expect(res.contentLength).toBe(3);
         expect(res.totalSize).toBe(5);
+    });
+});
+
+// ─── Authoritative Single-Round-Trip Ranges (via the web adapter) ───────────
+
+describe("memoryStore: authoritative-range fast path", () => {
+    test("a plain range serves in one round-trip with zero HEADs", async () => {
+        const base = memoryStore({ objects: { k: { body: "0123456789", etag: '"m1"' } } });
+        let heads = 0;
+        const counting = {
+            ...base,
+            headObject: (async (key: string, o?: { signal?: AbortSignal }) => {
+                heads++;
+                return base.headObject(key, o);
+            }) as typeof base.headObject,
+        };
+        const handler = serveObject(counting);
+        const res = await handler(
+            new Request("http://localhost/f", { headers: { Range: "bytes=2-4" } }),
+            { key: "k" },
+        );
+
+        expect(res.status).toBe(206);
+        expect(await res.text()).toBe("234");
+        expect(res.headers.get("Content-Range")).toBe("bytes 2-4/10");
+        expect(res.headers.get("ETag")).toBe('"m1"');
+        expect(heads).toBe(0);
+    });
+
+    test("a start beyond EOF falls back to validation and answers a true 416", async () => {
+        const handler = serveObject(memoryStore({ objects: { k: { body: "0123456789" } } }));
+        const res = await handler(
+            new Request("http://localhost/f", { headers: { Range: "bytes=50-60" } }),
+            { key: "k" },
+        );
+
+        expect(res.status).toBe(416);
+        expect(res.headers.get("Content-Range")).toBe("bytes */10");
     });
 });

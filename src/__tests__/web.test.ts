@@ -1590,7 +1590,9 @@ describe("precompressed variant negotiation", () => {
         expect(res.status).toBe(206);
         expect(res.headers.get("Vary")).toBeNull();
         expect(res.headers.get("Content-Encoding")).toBeNull();
-        expect(heads).toEqual(["data.json"]);
+        // No sibling probes AND no validating HEAD: a plain range on an
+        // authoritative store rides the single-round-trip fast path.
+        expect(heads).toEqual([]);
     });
 
     test("byte ranges address the ENCODED representation", async () => {

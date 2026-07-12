@@ -365,7 +365,9 @@ only standard HTTP headers, with no application-layer checksums required.
 **Plain-range fast path (no HEAD at all).** A range request carrying no
 conditional headers and no `If-Range` needs nothing from a HEAD: on stores
 declaring `authoritativeRange` (S3, Azure, R2, http -- their 206
-bounds/total are parsed from the backend's actual `Content-Range`), the
+bounds/total are parsed from the backend's actual `Content-Range` -- plus
+fs and memory, whose served bounds, validators, and bytes come from one
+open handle or one slice and are coherent by construction), the
 orchestrator issues a single GET. `bytes=a-b` and `bytes=a-` qualify (an
 open end travels through the adapters as the `OPEN_ENDED` sentinel and is
 emitted in each backend's idiomatic open form -- `bytes=a-` on the wire, an

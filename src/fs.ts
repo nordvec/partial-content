@@ -238,6 +238,14 @@ export function fsStore(opts: FsStoreOptions): ObjectStore {
 
   return {
     supportsRange: true,
+    // Ranged reads qualify as authoritative: getObject opens ONCE and stats,
+    // clamps, and reads from that same handle (an inode pin, so bounds,
+    // validators, and bytes are mutually coherent by construction), and a
+    // start beyond EOF is rejected natively. The framework adapter can
+    // therefore serve a plain range in a single round-trip with no
+    // validating HEAD; its Path A fallback turns the native rejection into
+    // a correct 416.
+    authoritativeRange: true,
 
     async headObject(key: string, opts?: { signal?: AbortSignal }): Promise<ObjectMetadata> {
       opts?.signal?.throwIfAborted();

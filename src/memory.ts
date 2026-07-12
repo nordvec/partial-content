@@ -94,6 +94,11 @@ export function memoryStore(opts: MemoryStoreOptions): ObjectStore {
 
   return {
     supportsRange: true,
+    // A single in-memory read is atomic by construction: served bounds are
+    // derived from the actual slice, a start beyond EOF is rejected
+    // natively, and validators come from the same entry the bytes do. Plain
+    // ranges therefore serve in one round-trip with no validating HEAD.
+    authoritativeRange: true,
 
     async headObject(key: string, opts?: { signal?: AbortSignal }): Promise<ObjectMetadata> {
       opts?.signal?.throwIfAborted();

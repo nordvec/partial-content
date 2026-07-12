@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.4.0 (2026-07-12)
+
+- `fsStore` and `memoryStore` now declare `authoritativeRange`: plain range
+  requests (no conditionals, no `If-Range`) serve in a single round-trip with
+  no validating HEAD. Both adapters already satisfied the contract -- the fs
+  store stats, clamps, and reads from ONE open handle (bounds, validators,
+  and bytes are coherent by construction; a start beyond EOF is rejected
+  natively and becomes a correct 416 via the fallback path), and a memory
+  read is atomic by definition. This removes the extra stat on the hottest
+  local-serving path (media seeks, PDF.js chunked loading) and makes ranged
+  serving MORE coherent, not less: one handle is a true pin, where
+  HEAD-then-GET needed the drift guard.
+- New fuzzed totality suite for the adapter's never-throw contract
+  (`fast-check` over `serveObjectRaw`): arbitrary methods, adversarial
+  protocol-header soup (malformed ranges, header-splitting attempts, control
+  bytes, hostile qvalues), and arbitrary filename/MIME contexts must always
+  resolve to structurally sound response parts -- integer status, CR/LF/NUL-free
+  header names and values, numeric Content-Length, bodyless HEAD.
+- Mutation-testing floor for `web.ts` (83; baseline 85.07 after a
+  survivor-driven sweep added 35 behavior-pinning tests).
+
 ## 1.3.0 (2026-07-12)
 
 - `accessControlExposeHeaders` serve option (+ exported

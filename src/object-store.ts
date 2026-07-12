@@ -645,9 +645,10 @@ export interface ObjectStore {
    * validating HEAD for plain range requests (no conditionals, no
    * If-Range) and serves the seek in a single round-trip -- validators,
    * bounds, and digest all come from the GET response itself, which is
-   * also inherently TOCTOU-atomic. Leave unset for stores that need the
-   * orchestrator's pre-clamped ranges (fs, memory) or that fetch metadata
-   * themselves anyway (GCS).
+   * also inherently TOCTOU-atomic. Any adapter that clamps ranges itself,
+   * rejects a start beyond EOF, and reports the SERVED bounds qualifies
+   * (S3, HTTP, fs, memory). Leave unset for stores that echo the requested
+   * range or fetch metadata themselves anyway (GCS).
    *
    * @default false
    */

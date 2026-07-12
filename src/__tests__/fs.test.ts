@@ -2,6 +2,7 @@ import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import { mkdtemp, rm, writeFile, mkdir, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { serveObject } from "../web";
 import { fsStore, ObjectNotFoundError } from "../fs";
 
 let root: string;
@@ -600,5 +601,56 @@ describe("fsStore: opt-in hot-object cache", () => {
         } finally {
             await rm(dir, { recursive: true, force: true });
         }
+    });
+});
+
+// ─── Authoritative Single-Round-Trip Ranges (via the web adapter) ───────────
+
+describe("fsStore: authoritative-range fast path", () => {
+    test("a plain range serves in one round-trip: zero HEADs, bounds from the handle", async () => {
+        const base = fsStore({ root });
+        let heads = 0;
+        const counting = {
+            ...base,
+            headObject: (async (key: string, o?: { signal?: AbortSignal }) => {
+                heads++;
+                return base.headObject(key, o);
+            }) as typeof base.headObject,
+        };
+        const handler = serveObject(counting);
+        const res = await handler(
+            new Request("http://localhost/f", { headers: { Range: "bytes=5-9" } }),
+            { key: "hello.txt" },
+        );
+
+        expect(res.status).toBe(206);
+        expect(await res.text()).toBe("56789");
+        expect(res.headers.get("Content-Range")).toBe("bytes 5-9/20");
+        // The weak nanosecond validator rides the 206 straight from the GET.
+        expect(res.headers.get("ETag")).toStartWith('W/"');
+        expect(heads).toBe(0);
+    });
+
+    test("a start beyond EOF falls back to validation and answers a true 416", async () => {
+        const handler = serveObject(fsStore({ root }));
+        const res = await handler(
+            new Request("http://localhost/f", { headers: { Range: "bytes=100-200" } }),
+            { key: "hello.txt" },
+        );
+
+        expect(res.status).toBe(416);
+        expect(res.headers.get("Content-Range")).toBe("bytes */20");
+    });
+
+    test("an open-ended range is clamped by the store itself", async () => {
+        const handler = serveObject(fsStore({ root }));
+        const res = await handler(
+            new Request("http://localhost/f", { headers: { Range: "bytes=15-" } }),
+            { key: "hello.txt" },
+        );
+
+        expect(res.status).toBe(206);
+        expect(await res.text()).toBe("fghij");
+        expect(res.headers.get("Content-Range")).toBe("bytes 15-19/20");
     });
 });
