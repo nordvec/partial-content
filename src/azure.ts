@@ -32,7 +32,7 @@ import {
   type ObjectStream,
   type ParsedRange,
   type StoreErrorClassifiers,
-} from "./index.js";
+} from "./index.ts";
 
 // Re-export for convenience
 export { ObjectNotFoundError, ObjectChangedError, StoreUnavailableError };

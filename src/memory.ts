@@ -35,7 +35,7 @@ import {
   type ObjectMetadata,
   type ObjectStream,
   type ParsedRange,
-} from "./index.js";
+} from "./index.ts";
 
 // Re-export for convenience
 export { ObjectNotFoundError, ObjectChangedError };

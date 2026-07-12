@@ -8,8 +8,8 @@ import {
   parseAcceptEncoding,
   negotiateEncoding,
   isCompressibleMime,
-} from "../encoding.js";
-import { buildCacheControl } from "../cache-control.js";
+} from "../encoding.ts";
+import { buildCacheControl } from "../cache-control.ts";
 
 const SERVER_PREF = ["br", "zstd", "gzip"] as const;
 
@@ -184,5 +184,40 @@ describe("buildCacheControl", () => {
 
   test("empty policy throws instead of composing nothing", () => {
     expect(() => buildCacheControl({ noTransform: false })).toThrow(TypeError);
+  });
+
+  test("maxAge 0 is valid (sirv-style always-revalidate policy)", () => {
+    expect(buildCacheControl({ visibility: "public", maxAge: 0, mustRevalidate: true }))
+      .toBe("public, max-age=0, must-revalidate, no-transform");
+  });
+
+  test.each([
+    [{ visibility: "private" } as const],
+    [{ sMaxAge: 60 } as const],
+    [{ staleWhileRevalidate: 60 } as const],
+    [{ staleIfError: 60 } as const],
+  ])("no-store contradicts %j individually", (extra) => {
+    expect(() => buildCacheControl({ noStore: true, ...extra })).toThrow(TypeError);
+  });
+});
+
+describe("mutation-hardening cases", () => {
+  test("parameter without '=' marks the member malformed", () => {
+    expect(parseAcceptEncoding("gzip;q, br")).toEqual([{ coding: "br", q: 1 }]);
+  });
+
+  test("unknown parameter alone leaves q at 1", () => {
+    expect(parseAcceptEncoding("gzip;level=9")).toEqual([{ coding: "gzip", q: 1 }]);
+  });
+
+  test.each([
+    ["application/vnd.api+toml", true],
+    ["application/vnd.custom+text", true],
+    ["application/vnd.custom+zip", false],
+    ["application/x-sh", true],
+    ["font/collection", true],
+    ["text", false],
+  ])("isCompressibleMime(%s) -> %p", (mime, expected) => {
+    expect(isCompressibleMime(mime)).toBe(expected);
   });
 });

@@ -1798,3 +1798,47 @@ describe("preferSignedUrl offload", () => {
         expect(await res.text()).toBe("0123456789abcdefghij");
     });
 });
+
+// ─── Access-Control-Expose-Headers (cross-origin readers) ───────────────────
+
+describe("accessControlExposeHeaders", () => {
+    test("true exposes the protocol header list on 200, HEAD, and 304", async () => {
+        const handler = serveObject(memoryStore({ etag: ETAG }), {
+            accessControlExposeHeaders: true,
+        });
+        const ok = await handler(req(), { key: KEY });
+        expect(ok.headers.get("Access-Control-Expose-Headers"))
+            .toBe("Accept-Ranges, Content-Range, Content-Encoding, ETag, Content-Disposition, Repr-Digest, Content-Digest, Server-Timing");
+
+        const head = await handler(req({}, "HEAD"), { key: KEY });
+        expect(head.headers.get("Access-Control-Expose-Headers")).toContain("Accept-Ranges");
+
+        const revalidated = await handler(req({ "If-None-Match": ETAG }), { key: KEY });
+        expect(revalidated.status).toBe(304);
+        expect(revalidated.headers.get("Access-Control-Expose-Headers")).toContain("ETag");
+    });
+
+    test("a custom string is emitted verbatim", async () => {
+        const handler = serveObject(memoryStore({ etag: ETAG }), {
+            accessControlExposeHeaders: "Content-Range, ETag",
+        });
+        const res = await handler(req({ Range: "bytes=0-3" }), { key: KEY });
+        expect(res.status).toBe(206);
+        expect(res.headers.get("Access-Control-Expose-Headers")).toBe("Content-Range, ETag");
+    });
+
+    test("caller securityHeaders value wins", async () => {
+        const handler = serveObject(memoryStore({ etag: ETAG }), {
+            accessControlExposeHeaders: true,
+            securityHeaders: () => ({ "Access-Control-Expose-Headers": "ETag" }),
+        });
+        const res = await handler(req(), { key: KEY });
+        expect(res.headers.get("Access-Control-Expose-Headers")).toBe("ETag");
+    });
+
+    test("absent by default", async () => {
+        const handler = serveObject(memoryStore({ etag: ETAG }));
+        const res = await handler(req(), { key: KEY });
+        expect(res.headers.get("Access-Control-Expose-Headers")).toBeNull();
+    });
+});

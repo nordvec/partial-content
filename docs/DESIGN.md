@@ -556,8 +556,10 @@ Access-Control-Expose-Headers: Accept-Ranges, Content-Range, Content-Encoding,
   ETag, Content-Disposition, Repr-Digest, Content-Digest, Server-Timing
 ```
 
-(trim to what the reader actually consumes; `Server-Timing` additionally
-requires `Timing-Allow-Origin`, the `timingAllowOrigin` option).
+(the serve adapters emit exactly this list with
+`accessControlExposeHeaders: true`; trim via a custom string if the reader
+consumes less. `Server-Timing` additionally requires `Timing-Allow-Origin`,
+the `timingAllowOrigin` option).
 
 ## Precompressed Variants and Content-Encoding
 

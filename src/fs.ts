@@ -37,7 +37,7 @@ import {
   type ObjectMetadata,
   type ObjectStream,
   type ParsedRange,
-} from "./index.js";
+} from "./index.ts";
 
 // Re-export for convenience (consumers can catch without importing the kernel)
 export { ObjectNotFoundError };

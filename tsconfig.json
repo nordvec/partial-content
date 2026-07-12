@@ -14,9 +14,21 @@
     "forceConsistentCasingInFileNames": true,
     "isolatedModules": true,
     "verbatimModuleSyntax": true,
-    "types": ["node"],
-    "lib": ["ES2025"]
+    "types": [
+      "node"
+    ],
+    "lib": [
+      "ES2025"
+    ],
+    "allowImportingTsExtensions": true,
+    "rewriteRelativeImportExtensions": true
   },
-  "include": ["src"],
-  "exclude": ["node_modules", "dist", "**/__tests__/**"]
+  "include": [
+    "src"
+  ],
+  "exclude": [
+    "node_modules",
+    "dist",
+    "**/__tests__/**"
+  ]
 }

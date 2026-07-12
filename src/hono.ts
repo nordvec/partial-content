@@ -22,12 +22,12 @@
  * @packageDocumentation
  */
 
-import { serveObject as serveObjectWeb, type ServeObjectOptions, type ServeContext } from "./web.js";
-import type { ObjectStore } from "./index.js";
+import { serveObject as serveObjectWeb, type ServeObjectOptions, type ServeContext } from "./web.ts";
+import type { ObjectStore } from "./index.ts";
 
 // Re-export for convenience
-export type { ServeObjectOptions, ServeContext } from "./web.js";
-export type { ObjectStore } from "./index.js";
+export type { ServeObjectOptions, ServeContext } from "./web.ts";
+export type { ObjectStore } from "./index.ts";
 
 // ─── Hono Types ─────────────────────────────────────────────────────────────
 

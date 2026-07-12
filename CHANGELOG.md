@@ -1,8 +1,17 @@
 # Changelog
 
-## Unreleased
+## 1.3.0 (2026-07-12)
 
-Docs only: "Behind a CDN" interop guide (verified against vendor docs,
+- `accessControlExposeHeaders` serve option (+ exported
+  `PROTOCOL_EXPOSE_HEADERS`): one flag exposes the protocol's
+  non-CORS-safelisted response headers (`Accept-Ranges`, `Content-Range`,
+  `Content-Encoding`, `ETag`, `Content-Disposition`, digest fields,
+  `Server-Timing`) so cross-origin readers like pdf.js stop silently
+  degrading to full downloads.
+- Mutation-testing floors for the 1.2.0 modules (`encoding.ts` 86,
+  `cache-control.ts` 96).
+
+Docs: "Behind a CDN" interop guide (verified against vendor docs,
 July 2026) covering which CDNs forward ranges vs fetch-and-slice, the
 Content-Length requirement for edge 206s (and the Bun chunked-stream
 interaction), Accept-Encoding normalization (`.zst` unreachable through

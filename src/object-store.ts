@@ -7,7 +7,7 @@
  *
  * @packageDocumentation
  */
-import { parseContentRange, type ParsedRange } from "./kernel.js";
+import { parseContentRange, type ParsedRange } from "./kernel.ts";
 
 // ─── Cancel Signal ──────────────────────────────────────────────────────────
 

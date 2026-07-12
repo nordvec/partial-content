@@ -41,8 +41,8 @@
  */
 
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { serveObjectRaw, type RawResponseParts, type ServeObjectOptions, type ServeContext } from "./web.js";
-import type { ObjectStore } from "./index.js";
+import { serveObjectRaw, type RawResponseParts, type ServeObjectOptions, type ServeContext } from "./web.ts";
+import type { ObjectStore } from "./index.ts";
 
 // ─── Options ────────────────────────────────────────────────────────────────
 

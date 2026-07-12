@@ -227,14 +227,14 @@ Full HTTP serving vs `send` and `sirv` (Node 24, loopback, out-of-process autoca
 
 | Scenario | partial-content | + `cache` | send | sirv |
 |---|---|---|---|---|
-| GET 4 KB (200) | 9,210 req/s | **15,772 req/s** | 6,557 req/s | 7,162 req/s |
-| GET 1 MB (200) | 118 req/s | 116 req/s | 117 req/s | 119 req/s |
-| Range 64 KB of 1 MB (206) | 1,441 req/s | 1,413 req/s | 1,403 req/s | 1,443 req/s |
-| Revalidation (304) | 11,716 req/s | **19,542 req/s** | 10,081 req/s | 23,774 req/s* |
+| GET 4 KB (200) | 8,946 req/s | **14,235 req/s** | 8,384 req/s | 8,093 req/s |
+| GET 1 MB (200) | 112 req/s | 117 req/s | 117 req/s | 119 req/s |
+| Range 64 KB of 1 MB (206) | 1,443 req/s | 1,496 req/s | 1,526 req/s | 1,562 req/s |
+| Revalidation (304) | 17,887 req/s | **20,242 req/s** | 13,238 req/s | 29,214 req/s* |
 
 - At payload sizes where file serving actually spends its time (>= 64 KB), all contenders converge on I/O parity.
 - Small bodies and revalidations lead `send` and `sirv` even without the cache, while doing strictly more per request (digest negotiation, audit hooks, pinned-read plumbing, storage abstraction).
-- The `cache` column is the opt-in fs hot-object cache (nginx `open_file_cache` semantics: TTL revalidation, `maxEntries` + `maxBytes` LRU bounds). \* sirv's 304 figure comes from a boot-time directory snapshot that 404s files created after startup; in the mode that can serve runtime uploads it measures 4,957 req/s.
+- The `cache` column is the opt-in fs hot-object cache (nginx `open_file_cache` semantics: TTL revalidation, `maxEntries` + `maxBytes` LRU bounds). \* sirv's 304 figure comes from a boot-time directory snapshot that 404s files created after startup; in the mode that can serve runtime uploads it measures 5,336 req/s.
 
 Kernel micro-benchmarks, the Bun.serve numbers (38k req/s revalidation with cache), and the full fairness notes are in **[docs/BENCHMARKS.md](docs/BENCHMARKS.md)**.
 

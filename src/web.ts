@@ -54,7 +54,7 @@ import {
   type ObjectStore,
   type ObjectMetadata,
   type ParsedRange,
-} from "./index.js";
+} from "./index.ts";
 
 // Re-export kernel types so consumers only need one import
 export type {
@@ -64,7 +64,7 @@ export type {
   ObjectStream,
   ParsedRange,
   ETagSource,
-} from "./index.js";
+} from "./index.ts";
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -103,6 +103,17 @@ export type PrecompressedCoding = keyof typeof PRECOMPRESSED_SUFFIX;
 
 /** Default server preference: best ratio first (RFC 9110 lets ties go to us). */
 const DEFAULT_PRECOMPRESSED: readonly PrecompressedCoding[] = ["br", "zstd", "gzip"];
+
+/**
+ * The response headers this protocol emits that are NOT CORS-safelisted:
+ * cross-origin JavaScript cannot read them unless they appear in
+ * `Access-Control-Expose-Headers`. Without exposure, range-consuming readers
+ * degrade SILENTLY -- pdf.js falls back to full-file download when it cannot
+ * read `Accept-Ranges` cross-origin. The value behind
+ * `accessControlExposeHeaders: true`, exported for kernel-only consumers.
+ */
+export const PROTOCOL_EXPOSE_HEADERS =
+  "Accept-Ranges, Content-Range, Content-Encoding, ETag, Content-Disposition, Repr-Digest, Content-Digest, Server-Timing";
 
 // ─── Options ────────────────────────────────────────────────────────────────
 
@@ -402,6 +413,24 @@ export interface ServeObjectOptions {
    * @default 60
    */
   signedUrlExpiresSeconds?: number;
+
+  /**
+   * Emit `Access-Control-Expose-Headers` on success responses so
+   * cross-origin JavaScript can read the protocol headers.
+   *
+   * `true` exposes {@link PROTOCOL_EXPOSE_HEADERS}; a string is emitted
+   * verbatim. Without this, cross-origin readers degrade SILENTLY: pdf.js
+   * cannot see `Accept-Ranges` and downloads the whole file instead of
+   * range-loading pages.
+   *
+   * Exposure only; pair it with your platform's CORS layer
+   * (`Access-Control-Allow-Origin`), which this library deliberately does
+   * not manage. A caller-supplied `securityHeaders` value for the same
+   * header wins.
+   *
+   * @default No header (same-origin consumers need none).
+   */
+  accessControlExposeHeaders?: boolean | string;
 }
 
 /** Structured audit event for compliance logging. */
@@ -554,7 +583,14 @@ export function serveObjectRaw(
     precompressed = false,
     preferSignedUrl,
     signedUrlExpiresSeconds = 60,
+    accessControlExposeHeaders = false,
   } = opts;
+
+  // Resolve the exposure list once: `true` means the protocol's own
+  // non-safelisted headers; a string is caller-verbatim.
+  const exposeHeaders = accessControlExposeHeaders === true
+    ? PROTOCOL_EXPOSE_HEADERS
+    : accessControlExposeHeaders || undefined;
 
   // Resolve and validate the precompressed coding list ONCE. An unknown
   // coding is a configuration bug: fail at setup, not per-request.
@@ -768,6 +804,7 @@ export function serveObjectRaw(
       // appear later) and on multi-range identity responses -- so shared
       // caches always key compressible objects on Accept-Encoding.
       varyAcceptEncoding: negotiating,
+      exposeHeaders,
     };
 
     // ── Path B: plain range on an authoritative-range store ──────────────
@@ -887,6 +924,10 @@ export function serveObjectRaw(
         // Negotiated responses add their own Vary member the same way.
         const headers304: Record<string, string> = { ...evaluation.headers, ...rctx.extraHeaders };
         if (rctx.varyAcceptEncoding) headers304["Vary"] = appendVaryAcceptEncoding(headers304["Vary"]);
+        // A cross-origin revalidator needs ETag readable off the 304 too.
+        if (rctx.exposeHeaders && !headers304["Access-Control-Expose-Headers"]) {
+          headers304["Access-Control-Expose-Headers"] = rctx.exposeHeaders;
+        }
         return {
           status: 304,
           statusText: STATUS_TEXT[304],
@@ -1224,6 +1265,8 @@ interface ResponseContext {
    * `Vary: Accept-Encoding` so shared caches key on the request coding.
    */
   readonly varyAcceptEncoding: boolean;
+  /** Resolved Access-Control-Expose-Headers value, when configured. */
+  readonly exposeHeaders?: string;
 }
 
 /** Protocol metadata for building response headers. */
@@ -1278,6 +1321,10 @@ function applyAdapterHeaders(base: Record<string, string>, ctx: ResponseContext)
   };
   if (ctx.crossOriginResourcePolicy) headers["Cross-Origin-Resource-Policy"] = ctx.crossOriginResourcePolicy;
   if (ctx.timingAllowOrigin) headers["Timing-Allow-Origin"] = ctx.timingAllowOrigin;
+  // Caller extraHeaders win (already spread above): only fill when absent.
+  if (ctx.exposeHeaders && !headers["Access-Control-Expose-Headers"]) {
+    headers["Access-Control-Expose-Headers"] = ctx.exposeHeaders;
+  }
   // Merged LAST so a caller-supplied Vary (extraHeaders) is extended, never
   // clobbered, and vice versa.
   if (ctx.varyAcceptEncoding) headers["Vary"] = appendVaryAcceptEncoding(headers["Vary"]);

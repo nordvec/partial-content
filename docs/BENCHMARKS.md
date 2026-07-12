@@ -26,10 +26,18 @@ through the node adapter + fsStore. Reproduce with `npm run bench`.
 
 | Scenario | partial-content | + `cache` | send | sirv |
 |---|---|---|---|---|
-| GET 4 KB (200) | 9,210 req/s | **15,772 req/s** | 6,557 req/s | 7,162 req/s |
-| GET 1 MB (200) | 118 req/s | 116 req/s | 117 req/s | 119 req/s |
-| Range 64 KB of 1 MB (206) | 1,441 req/s | 1,413 req/s | 1,403 req/s | 1,443 req/s |
-| Revalidation (304) | 11,716 req/s | **19,542 req/s** | 10,081 req/s | 23,774 req/s* |
+| GET 4 KB (200) | 8,946 req/s | **14,235 req/s** | 8,384 req/s | 8,093 req/s |
+| GET 1 MB (200) | 112 req/s | 117 req/s | 117 req/s | 119 req/s |
+| Range 64 KB of 1 MB (206) | 1,443 req/s | 1,496 req/s | 1,526 req/s | 1,562 req/s |
+| Revalidation (304) | 17,887 req/s | **20,242 req/s** | 13,238 req/s | 29,214 req/s* |
+
+Numbers from the 1.3.0 run (Node 24.11): the full conditional chain, digest
+negotiation, disposition hardening, and the 1.2.0 additions (encoding
+negotiation gate, inline-CSP check, offload hooks -- all disabled-by-default
+paths) are in the measured column. The 206 row trails send/sirv by ~5%: on a
+non-pinning fs store every ranged serve pays a validating HEAD plus the
+response-side TOCTOU/byte-coherence guards, a deliberate correctness trade
+the comparison libraries do not make.
 
 The `cache` column is `fsStore({ root, cache: { ttlMs: 1000 } })`: an opt-in
 hot-object cache with nginx `open_file_cache` semantics (TTL revalidation,
@@ -45,7 +53,7 @@ acceptable staleness (see DESIGN.md).
 `dev: false` it pre-renders complete header sets for a directory snapshot
 taken at boot, so a file created after startup is a 404. In the
 configuration that CAN see runtime-created files (`dev: true`), the same
-run measures sirv at 4,957 req/s -- a quarter of the `cache` column. For a
+run measures sirv at 5,336 req/s -- a quarter of the `cache` column. For a
 fixed directory of immutable assets sirv's trade is exactly right; for
 object storage (where uploads happen while the server runs) it is
 disqualifying, which is why the boot-snapshot design stays a non-goal here.

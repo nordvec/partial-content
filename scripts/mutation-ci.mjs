@@ -36,6 +36,8 @@ const FLOORS = {
     "kernel.ts": 82,
     "mime.ts": 84,
     "content-disposition.ts": 96,
+    "encoding.ts": 86,          // baseline 88.89 (survivors: token-regex class mutants, largely equivalent)
+    "cache-control.ts": 96,     // baseline 100.00 (80 mutants; tolerates ~3 survivors)
     "object-store.ts": 92,
     "http.ts": 91,
     // ── SDK adapters (thin wrappers; equivalent-mutant heavy) ──
