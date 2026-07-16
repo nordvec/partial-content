@@ -372,7 +372,13 @@ describe("fsUploadStore: digest verification at completion", () => {
 describe("fsUploadStore: hostile keys and tokens", () => {
     test("traversal keys are rejected at creation", async () => {
         const store = fsUploadStore({ root });
-        for (const key of ["../escape.txt", "..\\escape.txt", "/abs.txt"]) {
+        // Backslash is a path separator only on Windows; on POSIX it is a
+        // legal filename byte and "..\\x" stays inside the root (the same
+        // platform semantics the read-side store documents).
+        const hostile = process.platform === "win32"
+            ? ["../escape.txt", "..\\escape.txt", "/abs.txt"]
+            : ["../escape.txt", "/abs.txt"];
+        for (const key of hostile) {
             await expect(store.createUpload({ key, now: 0 })).rejects.toBeInstanceOf(ObjectNotFoundError);
         }
     });
@@ -483,7 +489,8 @@ describe("fsUploadStore: sweepExpired", () => {
         await expect(store.getUploadState(stale.uploadToken)).rejects.toBeInstanceOf(UploadNotFoundError);
         expect((await store.getUploadState(active.uploadToken)).offset).toBe(1);
         // Both files of the swept resource are gone, not just the sidecar.
-        expect(await readdir(join(root, ".uploads"))).toEqual([
+        // readdir order is OS-dependent: sort both sides.
+        expect((await readdir(join(root, ".uploads"))).sort()).toEqual([
             active.uploadToken,
             `${active.uploadToken}.json`,
         ].sort());
