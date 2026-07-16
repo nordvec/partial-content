@@ -40,6 +40,9 @@ const FLOORS = {
     "cache-control.ts": 96,     // baseline 100.00 (80 mutants; tolerates ~3 survivors)
     "object-store.ts": 92,
     "http.ts": 92,
+    "upload-engine.ts": 90,     // baseline 91.73 (344 mutants; survivors are
+                                // undefined-comparison no-ops in optional-bound
+                                // guards, provably outcome-equivalent)
     "web.ts": 83,      // baseline 85.07 (988 mutants; survivors are telemetry payload
                        // contents, Server-Timing arithmetic, and stream-teardown
                        // internals with no observable contract)
