@@ -39,7 +39,7 @@ const FLOORS = {
     "encoding.ts": 86,          // baseline 88.89 (survivors: token-regex class mutants, largely equivalent)
     "cache-control.ts": 96,     // baseline 100.00 (80 mutants; tolerates ~3 survivors)
     "object-store.ts": 92,
-    "http.ts": 91,
+    "http.ts": 92,
     "web.ts": 83,      // baseline 85.07 (988 mutants; survivors are telemetry payload
                        // contents, Server-Timing arithmetic, and stream-teardown
                        // internals with no observable contract)

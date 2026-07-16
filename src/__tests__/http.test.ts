@@ -89,6 +89,101 @@ describe("httpStore: unit (stub fetch)", () => {
         expect(seen[0]["authorization"]).toBe("Bearer tok");
     });
 
+    test("case-variant identity Content-Encoding is accepted, not refused", async () => {
+        // The identity check normalizes case; an origin answering
+        // "Content-Encoding: IDENTITY" is identity-coded, not compressed.
+        const store = httpStore({
+            url: (key) => `https://origin.example/${key}`,
+            fetch: stubFetch(() => new Response(null, {
+                headers: { "Content-Length": "5", "Content-Encoding": "IDENTITY" },
+            })),
+        });
+        const meta = await store.headObject("doc.bin");
+        expect(meta.contentLength).toBe(5);
+    });
+
+    test("a custom fetch returning unstripped header values still parses Content-Length", async () => {
+        // opts.fetch is an injection point: a wrapper that surfaces raw header
+        // strings (no Headers OWS-stripping) must not break size parsing.
+        const raw = {
+            status: 200,
+            ok: true,
+            body: null,
+            headers: { get: (n: string) => (n === "content-length" ? " 5" : null) },
+        } as unknown as Response;
+        const store = httpStore({
+            url: (key) => `https://origin.example/${key}`,
+            fetch: (async () => raw) as unknown as typeof globalThis.fetch,
+        });
+        const meta = await store.headObject("doc.bin");
+        expect(meta.contentLength).toBe(5);
+    });
+
+    test("Repr-Digest values that merely resemble digests are never extracted", async () => {
+        const digestOf = async (reprDigest: string) => {
+            const store = httpStore({
+                url: (key) => `https://origin.example/${key}`,
+                fetch: stubFetch(() => new Response(null, {
+                    headers: { "Content-Length": "1", "Repr-Digest": reprDigest },
+                })),
+            });
+            return (await store.headObject("doc.bin")).digest;
+        };
+
+        // No sha-256 marker at all: scanning must not start mid-string and
+        // return a fragment of some other algorithm's value.
+        expect(await digestOf("md5=:AAAA:")).toBeUndefined();
+        // Empty value between the colons.
+        expect(await digestOf("sha-256=::")).toBeUndefined();
+        // Unterminated value (no closing colon).
+        expect(await digestOf("sha-256=:abcd")).toBeUndefined();
+        // Characters just OUTSIDE each base64 alphabet range must terminate
+        // the run and fail the closing-colon check, never be swallowed.
+        expect(await digestOf("sha-256=:ab@cd:")).toBeUndefined(); // 0x40, below A-Z
+        expect(await digestOf("sha-256=:ab[cd:")).toBeUndefined(); // 0x5b, above A-Z
+        expect(await digestOf("sha-256=:ab`cd:")).toBeUndefined(); // 0x60, below a-z
+        expect(await digestOf("sha-256=:ab{cd:")).toBeUndefined(); // 0x7b, above a-z
+        expect(await digestOf("sha-256=:ab*cd:")).toBeUndefined(); // 0x2a, next to +
+        // Control: a well-formed value still extracts.
+        expect(await digestOf("sha-256=:abcABC0189+/xyz=:")).toBe("abcABC0189+/xyz=");
+    });
+
+    test("error-path drain reads a bounded prefix then cancels, never the whole body", async () => {
+        // The refusal paths drain a bounded prefix (connection reuse) and then
+        // cancel: an unbounded drain would buffer a decompression bomb.
+        let pulls = 0;
+        let cancelled = false;
+        const chunk = new Uint8Array(40 * 1024);
+        const body = new ReadableStream<Uint8Array>({
+            pull(controller) {
+                pulls++;
+                if (pulls >= 10) {
+                    controller.close();
+                    return;
+                }
+                controller.enqueue(chunk);
+            },
+            cancel() {
+                cancelled = true;
+            },
+        });
+        const store = httpStore({
+            url: (key) => `https://origin.example/${key}`,
+            fetch: stubFetch(() => new Response(body, {
+                status: 503,
+                headers: { "Retry-After": "1" },
+            })),
+        });
+        await expect(store.getObject("big.bin")).rejects.toBeInstanceOf(StoreUnavailableError);
+
+        // 40 KiB chunks cross the 64 KiB cap on the second read: the drain
+        // consumes exactly two chunks (plus one readahead pull) and cancels.
+        // A cap that fires too early reads one chunk; no cap reads all ten.
+        expect(cancelled).toBe(true);
+        expect(pulls).toBeGreaterThanOrEqual(2);
+        expect(pulls).toBeLessThanOrEqual(4);
+    });
+
     test("a bodyless 200 that declares bytes throws instead of serving a clean-looking empty stream", async () => {
         const store = httpStore({
             url: (key) => `https://origin.example/${key}`,
