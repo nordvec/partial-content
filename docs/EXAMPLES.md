@@ -1,6 +1,6 @@
 # Examples
 
-Recipes beyond the README's Quick Start. Every handler manages the full HTTP protocol (200, 206, 304, 412, 416, HEAD) automatically.
+Recipes beyond the README's Quick Start. Every serving handler manages the full HTTP protocol (200, 206, 304, 412, 416, HEAD) automatically; the upload handlers manage the full resumable-upload protocol (creation, offset probes, appends, termination, expiry) the same way.
 
 ## Hono
 
@@ -257,3 +257,144 @@ const handler = serveObject(store, {
   cacheControl: "private, no-cache", // rides the signed response too
 });
 ```
+
+## Resumable uploads: a tus 1.0 endpoint
+
+Upload and serving are two sides of the same storage: point an upload store
+and a read store at the same root/bucket/map and a completed upload is
+immediately servable with ranges, conditionals, and Repr-Digest.
+
+```typescript
+import { createTusHandler } from "partial-content/tus";
+import { serveObject } from "partial-content/web";
+import { fsStore, fsUploadStore } from "partial-content/fs";
+
+const root = "/var/data/files";
+const uploads = createTusHandler(fsUploadStore({ root }), {
+  // The server decides the key; the client filename stays metadata.
+  key: () => crypto.randomUUID(),
+  location: (token) => `/files/upload/${token}`,
+  resolveToken: (req) => new URL(req.url).pathname.split("/").pop() || undefined,
+  maxSize: 1024 * 1024 * 1024,
+  maxAgeSeconds: 24 * 60 * 60,
+  onUploadEvent: ({ uploadToken, event }) => logger.info({ uploadToken, ...event }, "upload"),
+  onError: (err, ctx) => logger.error({ err, ...ctx }, "upload.error"),
+});
+const downloads = serveObject(fsStore({ root }), { disposition: "attachment" });
+
+// Mount: POST /files/upload creates; HEAD/PATCH/DELETE /files/upload/<token>
+// probe, append, and terminate; OPTIONS discovers capabilities. Authorize
+// BEFORE calling the handler, exactly like the serving side.
+```
+
+Browser clients: any tus 1.0 client works unmodified. Give it the creation
+URL as its endpoint; the `Location` header on the 201 is the upload resource
+every follow-up request (offset probe, append, termination) targets, and the
+client resumes an interrupted transfer by re-probing that URL with HEAD. The
+handler advertises `creation`, `creation-with-upload`,
+`creation-defer-length`, `termination`, and `expiration`, so clients that use
+those extensions (unknown-length streams, upload cancellation, expiry
+display) negotiate them automatically. Cross-origin uploaders additionally
+need the tus headers exposed via `extraHeaders` (e.g.
+`Access-Control-Expose-Headers: Location, Upload-Offset, Upload-Length,
+Upload-Expires, Tus-Resumable`) plus your CORS layer's
+`Access-Control-Allow-*` response.
+
+Housekeeping: expired resources refuse interaction on their own
+(`maxAgeSeconds`), but their storage is reclaimed by the store's sweep hook.
+Run it on a schedule with the same cutoff:
+
+```typescript
+const store = fsUploadStore({ root });
+// e.g. hourly: reap uploads idle longer than the policy's max age
+await store.sweepExpired(Date.now() - 24 * 60 * 60 * 1000);
+```
+
+## Resumable uploads: a custom ResumableWriteStore
+
+Any backend that can append durably and publish atomically can host
+resumable uploads. Implement the write contract; the object you pass to
+`createTusHandler`/`createUploadHandler` is checked structurally, and the
+error classes are matched by `name`, so a custom store can throw
+equivalently-named errors without importing them (or import them from a
+built-in store subpath such as `partial-content/memory`).
+
+```typescript
+import { UploadNotFoundError } from "partial-content/memory";
+
+const myUploadStore = {
+  // ── Capability flags: HONEST, per backend, never aspirational ──
+  exactOffsetRecovery: true,   // only if the derived offset is crash-durable
+  atomicCompletion: true,      // completeUpload must be all-or-nothing
+  digestOnComplete: false as const, // "sha256" ONLY if you verify before publishing
+  // appendGranularity / uniformPartSize / maxAppendSize: set when the
+  // backend forces them; omit for byte-exact appends.
+
+  async createUpload({ key, length, metadata, now }) {
+    // Allocate the resource; fold EVERYTHING resumption needs into the
+    // token (the built-ins encode key + backend upload id). Nothing
+    // upstream ever parses it.
+    const uploadToken = await backend.allocate({ key, length, metadata, createdAt: now });
+    return { uploadToken };
+  },
+
+  async getUploadState(uploadToken) {
+    const record = await backend.find(uploadToken);
+    if (!record) throw new UploadNotFoundError(uploadToken);
+    return {
+      // THE rule: derive the offset from the backend's own durable
+      // bookkeeping (part listing, block list, fsynced size). Never
+      // persist an offset counter next to the data: the two cannot be
+      // written atomically, and their post-crash drift is the corruption
+      // resumable uploads exist to prevent.
+      offset: await backend.sumDurableBytes(uploadToken),
+      length: record.length,            // immutable once known
+      isComplete: record.isComplete,
+      isInvalidated: record.isInvalidated, // terminal; recorded durably
+      createdAt: record.createdAt,
+      lastAppendAt: record.lastAppendAt,
+      metadata: record.metadata,
+    };
+  },
+
+  async appendChunk(uploadToken, offset, body, { maxBytes, now, signal }) {
+    // Write at `offset` (already validated against fresh state, under the
+    // upload's lock). Rules:
+    // - Stop at `maxBytes`; if the body tries to cross it, terminally
+    //   invalidate the resource (bytes past a known length are the
+    //   protocol's terminal fault, and only you see the stream).
+    // - Honor `signal` at chunk boundaries, flushing what you have: the
+    //   orchestrator's grace window is already built into it.
+    // - Return the bytes made DURABLE by this call; the next
+    //   getUploadState must agree with it.
+    const bytesWritten = await backend.append(uploadToken, offset, body, { maxBytes, signal });
+    return { bytesWritten };
+  },
+
+  async completeUpload(uploadToken, { expectedDigest, now }) {
+    // Publish atomically: after success the object is readable under its
+    // key; after ANY failure nothing new is visible to readers. If you
+    // declared digestOnComplete: "sha256", verify expectedDigest against
+    // the assembled bytes BEFORE publishing and throw an
+    // UploadDigestMismatchError-named error on mismatch.
+    const { etag, digest } = await backend.publishAtomically(uploadToken);
+    return { etag, digest };
+  },
+
+  async abortUpload(uploadToken) {
+    await backend.discard(uploadToken); // idempotent: already-gone is fine
+  },
+
+  async sweepExpired(olderThanMs) {
+    // Optional: reap resources idle since before the cutoff (epoch ms).
+    return { removed: await backend.reapIdleSince(olderThanMs) };
+  },
+};
+```
+
+The dialect handlers do not call these methods concurrently for one upload
+resource: the orchestrator serializes every interaction (probes included)
+under a cooperative-preemption lock and re-derives fresh state before each
+decision. Your store's job is durability and honesty, not coordination --
+just remember the default lock is in-process, so multi-instance deployments
+supply a shared `locker` (see API.md, Locking).

@@ -62,7 +62,7 @@
   {
     "name": "/s3",
     "path": "dist/s3.js",
-    "limit": "3.5 kB",
+    "limit": "6.5 kB",
     "ignore": [
       "node:fs/promises",
       "node:path",
@@ -77,7 +77,7 @@
   {
     "name": "/r2",
     "path": "dist/r2.js",
-    "limit": "1 kB",
+    "limit": "3.25 kB",
     "ignore": [
       "node:fs/promises",
       "node:path",
@@ -92,7 +92,7 @@
   {
     "name": "/gcs",
     "path": "dist/gcs.js",
-    "limit": "2.5 kB",
+    "limit": "5 kB",
     "ignore": [
       "node:fs/promises",
       "node:path",
@@ -107,7 +107,7 @@
   {
     "name": "/azure",
     "path": "dist/azure.js",
-    "limit": "2.75 kB",
+    "limit": "5.5 kB",
     "ignore": [
       "node:fs/promises",
       "node:path",
@@ -122,7 +122,7 @@
   {
     "name": "/fs",
     "path": "dist/fs.js",
-    "limit": "2.25 kB",
+    "limit": "3.75 kB",
     "ignore": [
       "node:fs/promises",
       "node:path",
@@ -152,7 +152,7 @@
   {
     "name": "/memory",
     "path": "dist/memory.js",
-    "limit": "0.75 kB",
+    "limit": "2 kB",
     "ignore": [
       "node:fs/promises",
       "node:path",
@@ -168,6 +168,36 @@
     "name": "/mime",
     "path": "dist/mime.js",
     "limit": "0.75 kB",
+    "ignore": [
+      "node:fs/promises",
+      "node:path",
+      "node:stream",
+      "node:buffer",
+      "node:crypto",
+      "node:os",
+      "node:http",
+      "node:events"
+    ]
+  },
+  {
+    "name": "/tus",
+    "path": "dist/tus.js",
+    "limit": "5.5 kB",
+    "ignore": [
+      "node:fs/promises",
+      "node:path",
+      "node:stream",
+      "node:buffer",
+      "node:crypto",
+      "node:os",
+      "node:http",
+      "node:events"
+    ]
+  },
+  {
+    "name": "/upload",
+    "path": "dist/upload.js",
+    "limit": "5.5 kB",
     "ignore": [
       "node:fs/promises",
       "node:path",

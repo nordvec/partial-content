@@ -20,8 +20,10 @@ import {
   guardStreamLength,
   resolveServedRange,
 } from "../dist/index.js";
-import { memoryStore } from "../dist/memory.js";
+import { memoryStore, memoryUploadStore } from "../dist/memory.js";
 import { serveObject } from "../dist/web.js";
+import { createTusHandler } from "../dist/tus.js";
+import { createUploadHandler } from "../dist/upload.js";
 
 const runtime =
   typeof globalThis.Deno !== "undefined" ? `Deno ${globalThis.Deno.version.deno}`
@@ -149,6 +151,84 @@ await check("a streaming body survives the runtime's Response plumbing", async (
   });
   const res = new Response(guardStreamLength(src, 11));
   assert.equal(await res.text(), "hello world");
+});
+
+await check("tus dialect: create, append, probe, and serve the published object", async () => {
+  // The full write-then-read life of an object through the shipped artifact:
+  // resumable-upload wire protocol in, range-capable serving out.
+  const objects = {};
+  const uploadStore = memoryUploadStore({ objects });
+  const tus = createTusHandler(uploadStore, {
+    key: () => "uploaded.txt",
+    location: (token) => `/files/${token}`,
+  });
+
+  const created = await tus(new Request("http://s/files", {
+    method: "POST",
+    headers: { "Tus-Resumable": "1.0.0", "Upload-Length": "11" },
+  }));
+  assert.equal(created.status, 201);
+  const token = created.headers.get("Location").split("/").pop();
+
+  const patched = await tus(new Request(`http://s/files/${token}`, {
+    method: "PATCH",
+    headers: {
+      "Tus-Resumable": "1.0.0",
+      "Upload-Offset": "0",
+      "Content-Type": "application/offset+octet-stream",
+    },
+    body: new TextEncoder().encode("hello world"),
+  }), { uploadToken: token });
+  assert.equal(patched.status, 204);
+  assert.equal(patched.headers.get("Upload-Offset"), "11");
+
+  const head = await tus(new Request(`http://s/files/${token}`, {
+    method: "HEAD",
+    headers: { "Tus-Resumable": "1.0.0" },
+  }), { uploadToken: token });
+  assert.equal(head.headers.get("Upload-Offset"), "11");
+
+  const served = await serveObject(memoryStore({ objects }))(
+    new Request("http://s/uploaded.txt", { headers: { Range: "bytes=6-10" } }),
+    { key: "uploaded.txt" },
+  );
+  assert.equal(served.status, 206);
+  assert.equal(await served.text(), "world");
+});
+
+await check("draft dialect: interop-version-gated create and offset conflict", async () => {
+  const objects = {};
+  const uploadStore = memoryUploadStore({ objects });
+  const handler = createUploadHandler(uploadStore, {
+    key: () => "draft.bin",
+    location: (token) => `/up/${token}`,
+  });
+
+  const created = await handler(new Request("http://s/up", {
+    method: "POST",
+    headers: {
+      "Upload-Draft-Interop-Version": "6",
+      "Upload-Complete": "?0",
+      "Upload-Length": "4",
+    },
+    body: new TextEncoder().encode("ab"),
+  }));
+  assert.equal(created.status, 201);
+  const token = created.headers.get("Location").split("/").pop();
+
+  // A stale offset must answer 409 with the CORRECT offset (the retry hook).
+  const conflicted = await handler(new Request(`http://s/up/${token}`, {
+    method: "PATCH",
+    headers: {
+      "Upload-Draft-Interop-Version": "6",
+      "Upload-Offset": "0",
+      "Upload-Complete": "?0",
+      "Content-Type": "application/partial-upload",
+    },
+    body: new TextEncoder().encode("xx"),
+  }), { uploadToken: token });
+  assert.equal(conflicted.status, 409);
+  assert.equal(conflicted.headers.get("Upload-Offset"), "2");
 });
 
 console.log(`\n${passed} checks passed on ${runtime}`);

@@ -169,3 +169,113 @@ const meta = await classifyStoreRead(key, () => backend.head(key), classifiers);
 **`StoreUnavailableError`** (class) - Throw from an adapter when the backend is transiently unavailable (throttled/overloaded after the adapter's own retries). Carries an optional `retryAfterSeconds` echoed as `Retry-After`. Distinct from a malformed-response `502`: this is the retryable `503` case.
 
 **`nodeStreamToWeb(iterable, opts?)` / `guardStreamLength(stream, expectedBytes)` / `resolveServedRange(contentRange)` / `parseRetryAfterSeconds(raw, opts?)`** - The stream/accounting primitives the built-in adapters are made of, exported for custom adapter authors: Node-to-web stream conversion with backpressure, abort propagation, and short-read detection; a committed-length guard for web streams; backend `Content-Range` resolution with the unknown-total (`bytes a-b/*`) sentinel; and the shared `Retry-After` parser.
+
+## Resumable Uploads
+
+Two wire dialects over one engine. Each dialect factory takes a `ResumableWriteStore` (the write-side storage contract; each of the six storage backends ships one) and returns a framework-agnostic `(req: Request, ctx?) => Promise<Response>` handler that never throws: storage failures become hardened error responses and are reported to `onError`. Under both dialects sits the same orchestrator, which owns locking, fresh-state sequencing, and the post-abort grace window, and the same pure state machine, which makes every protocol decision.
+
+Both dialect subpaths re-export the whole shared surface, so custom stores and custom dialects import everything from `partial-content/tus` or `partial-content/upload`: `createUploadOrchestrator` (+ its option/outcome types), the `ResumableWriteStore` contract types, `UploadPolicy`, `memoryUploadLocker` / the `UploadLocker` interface, and the error classes with their name-based matchers (`isUploadNotFoundError`, `isUploadOffsetConflictError`, `isUploadDigestMismatchError`).
+
+### tus dialect (`partial-content/tus`)
+
+**`createTusHandler(store, options)`** - A tus 1.0 endpoint: core protocol plus the creation, creation-with-upload, creation-defer-length, termination, and expiration extensions (advertised on OPTIONS via `Tus-Extension`). Method surface: `POST` creates (optionally carrying first bytes under `Content-Type: application/offset+octet-stream`), `HEAD` probes the offset, `PATCH` appends, `DELETE` terminates, `OPTIONS` discovers capabilities; `X-HTTP-Method-Override` tunnels PATCH/DELETE through POST for environments that cannot send them. Every non-OPTIONS request is version-gated on `Tus-Resumable: 1.0.0` (412 otherwise). tus completion is implicit (an upload is complete when its offset reaches its length), and the handler publishes the assembled object the moment that happens, including when the final bytes arrived from a connection that died mid-request.
+
+Options (flat `UploadPolicy` fields may ride the options object directly; they win over the `policy` object form):
+
+- **`key(creation)`** (required) - Decide the final storage key for a new upload from `{ metadata, request }` (the base64-decoded `Upload-Metadata` pairs, commonly `filename`/`filetype`, plus the raw `Request`). The server decides the key; never derive it from the client filename verbatim (a caller-controlled key is a path/overwrite primitive).
+- **`location(uploadToken)`** (required) - Build the `Location` header value for a created upload resource (absolute or path-relative URL).
+- **`resolveToken(req)`** - Extract the upload token from a resource request when the caller does not pass `ctx.uploadToken` (e.g. parse the URL path). `undefined` means "no token here" and the request is answered 404.
+- **`auditKey(uploadToken, metadata?)`** - Audit-safe identifier reported on upload events instead of the raw token, called per resource request (HEAD/PATCH/DELETE). Creation events fire before any token exists to map, so they carry only the token.
+- **`policy`** - `UploadPolicy` object form (see below).
+- **`locker`** - Lock provider (see Locking below). Default: in-process cooperative-preemption locker.
+- **`onUploadEvent(event)`** - Structured, content-free audit events (see Upload audit events below).
+- **`onError(error, { uploadToken?, operation })`** - Error sink for storage failures, throwing hooks, and dialect-level failures (a throwing `key`/`location`/`resolveToken` callback reports with operation `"handler"`). Must not throw.
+- **`graceMs`** (default `10000`) - Post-abort flush window in milliseconds: how long store writes keep running after the client vanished so received bytes become durable. `0` disables it.
+- **`now`** - Clock injection (tests); also anchors `Upload-Expires`.
+- **`extraHeaders`** - Extra headers on EVERY response (CORS exposure, tracing). Protocol headers win on collision.
+
+Status mapping: `409` offset mismatch (recover via HEAD re-probe; tus defines no offset header on the 409), `410` expired/invalidated, `404` unknown resource or missing token, `413` size violations (with `Tus-Max-Size` when configured), `400` other policy floors and length conflicts, `423` contended (kept distinct from 409 so retry-later never looks like re-probe-now), `415` PATCH without `application/offset+octet-stream`, `502` storage failure (details only to `onError`). Not implemented: the concatenation extension, and the checksum extension (the package is zero-dependency, so per-append hashing needs a caller-injected hasher; not yet surfaced).
+
+**`parseUploadMetadata(header)`** - Parse an `Upload-Metadata` header (creation extension) into decoded key/value pairs. Strict: standard base64 with canonical padding, printable-ASCII keys, unique keys, UTF-8 values; returns `null` for malformed input (the handler answers 400), `{}` for an absent header.
+
+### IETF draft dialect (`partial-content/upload`)
+
+**`createUploadHandler(store, options)`** - An endpoint speaking the IETF resumable-uploads draft (`draft-ietf-httpbis-resumable-upload`) over Fetch primitives. It serves the draft revisions actual clients implement, identified by `Upload-Draft-Interop-Version`: **3, 5, and 6**. The per-version wire differences are handled internally, most importantly the completeness header flip: interop 3 sends `Upload-Incomplete` (`?1` = not complete), interop 5 and 6 send `Upload-Complete` (`?1` = complete); interop 6 adds the `application/partial-upload` media-type requirement on appends, RFC 9457 problem details on offset mismatches, and `Upload-Length` on probes. A missing or unlisted version is answered 400 with the supported set named (the draft forbids cross-version interop, so nothing falls through).
+
+Requests without an upload token (none in `ctx.uploadToken`, none from `resolveToken`) are creations; requests with one target the resource: `HEAD` probes, `PATCH` appends, `DELETE` cancels. A creation or append may assert a whole-representation SHA-256 via `Repr-Digest` (RFC 9530); it is verified at completion when the store supports it (`digestOnComplete: "sha256"`), and rejected up front when the store cannot verify, never silently ignored. The offset-mismatch 409 carries the CORRECT offset and true completeness, so clients re-anchor without a probe round trip.
+
+Options: `key(creation)` (from `{ request, interopVersion, declaredLength, complete }`), `location(uploadToken)`, `resolveToken(req)`, `auditKey(req)`, `policy`, `locker`, `onUploadEvent`, `onError`, `graceMs`, `now` (all as in the tus dialect), plus:
+
+- **`interopVersions`** (default `[3, 5, 6]`) - Versions to serve; construction throws `TypeError` for a version with no wire mapping (misconfiguration is loud, requests never throw).
+- **`onResumptionSupported(info)`** - Fires when a creation produced an upload resource, carrying what a `104 (Upload Resumption Supported)` interim response would (`{ uploadToken, location, interopVersion }`). A Fetch `Response` cannot carry interim responses, so the handler itself never emits 104; a transport that can write interim responses may wire this hook. Guarded: a throwing hook is routed to `onError`.
+
+### Upload policy (`UploadPolicy`)
+
+Server policy for one upload surface; every field optional, an absent bound is simply not enforced. The engine enforces these BEFORE any byte reaches a store; the dialects advertise them where their protocol has a vocabulary for it (`Tus-Max-Size`).
+
+| Field | Meaning |
+|---|---|
+| `maxSize` | Maximum total representation size in bytes |
+| `minSize` | Minimum total representation size in bytes |
+| `maxAppendSize` | Maximum bytes accepted by a single append (a store's own `maxAppendSize` capability is folded in as a further minimum) |
+| `minAppendSize` | Minimum bytes required per append. Exempt: a creation with no content, and an append that completes the upload (the tail is however small it is) |
+| `maxAgeSeconds` | Maximum resource lifetime, from creation. Expired resources refuse every interaction (tus 410 / IETF 404) and drive `Upload-Expires` |
+
+### Write stores
+
+Every storage backend subpath except `/http` (a generic HTTP origin cannot accept resumable writes) exports a `ResumableWriteStore` factory next to its `ObjectStore`. Point both at the same bucket/root/map and a completed upload becomes servable the moment completion returns.
+
+**`memoryUploadStore({ objects })`** (`partial-content/memory`) - Process-memory write store for consumer test suites and demos; publishes into the same map a `memoryStore` serves.
+
+**`fsUploadStore({ root })`** (`partial-content/fs`) - Local filesystem. In-flight bytes live in a reserved `.uploads/` subtree under `root`; appends are fsynced before they are acknowledged (the offset a later probe derives from `stat` is crash-durable), completion verifies any asserted SHA-256 by streaming the assembled file, then publishes with a same-volume atomic `rename()`.
+
+**`s3UploadStore({ client, bucket, minPartSize?, uploadPrefix?, checksums? })`** (`partial-content/s3`) - Any S3-compatible backend, built on multipart uploads. Appends buffer to the 5 MiB part-size floor (`minPartSize`; raise it when objects may exceed 10,000 x minPartSize); the sub-minimum remainder is parked in a sidecar object and committed as the size-exempt final part at completion. The offset derives from `ListParts` plus the sidecar's size. `checksums: true` opts into per-part SHA-256 (transport integrity, verified by the backend part by part, restated at completion); it is OFF by default because the parameters are not portable across S3-compatibles, and it never enables whole-object digest verification: multipart SHA-256 is composite (a hash of per-part hashes), so `digestOnComplete` stays `false` either way.
+
+**`azureUploadStore({ containerClient, uploadPrefix?, blockSize? })`** (`partial-content/azure`) - Azure Blob Storage via uncommitted blocks staged on the final blob (nothing visible until commit); `Put Block List` publishes atomically. Appends are byte-exact (`blockSize` only bounds adapter memory). A one-byte sentinel block distinguishes a freshly created upload from a missing one. Azure garbage-collects uncommitted blocks after 7 days; `sweepExpired` reaps the small `.info` bookkeeping blobs Azure will not. One in-flight upload per key (blocks stage on the final blob's namespace).
+
+**`gcsUploadStore({ storage, bucket, uploadPrefix? })`** (`partial-content/gcs`) - Google Cloud Storage via object-per-chunk plus server-side compose (deliberately not GCS's native resumable sessions; see DESIGN.md). Appends are byte-exact immutable chunk objects; completion composes level by level (32 sources per call) with a single final compose onto the destination key, so publication is all-or-nothing. No native lifecycle covers the staging objects: schedule `sweepExpired` or scope a bucket lifecycle rule to `uploadPrefix`.
+
+**`r2UploadStore({ bucket, uploadPrefix?, partSize? })`** (`partial-content/r2`) - Cloudflare R2 via the native multipart binding (no AWS SDK). The binding has no ListParts, so the adapter keeps its own durable part ledger (a `.manifest` object rewritten after every accepted part) and the offset derives from that ledger; that is why `exactOffsetRecovery` is `false`. R2 requires every non-final part to be the SAME size (`partSize`, default and minimum 5 MiB). R2's default lifecycle aborts incomplete multipart uploads after 7 days; `sweepExpired` reaps the manifests.
+
+Capability flags, per built-in store (what the orchestrator reads to decide what it may promise on the wire):
+
+| Store | `appendGranularity` | `uniformPartSize` | `exactOffsetRecovery` | `atomicCompletion` | `digestOnComplete` | `maxAppendSize` |
+|---|---|---|---|---|---|---|
+| `memory` | byte-exact | - | `true` | `true` | `"sha256"` | - |
+| `fs` | byte-exact | - | `true` (fsync before ack) | `true` (atomic rename) | `"sha256"` | - |
+| `s3` | `minPartSize` (5 MiB floor) | `false` | `true` (ListParts + sidecar) | `true` (CompleteMultipartUpload) | `false` (composite-only checksums) | - (parts stream out as they fill) |
+| `azure` | byte-exact | - | `true` (block-list sums) | `true` (Put Block List) | `false` (no service-side whole-blob SHA-256) | - |
+| `gcs` | byte-exact | - | `true` (chunk-listing sums) | `true` (single final compose) | `false` (native checksums are MD5/CRC32C) | - |
+| `r2` | `partSize` (5 MiB default) | `true` (R2's rule) | `false` (adapter-owned ledger, no ListParts to cross-check) | `true` (binding `complete()`) | `false` (multipart etags are not content hashes) | - |
+
+### `ResumableWriteStore` (custom write stores)
+
+The write-side storage contract, independent of `ObjectStore` (an adapter implements one, the other, or both). Methods, all invoked by the orchestrator under the upload's lock and after a fresh state read:
+
+- **`createUpload({ key, length?, metadata?, now, signal? })`** -> `{ uploadToken }`. The token is the ONLY handle later calls receive: fold everything resumption needs into it (the built-ins encode key + backend upload id). It is never parsed upstream.
+- **`getUploadState(uploadToken)`** -> `{ offset, length?, isComplete, isInvalidated, createdAt, lastAppendAt?, metadata? }`. **The contract's one load-bearing rule: `offset` must be derived from storage bookkeeping the backend itself maintains** (a part listing, a block list, an fsynced file size), never from a counter persisted alongside the data. A stored counter and the bytes it describes cannot be written atomically, and their drift after a crash is exactly the corruption class resumable uploads exist to prevent.
+- **`appendChunk(uploadToken, offset, body, { maxBytes?, now, signal? })`** -> `{ bytesWritten }`, the bytes made DURABLE by this call (on interruption, the flushed prefix; the next `getUploadState` must agree). The adapter MUST stop at `maxBytes` and terminally invalidate the resource if the body tries to cross it.
+- **`completeUpload(uploadToken, { expectedDigest?, now, signal? })`** -> `{ etag?, digest? }`. Atomically publish: after success the object is readable; after ANY failure (including a digest mismatch) nothing new is visible to readers.
+- **`abortUpload(uploadToken)`** - Discard the resource and its partial bytes. Idempotent.
+- **`sweepExpired?(olderThanMs)`** -> `{ removed }`. Remove resources idle since before the epoch-ms cutoff (callers typically pass `Date.now() - maxAgeMs` on a schedule). Optional: adapters whose backend has native lifecycle rules may document the native rule instead.
+
+Capability flags (readonly fields, honest per backend, never assumed): `appendGranularity?` (backend append granularity in bytes; forces orchestrator-side buffering; `undefined` = byte-exact), `uniformPartSize?` (every non-final part must be the same size), `exactOffsetRecovery` (the derived offset is byte-exact and crash-durable; when `false` the orchestrator never advertises exact resume), `atomicCompletion` (`completeUpload` is all-or-nothing), `digestOnComplete` (`"sha256"`, `"crc32c"`, or `false`; only `"sha256"` enables end-to-end verification of a client-asserted digest), `maxAppendSize?` (largest single append the backend accepts, folded into the effective policy).
+
+### Locking (`UploadLocker`)
+
+Interactions on one upload resource are serialized by a lock, probes included (deriving an offset can be a multi-call backend read, and a torn snapshot would hand the client an offset its next request fails on). The lock is **cooperatively preempted**, not a plain mutex: a new acquirer asks the current holder to stop, the holder aborts its append at the next chunk boundary (flushing what it has, so the offset stays truthful), and the lock hands over in milliseconds. The interface is one method: `acquire(uploadToken, onPreemptRequested, { timeoutMs? })` -> `Promise<UploadLock>` (`{ release() }`); a holder that does not yield within `timeoutMs` (default 15 s) rejects with `UploadLockTimeoutError`, which the dialects answer as 423.
+
+The default locker is in-process and correct for a single process. **Supply your own via the `locker` option when more than one server instance can receive requests for the same upload resource** (horizontally scaled deployments without upload-affinity routing), backed by shared infrastructure; the interface is deliberately tiny so that stays a page of code.
+
+### Upload audit events (`onUploadEvent`)
+
+Structured, content-free by construction (no filenames, no bytes, no metadata values): `{ uploadToken?, auditKey?, event }` where `event` is one of `created` (with `declaredLength?`), `append-accepted` (`atOffset`, `completes`), `append-rejected` (`reason`, `atOffset?`), `completed` (`length`), `cancelled`, `expired`. Reject reasons: `offset-mismatch`, `length-inconsistent`, `size-exceeded`, `append-too-small`, `append-too-large`, `below-min-size`, `already-complete`, `invalidated`, `expired`, `contended`. A throwing hook is routed to `onError` (`operation: "audit"`) and never affects the upload.
+
+### Upload error classes
+
+Thrown by write stores, re-exported from the storage subpaths (`UploadNotFoundError` and `UploadOffsetConflictError` from all six; `UploadDigestMismatchError` additionally from `/fs`, `/memory`, and `/s3`), and matched **by `name`** so custom stores can throw equivalently-named errors without importing the classes:
+
+- **`UploadNotFoundError`** - The upload resource does not exist (never created, completed and reaped, cancelled, or expired-and-swept). Dialects answer 404.
+- **`UploadOffsetConflictError`** - An append's claimed offset lost a race with durable state (defense in depth under the lock; carries `durableOffset`). The orchestrator answers offset-mismatch with the correct offset.
+- **`UploadDigestMismatchError`** - The assembled bytes do not hash to the digest the client asserted (carries `expectedDigest`, `actualDigest?`). Thrown BEFORE publishing; the dialect answers a client error, never a torn object.
+- **`UploadLockTimeoutError`** - The lock holder did not yield within the acquire timeout; raised by the locker rather than a store (a custom `UploadLocker` signals timeout by rejecting with an error of this `name`). Dialects answer 423.

@@ -1,8 +1,12 @@
 /**
- * Local filesystem ObjectStore adapter for partial-content.
+ * Local filesystem ObjectStore and ResumableWriteStore adapters for
+ * partial-content.
  *
- * Implements the read-only {@link ObjectStore} interface using Node.js
- * `fs.stat()` and `fs.createReadStream()`. Suitable for:
+ * {@link fsStore} implements the read-only {@link ObjectStore} interface
+ * using Node.js `fs.stat()` and `fs.createReadStream()`;
+ * {@link fsUploadStore} implements the resumable-upload write contract over
+ * the same root, publishing completed uploads where an fsStore serves them.
+ * Suitable for:
  *   - Development servers
  *   - Small/medium deployments
  *   - Hybrid architectures (local cache + cloud primary)
@@ -28,8 +32,9 @@
  * @packageDocumentation
  */
 
-import { open, stat } from "node:fs/promises";
-import { resolve, relative, sep, isAbsolute } from "node:path";
+import { mkdir, open, readdir, readFile, rename, rm, stat, type FileHandle } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
   ObjectNotFoundError,
   nodeStreamToWeb,
@@ -38,9 +43,21 @@ import {
   type ObjectStream,
   type ParsedRange,
 } from "./index.ts";
+import {
+  UploadNotFoundError,
+  UploadOffsetConflictError,
+  UploadDigestMismatchError,
+  type ResumableWriteStore,
+  type StoredUploadState,
+  type CreateUploadOptions,
+  type AppendChunkOptions,
+  type CompleteUploadOptions,
+  type CompletedUpload,
+} from "./upload-store.ts";
 
 // Re-export for convenience (consumers can catch without importing the kernel)
 export { ObjectNotFoundError };
+export { UploadNotFoundError, UploadOffsetConflictError, UploadDigestMismatchError };
 
 // ─── Options ────────────────────────────────────────────────────────────────
 
@@ -203,56 +220,6 @@ export function fsStore(opts: FsStoreOptions): ObjectStore {
     cacheBytes += newBytes;
   }
 
-  /**
-   * Resolve a key to an absolute path within the root directory.
-   * Rejects path traversal attempts that escape the root.
-   */
-  function safePath(key: string): string {
-    // Null bytes are invalid in every filesystem and are a classic probe for
-    // C-string truncation bugs in lower layers. Treat as "no such object"
-    // rather than letting fs throw ERR_INVALID_ARG_VALUE (which would map
-    // to a misleading 502 upstream).
-    if (key.includes("\0")) {
-      throw new ObjectNotFoundError(key);
-    }
-
-    // Windows-only hardening (sep === "\\"). ':' is illegal in a normal
-    // Windows filename -- it only appears in a drive designator ("D:\x")
-    // or an NTFS alternate-data-stream name ("secret.txt::$DATA"). Rejecting
-    // it early stops a cross-volume escape (resolve() would turn "D:\x" into
-    // an absolute path on another drive) and hidden-stream access. Reserved
-    // device names (NUL, CON, COM1...) map to hardware from ANY directory,
-    // so open() on them never touches a file under the root.
-    if (sep === "\\") {
-      if (key.includes(":")) {
-        throw new ObjectNotFoundError(key);
-      }
-      // Win32 path normalization strips trailing dots and spaces before
-      // resolving names, so "CON ", "con." and "con . ." all reach the
-      // device; strip them the same way before testing. COM/LPT also
-      // reserve the superscript digits U+00B9/U+00B2/U+00B3 ("COM¹").
-      const base = key.slice(
-        Math.max(key.lastIndexOf("/"), key.lastIndexOf("\\")) + 1,
-      ).replace(/[. ]+$/, "");
-      if (/^(con|prn|aux|nul|com[0-9¹²³]|lpt[0-9¹²³])(\.|$)/i.test(base)) {
-        throw new ObjectNotFoundError(key);
-      }
-    }
-
-    const resolved = resolve(root, key);
-    const rel = relative(root, resolved);
-
-    // rel escapes the root when it climbs out ("..") or is itself absolute.
-    // A cross-drive key resolves onto another volume and relative() then
-    // returns that absolute path unchanged, which a bare startsWith("..")
-    // check would wave through.
-    if (rel === ".." || rel.startsWith(".." + sep) || isAbsolute(rel)) {
-      throw new ObjectNotFoundError(key);
-    }
-
-    return resolved;
-  }
-
   return {
     supportsRange: true,
     // Ranged reads qualify as authoritative: getObject opens ONCE and stats,
@@ -274,7 +241,7 @@ export function fsStore(opts: FsStoreOptions): ObjectStore {
           etag: cached.etag,
         };
       }
-      const filePath = safePath(key);
+      const filePath = safeResolve(root, key);
 
       let stats;
       try {
@@ -338,7 +305,7 @@ export function fsStore(opts: FsStoreOptions): ObjectStore {
         };
       }
 
-      const filePath = safePath(key);
+      const filePath = safeResolve(root, key);
 
       // Open once and both stat and stream from the same file handle. A
       // stat-then-reopen sequence races against file replacement: the stream
@@ -471,6 +438,354 @@ export function fsStore(opts: FsStoreOptions): ObjectStore {
   };
 }
 
+// ─── Resumable Uploads: Options ─────────────────────────────────────────────
+
+/** Reserved workspace for in-flight upload bytes and their sidecars. */
+const UPLOADS_DIR = ".uploads";
+
+export interface FsUploadStoreOptions {
+  /**
+   * Root directory completed objects are published under (point an
+   * {@link fsStore} at the same root to serve them). In-flight bytes live in
+   * a reserved `.uploads/` subdirectory inside it; publish keys are barred
+   * from that subtree, and upload tokens are the only handles into it.
+   */
+  root: string;
+}
+
+/**
+ * Creation-time facts plus terminal flags, persisted next to the data file.
+ * Deliberately NO offset: the offset is always derived from a stat of the
+ * fsynced data file, because a stored counter and the bytes it describes
+ * cannot be written atomically, and their drift after a crash is exactly
+ * the corruption class resumable uploads exist to prevent.
+ */
+interface UploadSidecar {
+  key: string;
+  length?: number;
+  metadata?: Record<string, string>;
+  createdAt: number;
+  lastAppendAt?: number;
+  isComplete: boolean;
+  isInvalidated: boolean;
+  /** Recorded at completion: the data file has been renamed away by then. */
+  completedSize?: number;
+  digest?: string;
+  etag?: string;
+}
+
+// ─── Resumable Uploads: Factory ─────────────────────────────────────────────
+
+/**
+ * Create a {@link ResumableWriteStore} backed by the local filesystem.
+ *
+ * Layout: `<root>/.uploads/<token>` holds the in-flight bytes and
+ * `<root>/.uploads/<token>.json` the sidecar facts. Completion verifies any
+ * asserted SHA-256 by streaming the assembled file, then publishes with a
+ * same-volume `rename()` onto the final key: the all-or-nothing primitive,
+ * so a failed or crashed completion never leaves a torn object visible.
+ *
+ * Durability: the data file is fsynced before an append returns, so the
+ * offset a later `getUploadState` derives from stat is crash-durable
+ * (claiming `exactOffsetRecovery` without that fsync would be a lie). The
+ * sidecar is fsynced at create, complete, and invalidate; the advisory
+ * `lastAppendAt` refresh is not (losing it only ages the resource toward
+ * the sweep slightly early).
+ *
+ * @example
+ * ```typescript
+ * import { fsStore, fsUploadStore } from "partial-content/fs";
+ *
+ * const writes = fsUploadStore({ root: "/var/data/files" });
+ * const reads = fsStore({ root: "/var/data/files" }); // serves completions
+ * ```
+ */
+export function fsUploadStore(opts: FsUploadStoreOptions): ResumableWriteStore {
+  const root = resolve(opts.root);
+  const uploadsDir = join(root, UPLOADS_DIR);
+
+  /**
+   * Token -> workspace paths, or null for a token this store cannot have
+   * issued. The charset gate doubles as the traversal defense for
+   * token-derived paths: no separators, no dots, no null bytes.
+   */
+  function tokenPaths(uploadToken: string): { data: string; sidecar: string } | null {
+    if (!/^[0-9a-f-]+$/.test(uploadToken)) return null;
+    return {
+      data: join(uploadsDir, uploadToken),
+      sidecar: join(uploadsDir, `${uploadToken}.json`),
+    };
+  }
+
+  function requireTokenPaths(uploadToken: string): { data: string; sidecar: string } {
+    const paths = tokenPaths(uploadToken);
+    if (!paths) throw new UploadNotFoundError(uploadToken);
+    return paths;
+  }
+
+  return {
+    exactOffsetRecovery: true,
+    atomicCompletion: true,
+    digestOnComplete: "sha256",
+
+    async createUpload(createOpts: CreateUploadOptions): Promise<{ uploadToken: string }> {
+      createOpts.signal?.throwIfAborted();
+      // Reject hostile keys at the door: nothing is allocated for a key
+      // that could never publish.
+      resolveFinalKeyPath(root, createOpts.key);
+      const uploadToken = randomUUID();
+      const paths = requireTokenPaths(uploadToken);
+      await mkdir(uploadsDir, { recursive: true });
+      // "wx": a token collision must fail loudly, never adopt foreign bytes.
+      const handle = await open(paths.data, "wx");
+      try {
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
+      await writeSidecar(paths.sidecar, {
+        key: createOpts.key,
+        length: createOpts.length,
+        metadata: createOpts.metadata,
+        createdAt: createOpts.now,
+        isComplete: false,
+        isInvalidated: false,
+      }, true);
+      return { uploadToken };
+    },
+
+    async getUploadState(
+      uploadToken: string,
+      stateOpts?: { signal?: AbortSignal },
+    ): Promise<StoredUploadState> {
+      stateOpts?.signal?.throwIfAborted();
+      const paths = requireTokenPaths(uploadToken);
+      const sidecar = await readSidecar(paths.sidecar, uploadToken);
+      const facts = {
+        length: sidecar.length,
+        createdAt: sidecar.createdAt,
+        lastAppendAt: sidecar.lastAppendAt,
+        metadata: sidecar.metadata,
+      };
+      if (sidecar.isComplete) {
+        return { ...facts, offset: sidecar.completedSize ?? 0, isComplete: true, isInvalidated: false };
+      }
+      let size: number;
+      try {
+        // Backend-derived offset: a stat of the data file appendChunk fsyncs
+        // before acking, never a stored counter.
+        size = (await stat(paths.data)).size;
+      } catch (err) {
+        if (!isFileNotFound(err)) throw err;
+        // Data file lost under a live sidecar: the bytes are gone, which is
+        // the terminal dead state, not a not-found (the resource existed).
+        return { ...facts, offset: 0, isComplete: false, isInvalidated: true };
+      }
+      return { ...facts, offset: size, isComplete: false, isInvalidated: sidecar.isInvalidated };
+    },
+
+    async appendChunk(
+      uploadToken: string,
+      offset: number,
+      body: ReadableStream<Uint8Array> | Uint8Array,
+      appendOpts: AppendChunkOptions,
+    ): Promise<{ bytesWritten: number }> {
+      appendOpts.signal?.throwIfAborted();
+      const paths = requireTokenPaths(uploadToken);
+      const sidecar = await readSidecar(paths.sidecar, uploadToken);
+      if (sidecar.isComplete) {
+        // Published resources refuse appends; the durable offset is final.
+        throw new UploadOffsetConflictError(uploadToken, sidecar.completedSize ?? 0);
+      }
+
+      let handle: FileHandle;
+      try {
+        handle = await open(paths.data, "r+");
+      } catch (err) {
+        // Data file lost under a live sidecar: nothing to append to.
+        if (isFileNotFound(err)) throw new UploadNotFoundError(uploadToken, err);
+        throw err;
+      }
+      try {
+        const durableOffset = (await handle.stat()).size;
+        // Verify the claim against DURABLE truth (defense in depth under the
+        // orchestrator's lock), and refuse invalidated resources outright.
+        if (sidecar.isInvalidated || offset !== durableOffset) {
+          throw new UploadOffsetConflictError(uploadToken, durableOffset);
+        }
+
+        let flushed = 0;
+        let crossedBound = false;
+        /** Write as much of `chunk` as the byte bound allows; false = crossed. */
+        const acceptChunk = async (chunk: Uint8Array): Promise<boolean> => {
+          const room = appendOpts.maxBytes === undefined
+            ? chunk.length
+            : Math.min(chunk.length, appendOpts.maxBytes - flushed);
+          if (room > 0) {
+            await writeFully(handle, chunk.subarray(0, room), durableOffset + flushed);
+            flushed += room;
+          }
+          if (room < chunk.length) {
+            crossedBound = true;
+            return false;
+          }
+          return true;
+        };
+
+        if (body instanceof Uint8Array) {
+          await acceptChunk(body);
+        } else {
+          const reader = body.getReader();
+          try {
+            while (appendOpts.signal?.aborted !== true) {
+              let next: Awaited<ReturnType<typeof reader.read>>;
+              try {
+                next = await reader.read();
+              } catch {
+                // Torn body (the client vanished mid-request): the flushed
+                // prefix is the truthful answer; the stream error itself
+                // carries no bytes to account.
+                break;
+              }
+              if (next.done) break;
+              if (!(await acceptChunk(next.value))) break;
+            }
+          } finally {
+            // Stop the producer on early exit (bound crossed, abort). On an
+            // already-errored stream cancel() rejects with that same error,
+            // which the loop above already accounted for.
+            void reader.cancel().catch(() => {});
+          }
+        }
+
+        // Durability BEFORE the offset becomes reportable: exactOffsetRecovery
+        // is only honest if a post-crash stat can never see bytes this call
+        // acked but never flushed.
+        await handle.sync();
+
+        sidecar.lastAppendAt = appendOpts.now;
+        if (crossedBound) {
+          // Bytes tried to land past the engine's bound: terminal fault,
+          // recorded durably so every later interaction refuses.
+          sidecar.isInvalidated = true;
+          await writeSidecar(paths.sidecar, sidecar, true);
+        } else {
+          await writeSidecar(paths.sidecar, sidecar, false);
+        }
+        return { bytesWritten: flushed };
+      } finally {
+        await handle.close().catch(() => {
+          // Best-effort close; the append outcome is already decided
+        });
+      }
+    },
+
+    async completeUpload(
+      uploadToken: string,
+      completeOpts: CompleteUploadOptions,
+    ): Promise<CompletedUpload> {
+      completeOpts.signal?.throwIfAborted();
+      const paths = requireTokenPaths(uploadToken);
+      const sidecar = await readSidecar(paths.sidecar, uploadToken);
+      // Idempotent retry: already published; answer the recorded facts.
+      if (sidecar.isComplete) return { etag: sidecar.etag, digest: sidecar.digest };
+      if (sidecar.isInvalidated) {
+        throw new Error(
+          `fsUploadStore ${uploadToken}: cannot complete an invalidated upload`,
+        );
+      }
+      // Re-validate the key at publish time: the sidecar sat on disk between
+      // create and complete, and a tampered key must not become a traversal.
+      const finalPath = resolveFinalKeyPath(root, sidecar.key);
+
+      const digest = await sha256FileBase64(paths.data, uploadToken);
+      if (completeOpts.expectedDigest !== undefined && digest !== completeOpts.expectedDigest) {
+        // Atomic completion: a failed verification publishes NOTHING; the
+        // orchestrator aborts the resource.
+        throw new UploadDigestMismatchError(uploadToken, completeOpts.expectedDigest, digest);
+      }
+
+      await mkdir(dirname(finalPath), { recursive: true });
+      // Every append fsynced its bytes already; rename is the atomic publish.
+      await rename(paths.data, finalPath);
+
+      const stats = await stat(finalPath, { bigint: true });
+      // The same validator the read side derives, so an fsStore over this
+      // root serves the published object under THIS etag.
+      const etag = weakFsETag(stats.size, stats.mtimeNs);
+      sidecar.isComplete = true;
+      sidecar.completedSize = Number(stats.size);
+      sidecar.digest = digest;
+      sidecar.etag = etag;
+      await writeSidecar(paths.sidecar, sidecar, true);
+      return { etag, digest };
+    },
+
+    async abortUpload(uploadToken: string, abortOpts?: { signal?: AbortSignal }): Promise<void> {
+      abortOpts?.signal?.throwIfAborted();
+      const paths = tokenPaths(uploadToken);
+      // Idempotent: a token this store never issued has nothing to discard.
+      if (!paths) return;
+      await rm(paths.data, { force: true });
+      await rm(paths.sidecar, { force: true });
+    },
+
+    async sweepExpired(
+      olderThanMs: number,
+      sweepOpts?: { signal?: AbortSignal },
+    ): Promise<{ removed: number }> {
+      sweepOpts?.signal?.throwIfAborted();
+      let names: string[];
+      try {
+        names = await readdir(uploadsDir);
+      } catch (err) {
+        // No uploads workspace yet: nothing was ever created here.
+        if (isFileNotFound(err)) return { removed: 0 };
+        throw err;
+      }
+      let removed = 0;
+      const sidecarNames = new Set(names.filter((name) => name.endsWith(".json")));
+      for (const name of sidecarNames) {
+        const sidecarPath = join(uploadsDir, name);
+        let idleSince: number;
+        try {
+          const sidecar = JSON.parse(await readFile(sidecarPath, "utf8")) as UploadSidecar;
+          idleSince = sidecar.lastAppendAt ?? sidecar.createdAt;
+        } catch {
+          // Unreadable or torn sidecar: age it by mtime, so a crash artifact
+          // is still reaped once idle but a sidecar mid-write is not raced.
+          try {
+            idleSince = (await stat(sidecarPath)).mtimeMs;
+          } catch {
+            continue; // vanished mid-scan (concurrent abort): nothing to reap
+          }
+        }
+        if (idleSince >= olderThanMs) continue;
+        await rm(join(uploadsDir, name.slice(0, -".json".length)), { force: true });
+        await rm(sidecarPath, { force: true });
+        removed++;
+      }
+      // Orphaned data files (a crash between data-file creation and sidecar
+      // write): without this pass they would leak forever, exactly the
+      // storage-limitation failure this hook exists to prevent. The mtime
+      // guard keeps a mid-creation file out of reach.
+      for (const name of names) {
+        if (name.endsWith(".json") || sidecarNames.has(`${name}.json`)) continue;
+        let mtimeMs: number;
+        try {
+          mtimeMs = (await stat(join(uploadsDir, name))).mtimeMs;
+        } catch {
+          continue; // vanished mid-scan (concurrent abort): nothing to reap
+        }
+        if (mtimeMs >= olderThanMs) continue;
+        await rm(join(uploadsDir, name), { force: true });
+        removed++;
+      }
+      return { removed };
+    },
+  };
+}
+
 // ─── Internal Helpers ───────────────────────────────────────────────────────
 
 /**
@@ -486,6 +801,134 @@ const SMALL_READ_LIMIT = 128 * 1024;
  * of leaving it implied by `maxEntries * SMALL_READ_LIMIT`.
  */
 const DEFAULT_CACHE_MAX_BYTES = 64 * 1024 * 1024;
+
+/**
+ * Resolve a key to an absolute path within the root directory.
+ * Rejects path traversal attempts that escape the root.
+ */
+function safeResolve(root: string, key: string): string {
+  // Null bytes are invalid in every filesystem and are a classic probe for
+  // C-string truncation bugs in lower layers. Treat as "no such object"
+  // rather than letting fs throw ERR_INVALID_ARG_VALUE (which would map
+  // to a misleading 502 upstream).
+  if (key.includes("\0")) {
+    throw new ObjectNotFoundError(key);
+  }
+
+  // Windows-only hardening (sep === "\\"). ':' is illegal in a normal
+  // Windows filename -- it only appears in a drive designator ("D:\x")
+  // or an NTFS alternate-data-stream name ("secret.txt::$DATA"). Rejecting
+  // it early stops a cross-volume escape (resolve() would turn "D:\x" into
+  // an absolute path on another drive) and hidden-stream access. Reserved
+  // device names (NUL, CON, COM1...) map to hardware from ANY directory,
+  // so open() on them never touches a file under the root.
+  if (sep === "\\") {
+    if (key.includes(":")) {
+      throw new ObjectNotFoundError(key);
+    }
+    // Win32 path normalization strips trailing dots and spaces before
+    // resolving names, so "CON ", "con." and "con . ." all reach the
+    // device; strip them the same way before testing. COM/LPT also
+    // reserve the superscript digits U+00B9/U+00B2/U+00B3 ("COM¹").
+    const base = key.slice(
+      Math.max(key.lastIndexOf("/"), key.lastIndexOf("\\")) + 1,
+    ).replace(/[. ]+$/, "");
+    if (/^(con|prn|aux|nul|com[0-9¹²³]|lpt[0-9¹²³])(\.|$)/i.test(base)) {
+      throw new ObjectNotFoundError(key);
+    }
+  }
+
+  const resolved = resolve(root, key);
+  const rel = relative(root, resolved);
+
+  // rel escapes the root when it climbs out ("..") or is itself absolute.
+  // A cross-drive key resolves onto another volume and relative() then
+  // returns that absolute path unchanged, which a bare startsWith("..")
+  // check would wave through.
+  if (rel === ".." || rel.startsWith(".." + sep) || isAbsolute(rel)) {
+    throw new ObjectNotFoundError(key);
+  }
+
+  return resolved;
+}
+
+/**
+ * Resolve the FINAL publish path for an upload: the read side's traversal
+ * defense plus a reservation on the uploads workspace, so a hostile key can
+ * never address another upload's partial bytes or a sidecar.
+ */
+function resolveFinalKeyPath(root: string, key: string): string {
+  const resolved = safeResolve(root, key);
+  const rel = relative(root, resolved);
+  if (rel === UPLOADS_DIR || rel.startsWith(UPLOADS_DIR + sep)) {
+    throw new ObjectNotFoundError(key);
+  }
+  return resolved;
+}
+
+async function readSidecar(sidecarPath: string, uploadToken: string): Promise<UploadSidecar> {
+  let raw: string;
+  try {
+    raw = await readFile(sidecarPath, "utf8");
+  } catch (err) {
+    if (isFileNotFound(err)) throw new UploadNotFoundError(uploadToken, err);
+    throw err;
+  }
+  try {
+    return JSON.parse(raw) as UploadSidecar;
+  } catch (err) {
+    // Torn sidecar (crash mid-write): the bookkeeping is lost and the
+    // resource cannot be resumed safely. Gone, with the parse failure as
+    // the cause; the sweep reaps the remains by mtime.
+    throw new UploadNotFoundError(uploadToken, err);
+  }
+}
+
+/** Write the sidecar; `durable` fsyncs it (create/complete/invalidate facts). */
+async function writeSidecar(sidecarPath: string, sidecar: UploadSidecar, durable: boolean): Promise<void> {
+  const handle = await open(sidecarPath, "w");
+  try {
+    await handle.writeFile(JSON.stringify(sidecar));
+    if (durable) await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+/** Positional write loop: POSIX permits short writes even without an error. */
+async function writeFully(handle: FileHandle, bytes: Uint8Array, position: number): Promise<void> {
+  let written = 0;
+  while (written < bytes.length) {
+    const { bytesWritten } = await handle.write(
+      bytes, written, bytes.length - written, position + written,
+    );
+    written += bytesWritten;
+  }
+}
+
+/** RFC 9530 raw base64 SHA-256, streamed so large uploads stay O(1) memory. */
+async function sha256FileBase64(dataPath: string, uploadToken: string): Promise<string> {
+  let handle: FileHandle;
+  try {
+    handle = await open(dataPath, "r");
+  } catch (err) {
+    // Data file lost under a live sidecar: nothing exists to publish.
+    if (isFileNotFound(err)) throw new UploadNotFoundError(uploadToken, err);
+    throw err;
+  }
+  const hash = createHash("sha256");
+  try {
+    // autoClose: false -- the finally below owns the handle either way.
+    for await (const chunk of handle.createReadStream({ autoClose: false })) {
+      hash.update(chunk as Uint8Array);
+    }
+  } finally {
+    await handle.close().catch(() => {
+      // Best-effort close; the hash (or the read error) decides the outcome
+    });
+  }
+  return hash.digest("base64");
+}
 
 /**
  * Weak validator from size + NANOSECOND mtime (bigint stat).

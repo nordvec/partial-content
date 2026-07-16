@@ -1,5 +1,61 @@
 # Changelog
 
+## 2.0.0 (2026-07-16)
+
+The write side. One resumable-upload engine, two wire dialects, and write
+support across every storage adapter, alongside the existing read-side
+serving. Design grounded in the current IETF resumable-uploads draft, the
+deployed client ecosystem, and the write primitives each backend really has.
+
+### Added
+- **`partial-content/tus`**: a tus 1.0 server handler (`createTusHandler`)
+  speaking core + creation + creation-with-upload + creation-defer-length +
+  termination + expiration. Framework-agnostic (Fetch Request/Response),
+  never-throw, hardened error responses.
+- **`partial-content/upload`**: an IETF resumable-uploads draft handler
+  (`createUploadHandler`) supporting draft interop versions 3, 5, and 6
+  (the versions deployed clients actually speak), with the per-version
+  completeness-header polarity handled explicitly, 409 offset-mismatch
+  responses carrying the correct offset (and problem+json at interop 6),
+  and 423 for lock contention as a distinct retry-later signal.
+- **Upload engine + orchestrator (shared by both dialects)**: a pure,
+  wire-agnostic state machine (offset monotonicity, length immutability,
+  limit enforcement BEFORE bytes move, expiry, terminal invalidation) under
+  an orchestrator that always re-derives state from storage inside the
+  resource lock, preempts hung holders cooperatively (the disconnect-resume
+  race), grants aborted appends a grace window so received bytes still
+  flush, and emits content-free, auditKey-aware upload events.
+- **`ResumableWriteStore`** contract with honest per-backend capability
+  flags, implemented by every storage adapter: `memoryUploadStore` and
+  `fsUploadStore` (fsync-before-ack offsets, atomic rename publish,
+  sha-256 verification at completion), `s3UploadStore` (multipart with
+  sub-minimum tail buffering, offsets derived from part listings, error
+  translation for S3-compatibles), `azureUploadStore` (uncommitted blocks
+  with a creation sentinel, byte-exact offset recovery),
+  `gcsUploadStore` (object-per-chunk with batched composition, exact
+  offsets, stateless recovery), `r2UploadStore` (manifest-tracked parts,
+  uniform part size, honest `exactOffsetRecovery: false`).
+- Upload policy limits (max/min size, per-append bounds, max age) enforced
+  in the engine and advertised per dialect; `sweepExpired` on stores for
+  abandoned-upload cleanup.
+
+### Changed (breaking)
+- `evaluateConditionalRequest` `opts.method` is typed `"GET" | "HEAD"`
+  (writes belong to `evaluateConditionalWrite`).
+- `preferSignedUrl` receives `method: "GET"` only (HEAD never offloads).
+- `onError` `operation` union gains `"sign"`: signed-URL minting failures
+  report truthfully instead of as `"get"`/`"head"`.
+- The onServe/onTransfer hooks are deliberately UNCHANGED: grant-time and
+  settle-time events have different lifecycles, and unifying them was
+  evaluated and rejected.
+
+### Fixed
+- `s3UploadStore` checksum posture: multipart SHA-256 checksums are
+  composite-only, so the `checksums` option provides per-part transport
+  integrity (verified at part-upload time, restated at completion) and
+  `digestOnComplete` is honestly `false`; whole-object digest assertions
+  are refused loudly instead of laundered.
+
 ## 1.5.0 (2026-07-16)
 
 Gap-removal release from a full-package adversarial audit (protocol core,

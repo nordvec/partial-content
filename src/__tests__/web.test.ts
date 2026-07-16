@@ -902,7 +902,7 @@ describe("serveObject: never-throw contract (Path C)", () => {
 
         expect(res.status).toBe(502);
         expect(res.headers.get("Cache-Control")).toBe("no-store");
-        expect(errors).toEqual([{ op: "get" }]);
+        expect(errors).toEqual([{ op: "sign" }]);
     });
 
     test("supportsRange: false with a declining createSignedUrl returns a reported 502", async () => {
@@ -2270,7 +2270,7 @@ describe("signed-url provider failures (offload path telemetry)", () => {
         });
         const res = await handler(req(), { key: KEY });
         expect(res.status).toBe(502);
-        expect(reported).toEqual([{ key: KEY, operation: "get" }]);
+        expect(reported).toEqual([{ key: KEY, operation: "sign" }]);
     });
 });
 

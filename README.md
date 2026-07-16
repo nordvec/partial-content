@@ -6,7 +6,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![TypeScript](https://img.shields.io/badge/TypeScript-6.x-3178C6.svg)](https://www.typescriptlang.org/)
 
-RFC-compliant HTTP file serving for any storage backend. Range requests, conditional caching, Content-Disposition, ETag generation, and complete storage adapters in one zero-dependency kernel.
+RFC-compliant HTTP file serving and resumable uploads for any storage backend. Range requests, conditional caching, Content-Disposition, ETag generation, a resumable-upload engine speaking tus 1.0 and the IETF resumable-uploads draft, and complete storage adapters in one zero-dependency kernel.
 
 ```
 npm install partial-content
@@ -49,6 +49,8 @@ One package. Subpath exports. Install only the SDKs you use.
 ```
 partial-content              Zero-dep kernel (RFC 7232/7233/9110 evaluation)
 partial-content/web          Fetch API handler (Next.js, SvelteKit, Remix, Workers)
+partial-content/tus          Resumable uploads: tus 1.0 dialect (Fetch handler)
+partial-content/upload       Resumable uploads: IETF draft dialect (Fetch handler)
 partial-content/s3           AWS S3, R2 (S3 mode), Hetzner, MinIO, Wasabi
 partial-content/r2           Cloudflare R2 native bindings (no AWS SDK)
 partial-content/gcs          Google Cloud Storage
@@ -61,7 +63,9 @@ partial-content/memory       In-memory store (tests, demos, embedded assets)
 partial-content/mime         Curated zero-dep MIME lookup
 ```
 
-Cloud SDKs are **optional peer dependencies**: `@aws-sdk/client-s3` for `/s3` (plus `@aws-sdk/s3-request-presigner` only if you use `createSignedUrl()`), `@google-cloud/storage` for `/gcs`, `@azure/storage-blob` for `/azure`, `hono` for `/hono`. The kernel, `/web`, `/node`, `/fs`, `/http`, `/r2`, `/memory`, and `/mime` need nothing beyond the platform.
+Every storage backend ships both sides of the protocol from the same subpath: an `ObjectStore` for serving and a `ResumableWriteStore` for uploads. `s3Store` + `s3UploadStore` (multipart), `r2Store` + `r2UploadStore` (native multipart), `gcsStore` + `gcsUploadStore` (compose), `azureStore` + `azureUploadStore` (uncommitted blocks), `fsStore` + `fsUploadStore` (fsync + atomic rename), `memoryStore` + `memoryUploadStore`. `/http` is read-side only: a generic HTTP origin cannot accept resumable writes.
+
+Cloud SDKs are **optional peer dependencies**: `@aws-sdk/client-s3` for `/s3` (plus `@aws-sdk/s3-request-presigner` only if you use `createSignedUrl()`), `@google-cloud/storage` for `/gcs`, `@azure/storage-blob` for `/azure`, `hono` for `/hono`. The kernel, `/web`, `/node`, `/fs`, `/http`, `/r2`, `/memory`, `/mime`, `/tus`, and `/upload` need nothing beyond the platform.
 
 ## Features
 
@@ -70,6 +74,11 @@ Cloud SDKs are **optional peer dependencies**: `@aws-sdk/client-s3` for `/s3` (p
 - **RFC 9530 Repr-Digest**: End-to-end integrity verification via `sha-256=:<base64>:` header, with `Want-Repr-Digest` negotiation -- first-class support that `send`, `sirv`, and the framework static middlewares lack
 - **Built-in storage adapters**: S3-compatible (AWS, R2 S3-mode, Hetzner, MinIO, Backblaze, Wasabi), R2 native, GCS, Azure, local filesystem, any range-capable HTTP origin, in-memory
 - **Built-in framework adapters**: Fetch API (Next.js, SvelteKit, Remix, Nuxt, Astro, Workers, Bun.serve, Deno.serve), Node.js (Express/Fastify/Koa/raw http), Hono
+- **Resumable uploads, one engine, two dialects**: `createTusHandler` (`/tus`: tus 1.0 core plus the creation, creation-with-upload, creation-defer-length, termination, and expiration extensions) and `createUploadHandler` (`/upload`: IETF resumable-uploads draft, interop versions 3, 5, and 6) translate the wire; one shared, wire-agnostic state machine makes every protocol decision
+- **Upload write stores for every backend**: in-memory, filesystem (fsynced appends, atomic-rename publish), S3 multipart, Azure uncommitted blocks, GCS compose, R2 native multipart -- each declaring honest capability flags the engine adapts to
+- **Crash-safe upload offsets**: the offset a probe reports is always derived from storage's own bookkeeping (part listings, block lists, an fsynced file size), never from a stored counter that can drift from the bytes after a crash
+- **Upload policy enforced before bytes land**: max/min total size, per-append bounds, and max age are evaluated against fresh state before any byte reaches storage, and streaming appends are hard-capped mid-flight
+- **Cooperative-preemption upload locking** plus a post-abort grace window: a dropped connection resumes in milliseconds instead of stalling behind a zombie request, and bytes received before the drop still become durable
 - Range requests (206, 416), including multi-range `multipart/byteranges` with overlapping/adjacent-range coalescing and range-amplification defense (`maxRanges`)
 - **Precompressed variant negotiation** (`precompressed: true`): serves `<key>.br`/`<key>.zst`/`<key>.gz` siblings via Accept-Encoding (RFC 9110 12.5.3) with `Content-Encoding` + `Vary`, the variant's OWN validators and digest, and byte ranges computed against the encoded bytes -- the correctness detail naive precompressed serving gets wrong
 - **Per-request egress offload** (`preferSignedUrl`): split one route by request shape -- proxy ranges, revalidations, and HEAD probes, 302 large full-file downloads to a signed URL that carries your `Cache-Control` (S3 `response-cache-control`; signed URLs also mint on GCS and Azure)
@@ -152,7 +161,75 @@ const { body } = range
 return new Response(body, { status, headers });
 ```
 
-More recipes in **[docs/EXAMPLES.md](docs/EXAMPLES.md)**: Hono, Cloudflare Workers (R2 native), kernel-only Express, Content-Disposition, Repr-Digest, and the manual step-by-step primitives. Coming from `send` or `sirv`? **[docs/MIGRATION.md](docs/MIGRATION.md)** maps every option and event, and is honest about what has no equivalent.
+More recipes in **[docs/EXAMPLES.md](docs/EXAMPLES.md)**: Hono, Cloudflare Workers (R2 native), kernel-only Express, Content-Disposition, Repr-Digest, resumable uploads, and the manual step-by-step primitives. Coming from `send` or `sirv`? **[docs/MIGRATION.md](docs/MIGRATION.md)** maps every option and event, and is honest about what has no equivalent.
+
+## Resumable uploads
+
+The upload side mirrors the serving side: a wire dialect handler over a storage write store. The handler manages the full upload protocol (creation, offset probes, appends, cancellation, expiry) automatically.
+
+### tus 1.0 (Next.js route handler)
+
+```typescript
+// app/api/files/[[...token]]/route.ts -- one catch-all route serves the
+// creation endpoint (/api/files) and every upload resource (/api/files/<token>)
+import { createTusHandler } from "partial-content/tus";
+import { s3UploadStore } from "partial-content/s3";
+import { S3Client } from "@aws-sdk/client-s3";
+
+const client = new S3Client({ region: "eu-central-1" });
+const store = s3UploadStore({ client, bucket: "documents" });
+// Local disk instead: fsUploadStore({ root: "/var/data/files" }) from "partial-content/fs"
+
+const handler = createTusHandler(store, {
+  // The SERVER decides the final storage key. Never derive it from the
+  // client's filename (a caller-controlled key is a path/overwrite
+  // primitive); keep the filename as metadata.
+  key: () => `uploads/${crypto.randomUUID()}`,
+  // Where the created upload resource lives (the Location header).
+  location: (token) => `/api/files/${token}`,
+  // How resource requests recover the token from the URL.
+  resolveToken: (req) => new URL(req.url).pathname.split("/").pop() || undefined,
+  maxSize: 5 * 1024 * 1024 * 1024,  // advertised as Tus-Max-Size
+  maxAgeSeconds: 24 * 60 * 60,      // drives Upload-Expires
+});
+
+const route = (req: Request) => handler(req);
+export { route as POST };    // creation (+ creation-with-upload)
+export { route as HEAD };    // offset probe
+export { route as PATCH };   // append at offset
+export { route as DELETE };  // termination
+export { route as OPTIONS }; // capability discovery
+```
+
+Point any tus 1.0 client at the creation URL and resumable uploads work end to end: pause, disconnect, resume from the durable offset. On frameworks that route the token as a path parameter, pass it explicitly instead of using `resolveToken`: `handler(req, { uploadToken: params.token })`.
+
+### IETF resumable-uploads draft
+
+The same store works under the IETF dialect (`draft-ietf-httpbis-resumable-upload`), which speaks the draft revisions actual clients implement, identified by interop versions 3, 5, and 6, including the `Upload-Complete`/`Upload-Incomplete` header flip between them. A request may assert a whole-representation SHA-256 via `Repr-Digest`; it is verified before publication on stores that can hash the assembled bytes.
+
+```typescript
+import { createUploadHandler } from "partial-content/upload";
+import { fsUploadStore } from "partial-content/fs";
+
+const handler = createUploadHandler(fsUploadStore({ root: "/var/data/files" }), {
+  key: () => `uploads/${crypto.randomUUID()}`,
+  location: (token) => `/api/uploads/${token}`,
+  policy: { maxSize: 5 * 1024 * 1024 * 1024, maxAgeSeconds: 24 * 60 * 60 },
+});
+// Requests without an upload token are creations; requests with one target
+// the resource: HEAD probes the offset, PATCH appends, DELETE cancels.
+```
+
+### One engine, two dialects
+
+Both handlers are thin header translations over the same wire-agnostic engine: a pure state machine evaluates every interaction (create, probe, append, cancel) against fresh storage state and a policy, and returns a typed verdict; the dialect only maps verdicts to each protocol's statuses and header names. What that buys, on every backend and both wires:
+
+- **Offsets are always derived from storage** (a part listing, a block list, an fsynced file size), never from a stored counter -- so the offset a client resumes from can never be ahead of the bytes that actually survived a crash.
+- **Cooperative-preemption locking**: when a client's connection drops mid-append and it resumes before the server notices the dead socket, the new request asks the old one to stop at the next chunk boundary instead of stalling behind its timeout.
+- **A post-abort grace window** (default 10 s) lets storage finish flushing bytes that already arrived when the client vanished, so the next offset probe answers truthfully.
+- **Digest verification at completion where the backend honestly can**: the filesystem and memory stores hash the assembled bytes and refuse to publish on a mismatch. S3 multipart SHA-256 checksums are composite (a hash of per-part hashes), so whole-object verification is impossible server-side and the S3 store declines the capability instead of faking it; the optional `checksums` flag still gives per-part transport integrity.
+
+See [docs/DESIGN.md](docs/DESIGN.md#resumable-uploads) for the design rationale and [docs/API.md](docs/API.md#resumable-uploads) for the full option reference.
 
 ## Real-world example: authorized proxy from object storage
 
@@ -209,6 +286,7 @@ The full reference lives in **[docs/API.md](docs/API.md)**. The shape of the sur
 - **Serving** (`/web`, `/node`, `/hono`): `serveObject` handlers with `disposition`, `cacheControl` (verbatim passthrough), security headers, `onServe` / `onTransfer` / `onError` / `onTiming` observability hooks, `auditKey` (PII-free audit events), `maxRanges`, and a slow-read stall bound on the Node pump
 - **Stores** (`/s3`, `/r2`, `/gcs`, `/azure`, `/fs`, `/http`, `/memory`): ready-made `ObjectStore` implementations with pinned reads and truthful error mapping (404 / retryable 503 + `Retry-After` / 502)
 - **Custom adapters**: the published `ObjectStore` contract plus the primitives the built-ins are made of (`classifyStoreRead`, `nodeStreamToWeb`, `guardStreamLength`, `resolveServedRange`)
+- **Resumable uploads** (`/tus`, `/upload`, plus an `*UploadStore` factory on every storage subpath): `createTusHandler` / `createUploadHandler` wire dialects, the `ResumableWriteStore` write contract with honest per-backend capability flags, `UploadPolicy` bounds, cooperative-preemption locking, `onUploadEvent` content-free audit events, and `sweepExpired` housekeeping
 
 ## Design Decisions
 
@@ -266,6 +344,12 @@ The library surface maps directly to audit requirements for SOC 2 Type II, ISO 2
 | Cross-origin resource policy | CORP | `Cross-Origin-Resource-Policy` header support |
 | Performance observability | W3C Server-Timing | `Server-Timing` metrics with `onTiming` callback |
 | Cache control | RFC 9111 / RFC 5861 | Verbatim `Cache-Control` passthrough (`s-maxage`, `must-revalidate`, `stale-while-revalidate`, `stale-if-error`); auto-`immutable` for content-addressed keys |
+| Upload audit trail | SOC 2 CC7.2, ISO 27001 A.8.15 | `onUploadEvent` structured, content-free events (created, append accepted/rejected with reason, completed, cancelled, expired); `auditKey` substitutes an opaque id for the upload token and the filename-bearing storage key in every event |
+| Upload size bounds | OWASP (resource exhaustion) | `UploadPolicy` `maxSize`/`minSize`/`maxAppendSize`/`minAppendSize` enforced by the engine before any byte reaches storage; appends of unknown length are hard-capped mid-stream and an over-bound append terminally invalidates the resource |
+| Abandoned-upload expiry | GDPR Art. 5(1)(e) (storage limitation) | `maxAgeSeconds` policy (expired resources refuse every interaction and answer 410/404) plus the `sweepExpired` store hook to reap idle upload state on a schedule |
+| Upload integrity at completion | RFC 9530, GDPR Art. 32 (integrity of processing) | Client-asserted `Repr-Digest` SHA-256 verified against the assembled bytes BEFORE publication, on stores that can hash them (`fs`, `memory`); S3 multipart checksums are composite-only, so the S3 store honestly declines whole-object verification (`digestOnComplete: false`) and a digest asserted against it is rejected rather than silently ignored |
+
+Not claimed, deliberately: malware scanning, content-type allowlists, authentication/authorization, and per-tenant quotas are the caller's responsibility -- the upload handlers assume the request was already authorized, exactly like the serving handlers.
 
 ## License
 

@@ -1,4 +1,32 @@
-# Migrating from send or sirv
+# Migration
+
+## partial-content 1.x to 2.0
+
+2.0 adds the resumable-upload surface (`partial-content/tus`,
+`partial-content/upload`, and a `ResumableWriteStore` factory on every
+storage subpath). Everything new is additive. Three existing type signatures
+tightened; plain-JavaScript callers are unaffected by the first two, and the
+third only surfaces if you switch on the operation string:
+
+- **`evaluateConditionalRequest` `opts.method`** is now the union
+  `"GET" | "HEAD"` (previously a wider string type). Passing any other
+  method was never meaningful; a TypeScript caller forwarding `req.method`
+  verbatim now needs to narrow it first (writes belong to
+  `evaluateConditionalWrite`, everything else to your router's 405).
+- **`preferSignedUrl` `info.method`** is now the literal `"GET"`. HEAD
+  requests never consult the predicate (a metadata probe answered with a
+  bare 302 defeats exactly the clients that send HEAD), so the field could
+  never be anything else; the type now says so. Remove any dead
+  `method === "HEAD"` branches.
+- **The serve adapters' `onError` `operation` union gains `"sign"`**:
+  signed-URL minting failures now report as `operation: "sign"` (previously
+  they were folded into `"get"`/`"head"`). If you switch exhaustively on the
+  operation, add the arm.
+
+Everything else is unchanged: no serving option was renamed or removed, and
+the wire behavior of the read side is identical.
+
+## Migrating from send or sirv
 
 Both are excellent libraries for their job: serving a **local directory** over
 Node's `http`. Migrate when the job changes, typically because your bytes
@@ -6,7 +34,7 @@ moved to object storage (S3, R2, GCS, Azure), or because you need protocol
 behavior they don't implement. If you are serving a static asset folder and
 that's the whole job, keep what you have.
 
-## What changes conceptually
+### What changes conceptually
 
 `send` and `sirv` resolve a **URL path against a directory tree** (index
 files, extension fallbacks, dotfile policy). partial-content serves an
@@ -14,7 +42,7 @@ files, extension fallbacks, dotfile policy). partial-content serves an
 handles the HTTP protocol (200/206/304/412/416, HEAD). There is no directory
 walking, so directory-oriented features have no equivalent here by design.
 
-## What you gain
+### What you gain
 
 - Storage backends: S3-compatible, R2 native, GCS, Azure, any range-capable
   HTTP origin, local fs, in-memory. Same handler, same semantics.
@@ -33,7 +61,7 @@ walking, so directory-oriented features have no equivalent here by design.
   `dev: true` lifts it at a large throughput cost). partial-content always
   consults the backend.
 
-## What you lose (on purpose)
+### What you lose (on purpose)
 
 No `index.html` resolution, no extension fallback (`/page` -> `page.html`),
 no dotfile policy, no SPA `single` fallback, no precompressed `.gz`/`.br`
@@ -41,7 +69,7 @@ sibling lookup. Those are directory-tree concerns; put them in your router or
 keep `sirv` for that route. A hybrid is normal: `sirv` for the SPA shell,
 partial-content for user files.
 
-## From send
+### From send
 
 Before:
 
@@ -104,7 +132,7 @@ Two behavioral differences worth knowing before you flip traffic:
   weak ETag exists server-side, falling back to a full 200 rather than
   risking a spliced body.
 
-## From sirv
+### From sirv
 
 `sirv` is a static-asset middleware with a boot-time cache; most migrations
 keep sirv for the asset folder and adopt partial-content for dynamic or
@@ -132,7 +160,7 @@ app.use("/assets", serveObject(store, {
 | `onNoMatch` | 404 response is built in; wrap the handler to customize |
 | `single`, `extensions`, `gzip`, `brotli`, `ignores`, `dotfiles` | no equivalent, router/CDN concerns here |
 
-## Checklist
+### Checklist
 
 1. Pick the store for where the bytes live (`/fs`, `/s3`, `/r2`, `/gcs`,
    `/azure`, `/http`, `/memory`).

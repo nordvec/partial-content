@@ -283,7 +283,8 @@ export interface ServeObjectOptions {
    *
    * @param error - The original error from the storage backend
    * @param context - Additional context about the failed operation
-   * (`audit` = the consumer's own onServe/onTransfer hook threw; the
+   * (`sign` = a signed-URL provider rejected or declined during a redirect;
+   * `audit` = the consumer's own onServe/onTransfer hook threw; the
    * response was still served, the hook failure is surfaced here instead
    * of crashing. `context` = a consumer-supplied key/mime/filename
    * extractor threw in a server adapter; the request became a 500).
@@ -292,7 +293,7 @@ export interface ServeObjectOptions {
    * there is no sink for a failure of the error sink itself: a throwing
    * `onError` escapes the handler on every error path.
    */
-  onError?: (error: unknown, context: { key: string; operation: "head" | "get" | "audit" | "context" }) => void;
+  onError?: (error: unknown, context: { key: string; operation: "head" | "get" | "sign" | "audit" | "context" }) => void;
 
   /**
    * Audit callback for compliance logging (SOC 2 CC7.2, ISO 27001 A.8.15).
@@ -407,8 +408,7 @@ export interface ServeObjectOptions {
    * HEAD requests never consult the predicate: a metadata probe answered
    * with a bare 302 defeats exactly the clients that send HEAD (PDF.js size
    * probing, cache priming), so HEAD always serves real headers from the
-   * origin and `info.method` is always `"GET"`. (The field stays for
-   * signature compatibility; it narrows to `"GET"` in the next major.)
+   * origin and the predicate only ever evaluates GET requests.
    *
    * @example
    * ```ts
@@ -418,7 +418,7 @@ export interface ServeObjectOptions {
   preferSignedUrl?: (info: {
     key: string;
     mime: string;
-    method: "GET" | "HEAD";
+    method: "GET";
     isRange: boolean;
     isConditional: boolean;
   }) => boolean;
@@ -704,7 +704,7 @@ export function serveObjectRaw(
       ? (event: TransferEvent): void => onTransferBase({ ...event, key: auditKey })
       : onTransferBase;
     const onError = onErrorBase && auditKey !== undefined
-      ? (err: unknown, context: { key: string; operation: "head" | "get" | "audit" | "context" }): void =>
+      ? (err: unknown, context: { key: string; operation: "head" | "get" | "sign" | "audit" | "context" }): void =>
           onErrorBase(err, { ...context, key: auditKey })
       : onErrorBase;
 
@@ -1243,7 +1243,7 @@ async function signedUrlRedirect(args: SignedUrlRedirectArgs): Promise<RawRespon
   } catch (err) {
     // Never-throw contract: a rejecting signed-URL provider becomes a
     // reported 502, never an escaped rejection (which crashes Express 4).
-    onError?.(err, { key, operation: isHead ? "head" : "get" });
+    onError?.(err, { key, operation: "sign" });
     return plainTextError(502, "Bad Gateway", "Storage backend error");
   }
   if ("url" in result) {
@@ -1269,7 +1269,7 @@ async function signedUrlRedirect(args: SignedUrlRedirectArgs): Promise<RawRespon
   // honest 502.
   onError?.(
     new Error(`createSignedUrl declined for ${key}: ${result.error}`),
-    { key, operation: isHead ? "head" : "get" },
+    { key, operation: "sign" },
   );
   return plainTextError(502, "Bad Gateway", "Storage backend error");
 }

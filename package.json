@@ -1,7 +1,7 @@
 {
   "name": "partial-content",
-  "version": "1.5.0",
-  "description": "RFC-compliant HTTP file serving for any storage backend. Range requests (206), conditional caching (304/412), Content-Disposition, and ETag generation. Zero dependencies.",
+  "version": "2.0.0",
+  "description": "RFC-compliant HTTP file serving and resumable uploads for any storage backend. Range requests (206), conditional caching (304/412), Content-Disposition, ETag generation, and a resumable-upload engine speaking tus 1.0 and the IETF resumable-uploads draft. Zero dependencies.",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -78,7 +78,19 @@
       "import": "./dist/memory.js",
       "default": "./dist/memory.js"
     },
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./tus": {
+      "types": "./dist/tus.d.ts",
+      "bun": "./src/tus.ts",
+      "import": "./dist/tus.js",
+      "default": "./dist/tus.js"
+    },
+    "./upload": {
+      "types": "./dist/upload.d.ts",
+      "bun": "./src/upload.ts",
+      "import": "./dist/upload.js",
+      "default": "./dist/upload.js"
+    }
   },
   "files": [
     "dist",
@@ -129,7 +141,11 @@
     "hono",
     "nextjs",
     "express",
-    "fastify"
+    "fastify",
+    "resumable-upload",
+    "tus",
+    "upload",
+    "multipart-upload"
   ],
   "scripts": {
     "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc",

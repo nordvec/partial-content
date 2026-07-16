@@ -43,17 +43,24 @@ const FLOORS = {
     "upload-engine.ts": 90,     // baseline 91.73 (344 mutants; survivors are
                                 // undefined-comparison no-ops in optional-bound
                                 // guards, provably outcome-equivalent)
+    "upload-orchestrator.ts": 94, // baseline 95.98 (249 mutants; residuals are
+                                  // post-settle cleanup closures, once:true
+                                  // hygiene, and a defensive unreachable throw)
+    "upload-locker.ts": 96,     // baseline 100.00 (55 mutants; headroom for
+                                // timer-jitter timeout mutants)
+    "tus.ts": 90,               // baseline 91.94 (387 mutants)
+    "upload.ts": 97,            // baseline 100.00 (297 mutants; small headroom)
     "web.ts": 83,      // baseline 85.07 (988 mutants; survivors are telemetry payload
                        // contents, Server-Timing arithmetic, and stream-teardown
                        // internals with no observable contract)
     // ── SDK adapters (thin wrappers; equivalent-mutant heavy) ──
-    "s3.ts": 50,       // baseline 52.11
-    "r2.ts": 75,       // baseline 77.05
-    "gcs.ts": 66,      // baseline 68.99
-    "azure.ts": 64,    // baseline 66.87 (rose from 60.34 once async assertions were awaited)
+    "s3.ts": 73,       // baseline 75.55 (write store lifted it from 52.11)
+    "r2.ts": 80,       // baseline 82.46 (write store lifted it from 77.05)
+    "gcs.ts": 66,      // baseline 68.26 (write store; equivalent-heavy SDK spreads)
+    "azure.ts": 68,    // baseline 71.53 (write store lifted it from 66.87)
     "node.ts": 63,     // baseline 65.79
-    "memory.ts": 82,   // baseline 84.09
-    "fs.ts": 72,       // baseline 83.04 on win32; ~76 on CI (the win32-only device/ADS guard block is unreachable on Linux, its mutants survive there)
+    "memory.ts": 93,   // baseline 95.43 (write store lifted it from 84.09)
+    "fs.ts": 72,       // baseline 84.07 on win32 incl. the write store; lower on CI (the win32-only device/ADS guard block is unreachable on Linux, its mutants survive there)
     "hono.ts": 80,     // baseline 100.00 (5 mutants; tolerates one survivor)
 };
 

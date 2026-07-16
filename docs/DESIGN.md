@@ -14,6 +14,9 @@ Implementation details, RFC deviations, and architecture decisions for `partial-
 - Write-side preconditions (If-Match / If-None-Match / If-Unmodified-Since)
 - ETag derivation from storage metadata
 - Security-hardened `Content-Disposition`
+- Resumable-upload protocol evaluation: one wire-agnostic engine under two
+  dialects, tus 1.0 and the IETF resumable-uploads draft (see
+  [Resumable Uploads](#resumable-uploads))
 
 **Non-goals** (deliberately the caller's responsibility)
 
@@ -34,9 +37,9 @@ Implementation details, RFC deviations, and architecture decisions for `partial-
 
 ### When you need a protocol layer (and when you don't)
 
-You need this when you **proxy bytes through your own origin** — because each request must be authorized or audited, or because the browser talks to your origin rather than to storage (`<video>`/`<audio>` `Range` requests, PDF.js progressive loading, iframe CORS).
+You need this when you **proxy bytes through your own origin** -- because each request must be authorized or audited, or because the browser talks to your origin rather than to storage (`<video>`/`<audio>` `Range` requests, PDF.js progressive loading, iframe CORS).
 
-If you can instead hand the client a **short-lived signed URL** and let object storage or a CDN serve the bytes directly, the backend already speaks this protocol for you — and you may not need this library at all. Reach for `partial-content` precisely when that redirect *isn't* an option.
+If you can instead hand the client a **short-lived signed URL** and let object storage or a CDN serve the bytes directly, the backend already speaks this protocol for you -- and you may not need this library at all. Reach for `partial-content` precisely when that redirect *isn't* an option.
 
 ## Evaluation Order
 
@@ -597,6 +600,163 @@ protocol honest:
   silently. `buildCacheControl()` therefore defaults `no-transform` on; if
   you hand-write `cacheControl` strings for digest- or range-heavy routes,
   add it yourself.
+
+## Resumable Uploads
+
+The write side follows the same doctrine as the read side: a pure decision
+core that never touches bytes, wire dialects that only translate headers, and
+storage adapters that are honest about what their backend can actually
+promise.
+
+### One engine, two dialects
+
+There are two live resumable-upload wire protocols worth speaking: tus 1.0
+(the widely deployed de-facto standard) and the IETF draft
+(`draft-ietf-httpbis-resumable-upload`, its standards-track successor). Their
+wire syntax differs; their semantics are the same protocol: create a
+resource, probe its offset, append at the offset, complete, cancel. So the
+package implements the semantics ONCE, as a pure state machine that evaluates
+every interaction (create, probe, append, cancel) against caller-supplied
+state and policy and returns a typed verdict, and each dialect is a thin
+translation layer: parse this protocol's headers into an intent, map the
+verdict back to this protocol's statuses and header names. The dialects
+contain no protocol decisions at all, which is what keeps two wires from
+drifting into two subtly different upload semantics.
+
+Between the engine and storage sits an orchestrator that owns sequencing:
+every interaction runs under the resource's lock, state is fetched fresh from
+the store inside the lock immediately before evaluation (nothing from an
+earlier request is ever reused), and the orchestrator executes exactly the
+verdict's action and nothing else.
+
+### The interop-version allowlist {3, 5, 6}
+
+The IETF handler speaks the draft revisions actual clients implement,
+identified by their interop versions: 3 (draft-01), 5 (draft-03), and 6
+(draft-04/-05). The draft itself forbids cross-version interop, so versions
+are a compiled allowlist and an unlisted version is answered 400 with the
+supported set named. Later revisions have no deployed speakers, so their
+surface (version negotiation, `Upload-Limit`, GET as an offset probe) is
+deliberately absent until a stabilized revision ships real clients. The wire
+differences between the supported versions are encoded in one explicit
+mapping table, the most important being the completeness header flip:
+interop 3 sends `Upload-Incomplete` (`?1` asserts NOT complete), interop 5
+and 6 send `Upload-Complete` (`?1` asserts complete). Both names ride
+requests and responses, so the polarity is a per-version fact, never a
+renamed boolean.
+
+### Offsets are backend-derived, never stored counters
+
+The write contract's one load-bearing rule: `getUploadState().offset` must be
+computed from storage bookkeeping the backend itself maintains -- a part
+listing, an uncommitted-block list, an fsynced file size -- never from a
+counter the adapter persisted alongside the data. A stored counter and the
+bytes it describes cannot be written atomically: crash between them and one
+is a lie. If the counter runs ahead, the client resumes past bytes that never
+landed and the object is silently corrupt; that drift is exactly the
+corruption class resumable uploads exist to prevent. Deriving the offset from
+the durable artifacts themselves makes the crash case boring: whatever
+survived IS the offset. The engine treats adapter-reported state as
+authoritative truth, and a malformed state (offset past a known length
+without invalidation) throws loudly as an adapter bug rather than laundering
+corruption into protocol answers.
+
+### Cooperative-preemption locking
+
+The race that shapes the lock design: a client's connection drops mid-append,
+and the client resumes (probe, then append) BEFORE the server has noticed the
+dead socket. A plain acquire-or-wait mutex would stall every resume behind
+the zombie holder's timeout. Cooperative preemption inverts it: the new
+acquirer asks the HOLDER to stop, the holder aborts its append at the next
+chunk boundary (flushing what it has, so the offset stays truthful), and the
+lock hands over in milliseconds. Probes take the lock too: deriving an offset
+can be a multi-call read against the backend, and answering from a torn
+snapshot while an append is mid-flight would hand the client an offset its
+very next request fails on. A holder that cannot be interrupted surfaces as a
+retryable 423 after the acquire timeout, never an indefinite hang. The
+default locker is in-process; multi-instance deployments supply their own
+through the same tiny interface.
+
+### The post-abort grace window
+
+When a client vanishes mid-append, the bytes that already arrived deserve to
+become durable: the tus core protocol's network-failure guidance has both
+sides keep as much transferred data as possible, and the next probe must
+report an offset that reflects reality. So the orchestrator decouples the
+storage signal from the request signal: on client abort, the store write gets
+a grace window (default 10 s) to flush what it received before it is
+cancelled. Without the window, an aborted request would tear down the storage
+write mid-flush and the durable offset would be smaller than it honestly
+could be, costing the client a re-upload of bytes the server already had.
+
+### Per-backend mapping honesty
+
+Each write store maps the contract onto what its backend can actually do, and
+declares capability flags the orchestrator reads instead of assuming:
+
+- **Filesystem**: appends are fsynced before they are acknowledged, because
+  `exactOffsetRecovery` is only honest if a post-crash `stat` can never see
+  bytes that were acked but not flushed. Completion verifies any asserted
+  SHA-256 by streaming the assembled file, then publishes with a same-volume
+  atomic `rename()`: a failed or crashed completion never leaves a torn
+  object visible.
+- **S3-compatible**: multipart uploads enforce a 5 MiB floor on every
+  non-final part, so appends buffer to the floor and the sub-minimum
+  remainder is parked in a sidecar object, prepended to the next append or
+  committed as the size-exempt final part at completion. The offset derives
+  from `ListParts` plus the sidecar's size. The optional flexible-checksums
+  mode gives per-part transport integrity only: multipart SHA-256 checksums
+  are composite (a hash of per-part hashes), so no S3 backend can verify a
+  caller-asserted whole-representation SHA-256 at completion, and the store
+  declares `digestOnComplete: false` rather than pretending.
+- **GCS**: deliberately NOT the native resumable sessions, which demand
+  256 KiB append alignment and bind the whole upload to one session URI --
+  breaking byte-exact appends and stateless crash recovery. Instead each
+  append is its own immutable chunk object (a single-shot object write is
+  atomic: a chunk fully exists or does not exist), the offset is the sum of
+  listed chunk sizes, and completion assembles via server-side compose,
+  level by level under the 32-source cap, with a single final compose onto
+  the destination key so publication is all-or-nothing. Chunks are deleted
+  only after that final compose, so a crashed completion retries from intact
+  chunks.
+- **Azure**: appends stage uncommitted blocks on the final blob (invisible to
+  readers until commit), the offset derives from the uncommitted-block list,
+  and `Put Block List` publishes atomically. A freshly created upload with no
+  data staged would be indistinguishable from a missing one, so creation
+  stages a one-byte sentinel block under a reserved id: excluded from offset
+  sums, never committed, dropped by Azure at commit time. Azure's native GC
+  reaps uncommitted blocks after 7 days; the sweep hook reaps the small
+  bookkeeping blobs Azure will not.
+- **R2**: the native multipart binding exposes no ListParts, so the adapter
+  keeps its own durable part ledger, rewritten after every accepted part, and
+  derives the offset from it. The write ordering (part first, then ledger)
+  means a crash between the two orphans the just-uploaded part and the
+  derived offset honestly excludes it. That honesty has a hard limit, and it
+  is why R2 is the one store declaring `exactOffsetRecovery: false`: the
+  ledger is the adapter's own bookkeeping, not backend-derived truth, and the
+  binding offers nothing to cross-check it against. R2 also requires every
+  non-final part of an upload to be the same size, so appends buffer to a
+  fixed part size recorded at creation.
+
+### Deliberate omissions
+
+- **No concatenation extension** (tus): a parallel-upload pattern with
+  substantial storage surface (partial uploads merged server-side), outside
+  the dialect's scope.
+- **No per-request checksum extension yet** (tus `Upload-Checksum`): the
+  package is zero-dependency and runtime-agnostic, so per-append hashing
+  needs a caller-injected hasher; the extension waits on that API rather than
+  shipping a runtime-coupled hash. Whole-representation verification at
+  completion (the IETF dialect's `Repr-Digest`) exists where the store can
+  honestly provide it.
+- **No `104 (Upload Resumption Supported)` interim responses** from the Fetch
+  handlers: a Fetch `Response` cannot carry interim responses, and the draft
+  only asks servers to send 104 when they can. The
+  `onResumptionSupported` hook carries the same facts, so a transport that
+  can write interim responses may emit the 104 itself.
+- **Final-response replay is descoped**: a completed upload answers
+  idempotent retries with its offset and completeness (the durable facts),
+  not a stored copy of the original completion response.
 
 ## Runtime Notes
 

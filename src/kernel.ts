@@ -1057,9 +1057,11 @@ export function evaluateConditionalRequest(
     /**
      * Request method this evaluation answers. Range/If-Range are honored
      * only for `"GET"`; `"HEAD"` additionally suppresses `Content-Digest`.
+     * Only these two methods have read-conditional semantics: writes go
+     * through `evaluateConditionalWrite`, whose 412 rules differ.
      * @default "GET"
      */
-    method?: string;
+    method?: "GET" | "HEAD";
   },
 ): EvaluatedRequest {
   // Guard against corrupt metadata from storage adapters. NaN, Infinity,
