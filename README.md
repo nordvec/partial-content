@@ -72,7 +72,7 @@ Cloud SDKs are **optional peer dependencies**: `@aws-sdk/client-s3` for `/s3` (p
 - **Built-in framework adapters**: Fetch API (Next.js, SvelteKit, Remix, Nuxt, Astro, Workers, Bun.serve, Deno.serve), Node.js (Express/Fastify/Koa/raw http), Hono
 - Range requests (206, 416), including multi-range `multipart/byteranges` with overlapping/adjacent-range coalescing and range-amplification defense (`maxRanges`)
 - **Precompressed variant negotiation** (`precompressed: true`): serves `<key>.br`/`<key>.zst`/`<key>.gz` siblings via Accept-Encoding (RFC 9110 12.5.3) with `Content-Encoding` + `Vary`, the variant's OWN validators and digest, and byte ranges computed against the encoded bytes -- the correctness detail naive precompressed serving gets wrong
-- **Per-request egress offload** (`preferSignedUrl`): split one route by request shape -- proxy ranges and revalidations, 302 large full-file downloads to a signed URL that carries your `Cache-Control` (S3 `response-cache-control`)
+- **Per-request egress offload** (`preferSignedUrl`): split one route by request shape -- proxy ranges, revalidations, and HEAD probes, 302 large full-file downloads to a signed URL that carries your `Cache-Control` (S3 `response-cache-control`; signed URLs also mint on GCS and Azure)
 - **Inline active-content lockdown**: SVG/HTML/XML served `inline` automatically gets `Content-Security-Policy: sandbox` (caller-overridable), so a stored `image/svg+xml` cannot execute script from your origin
 - **`buildCacheControl()`**: typed Cache-Control composer (visibility, max-age, immutable, RFC 5861 stale-while-revalidate/stale-if-error) that defaults `no-transform` on, because intermediary transforms corrupt byte ranges, digests, and strong validators
 - Conditional requests (304, 412) with sub-second timestamp flooring
@@ -190,6 +190,11 @@ async function serveFile(request: Request, key: string) {
     key: file.path,
     mime: file.mimeType,
     filename: file.filename,
+    // Storage keys usually embed the filename: personal data that logging
+    // controls (ISO 27001 A.8.15, OWASP ASVS) keep out of log records.
+    // auditKey replaces `key` in every hook event with an opaque id, so
+    // the audit trail stays correlatable without the filename.
+    auditKey: file.id,
   });
 }
 ```
@@ -201,7 +206,7 @@ This is the path behind `<video>`/`<audio>` seeking and PDF.js progressive loadi
 The full reference lives in **[docs/API.md](docs/API.md)**. The shape of the surface:
 
 - **Kernel** (`partial-content`): `evaluateConditionalRequest` / `evaluateConditionalWrite` (the one-call orchestrators), the step-by-step primitives (`parseRangeHeader`, `parseRanges`, `isConditionalFresh`, `isPreconditionFailure`, `isRangeFresh`, the `build*Headers` family), `generateETag`, `buildContentDisposition`, `clientWantsDigest`, `clientWantsContentDigest`, `fromNodeHeaders`, `sanitizeHeaderValue`
-- **Serving** (`/web`, `/node`, `/hono`): `serveObject` handlers with `disposition`, `cacheControl` (verbatim passthrough), security headers, `onServe` / `onTransfer` / `onError` / `onTiming` observability hooks, `maxRanges`, and a slow-read stall bound on the Node pump
+- **Serving** (`/web`, `/node`, `/hono`): `serveObject` handlers with `disposition`, `cacheControl` (verbatim passthrough), security headers, `onServe` / `onTransfer` / `onError` / `onTiming` observability hooks, `auditKey` (PII-free audit events), `maxRanges`, and a slow-read stall bound on the Node pump
 - **Stores** (`/s3`, `/r2`, `/gcs`, `/azure`, `/fs`, `/http`, `/memory`): ready-made `ObjectStore` implementations with pinned reads and truthful error mapping (404 / retryable 503 + `Retry-After` / 502)
 - **Custom adapters**: the published `ObjectStore` contract plus the primitives the built-ins are made of (`classifyStoreRead`, `nodeStreamToWeb`, `guardStreamLength`, `resolveServedRange`)
 
@@ -244,13 +249,14 @@ The library surface maps directly to audit requirements for SOC 2 Type II, ISO 2
 
 | Requirement | Standard | Feature |
 |---|---|---|
-| Integrity verification | RFC 9530, SOC 2 CC6.1 | `Repr-Digest` (SHA-256) on 200/206 responses whenever the backend supplies a representation digest (S3 checksummed uploads, `digest` in metadata) |
+| Integrity verification | RFC 9530, GDPR Art. 32 (integrity of processing) | `Repr-Digest` (SHA-256) on 200/206 responses whenever the backend supplies a representation digest (S3 checksummed uploads, `digest` in metadata, `gcsStore` `digestMetadataKey`) |
 | Content integrity | RFC 9530 Section 2 | `Content-Digest` on 200 (content = full representation) |
 | Digest negotiation | RFC 9530 Section 4 | `Want-Repr-Digest` / `Want-Content-Digest` parsing |
-| Audit trail | SOC 2 CC7.2, ISO 27001 A.8.15 | `onServe` callback with structured audit events (bytes granted) |
+| Audit trail | SOC 2 CC7.2, ISO 27001 A.8.15 | `onServe` callback with structured audit events (bytes granted); feeds the monitoring/detection layer DORA Art. 10 and EU AI Act Art. 12 ask for once wired to your alerting stack |
+| Log data minimization | ISO 27001 A.8.15, OWASP ASVS (no PII in logs) | `auditKey` substitutes an opaque id for the filename-bearing storage key in every hook event |
 | Egress accounting / abandonment | operational | `onTransfer` callback with true bytes transferred and a `completed` flag |
 | Encoding-sniffing XSS prevention | OWASP | `charset=utf-8` enforcement on textual MIME types |
-| MIME-sniffing prevention | OWASP, SOC 2 CC6.6 | `X-Content-Type-Options: nosniff` on every success + error response (`200`/`206`, the `404`/`502`/`503` bodies, and the bodyless `412`/`416` denials); `304`/`302` carry none |
+| MIME-sniffing prevention | OWASP | `X-Content-Type-Options: nosniff` on every success + error response (`200`/`206`, the `404`/`502`/`503` bodies, and the bodyless `412`/`416` denials); `304`/`302` carry none |
 | Header injection prevention | OWASP, CWE-113 | CRLF stripping in ETag, Last-Modified, filename |
 | Content-Disposition hardening | RFC 6266, RFC 8187 | Bidi override stripping, path traversal prevention |
 | Conditional request compliance | RFC 9110, RFC 7232 | Full precondition evaluation chain (412, 304, 416) |

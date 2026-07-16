@@ -472,6 +472,64 @@ describe("serveObject: supportsRange=false degradation", () => {
         const body = await res.text();
         expect(String(body.length)).toBe(res.headers.get("Content-Length")!);
     });
+
+    function rangelessSignedStore(signedCalls: unknown[] = []): ObjectStore {
+        return {
+            supportsRange: false,
+            headObject: async () => ({ contentLength: 20, etag: '"v1"' }),
+            getObject: async () => { throw new Error("unreachable"); },
+            createSignedUrl: async (_key, opts) => {
+                signedCalls.push(opts);
+                return { ok: true, url: "https://cdn.example/signed" };
+            },
+        };
+    }
+
+    test("HEAD serves real metadata headers from the origin, never a 302", async () => {
+        // A metadata probe answered with a bare Location defeats the clients
+        // that send HEAD (PDF.js size probing); the store can headObject, so
+        // answer with the real headers.
+        const signedCalls: unknown[] = [];
+        const handler = serveObject(rangelessSignedStore(signedCalls));
+        const res = await handler(req({}, "HEAD"), { key: KEY });
+
+        expect(res.status).toBe(200);
+        expect(res.headers.get("Content-Length")).toBe("20");
+        expect(res.headers.get("ETag")).toBe('"v1"');
+        expect(res.headers.get("Accept-Ranges")).toBe("none");
+        expect(signedCalls).toHaveLength(0);
+    });
+
+    test("a matching conditional GET revalidates as 304 at the origin instead of redirecting", async () => {
+        // Redirecting a revalidation would force a full re-download from the
+        // backend on every If-None-Match round; the origin can answer 304
+        // from headObject alone.
+        const signedCalls: unknown[] = [];
+        const handler = serveObject(rangelessSignedStore(signedCalls));
+        const res = await handler(req({ "If-None-Match": '"v1"' }), { key: KEY });
+
+        expect(res.status).toBe(304);
+        expect(signedCalls).toHaveLength(0);
+    });
+
+    test("a stale conditional GET still offloads: the would-be 200 body redirects", async () => {
+        const signedCalls: unknown[] = [];
+        const handler = serveObject(rangelessSignedStore(signedCalls));
+        const res = await handler(req({ "If-None-Match": '"old"' }), { key: KEY });
+
+        expect(res.status).toBe(302);
+        expect(res.headers.get("Location")).toBe("https://cdn.example/signed");
+        expect(signedCalls).toHaveLength(1);
+    });
+
+    test("a failed If-Match write precondition answers 412 at the origin, not a 302", async () => {
+        const signedCalls: unknown[] = [];
+        const handler = serveObject(rangelessSignedStore(signedCalls));
+        const res = await handler(req({ "If-Match": '"stale"' }), { key: KEY });
+
+        expect(res.status).toBe(412);
+        expect(signedCalls).toHaveLength(0);
+    });
 });
 
 // ─── Observability ──────────────────────────────────────────────────────────
@@ -489,6 +547,50 @@ describe("serveObject: audit and headers", () => {
             key: KEY, status: 206, mime: "video/mp4",
             bytesServed: 5, rangeStart: 5, rangeEnd: 9,
         });
+    });
+
+    test("ctx.auditKey substitutes the storage key in every hook event", async () => {
+        // Storage keys embed filenames (personal data); an opaque auditKey
+        // keeps the audit trail correlatable without them. The store must
+        // still be read by the REAL key.
+        const events: ServeAuditEvent[] = [];
+        const transfers: string[] = [];
+        const handler = serveObject(memoryStore({ etag: ETAG }), {
+            onServe: (e) => events.push(e),
+            onTransfer: (e) => transfers.push(e.key),
+        });
+        const res = await handler(req(), { key: KEY, auditKey: "doc-42" });
+
+        expect(res.status).toBe(200);
+        expect(await res.text()).toBe("0123456789abcdefghij");
+        expect(events).toHaveLength(1);
+        expect(events[0]!.key).toBe("doc-42");
+        expect(transfers).toEqual(["doc-42"]);
+    });
+
+    test("ctx.auditKey substitutes the key in onError events too", async () => {
+        const errorKeys: string[] = [];
+        const store = memoryStore({ etag: ETAG });
+        store.headObject = async () => { throw new Error("backend down"); };
+        const handler = serveObject(store, {
+            onError: (_err, ctx) => errorKeys.push(ctx.key),
+        });
+        const res = await handler(req({ "If-None-Match": ETAG }), { key: KEY, auditKey: "doc-42" });
+
+        expect(res.status).toBe(502);
+        expect(errorKeys).toEqual(["doc-42"]);
+    });
+
+    test("a throwing hook reports the auditKey, not the storage key, through onError", async () => {
+        const errorKeys: string[] = [];
+        const handler = serveObject(memoryStore({ etag: ETAG }), {
+            onServe: () => { throw new Error("audit sink down"); },
+            onError: (_err, ctx) => errorKeys.push(ctx.key),
+        });
+        const res = await handler(req(), { key: KEY, auditKey: "doc-42" });
+
+        expect(res.status).toBe(200);
+        expect(errorKeys).toEqual(["doc-42"]);
     });
 
     test("onServe fires with bytesServed 0 on 304", async () => {
@@ -578,6 +680,18 @@ describe("serveObject: audit and headers", () => {
             { key: KEY },
         );
         expect(res.headers.get("Repr-Digest")).toBeNull();
+    });
+
+    test("declined Repr-Digest does not suppress a wanted Content-Digest (independent Want-* fields)", async () => {
+        const digest = "MV9b23bQeMQ7isAGTkoBZGErH853yGk0W/yUx1iU7dM=";
+        const handler = serveObject(memoryStore({ etag: ETAG, digest }));
+        const res = await handler(
+            req({ "Want-Repr-Digest": "sha-256=0", "Want-Content-Digest": "sha-256=5" }),
+            { key: KEY },
+        );
+        expect(res.status).toBe(200);
+        expect(res.headers.get("Repr-Digest")).toBeNull();
+        expect(res.headers.get("Content-Digest")).toBe(`sha-256=:${digest}:`);
     });
 
     test("ctx.cacheControl overrides the handler-level Cache-Control per request", async () => {
@@ -1798,6 +1912,21 @@ describe("preferSignedUrl offload", () => {
 
         expect(res.status).toBe(200);
         expect(await res.text()).toBe("0123456789abcdefghij");
+    });
+
+    test("HEAD never offloads, even when the predicate says always", async () => {
+        // A metadata probe answered with a bare 302 defeats exactly the
+        // clients that send HEAD (PDF.js size probing); the predicate is
+        // never consulted for HEAD.
+        const signedOpts: unknown[] = [];
+        const handler = serveObject(offloadStore(signedOpts), {
+            preferSignedUrl: () => true,
+        });
+        const res = await handler(req({}, "HEAD"), { key: KEY });
+
+        expect(res.status).toBe(200);
+        expect(res.headers.get("Content-Length")).toBe("20");
+        expect(signedOpts).toHaveLength(0);
     });
 });
 

@@ -61,6 +61,12 @@ export interface HttpStoreOptions {
   /**
    * Request headers (e.g. Authorization). A static record, or a function of
    * the key for per-object credentials.
+   *
+   * `Accept-Encoding`, `Range`, and `If-Match` are reserved: the adapter owns
+   * them for byte-accounting and pinned-read correctness, and any supplied
+   * value is replaced (case-insensitively, so a lowercase `accept-encoding`
+   * cannot merge with the adapter's into a combined header the origin would
+   * honor over the identity requirement).
    */
   headers?: Record<string, string> | ((key: string) => Record<string, string>);
   /**
@@ -91,18 +97,28 @@ export function httpStore(opts: HttpStoreOptions): ObjectStore {
   const doFetch = opts.fetch ?? globalThis.fetch;
   const redirect = opts.redirect ?? "error";
 
-  function requestHeaders(key: string): Record<string, string> {
+  function requestHeaders(key: string): Headers {
     const base = typeof opts.headers === "function"
       ? opts.headers(key)
       : opts.headers ?? {};
-    return {
-      ...base,
-      // Byte accounting depends on the origin NOT transparently compressing:
-      // a gzip'd body would break Content-Length/Content-Range math. Server
-      // runtimes (undici, Bun, Deno, Workers) honor this; identity is also
-      // what object-storage origins serve anyway.
-      "Accept-Encoding": "identity",
-    };
+    // A Headers instance, not a spread record: header names are
+    // case-insensitive on the wire but object keys are not, so a consumer's
+    // lowercase `accept-encoding` would survive a spread alongside ours and
+    // fetch would MERGE the duplicates into e.g. "gzip, identity", silently
+    // authorizing the compressed bodies the identity requirement exists to
+    // prevent. `set()` replaces any spelling of the reserved fields.
+    const headers = new Headers(base);
+    // Byte accounting depends on the origin NOT transparently compressing:
+    // a gzip'd body would break Content-Length/Content-Range math. Server
+    // runtimes (undici, Bun, Deno, Workers) honor this; identity is also
+    // what object-storage origins serve anyway.
+    headers.set("Accept-Encoding", "identity");
+    // Reserved protocol fields: a stale consumer-supplied Range would turn a
+    // full read into an unrequested 206, and a consumer If-Match would fight
+    // the orchestrator's pin. Cleared here; set per request below.
+    headers.delete("Range");
+    headers.delete("If-Match");
+    return headers;
   }
 
   return {
@@ -160,9 +176,12 @@ export function httpStore(opts: HttpStoreOptions): ObjectStore {
       // Open-ended fast-path ranges carry the OPEN_ENDED sentinel end; emit
       // the bare `bytes=a-` form rather than a 16-digit last-byte-pos.
       if (range) {
-        headers["Range"] = isOpenEndedRange(range)
-          ? `bytes=${range.start}-`
-          : `bytes=${range.start}-${range.end}`;
+        headers.set(
+          "Range",
+          isOpenEndedRange(range)
+            ? `bytes=${range.start}-`
+            : `bytes=${range.start}-${range.end}`,
+        );
       }
       // Pin the read to the validated representation. Origins that honor
       // If-Match (S3, Azure, nginx, another partial-content server) answer
@@ -171,7 +190,7 @@ export function httpStore(opts: HttpStoreOptions): ObjectStore {
       // RFC 9110 mandates strong comparison for If-Match, so a `W/` ETag
       // would be rejected by every compliant origin on every attempt.
       if (ifMatch && !ifMatch.startsWith("W/")) {
-        headers["If-Match"] = ifMatch;
+        headers.set("If-Match", ifMatch);
       }
 
       const response = await doFetch(opts.url(key), {
@@ -248,6 +267,17 @@ export function httpStore(opts: HttpStoreOptions): ObjectStore {
         }
         contentLength = headerLength;
         totalSize = contentLength;
+      }
+
+      // A bodyless response that DECLARES bytes would otherwise serve a
+      // clean-looking empty stream under a non-zero committed Content-Length
+      // (truncated but "complete"). No conformant fetch runtime produces
+      // this shape (a 200/206 body is never null); refuse an injected or
+      // broken implementation loudly instead.
+      if (!response.body && contentLength > 0) {
+        throw new Error(
+          `httpStore GET ${key}: origin response has no body but declares ${contentLength} bytes`,
+        );
       }
 
       return {

@@ -38,7 +38,7 @@ The complete export surface. Everything is typed; your editor's IntelliSense mir
 
 **`clientWantsDigest(reqHeaders)`** - RFC 9530 Section 4 negotiation for `Repr-Digest`: `true` when the client's `Want-Repr-Digest` accepts `sha-256` (or the header is absent). Duplicate keys resolve last-wins per RFC 8941. The web adapter and orchestrator both honor this on every path including multipart, so `Want-Repr-Digest: sha-256=0` suppresses digest emission everywhere.
 
-**`clientWantsContentDigest(reqHeaders)`** - The same negotiation for `Content-Digest` via `Want-Content-Digest`. Each Want-* field gates only its own response field: a client can decline `Content-Digest` while still receiving `Repr-Digest`.
+**`clientWantsContentDigest(reqHeaders)`** - The same negotiation for `Content-Digest` via `Want-Content-Digest`. Each Want-* field gates only its own response field: a client can decline `Content-Digest` while still receiving `Repr-Digest`, and decline `Repr-Digest` while still receiving `Content-Digest` on a full 200.
 
 **`sanitizeHeaderValue(s)`** - Strip every byte outside RFC 9110 field-value grammar. The kernel applies it to all metadata-derived headers; exported so adapters can sanitize headers they build themselves.
 
@@ -67,7 +67,7 @@ app.get("/files/:key", serveObject(store, {
 
 ## Universal HTTP Store (`partial-content/http`)
 
-**`httpStore({ url, headers?, fetch?, redirect? })`** - Serve from ANY range-capable HTTP origin over plain `fetch`: Supabase Storage, presigned S3/GCS/Azure URLs, CDN origins, or another partial-content server. Pinned reads map to `If-Match` (origin 412 -> `ObjectChangedError`), `Repr-Digest` response headers are extracted, and requests are sent `Accept-Encoding: identity` and any response that still carries a non-identity `Content-Encoding` is refused, so transparent compression can never corrupt byte accounting. Redirects error by default (a hostile origin must not 3xx the store toward internal/metadata IPs); set `redirect: "follow"` for origins that legitimately redirect, paired with a validating `fetch` when keys are untrusted (see SECURITY.md).
+**`httpStore({ url, headers?, fetch?, redirect? })`** - Serve from ANY range-capable HTTP origin over plain `fetch`: Supabase Storage, presigned S3/GCS/Azure URLs, CDN origins, or another partial-content server. Pinned reads map to `If-Match` (origin 412 -> `ObjectChangedError`), `Repr-Digest` response headers are extracted, and requests are sent `Accept-Encoding: identity` and any response that still carries a non-identity `Content-Encoding` is refused, so transparent compression can never corrupt byte accounting. `Accept-Encoding`, `Range`, and `If-Match` are reserved: the adapter owns them and replaces any consumer-supplied value case-insensitively. Redirects error by default (a hostile origin must not 3xx the store toward internal/metadata IPs); set `redirect: "follow"` for origins that legitimately redirect, paired with a validating `fetch` when keys are untrusted (see SECURITY.md).
 
 ```typescript
 import { httpStore } from "partial-content/http";
@@ -88,9 +88,9 @@ const store = httpStore({
 
 **`r2Store({ bucket })`** (`partial-content/r2`) - Cloudflare R2 via the native Workers binding (no AWS SDK). Pinned reads via `onlyIf.etagMatches`; served bounds come from R2's own reported range.
 
-**`gcsStore({ bucket })`** (`partial-content/gcs`) - Google Cloud Storage via `@google-cloud/storage`. Pins reads to the object GENERATION (an opaque `pin` token from `headObject` makes the HEAD->GET pair a single metadata round-trip).
+**`gcsStore({ storage, bucket, digestMetadataKey? })`** (`partial-content/gcs`) - Google Cloud Storage via `@google-cloud/storage` (pass the constructed `Storage` client plus the bucket name). Pins reads to the object GENERATION (an opaque `pin` token from `headObject` makes the HEAD->GET pair a single metadata round-trip), and mints V4 signed READ URLs via `createSignedUrl` (no Cache-Control response override -- GCS signed URLs have no `response-cache-control` parameter, unlike S3). GCS exposes no native SHA-256 (`x-goog-hash` carries only `crc32c`/`md5`), so set `digestMetadataKey` to the custom-metadata key where your uploader stores the raw-base64 SHA-256 and the store surfaces it as the RFC 9530 digest; invalid or absent values are simply not emitted.
 
-**`azureStore({ containerClient })`** (`partial-content/azure`) - Azure Blob Storage via `@azure/storage-blob`. Single-call `download()` (metadata and body are one response by construction); pinned reads via `conditions.ifMatch`.
+**`azureStore({ containerClient })`** (`partial-content/azure`) - Azure Blob Storage via `@azure/storage-blob`. Single-call `download()` (metadata and body are one response by construction); pinned reads via `conditions.ifMatch`; `createSignedUrl` mints a read-only SAS URL (requires a shared-key credential on the client) with sanitized Content-Disposition, inert content type, and the Cache-Control response override.
 
 **`fsStore({ root, cache? })`** (`partial-content/fs`) - Local filesystem with path-traversal/null-byte/Windows-device-name hardening, nanosecond-mtime weak ETags, an fd-coherent stat+stream (no stat-then-reopen race), `authoritativeRange` single-round-trip range serving (the one open handle stats, clamps, and reads, so bounds, validators, and bytes are coherent by construction), a single-read fast path for bodies <= 128 KiB, and an opt-in TTL/LRU hot-object cache (nginx `open_file_cache` semantics; see Benchmarks).
 
@@ -98,7 +98,7 @@ The cloud SDKs are optional peer dependencies: install only the one your store u
 
 ## Hono Adapter (`partial-content/hono`)
 
-**`serveObject(store, options)`** - A Hono handler factory over the same engine: web-adapter options plus `key`/`mime`/`filename` extractors receiving the Hono `Context`.
+**`serveObject(store, options)`** - A Hono handler factory over the same engine: web-adapter options plus `key`/`mime`/`filename`/`auditKey` extractors receiving the Hono `Context`.
 
 ## Web Adapter (`partial-content/web`)
 
@@ -110,11 +110,23 @@ Options: `disposition`, `cacheControl`, `immutable`, `etag` (set `false` to supp
 
 **`precompressed: true | ["br", "zstd", "gzip"]`** - Serve precompressed sibling objects (`<key>.br`, `<key>.zst`, `<key>.gz`) negotiated via `Accept-Encoding` (RFC 9110 12.5.3: qvalues, `*`, `identity` preference; the array order is the server tie-break). The chosen variant is its own representation: its validators drive 304/If-Range, its size drives Range/`Content-Range`/416 (byte ranges address the ENCODED bytes), its digest rides `Repr-Digest`, and `Vary: Accept-Encoding` is emitted on every success response for the type, including identity fallbacks and 304s. Gated on compressible MIME types (`isCompressibleMime`); multi-range requests serve identity; a non-404 probe failure falls back to identity and reports to `onError`. Selection only -- upload the variants yourself (e.g. `brotli -k`, `gzip -k` at build/ingest time); the library never compresses at serve time because transforming would corrupt byte ranges and digests.
 
-**`preferSignedUrl(info)`** - Per-request egress offload: return `true` to answer a 302 to `createSignedUrl` instead of proxying bytes (`info` = `{ key, mime, method, isRange, isConditional }`). The classic split is `({ isRange, isConditional }) => !isRange && !isConditional`: ranges and revalidations stay on the origin where the protocol machinery matters, large full-file downloads go straight to the bucket. The signed request carries the route's `cacheControl` (S3 `response-cache-control` override) so private documents cannot be CDN-cached under an object's baked-in public Cache-Control. `signedUrlExpiresSeconds` (default 60) sets the URL lifetime -- note that temporary credentials (STS/Lambda) cap the effective lifetime at the session token's remaining life regardless.
+**`preferSignedUrl(info)`** - Per-request egress offload: return `true` to answer a 302 to `createSignedUrl` instead of proxying bytes (`info` = `{ key, mime, method, isRange, isConditional }`). The classic split is `({ isRange, isConditional }) => !isRange && !isConditional`: ranges and revalidations stay on the origin where the protocol machinery matters, large full-file downloads go straight to the bucket. HEAD requests never consult the predicate (a metadata probe answered with a bare 302 defeats exactly the clients that send HEAD, like PDF.js size probing), so `info.method` is always `"GET"`. The signed request carries the route's `cacheControl` (S3 `response-cache-control` override) so private documents cannot be CDN-cached under an object's baked-in public Cache-Control. `signedUrlExpiresSeconds` (default 60) sets the URL lifetime -- note that temporary credentials (STS/Lambda) cap the effective lifetime at the session token's remaining life regardless.
 
-Method surface: GET and HEAD are served (HEAD with identical headers and no body), OPTIONS answers `204` + `Allow: GET, HEAD, OPTIONS`, everything else `405`. A store with `supportsRange: false` redirects to a signed URL when it can (`createSignedUrl`), and otherwise serves the FULL representation with `Accept-Ranges: none` (Range and If-Range read as absent; conditionals still work).
+Method surface: GET and HEAD are served (HEAD with identical headers and no body), OPTIONS answers `204` + `Allow: GET, HEAD, OPTIONS`, everything else `405`. A store with `supportsRange: false` and `createSignedUrl` answers a plain GET with an immediate 302 (no origin round-trip), while HEAD and conditional requests are answered at the origin (real headers, 304, 412) and only a would-be-200 conditional GET redirects; without `createSignedUrl` it serves the FULL representation with `Accept-Ranges: none` (Range and If-Range read as absent; conditionals still work).
 
-`ServeContext`: `key` (required), `mime?`, `filename?`, `cacheControl?` (per-request override of the handler-level value, e.g. `immutable` for content-addressed keys next to `private, no-cache` user uploads from the same handler).
+**Option precedence** (the order the handler consults its routing options; each row only runs when no earlier row answered):
+
+| Order | Gate | Outcome |
+|---|---|---|
+| 1 | method is not GET/HEAD | `204` (OPTIONS) or `405` |
+| 2 | `supportsRange: false` + `createSignedUrl`, plain GET | immediate 302 |
+| 3 | `preferSignedUrl` predicate (GET only) | 302 |
+| 4 | `precompressed` negotiation (compressible MIME, not multi-range) | variant selected for all later steps |
+| 5 | plain-range fast path (`authoritativeRange`, identity, no conditionals) | single-round-trip 206 |
+| 6 | HEAD-resolved evaluation | 304 / 412 / 416 / multipart / 206 / 200, with the rangeless-offload 302 replacing a would-be-200 body from row 2's store |
+| 7 | plain GET, nothing above applied | full 200 stream |
+
+`ServeContext`: `key` (required), `mime?`, `filename?`, `cacheControl?` (per-request override of the handler-level value, e.g. `immutable` for content-addressed keys next to `private, no-cache` user uploads from the same handler), `auditKey?` (opaque identifier reported as `key` in every `onServe`/`onTransfer`/`onError` event; storage keys commonly embed filenames, which are personal data that logging controls such as ISO 27001 A.8.15 keep out of log records -- pass a document id or hash here and the audit trail stays correlatable without the filename).
 
 `cacheControl` is emitted verbatim on 200/206/304, so any directive vocabulary your CDN or edge understands passes straight through: RFC 9111 `s-maxage` / `must-revalidate` / `proxy-revalidate` and the RFC 5861 resilience directives `stale-while-revalidate` and `stale-if-error`. The library does not synthesize or reorder directives (only appending `immutable` when the `immutable` option is set and it is not already present), so you keep full control of the response caching policy. `Vary` (e.g. `Vary: Accept-Encoding`) rides `securityHeaders` and is forwarded onto 304 responses too, satisfying the RFC 9110 15.4.5 MUST-generate list.
 
@@ -122,7 +134,7 @@ Method surface: GET and HEAD are served (HEAD with identical headers and no body
 
 ## Node Adapter (`partial-content/node`)
 
-**`serveObject<Req>(store, options)`** - Create a Node.js `(req, res) => Promise<void>` handler for Express, Fastify (compat), Koa, and raw `http.createServer`. Extends the web adapter options with `key` (required, extracts the storage key from the request), `mime?`, and `filename?`. `Req` defaults to `IncomingMessage`; pass your framework's request type (`serveObject<express.Request>(store, { key: (req) => req.params.key })`) so framework fields typecheck in the extractors. A throwing extractor becomes a hardened 500 and is reported to `onError` with `operation: "context"`.
+**`serveObject<Req>(store, options)`** - Create a Node.js `(req, res) => Promise<void>` handler for Express, Fastify (compat), Koa, and raw `http.createServer`. Extends the web adapter options with `key` (required, extracts the storage key from the request), `mime?`, `filename?`, and `auditKey?` (see `ServeContext.auditKey`). `Req` defaults to `IncomingMessage`; pass your framework's request type (`serveObject<express.Request>(store, { key: (req) => req.params.key })`) so framework fields typecheck in the extractors. A throwing extractor becomes a hardened 500 and is reported to `onError` with `operation: "context"`.
 
 **Server timeouts (deployment note)** - Node's `http.Server` defaults (`requestTimeout` 300s, `headersTimeout` 60s) force-close any transfer that outlives them, independent of this adapter's stall detection: a large download over a slow link dies mid-stream at 5 minutes. Raise them on the server you `listen()` with (`server.requestTimeout = 0` or a generous ceiling) when serving large files.
 

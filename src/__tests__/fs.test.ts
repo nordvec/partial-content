@@ -465,6 +465,37 @@ describe("fsStore: opt-in hot-object cache", () => {
         }
     });
 
+    test("byte-budget eviction skips metadata-only entries (stat elision survives)", async () => {
+        const dir = await mkdtemp(join(tmpdir(), "pc-fs-metaonly-"));
+        try {
+            await writeFile(join(dir, "meta.txt"), "metadata"); // 8 bytes
+            await writeFile(join(dir, "b0.txt"), "body-0"); // 6 bytes
+            await writeFile(join(dir, "b1.txt"), "body-1"); // 6 bytes
+            const store = fsStore({ root: dir, cache: { ttlMs: 60_000, maxBytes: 10 } });
+
+            // Oldest LRU entry carries no bytes (HEAD caches metadata only).
+            await store.headObject("meta.txt");
+            // 6 + 6 > 10 forces a byte-budget eviction. Evicting the
+            // metadata entry would free zero bytes; the budget must reach
+            // past it and evict b0's BODY entry instead.
+            await drain((await store.getObject("b0.txt")).body);
+            await drain((await store.getObject("b1.txt")).body);
+
+            // The metadata-only entry survived: HEAD still answers from
+            // cache after the file is gone (within the TTL).
+            await rm(join(dir, "meta.txt"));
+            expect((await store.headObject("meta.txt")).contentLength).toBe(8);
+
+            // And the budget was genuinely relieved by evicting b0.
+            await rm(join(dir, "b0.txt"));
+            await expect(store.getObject("b0.txt")).rejects.toBeInstanceOf(ObjectNotFoundError);
+            await rm(join(dir, "b1.txt"));
+            expect(await drain((await store.getObject("b1.txt")).body)).toBe("body-1");
+        } finally {
+            await rm(dir, { recursive: true, force: true });
+        }
+    });
+
     test("a body larger than maxBytes is served but cached metadata-only", async () => {
         const dir = await mkdtemp(join(tmpdir(), "pc-fs-oversize-"));
         try {

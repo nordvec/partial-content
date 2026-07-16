@@ -1,5 +1,74 @@
 # Changelog
 
+## 1.5.0 (2026-07-16)
+
+Gap-removal release from a full-package adversarial audit (protocol core,
+serving layer, all seven storage adapters, RFC-currency re-verification
+against the live spec texts, and a compliance-mapping review).
+
+### Fixed
+- `httpStore` builds request headers through a `Headers` instance:
+  case-variant consumer spellings of the reserved fields (`accept-encoding`,
+  `range`, `if-match`) are now REPLACED instead of merged. Previously a
+  lowercase `accept-encoding` in `opts.headers` survived alongside the
+  adapter's `Accept-Encoding: identity` and fetch joined the duplicates
+  ("gzip, identity"), letting the origin compress and every request then
+  fail through the non-identity guard. Consumer `Range`/`If-Match` values
+  are cleared on requests that carry neither.
+- `Want-Content-Digest` and `Want-Repr-Digest` now negotiate fully
+  independently (RFC 9530 Section 4), in the kernel orchestrator and the
+  web adapter both: declining `Repr-Digest` no longer suppresses a wanted
+  `Content-Digest` on a full 200.
+- Range-incapable stores with `createSignedUrl` no longer redirect
+  unconditionally: HEAD serves real metadata headers, conditional requests
+  revalidate at the origin (304/412 from real validators), and only a
+  body-bearing GET answers 302, so client caching works again on these
+  stores. Plain GETs keep the zero-round-trip immediate redirect.
+- `preferSignedUrl` never consults the predicate for HEAD: a metadata probe
+  answered with a bare 302 defeats exactly the clients that send HEAD
+  (PDF.js size probing).
+- `buildMultipartHeaders` enforces the same bounds contract as
+  `buildRangeResponseHeaders` (RangeError on inverted/negative/past-EOF
+  parts and on the OPEN_ENDED sentinel) and rejects boundaries outside the
+  RFC 2046 grammar instead of interpolating them into header + framing.
+- `decodeGcsPin` validates what its hostile-token defense claims: negative
+  or fractional sizes, non-string validators, and malformed digests in a
+  forged pin now fall back to revalidation.
+- Signed-URL redirect failures report `operation: "head"` for HEAD requests.
+
+### Added
+- `auditKey` (`ServeContext` field; extractor on the node and hono
+  adapters): an opaque identifier substituted for the storage key in every
+  `onServe`/`onTransfer`/`onError` event, keeping filename-bearing keys
+  (personal data) out of consumer logs while the store reads by the real key.
+- `createSignedUrl` on `gcsStore` (V4 signed READ URLs; GCS offers no
+  Cache-Control response override, documented) and `azureStore` (read-only
+  SAS with disposition/type/cache-control response overrides), so
+  `preferSignedUrl` egress offload works on all three cloud stores.
+- `digestMetadataKey` on `gcsStore`: surfaces a caller-stored raw-base64
+  SHA-256 from custom object metadata as the RFC 9530 digest (GCS has no
+  native SHA-256; `x-goog-hash` is crc32c/md5 only).
+- `httpStore` refuses a bodyless response that declares a non-zero
+  Content-Length instead of serving a clean-looking empty stream.
+- The fs hot-object cache's byte-budget eviction skips metadata-only
+  entries (they free zero bytes); stat-elision entries now survive body
+  pressure and are bounded by the entry cap alone.
+
+### Docs
+- `gcsStore` signature corrected in the API reference (`{ storage, bucket }`).
+- The `ObjectMetadata.digest` contract no longer instructs an impossible
+  GCS mapping; it points at `digestMetadataKey` and names the fields that
+  really are SHA-256s.
+- Scope section updated: encoding negotiation over stored siblings is in
+  scope (shipped in 1.2.0); the non-goal is serve-time compression.
+- RFC 8941 citations annotated: RFC 9530 pins to 8941 by DOI, so they must
+  not be "modernized" to RFC 9651.
+- Compliance table: integrity verification cites GDPR Art. 32 (CC6.1 is a
+  logical-access control and was the wrong citation); the `nosniff` row no
+  longer cites SOC 2 CC6.6 (a network-boundary control); new log
+  data-minimization row for `auditKey`.
+- Option-precedence table for the serve handler's routing options.
+
 ## 1.4.0 (2026-07-12)
 
 - `fsStore` and `memoryStore` now declare `authoritativeRange`: plain range

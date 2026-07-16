@@ -85,7 +85,9 @@ export class ObjectChangedError extends Error {
  * {@link retryAfterSeconds} is set, emits a `Retry-After` header so clients and
  * shared caches back off instead of hammering an origin that is already shedding
  * load. Adapters map their backend's throttle signals here (S3/R2/Hetzner
- * `503 SlowDown`, `429 TooManyRequests`, request timeouts).
+ * `503 SlowDown`, `429 TooManyRequests`, Azure's server-side
+ * `OperationTimedOut`). Network-level client failures (connection refused,
+ * local timeouts) are NOT this: they propagate untouched and map to 502.
  */
 export class StoreUnavailableError extends Error {
   /** HTTP status hint: the backend is transiently unavailable. */
@@ -441,8 +443,11 @@ export interface ObjectMetadata {
    * When provided, the adapter emits `Repr-Digest: sha-256=:<base64>:` on
    * success responses for end-to-end integrity verification.
    *
-   * S3: map from `x-amz-checksum-sha256`
-   * GCS: map from `x-goog-hash` (extract sha256 component)
+   * Source it from a backend field that IS a SHA-256 of the object bytes:
+   * S3 `x-amz-checksum-sha256` (checksummed uploads); R2 `checksums.sha256`.
+   * GCS has no native SHA-256 (`x-goog-hash` carries only crc32c and md5,
+   * neither of which may be framed as `sha-256`): store your own hash as
+   * custom object metadata and point `gcsStore`'s `digestMetadataKey` at it.
    */
   digest?: string;
   /**
@@ -465,6 +470,14 @@ export interface ObjectMetadata {
  * The byte range a backend actually served, inclusive on both ends
  * (`bytes start-end/total` without the total: {@link ObjectStream.totalSize}
  * carries it, or is `undefined` when the backend reported `bytes a-b/*`).
+ *
+ * SERVED is the operative word: the orchestrator validates bounds, byte
+ * counts, and representation identity, but deliberately relays whatever
+ * span the backend answered (an authoritative backend clamping past-EOF
+ * ends is normal). An origin that answers a SHIFTED span therefore yields
+ * a truthful-but-unrequested 206; clients detect it via `Content-Range`,
+ * and custom orchestrators comparing against the requested range should
+ * check `range.start`.
  */
 export interface ServedRange {
   /** First byte position served (0-based, inclusive). */

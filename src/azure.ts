@@ -26,6 +26,7 @@ import {
   guardStreamLength,
   resolveServedRange,
   parseRetryAfterSeconds,
+  buildContentDisposition,
   isOpenEndedRange,
   type ObjectStore,
   type ObjectMetadata,
@@ -57,6 +58,26 @@ interface AzureBlobClient {
     count?: number,
     options?: { conditions?: { ifMatch?: string }; abortSignal?: AbortSignal },
   ): Promise<AzureBlobDownloadResponse>;
+  generateSasUrl(options: AzureGenerateSasUrlOptions): Promise<string>;
+}
+
+/**
+ * The read-signing subset of the SDK's `BlobGenerateSasUrlOptions`. The
+ * content* / cacheControl fields are the SAS response-header overrides
+ * (`rscd`/`rsct`/`rscc` query parameters) honored on the signed GET.
+ */
+interface AzureGenerateSasUrlOptions {
+  /**
+   * SAS permission set. The SDK normalizes this by calling `toString()` and
+   * re-parsing (`BlobSASPermissions.parse`, which validates the characters),
+   * so a minimal read-only stringifier satisfies the contract without a
+   * top-level SDK import.
+   */
+  permissions: { toString(): string };
+  expiresOn: Date;
+  contentDisposition?: string;
+  contentType?: string;
+  cacheControl?: string;
 }
 
 interface AzureBlobProperties {
@@ -206,10 +227,50 @@ export function azureStore(opts: AzureStoreOptions): ObjectStore {
         lastModified: response.lastModified?.toUTCString(),
       };
     },
+
+    async createSignedUrl(key, signOpts) {
+      // A signed URL is a 302 redirect target: the client fetches bytes
+      // DIRECTLY from Azure, bypassing the serve route's security headers
+      // (nosniff, CSP, CORP). Force a download disposition AND an inert
+      // content type so a stored SVG/HTML polyglot cannot render inline off
+      // the header-less origin response. All three overrides ride the SAS
+      // token as signed response-header parameters; the stored blob is
+      // untouched. `downloadFilename` only customizes the name.
+      //
+      // Signing requires the containerClient to have been constructed with a
+      // shared-key credential; without one, generateSasUrl throws a
+      // RangeError with a clear message. That error propagates deliberately:
+      // the web adapter treats a throwing createSignedUrl as a reported 502
+      // (onError), the same terminal outcome as a declined { ok: false }.
+      const url = await containerClient.getBlobClient(key).generateSasUrl({
+        permissions: READ_ONLY_SAS_PERMISSIONS,
+        expiresOn: new Date(Date.now() + signOpts.expiresInSeconds * 1000),
+        contentType: "application/octet-stream",
+        contentDisposition: buildContentDisposition(
+          signOpts.downloadFilename ?? "download",
+          { type: "attachment" },
+        ),
+        // Response-header override, not a blob mutation: keeps a private
+        // document's caching policy authoritative even when the blob was
+        // uploaded with a public Cache-Control (the CDN-caches-your-private
+        // -file footgun).
+        ...(signOpts.cacheControl ? { cacheControl: signOpts.cacheControl } : {}),
+      });
+
+      return { ok: true as const, url };
+    },
   };
 }
 
 // ─── Internal Helpers ───────────────────────────────────────────────────────
+
+/**
+ * Read-only SAS permission set ("r"): a signed download URL must never grant
+ * write/delete. Shaped as a stringifier because the SDK's SAS generation
+ * validates permissions via `BlobSASPermissions.parse(permissions.toString())`
+ * (see {@link AzureGenerateSasUrlOptions.permissions}).
+ */
+const READ_ONLY_SAS_PERMISSIONS = Object.freeze({ toString: () => "r" });
 
 /**
  * Azure `RestError`'s numeric HTTP status, when present. This is the

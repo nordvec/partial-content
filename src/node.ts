@@ -69,6 +69,14 @@ export interface NodeServeOptions<Req extends IncomingMessage = IncomingMessage>
   filename?: (req: Req) => string | undefined;
 
   /**
+   * Extract an audit-safe identifier reported as `key` in every
+   * `onServe`/`onTransfer`/`onError` event instead of the storage key
+   * (which commonly embeds a filename -- personal data that must stay out
+   * of log records). The store still reads by the real key.
+   */
+  auditKey?: (req: Req) => string | undefined;
+
+  /**
    * Max milliseconds to wait for a single backpressure `drain` while streaming
    * before treating the client as stalled and tearing the transfer down.
    *
@@ -101,7 +109,7 @@ export function serveObject<Req extends IncomingMessage = IncomingMessage>(
   store: ObjectStore,
   opts: NodeServeOptions<Req>,
 ) {
-  const { key: keyFn, mime: mimeFn, filename: filenameFn, writeStallTimeoutMs, ...serveOpts } = opts;
+  const { key: keyFn, mime: mimeFn, filename: filenameFn, auditKey: auditKeyFn, writeStallTimeoutMs, ...serveOpts } = opts;
   const handler = serveObjectRaw(store, serveOpts);
   const stallMs = writeStallTimeoutMs ?? DEFAULT_WRITE_STALL_MS;
 
@@ -151,6 +159,7 @@ export function serveObject<Req extends IncomingMessage = IncomingMessage>(
         key,
         mime: mimeFn?.(req),
         filename: filenameFn?.(req),
+        auditKey: auditKeyFn?.(req),
       };
       parts = await handler(fetchRequest, ctx);
     } catch (err) {

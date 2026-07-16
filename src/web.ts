@@ -153,6 +153,16 @@ export interface ServeContext {
    * Used verbatim: the `immutable` option is NOT appended to it.
    */
   cacheControl?: string;
+  /**
+   * Identifier reported as `key` in every `onServe`/`onTransfer`/`onError`
+   * event instead of the storage key. Storage keys commonly embed filenames
+   * or user paths -- personal data that logging controls (ISO 27001 A.8.15,
+   * OWASP ASVS logging) say must stay out of log records. Supply an opaque
+   * id (document id, hash) here and the audit trail stays correlatable
+   * without carrying the filename; the store still reads by the real `key`.
+   * When omitted, events carry the storage key unchanged.
+   */
+  auditKey?: string;
 }
 
 export interface ServeObjectOptions {
@@ -277,6 +287,10 @@ export interface ServeObjectOptions {
    * response was still served, the hook failure is surfaced here instead
    * of crashing. `context` = a consumer-supplied key/mime/filename
    * extractor threw in a server adapter; the request became a 500).
+   *
+   * Must not throw. `onServe`/`onTransfer` failures are routed HERE, but
+   * there is no sink for a failure of the error sink itself: a throwing
+   * `onError` escapes the handler on every error path.
    */
   onError?: (error: unknown, context: { key: string; operation: "head" | "get" | "audit" | "context" }) => void;
 
@@ -389,6 +403,12 @@ export interface ServeObjectOptions {
    * the point), but redirect large full-file downloads straight to the
    * storage backend. The redirect carries `Cache-Control: no-store` so the
    * expiring URL is never cached.
+   *
+   * HEAD requests never consult the predicate: a metadata probe answered
+   * with a bare 302 defeats exactly the clients that send HEAD (PDF.js size
+   * probing, cache priming), so HEAD always serves real headers from the
+   * origin and `info.method` is always `"GET"`. (The field stays for
+   * signature compatibility; it narrows to `"GET"` in the next major.)
    *
    * @example
    * ```ts
@@ -575,7 +595,7 @@ export function serveObjectRaw(
     timing: timingEnabled = false,
     onTiming,
     fallbackFilename = "download",
-    onError,
+    onError: onErrorBase,
     onServe: rawOnServe,
     onTransfer: rawOnTransfer,
     maxRanges = MAX_RANGES_DEFAULT,
@@ -603,12 +623,12 @@ export function serveObjectRaw(
   // bodyless emissions (302/304/412/416/HEAD) fire outside any guard, so a
   // throwing hook would escape the handler. Route hook failures to onError;
   // the response itself is unaffected.
-  const onServe = rawOnServe
+  const onServeBase = rawOnServe
     ? (event: ServeAuditEvent): void => {
         try {
           rawOnServe(event);
         } catch (err) {
-          onError?.(err, { key: event.key, operation: "audit" });
+          onErrorBase?.(err, { key: event.key, operation: "audit" });
         }
       }
     : undefined;
@@ -617,12 +637,12 @@ export function serveObjectRaw(
   // stream machinery (during the runtime's consumption, after the handler has
   // returned). A throw there would error the response stream mid-flight;
   // route it to onError instead so the transfer completes cleanly.
-  const onTransfer = rawOnTransfer
+  const onTransferBase = rawOnTransfer
     ? (event: TransferEvent): void => {
         try {
           rawOnTransfer(event);
         } catch (err) {
-          onError?.(err, { key: event.key, operation: "audit" });
+          onErrorBase?.(err, { key: event.key, operation: "audit" });
         }
       }
     : undefined;
@@ -671,6 +691,23 @@ export function serveObjectRaw(
     const isHead = method === "HEAD";
     const mime = ctx.mime ?? "application/octet-stream";
 
+    // Audit-key substitution, bound once per request: when the caller
+    // supplies ctx.auditKey, every hook event reports it as `key` (storage
+    // keys commonly embed filenames -- personal data that must stay out of
+    // logs), while the pipeline below keeps reading by the real key. The
+    // shadowed names mean no downstream code needs to know which is in play.
+    const auditKey = ctx.auditKey;
+    const onServe = onServeBase && auditKey !== undefined
+      ? (event: ServeAuditEvent): void => onServeBase({ ...event, key: auditKey })
+      : onServeBase;
+    const onTransfer = onTransferBase && auditKey !== undefined
+      ? (event: TransferEvent): void => onTransferBase({ ...event, key: auditKey })
+      : onTransferBase;
+    const onError = onErrorBase && auditKey !== undefined
+      ? (err: unknown, context: { key: string; operation: "head" | "get" | "audit" | "context" }): void =>
+          onErrorBase(err, { ...context, key: auditKey })
+      : onErrorBase;
+
     // Resolve Content-Disposition
     const dispositionType = typeof dispositionOpt === "function"
       ? dispositionOpt(mime)
@@ -702,22 +739,6 @@ export function serveObjectRaw(
 
     const effectiveCacheControl = ctx.cacheControl ?? cacheControl;
 
-    // ── Range-incapable stores: signed-URL redirect when available ───────
-    if (store.supportsRange === false && store.createSignedUrl) {
-      return signedUrlRedirect({
-        store, key, filename: ctx.filename,
-        expiresInSeconds: signedUrlExpiresSeconds,
-        cacheControl: effectiveCacheControl,
-        isHead, mime, onServe, onError,
-      });
-    }
-    // supportsRange === false with no signed-URL path: serve the FULL
-    // representation through the origin instead of failing. Range and
-    // If-Range read as absent below (RFC 9110 Section 14.2 lets a server
-    // ignore Range), and every success response advertises
-    // `Accept-Ranges: none` (rctx.acceptRanges) so clients stop asking.
-    // Conditionals (304/412) still evaluate: they need no byte seeking.
-
     // ── Detect request characteristics ──────────────────────────────────
     const headers = store.supportsRange === false
       ? withoutRangeHeaders(req.headers)
@@ -736,12 +757,41 @@ export function serveObjectRaw(
     // totalSize to clamp bounds and detect unsatisfiable ranges.
     const needsHead = hasConditional || hasIfRange || isHead || Boolean(rangeHeader);
 
+    // ── Range-incapable stores: signed-URL redirect when available ───────
+    // A 302 answers a byte DOWNLOAD; it cannot answer a metadata probe or a
+    // revalidation. A plain GET redirects immediately (no origin round-trip
+    // at all). HEAD and conditional requests continue into the proxied path
+    // so the origin answers with real headers, 304, or 412 -- redirecting
+    // those would turn every revalidation into a full re-download from the
+    // backend and every size probe into a bare Location. A conditional GET
+    // whose evaluation still demands the body redirects at that point (the
+    // rangelessOffload branch in Path A below).
+    const rangelessOffload = store.supportsRange === false && Boolean(store.createSignedUrl);
+    if (rangelessOffload && !isHead && !hasConditional) {
+      return signedUrlRedirect({
+        store, key, filename: ctx.filename,
+        expiresInSeconds: signedUrlExpiresSeconds,
+        cacheControl: effectiveCacheControl,
+        isHead, mime, onServe, onError,
+      });
+    }
+    // supportsRange === false with no signed-URL path: serve the FULL
+    // representation through the origin instead of failing. Range and
+    // If-Range read as absent (RFC 9110 Section 14.2 lets a server ignore
+    // Range), and every success response advertises `Accept-Ranges: none`
+    // (rctx.acceptRanges) so clients stop asking. Conditionals (304/412)
+    // still evaluate: they need no byte seeking.
+
     // ── Per-request egress offload (preferSignedUrl) ─────────────────────
+    // HEAD never offloads regardless of the predicate: a metadata probe
+    // answered with a bare 302 defeats exactly the clients that send HEAD
+    // (PDF.js size probing, cache priming), and costs the backend nothing
+    // to answer at the origin.
     if (
-      preferSignedUrl && store.createSignedUrl
+      preferSignedUrl && store.createSignedUrl && !isHead
       && preferSignedUrl({
         key, mime,
-        method: isHead ? "HEAD" : "GET",
+        method: "GET",
         isRange: Boolean(rangeHeader),
         isConditional: hasConditional || hasIfRange,
       })
@@ -971,6 +1021,19 @@ export function serveObjectRaw(
         return buildHeadResponse(meta, etag, rctx);
       }
 
+      // Range-incapable store with a signed-URL path: the conditional
+      // evaluation above needed the origin's real validators (its 304/412
+      // already returned before this point), but the body itself has no
+      // reason to proxy -- offload the would-be-200 download to the backend.
+      if (rangelessOffload) {
+        return signedUrlRedirect({
+          store, key, filename: ctx.filename,
+          expiresInSeconds: signedUrlExpiresSeconds,
+          cacheControl: effectiveCacheControl,
+          isHead, mime, onServe, onError,
+        });
+      }
+
       // Stream bytes from store, pinned to the representation just validated.
       // Only STRONG validators pin: RFC 9110 Section 13.1.1 mandates strong
       // comparison for If-Match, so a weak `W/` ETag would fail the
@@ -1180,7 +1243,7 @@ async function signedUrlRedirect(args: SignedUrlRedirectArgs): Promise<RawRespon
   } catch (err) {
     // Never-throw contract: a rejecting signed-URL provider becomes a
     // reported 502, never an escaped rejection (which crashes Express 4).
-    onError?.(err, { key, operation: "get" });
+    onError?.(err, { key, operation: isHead ? "head" : "get" });
     return plainTextError(502, "Bad Gateway", "Storage backend error");
   }
   if ("url" in result) {
@@ -1206,7 +1269,7 @@ async function signedUrlRedirect(args: SignedUrlRedirectArgs): Promise<RawRespon
   // honest 502.
   onError?.(
     new Error(`createSignedUrl declined for ${key}: ${result.error}`),
-    { key, operation: "get" },
+    { key, operation: isHead ? "head" : "get" },
   );
   return plainTextError(502, "Bad Gateway", "Storage backend error");
 }
@@ -1345,10 +1408,12 @@ function buildHeaders(
     contentType: withCharset(ctx.mime, ctx),
     etag: meta.etag,
     lastModified: meta.lastModified,
-    // RFC 9530 Section 4: respect Want-Repr-Digest negotiation. Weight 0 or
-    // an algorithm list without sha-256 means "do not send"; honoring that
-    // here keeps adapter responses consistent with the kernel orchestrator.
-    digest: ctx.digestWanted ? meta.digest : undefined,
+    // RFC 9530 Section 4: each digest field honors its own Want-* member,
+    // independently of the other. A declined Repr-Digest must not swallow a
+    // wanted Content-Digest, so the digest value passes through unfiltered
+    // and each field carries its own gate.
+    digest: meta.digest,
+    reprDigest: ctx.digestWanted,
     // Content-Digest requires an actual full body: never on HEAD (empty
     // message content, RFC 9530 Appendix B.2), never when the client
     // declined it via Want-Content-Digest.

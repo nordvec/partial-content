@@ -2366,7 +2366,7 @@ describe("evaluateConditionalRequest Repr-Digest", () => {
         expect(result.headers["Repr-Digest"]).toBe("sha-256=:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=:");
     });
 
-    test("omits digest when Want-Repr-Digest excludes sha-256", () => {
+    test("omits Repr-Digest when Want-Repr-Digest excludes sha-256; Content-Digest keeps its own default", () => {
         const result = evaluateConditionalRequest(
             mockHeaders({ "want-repr-digest": "sha-512=5" }),
             {
@@ -2375,7 +2375,11 @@ describe("evaluateConditionalRequest Repr-Digest", () => {
             },
         );
         expect(result.headers["Repr-Digest"]).toBeUndefined();
-        expect(result.headers["Content-Digest"]).toBeUndefined();
+        // No Want-Content-Digest was sent, and an absent field expresses no
+        // preference (unsolicited digests are permitted), so the full-200
+        // Content-Digest still goes out: the two fields negotiate
+        // independently.
+        expect(result.headers["Content-Digest"]).toBe("sha-256=:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=:");
     });
 
     test("omits digest when Want-Repr-Digest sets sha-256 weight to 0", () => {
@@ -2425,6 +2429,50 @@ describe("evaluateConditionalRequest Repr-Digest", () => {
         );
         expect(result.headers["Repr-Digest"]).toBe("sha-256=:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=:");
         expect(result.headers["Content-Digest"]).toBeUndefined();
+    });
+
+    test("Want-Repr-Digest gates only Repr-Digest, not Content-Digest (the vice-versa direction)", () => {
+        // The mirror of the test above: a client that declines Repr-Digest
+        // but wants Content-Digest gets exactly Content-Digest on a full 200.
+        const result = evaluateConditionalRequest(
+            mockHeaders({
+                "want-repr-digest": "sha-256=0",
+                "want-content-digest": "sha-256=5",
+            }),
+            {
+                totalSize: 1000,
+                digest: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
+            },
+        );
+        expect(result.headers["Repr-Digest"]).toBeUndefined();
+        expect(result.headers["Content-Digest"]).toBe("sha-256=:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=:");
+    });
+
+    test("declined Repr-Digest still never yields Content-Digest on 206 or HEAD", () => {
+        // Content-Digest's own preconditions (full GET body) keep applying
+        // when Repr-Digest is declined: nothing is emitted at all.
+        const ranged = evaluateConditionalRequest(
+            mockHeaders({
+                "want-repr-digest": "sha-256=0",
+                "want-content-digest": "sha-256=5",
+                range: "bytes=0-99",
+            }),
+            { totalSize: 1000, digest: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=" },
+        );
+        expect(ranged.status).toBe(206);
+        expect(ranged.headers["Repr-Digest"]).toBeUndefined();
+        expect(ranged.headers["Content-Digest"]).toBeUndefined();
+
+        const head = evaluateConditionalRequest(
+            mockHeaders({
+                "want-repr-digest": "sha-256=0",
+                "want-content-digest": "sha-256=5",
+            }),
+            { totalSize: 1000, digest: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=" },
+            { method: "HEAD" },
+        );
+        expect(head.headers["Repr-Digest"]).toBeUndefined();
+        expect(head.headers["Content-Digest"]).toBeUndefined();
     });
 
     test("duplicate Want-Repr-Digest keys: the LAST occurrence wins (RFC 8941 3.2)", () => {
@@ -3243,6 +3291,50 @@ describe("multipart/byteranges builders", () => {
         expect(() => buildMultipartHeaders({
             boundary: "B", ranges: [{ start: 0, end: 4 }], totalSize: -1, contentType: "text/plain",
         })).toThrow(RangeError);
+    });
+
+    // ── range-bounds guard (parity with buildRangeResponseHeaders) ──────────
+    // A part whose bounds the range parser could never produce must throw
+    // rather than serialize an invalid Content-Range into the framing.
+    test("throws RangeError for a part end at/past totalSize", () => {
+        expect(() => buildMultipartHeaders({
+            boundary: "B", ranges: [{ start: 0, end: 999 }], totalSize: 500, contentType: "text/plain",
+        })).toThrow(RangeError);
+    });
+
+    test("throws RangeError for inverted and negative part bounds", () => {
+        expect(() => buildMultipartHeaders({
+            boundary: "B", ranges: [{ start: 10, end: 4 }], totalSize: 100, contentType: "text/plain",
+        })).toThrow(RangeError);
+        expect(() => buildMultipartHeaders({
+            boundary: "B", ranges: [{ start: -1, end: 4 }], totalSize: 100, contentType: "text/plain",
+        })).toThrow(RangeError);
+    });
+
+    test("throws RangeError when the OPEN_ENDED sentinel reaches the framing", () => {
+        expect(() => buildMultipartHeaders({
+            boundary: "B", ranges: [{ start: 0, end: OPEN_ENDED }], totalSize: 100, contentType: "text/plain",
+        })).toThrow(RangeError);
+    });
+
+    // ── boundary guard ───────────────────────────────────────────────────────
+    // The boundary lands in the Content-Type header AND the body framing the
+    // Content-Length was computed against, so an invalid token throws instead
+    // of being silently sanitized into a desynced value.
+    test("throws RangeError for boundaries outside the RFC 2046 grammar", () => {
+        const base = { ranges: [{ start: 0, end: 4 }], totalSize: 100, contentType: "text/plain" };
+        expect(() => buildMultipartHeaders({ ...base, boundary: "bad\r\ninjected: yes" })).toThrow(RangeError);
+        expect(() => buildMultipartHeaders({ ...base, boundary: "" })).toThrow(RangeError);
+        expect(() => buildMultipartHeaders({ ...base, boundary: "ends with space " })).toThrow(RangeError);
+        expect(() => buildMultipartHeaders({ ...base, boundary: "x".repeat(71) })).toThrow(RangeError);
+        expect(() => buildMultipartHeaders({ ...base, boundary: 'quo"te' })).toThrow(RangeError);
+    });
+
+    test("accepts generated boundaries and full-grammar hand-supplied ones", () => {
+        const base = { ranges: [{ start: 0, end: 4 }], totalSize: 100, contentType: "text/plain" };
+        expect(() => buildMultipartHeaders({ ...base, boundary: generateMultipartBoundary() })).not.toThrow();
+        expect(() => buildMultipartHeaders({ ...base, boundary: "a'()+_,-./:=? z" })).not.toThrow();
+        expect(() => buildMultipartHeaders({ ...base, boundary: "x".repeat(70) })).not.toThrow();
     });
 });
 

@@ -6,6 +6,9 @@ import { gcsStore, ObjectNotFoundError, ObjectChangedError, StoreUnavailableErro
 const CONTENT = Buffer.from("0123456789abcdefghij"); // 20 bytes
 const ETAG = "CKih16GY0v8CEAE=";
 const GENERATION = "1719576000000000";
+/** Raw base64 of a 32-byte SHA-256: the only digest shape the adapter trusts. */
+const DIGEST = Buffer.alloc(32, 7).toString("base64");
+const SIGNED_URL = "https://storage.example/doc?X-Goog-Signature=abc";
 
 interface MockGcsOpts {
     missing?: boolean;
@@ -17,6 +20,12 @@ interface MockGcsOpts {
     reads?: Array<{ generation?: string | number; start?: number; end?: number }>;
     /** Count of getMetadata round trips. */
     metadataCalls?: { count: number };
+    /** Custom metadata returned by getMetadata (the x-goog-meta-* namespace). */
+    customMetadata?: Record<string, string>;
+    /** Record getSignedUrl configs. */
+    signCalls?: Array<Record<string, unknown>>;
+    /** getSignedUrl rejects (missing signing credentials, IAM denial). */
+    signError?: Error;
 }
 
 async function* iterate(buf: Buffer): AsyncGenerator<Buffer> {
@@ -40,7 +49,16 @@ function mockStorage(opts: MockGcsOpts = {}) {
                                 etag: ETAG,
                                 generation: GENERATION,
                                 updated: "2025-06-28T12:00:00.000Z",
-                            }] as [{ size: string; etag: string; generation: string; updated: string }];
+                                metadata: opts.customMetadata,
+                            }] as [{
+                                size: string; etag: string; generation: string;
+                                updated: string; metadata?: Record<string, string>;
+                            }];
+                        },
+                        async getSignedUrl(config: Record<string, unknown>) {
+                            opts.signCalls?.push(config);
+                            if (opts.signError) throw opts.signError;
+                            return [SIGNED_URL] as [string];
                         },
                         createReadStream(streamOpts?: { start?: number; end?: number }) {
                             opts.reads?.push({
@@ -213,6 +231,29 @@ describe("gcsStore: pin round-trip (single backend read)", () => {
         expect(metadataCalls.count).toBe(hostilePins.length); // each revalidated from scratch
     });
 
+    test("forged pins with dishonest byte accounting or non-string validators revalidate from scratch", async () => {
+        const metadataCalls = { count: 0 };
+        const store = gcsStore({ storage: mockStorage({ metadataCalls }), bucket: "b" });
+
+        // Each token is structurally valid JSON with a real generation, but
+        // carries a field that must never flow downstream: a negative or
+        // fractional size would corrupt range clamping and wire framing, and
+        // a non-string etag/lastModified would surface as a malformed
+        // response header.
+        const forgedPins = [
+            JSON.stringify({ generation: GENERATION, size: -5 }),
+            JSON.stringify({ generation: GENERATION, size: 10.5 }),
+            JSON.stringify({ generation: GENERATION, size: 20, etag: 123 }),
+            JSON.stringify({ generation: GENERATION, size: 20, lastModified: 42 }),
+        ];
+        for (const pin of forgedPins) {
+            const result = await store.getObject("doc.pdf", { pin });
+            expect(await drain(result.body)).toBe("0123456789abcdefghij");
+            expect(result.totalSize).toBe(20); // the measured size, not the forged one
+        }
+        expect(metadataCalls.count).toBe(forgedPins.length); // each revalidated
+    });
+
     test("an ifMatch is never satisfied by a pin that lacks the validator (revalidates, catches a stale read)", async () => {
         const metadataCalls = { count: 0 };
         const store = gcsStore({ storage: mockStorage({ metadataCalls }), bucket: "b" });
@@ -253,5 +294,164 @@ describe("gcsStore: failure propagation and cleanup", () => {
 
         await result.body.cancel();
         expect(destroyed.count).toBe(1);
+    });
+});
+
+describe("gcsStore: digestMetadataKey", () => {
+    test("headObject and getObject surface a valid custom-metadata SHA-256 as digest", async () => {
+        const store = gcsStore({
+            storage: mockStorage({ customMetadata: { sha256: DIGEST } }),
+            bucket: "b",
+            digestMetadataKey: "sha256",
+        });
+
+        const meta = await store.headObject("doc.pdf");
+        expect(meta.digest).toBe(DIGEST);
+
+        const result = await store.getObject("doc.pdf", { range: { start: 5, end: 9 } });
+        // Custom-metadata digests name the WHOLE representation, so a ranged
+        // read keeps it (Repr-Digest is valid on 206 responses).
+        expect(result.digest).toBe(DIGEST);
+        await result.body.cancel();
+    });
+
+    test("the pin round-trip carries the digest without a second metadata read", async () => {
+        const metadataCalls = { count: 0 };
+        const store = gcsStore({
+            storage: mockStorage({ customMetadata: { sha256: DIGEST }, metadataCalls }),
+            bucket: "b",
+            digestMetadataKey: "sha256",
+        });
+
+        const meta = await store.headObject("doc.pdf");
+        const result = await store.getObject("doc.pdf", { ifMatch: meta.etag, pin: meta.pin });
+        expect(result.digest).toBe(DIGEST);
+        expect(metadataCalls.count).toBe(1); // HEAD only; the pin skipped the re-fetch
+        await result.body.cancel();
+    });
+
+    test("invalid digest values yield undefined, never an error", async () => {
+        // Hex, truncated base64, a composite multipart-style value, and a
+        // wrong-length string must all be discarded: only the raw base64 of
+        // a 32-byte SHA-256 is a valid Repr-Digest payload.
+        const invalid = [
+            "deadbeef",
+            DIGEST.slice(0, 20),
+            `${DIGEST}-2`,
+            "not a digest at all",
+        ];
+        for (const value of invalid) {
+            const store = gcsStore({
+                storage: mockStorage({ customMetadata: { sha256: value } }),
+                bucket: "b",
+                digestMetadataKey: "sha256",
+            });
+            const meta = await store.headObject("doc.pdf");
+            expect(meta.digest).toBeUndefined();
+        }
+    });
+
+    test("an absent key or an unset option yields undefined", async () => {
+        // Key configured but not present on the object.
+        const keyed = gcsStore({
+            storage: mockStorage({ customMetadata: { other: "x" } }),
+            bucket: "b",
+            digestMetadataKey: "sha256",
+        });
+        expect((await keyed.headObject("doc.pdf")).digest).toBeUndefined();
+
+        // Value present but the option was never set: never read implicitly.
+        const unkeyed = gcsStore({
+            storage: mockStorage({ customMetadata: { sha256: DIGEST } }),
+            bucket: "b",
+        });
+        expect((await unkeyed.headObject("doc.pdf")).digest).toBeUndefined();
+    });
+});
+
+describe("gcsStore: createSignedUrl", () => {
+    test("returns ok with a V4 read URL and forwards the sanitized disposition", async () => {
+        const signCalls: Array<Record<string, unknown>> = [];
+        const store = gcsStore({ storage: mockStorage({ signCalls }), bucket: "b" });
+
+        const result = await store.createSignedUrl!("doc.pdf", {
+            expiresInSeconds: 120,
+            downloadFilename: "Quarterly Report.pdf",
+        });
+
+        expect(result).toEqual({ ok: true, url: SIGNED_URL });
+        expect(signCalls[0]?.version).toBe("v4");
+        expect(signCalls[0]?.action).toBe("read");
+        expect(String(signCalls[0]?.responseDisposition)).toContain("attachment");
+        expect(String(signCalls[0]?.responseDisposition)).toContain("Quarterly Report.pdf");
+        // Inert content type prevents an inline polyglot rendering off the redirect target.
+        expect(signCalls[0]?.responseType).toBe("application/octet-stream");
+    });
+
+    test("forces attachment + inert content type even without a downloadFilename", async () => {
+        const signCalls: Array<Record<string, unknown>> = [];
+        const store = gcsStore({ storage: mockStorage({ signCalls }), bucket: "b" });
+
+        const result = await store.createSignedUrl!("doc.pdf", { expiresInSeconds: 60 });
+
+        expect(result.ok).toBe(true);
+        // A signed URL bypasses the serve route's security headers; the redirect
+        // target must never render a stored HTML/SVG polyglot inline.
+        expect(signCalls[0]?.responseType).toBe("application/octet-stream");
+        expect(String(signCalls[0]?.responseDisposition)).toContain("attachment");
+    });
+
+    test("a hostile filename never reaches the signed disposition unsanitized", async () => {
+        const signCalls: Array<Record<string, unknown>> = [];
+        const store = gcsStore({ storage: mockStorage({ signCalls }), bucket: "b" });
+
+        await store.createSignedUrl!("doc.pdf", {
+            expiresInSeconds: 60,
+            downloadFilename: 'evil\r\nContent-Type: text/html;.."\\..pdf',
+        });
+
+        const disposition = String(signCalls[0]?.responseDisposition);
+        expect(disposition).not.toMatch(/[\r\n]/);
+        expect(disposition).toContain("attachment");
+    });
+
+    test("expiry is expiresInSeconds from now", async () => {
+        const signCalls: Array<Record<string, unknown>> = [];
+        const store = gcsStore({ storage: mockStorage({ signCalls }), bucket: "b" });
+
+        const before = Date.now();
+        await store.createSignedUrl!("doc.pdf", { expiresInSeconds: 120 });
+        const after = Date.now();
+
+        const expires = signCalls[0]?.expires as Date;
+        expect(expires).toBeInstanceOf(Date);
+        expect(expires.getTime()).toBeGreaterThanOrEqual(before + 120_000);
+        expect(expires.getTime()).toBeLessThanOrEqual(after + 120_000);
+    });
+
+    test("cacheControl is never forwarded (GCS has no response-cache-control override)", async () => {
+        const signCalls: Array<Record<string, unknown>> = [];
+        const store = gcsStore({ storage: mockStorage({ signCalls }), bucket: "b" });
+
+        await store.createSignedUrl!("doc.pdf", {
+            expiresInSeconds: 60,
+            cacheControl: "private, no-cache",
+        });
+
+        // The exact signing config: no faked cache-control parameter, and no
+        // accidental passthrough of unsupported options.
+        expect(Object.keys(signCalls[0] ?? {}).sort()).toEqual([
+            "action", "expires", "responseDisposition", "responseType", "version",
+        ]);
+    });
+
+    test("signer failure returns ok: false with the message (never throws)", async () => {
+        const store = gcsStore({
+            storage: mockStorage({ signError: new Error("no signing credentials") }),
+            bucket: "b",
+        });
+
+        const result = await store.createSignedUrl!("doc.pdf", { expiresInSeconds: 60 });
+        expect(result).toEqual({ ok: false, error: "no signing credentials" });
     });
 });

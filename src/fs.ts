@@ -136,6 +136,23 @@ export function fsStore(opts: FsStoreOptions): ObjectStore {
     if (!oldest.done) cacheDelete(oldest.value);
   }
 
+  /**
+   * Evict the least recently used BODY-carrying entry, or report false when
+   * none remains. Only body entries relieve the byte budget: evicting
+   * metadata-only entries on the way would free zero bytes while discarding
+   * still-valid stat-elision hits (those are bounded by the entry cap, not
+   * the byte budget).
+   */
+  function evictOldestBody(): boolean {
+    for (const [key, entry] of cache!) {
+      if (entry.bytes) {
+        cacheDelete(key);
+        return true;
+      }
+    }
+    return false;
+  }
+
   function cacheGet(key: string): CacheEntry | null {
     if (!cache) return null;
     const entry = cache.get(key);
@@ -177,10 +194,10 @@ export function fsStore(opts: FsStoreOptions): ObjectStore {
     if (!existed && cache.size >= cacheMax) {
       evictOldest();
     }
-    // Byte budget: evict least-recent entries until the new body fits.
+    // Byte budget: evict least-recent BODY entries until the new body fits.
     const newBytes = stored.bytes ? stored.bytes.byteLength : 0;
-    while (newBytes > 0 && cacheBytes + newBytes > cacheMaxBytes && cache.size > 0) {
-      evictOldest();
+    while (newBytes > 0 && cacheBytes + newBytes > cacheMaxBytes && evictOldestBody()) {
+      // evictOldestBody() did the work; the guard re-checks the budget.
     }
     cache.set(key, { ...stored, expiresAt: Date.now() + cacheTtl });
     cacheBytes += newBytes;

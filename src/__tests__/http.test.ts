@@ -15,10 +15,9 @@ function stubFetch(
 }
 
 function headersOf(init: RequestInit): Record<string, string> {
-    return Object.fromEntries(
-        Object.entries((init.headers ?? {}) as Record<string, string>)
-            .map(([k, v]) => [k.toLowerCase(), v]),
-    );
+    // Headers normalizes names to lowercase and, crucially for the reserved-
+    // header tests, mirrors how fetch itself would combine duplicate keys.
+    return Object.fromEntries(new Headers(init.headers ?? {}).entries());
 }
 
 describe("httpStore: unit (stub fetch)", () => {
@@ -56,6 +55,75 @@ describe("httpStore: unit (stub fetch)", () => {
 
         expect(seen[0]["accept-encoding"]).toBe("identity");
         expect(seen[0]["authorization"]).toBe("Bearer tok");
+    });
+
+    test("reserved headers override case-variant consumer values instead of merging", async () => {
+        const seen: Record<string, string>[] = [];
+        const store = httpStore({
+            url: (key) => `https://origin.example/${key}`,
+            // Lowercase spellings: a plain object spread would keep these
+            // alongside the adapter's capitalized fields and fetch would join
+            // the duplicates ("gzip, identity"), defeating the identity guard.
+            headers: {
+                "accept-encoding": "gzip",
+                "range": "bytes=0-0",
+                "if-match": '"stale"',
+                Authorization: "Bearer tok",
+            },
+            fetch: stubFetch((_url, init) => {
+                seen.push(headersOf(init));
+                return new Response("hello ther", {
+                    status: 206,
+                    headers: { "Content-Length": "10", "Content-Range": "bytes 5-14/100" },
+                });
+            }),
+        });
+        await store.getObject("doc.pdf", {
+            range: { start: 5, end: 14 },
+            ifMatch: '"pinned"',
+        });
+
+        expect(seen[0]["accept-encoding"]).toBe("identity");
+        expect(seen[0]["range"]).toBe("bytes=5-14");
+        expect(seen[0]["if-match"]).toBe('"pinned"');
+        expect(seen[0]["authorization"]).toBe("Bearer tok");
+    });
+
+    test("a bodyless 200 that declares bytes throws instead of serving a clean-looking empty stream", async () => {
+        const store = httpStore({
+            url: (key) => `https://origin.example/${key}`,
+            // No conformant fetch runtime returns a null body on 200 with a
+            // Content-Length; only a stubbed/broken implementation does.
+            fetch: stubFetch(() => new Response(null, { headers: { "Content-Length": "10" } })),
+        });
+        await expect(store.getObject("doc.pdf")).rejects.toThrow(/no body but declares 10 bytes/);
+    });
+
+    test("a bodyless 200 for a zero-byte object still serves the empty stream", async () => {
+        const store = httpStore({
+            url: (key) => `https://origin.example/${key}`,
+            fetch: stubFetch(() => new Response(null, { headers: { "Content-Length": "0" } })),
+        });
+        const result = await store.getObject("empty.bin");
+        expect(result.contentLength).toBe(0);
+        const reader = result.body.getReader();
+        expect((await reader.read()).done).toBe(true);
+    });
+
+    test("consumer Range/If-Match are cleared on requests that carry neither", async () => {
+        const seen: Record<string, string>[] = [];
+        const store = httpStore({
+            url: (key) => `https://origin.example/${key}`,
+            headers: { Range: "bytes=0-0", "If-Match": '"stale"' },
+            fetch: stubFetch((_url, init) => {
+                seen.push(headersOf(init));
+                return new Response(null, { headers: { "Content-Length": "1" } });
+            }),
+        });
+        await store.headObject("doc.pdf");
+
+        expect(seen[0]["range"]).toBeUndefined();
+        expect(seen[0]["if-match"]).toBeUndefined();
     });
 
     test("fails loudly when an origin transfer-compresses despite identity", async () => {

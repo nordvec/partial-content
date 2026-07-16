@@ -36,6 +36,10 @@ interface MockAzureOpts {
     opTimedOut?: boolean;
     /** Invoked when the download's readableStreamBody is destroyed. */
     onDestroy?: () => void;
+    /** Record generateSasUrl option objects. */
+    sasCalls?: Array<Record<string, unknown>>;
+    /** generateSasUrl throws (client not constructed with a shared-key credential). */
+    sasError?: Error;
 }
 
 function restError(statusCode: number): Error {
@@ -133,6 +137,11 @@ function mockContainer(opts: MockAzureOpts = {}) {
                         etag: ETAG,
                         lastModified: LAST_MODIFIED,
                     };
+                },
+                async generateSasUrl(options: Record<string, unknown>) {
+                    opts.sasCalls?.push(options);
+                    if (opts.sasError) throw opts.sasError;
+                    return "https://account.blob.example/documents/doc.pdf?sv=2025&sig=abc";
                 },
             };
         },
@@ -303,6 +312,100 @@ describe("azureStore: degenerate SDK responses", () => {
     test("response with no body at all fails loudly", async () => {
         const store = azureStore({ containerClient: mockContainer({ noBody: true }) });
         await expect(store.getObject("doc.pdf")).rejects.toThrow(/no body/);
+    });
+});
+
+describe("azureStore: createSignedUrl", () => {
+    test("returns ok with a SAS URL: read-only permissions and a sanitized disposition", async () => {
+        const sasCalls: Array<Record<string, unknown>> = [];
+        const store = azureStore({ containerClient: mockContainer({ sasCalls }) });
+
+        const result = await store.createSignedUrl!("doc.pdf", {
+            expiresInSeconds: 120,
+            downloadFilename: "Quarterly Report.pdf",
+        });
+
+        expect(result).toEqual({
+            ok: true,
+            url: "https://account.blob.example/documents/doc.pdf?sv=2025&sig=abc",
+        });
+        // A signed download URL must never grant write/delete: the permission
+        // set stringifies to exactly "r" for the SDK's parse-validate step.
+        expect(String(sasCalls[0]?.permissions)).toBe("r");
+        expect(String(sasCalls[0]?.contentDisposition)).toContain("attachment");
+        expect(String(sasCalls[0]?.contentDisposition)).toContain("Quarterly Report.pdf");
+        // Inert content type prevents an inline polyglot rendering off the redirect target.
+        expect(sasCalls[0]?.contentType).toBe("application/octet-stream");
+    });
+
+    test("forces attachment + inert content type even without a downloadFilename", async () => {
+        const sasCalls: Array<Record<string, unknown>> = [];
+        const store = azureStore({ containerClient: mockContainer({ sasCalls }) });
+
+        const result = await store.createSignedUrl!("doc.pdf", { expiresInSeconds: 60 });
+
+        expect(result.ok).toBe(true);
+        expect(sasCalls[0]?.contentType).toBe("application/octet-stream");
+        expect(String(sasCalls[0]?.contentDisposition)).toContain("attachment");
+    });
+
+    test("a hostile filename never reaches the SAS disposition unsanitized", async () => {
+        const sasCalls: Array<Record<string, unknown>> = [];
+        const store = azureStore({ containerClient: mockContainer({ sasCalls }) });
+
+        await store.createSignedUrl!("doc.pdf", {
+            expiresInSeconds: 60,
+            downloadFilename: 'evil\r\nContent-Type: text/html;.."\\..pdf',
+        });
+
+        const disposition = String(sasCalls[0]?.contentDisposition);
+        expect(disposition).not.toMatch(/[\r\n]/);
+        expect(disposition).toContain("attachment");
+    });
+
+    test("expiresOn is expiresInSeconds from now", async () => {
+        const sasCalls: Array<Record<string, unknown>> = [];
+        const store = azureStore({ containerClient: mockContainer({ sasCalls }) });
+
+        const before = Date.now();
+        await store.createSignedUrl!("doc.pdf", { expiresInSeconds: 120 });
+        const after = Date.now();
+
+        const expiresOn = sasCalls[0]?.expiresOn as Date;
+        expect(expiresOn).toBeInstanceOf(Date);
+        expect(expiresOn.getTime()).toBeGreaterThanOrEqual(before + 120_000);
+        expect(expiresOn.getTime()).toBeLessThanOrEqual(after + 120_000);
+    });
+
+    test("cacheControl override rides the SAS, absent when unset", async () => {
+        const sasCalls: Array<Record<string, unknown>> = [];
+        const store = azureStore({ containerClient: mockContainer({ sasCalls }) });
+
+        await store.createSignedUrl!("doc.pdf", {
+            expiresInSeconds: 60,
+            cacheControl: "private, no-cache",
+        });
+        expect(sasCalls[0]?.cacheControl).toBe("private, no-cache");
+
+        await store.createSignedUrl!("doc.pdf", { expiresInSeconds: 60 });
+        expect("cacheControl" in (sasCalls[1] ?? {})).toBe(false);
+    });
+
+    test("a client that cannot sign propagates the SDK's error", async () => {
+        // Without a shared-key credential generateSasUrl throws; the adapter
+        // lets it propagate (the web adapter reports a throwing
+        // createSignedUrl via onError and answers 502), never masks it as ok.
+        const store = azureStore({
+            containerClient: mockContainer({
+                sasError: new RangeError(
+                    "Can only generate the SAS when the client is initialized with a shared key credential",
+                ),
+            }),
+        });
+
+        await expect(
+            store.createSignedUrl!("doc.pdf", { expiresInSeconds: 60 }),
+        ).rejects.toThrow(/shared key credential/);
     });
 });
 

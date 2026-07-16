@@ -97,7 +97,9 @@ const { status, headers, range } = evaluateConditionalRequest(
   {
     totalSize: fileSize,
     etag: '"abc123"',
-    // S3: x-amz-checksum-sha256, GCS: x-goog-hash (sha256 component)
+    // S3: x-amz-checksum-sha256; R2: checksums.sha256. GCS has no native
+    // SHA-256 (x-goog-hash is crc32c/md5 only): store your own hash as
+    // custom metadata and use gcsStore's digestMetadataKey.
     digest: "d2VsY29tZQ==",  // raw base64 SHA-256
   },
 );

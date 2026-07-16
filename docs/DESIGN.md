@@ -19,13 +19,12 @@ Implementation details, RFC deviations, and architecture decisions for `partial-
 
 - **I/O.** No reads, writes, streaming, or network calls. You bring the bytes.
 - **Authentication / authorization.** The library assumes the request was already deemed allowed. Gate access *before* calling it.
-- **Caching policy.** It never emits `Cache-Control` on its own -- it only echoes a value you pass in `meta.cacheControl` (orchestrator) or `opts.cacheControl` (standalone builder). `Vary`, `Expires`, and `Date` are left to your runtime (see the [Response Header Matrix](#response-header-matrix)).
-- **Precompressed variant negotiation (`.br` / `.gz` + `Content-Encoding`).**
-  That is static-asset serving (sirv, CDN edge config), not object serving.
-  Ranges apply to the *encoded* representation and each encoding needs its own
-  ETag -- a correctness minefield with no payoff for documents and media,
-  which are already compressed formats. Serve pre-compressed web assets from
-  a CDN; serve documents through this library.
+- **Caching policy.** It never emits `Cache-Control` on its own -- it only echoes a value you pass in `meta.cacheControl` (orchestrator) or `opts.cacheControl` (standalone builder). `Vary`, `Expires`, and `Date` are left to your runtime (see the [Response Header Matrix](#response-header-matrix)). The one exception is `Vary: Accept-Encoding` when the `precompressed` option makes the response encoding-negotiated (see [Precompressed Variants](#precompressed-variants-and-content-encoding)).
+- **Serve-time compression.** Encoding negotiation (`precompressed`) only ever
+  SELECTS a stored sibling object; the library never compresses at serve
+  time. Ranges apply to the *encoded* representation and each encoding needs
+  its own ETag, so a serve-time transform would corrupt byte ranges, digests,
+  and strong validators.
 - **Live / growing representations.** Range serving assumes a representation
   whose length is fixed for the duration of a response (RFC 9110's model).
   Indeterminate-length content (live logs, in-progress transcodes, RFC 8673
@@ -220,7 +219,14 @@ other `Want-*` member is ignored, which is the correct outcome (we cannot
 honor an algorithm we do not produce). `Want-Repr-Digest` and
 `Want-Content-Digest` are evaluated independently -- each expresses a
 preference for its own response field -- via `clientWantsDigest()` and
-`clientWantsContentDigest()`.
+`clientWantsContentDigest()`, so declining one field never suppresses the
+other.
+
+Citation note: RFC 8941 was obsoleted by RFC 9651 (September 2024), but
+RFC 9530 normatively pins to RFC 8941 by DOI and section number, so the
+RFC 8941 citations here are deliberate -- do not "modernize" them to 9651.
+(The two documents' Dictionary duplicate-key algorithms are identical, so
+no parsing behavior is at stake either way.)
 
 **Unknown totals in backend `Content-Range` are passed through as `*`.**
 When an origin answers `bytes a-b/*` (RFC 7233 Section 4.2 -- a streaming
@@ -332,6 +338,10 @@ Key properties:
 - **Repr-Digest** covers the *full representation*, not the transmitted bytes.
   This means the same digest value appears on both full (200) and partial (206)
   responses, allowing clients to verify integrity regardless of transfer strategy.
+  This is the RFC's own recommendation, not just ours: "Basing Repr-Digest on
+  the selected representation makes it straightforward to apply it to use
+  cases where ... the content conveys a partial representation of a resource,
+  such as range requests" (RFC 9530 Section 1.2).
 - **Content-Digest** is identical to `Repr-Digest` on full 200 GET responses
   (content equals the full representation). On 206 it is omitted because a
   range-slice hash would require streaming through crypto, violating the

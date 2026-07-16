@@ -195,24 +195,31 @@ describe("parseRanges properties", () => {
 // ─── buildMultipartHeaders arithmetic ────────────────────────────────────────
 
 describe("buildMultipartHeaders properties", () => {
-    // A part span of bounded length (so the placeholder body stays cheap) at an
-    // arbitrary offset; buildMultipartHeaders does pure byte arithmetic and does
-    // not require in-bounds or non-overlapping ranges.
-    const part = fc
-        .tuple(fc.integer({ min: 0, max: 100_000 }), fc.integer({ min: 0, max: 256 }))
-        .map(([start, len]) => ({ start, end: start + len }));
-
-    const multipartCase = fc.record({
-        boundary: fc.stringMatching(/^[a-zA-Z0-9]{1,40}$/),
-        ranges: fc.array(part, { minLength: 1, maxLength: 8 }),
-        totalSize: fc.integer({ min: 1, max: 2 ** 40 }),
-        // Include obs-text (0x80-0xff) content types so the UTF-8 byte counting
-        // (not code-unit counting) is exercised on both sides.
-        contentType: fc.option(
-            fc.oneof(fc.constant("text/plain"), fc.constant("application/pdf"), arbitraryText),
-            { nil: undefined },
-        ),
-    });
+    // Parser-legal parts only: buildMultipartHeaders enforces the same bounds
+    // contract as buildRangeResponseHeaders (0 <= start <= end < totalSize),
+    // so the generator draws in-bounds spans of bounded length (cheap
+    // placeholder bodies). Overlap stays allowed: the builder does pure byte
+    // arithmetic over whatever order the caller framed.
+    const multipartCase = fc
+        .integer({ min: 1, max: 2 ** 40 })
+        .chain((totalSize) => {
+            const part = fc
+                .integer({ min: 0, max: totalSize - 1 })
+                .chain((start) => fc
+                    .integer({ min: 0, max: Math.min(256, totalSize - 1 - start) })
+                    .map((len) => ({ start, end: start + len })));
+            return fc.record({
+                boundary: fc.stringMatching(/^[a-zA-Z0-9]{1,40}$/),
+                ranges: fc.array(part, { minLength: 1, maxLength: 8 }),
+                totalSize: fc.constant(totalSize),
+                // Include obs-text (0x80-0xff) content types so the UTF-8 byte
+                // counting (not code-unit counting) is exercised on both sides.
+                contentType: fc.option(
+                    fc.oneof(fc.constant("text/plain"), fc.constant("application/pdf"), arbitraryText),
+                    { nil: undefined },
+                ),
+            });
+        });
 
     test("advertised Content-Length equals the real assembled multipart body length", () => {
         fc.assert(
@@ -237,6 +244,26 @@ describe("buildMultipartHeaders properties", () => {
                 expect(res.status).toBe(206);
             }),
             { numRuns: 300 },
+        );
+    });
+
+    test("a part end at or past totalSize always throws RangeError", () => {
+        // The bounds guard, not silent emission of an invalid Content-Range:
+        // parity with buildRangeResponseHeaders for every out-of-bounds excess.
+        fc.assert(
+            fc.property(
+                fc.integer({ min: 1, max: 100_000 }),
+                fc.integer({ min: 0, max: 300 }),
+                (totalSize, excess) => {
+                    expect(() => buildMultipartHeaders({
+                        boundary: "B",
+                        ranges: [{ start: 0, end: totalSize + excess }],
+                        totalSize,
+                        contentType: "text/plain",
+                    })).toThrow(RangeError);
+                },
+            ),
+            { numRuns: 200 },
         );
     });
 });

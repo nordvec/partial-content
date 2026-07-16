@@ -77,6 +77,14 @@ export interface HonoServeOptions extends ServeObjectOptions {
    * When omitted, no filename is set.
    */
   filename?: (c: HonoContext) => string | undefined;
+
+  /**
+   * Extract an audit-safe identifier reported as `key` in every
+   * `onServe`/`onTransfer`/`onError` event instead of the storage key
+   * (which commonly embeds a filename -- personal data that must stay out
+   * of log records). The store still reads by the real key.
+   */
+  auditKey?: (c: HonoContext) => string | undefined;
 }
 
 // ─── Factory ────────────────────────────────────────────────────────────────
@@ -107,7 +115,7 @@ export function serveObject(
   store: ObjectStore,
   opts: HonoServeOptions,
 ): (c: HonoContext) => HonoResponse {
-  const { key: keyFn, mime: mimeFn, filename: filenameFn, ...serveOpts } = opts;
+  const { key: keyFn, mime: mimeFn, filename: filenameFn, auditKey: auditKeyFn, ...serveOpts } = opts;
   const handler = serveObjectWeb(store, serveOpts);
 
   return async function honoHandler(c: HonoContext): Promise<Response> {
@@ -116,6 +124,7 @@ export function serveObject(
       key,
       mime: mimeFn?.(c),
       filename: filenameFn?.(c),
+      auditKey: auditKeyFn?.(c),
     };
 
     return handler(c.req.raw, ctx);

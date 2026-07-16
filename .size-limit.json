@@ -92,7 +92,7 @@
   {
     "name": "/gcs",
     "path": "dist/gcs.js",
-    "limit": "2 kB",
+    "limit": "2.5 kB",
     "ignore": [
       "node:fs/promises",
       "node:path",
@@ -107,7 +107,7 @@
   {
     "name": "/azure",
     "path": "dist/azure.js",
-    "limit": "2.25 kB",
+    "limit": "2.75 kB",
     "ignore": [
       "node:fs/promises",
       "node:path",

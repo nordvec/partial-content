@@ -105,6 +105,15 @@ export interface RangeResponseHeaderOpts {
    */
   contentDigest?: boolean;
   /**
+   * Whether `Repr-Digest` may be emitted. Set `false` when the client
+   * declined it via `Want-Repr-Digest: sha-256=0` (see
+   * {@link clientWantsDigest}). The two Want-* fields negotiate
+   * independently (RFC 9530 Section 4): declining `Repr-Digest` never
+   * suppresses a wanted `Content-Digest`, and vice versa.
+   * @default true
+   */
+  reprDigest?: boolean;
+  /**
    * Cache-Control directive to include in the response.
    *
    * The library never generates cache directives on its own. It only echoes
@@ -372,6 +381,13 @@ function coalesceRanges(ranges: OrderedRange[]): OrderedRange[] {
 }
 
 /**
+ * RFC 2046 Section 5.1.1 boundary grammar: 1-70 characters from the bchars
+ * set, with the final character not a space. Anything outside it (CR/LF,
+ * control bytes, quotes) could break header framing or the body delimiter.
+ */
+const MULTIPART_BOUNDARY_RE = /^[0-9A-Za-z'()+_,\-./:=? ]{0,69}[0-9A-Za-z'()+_,\-./:=?]$/;
+
+/**
  * Generate a multipart/byteranges boundary token. Hyphen-free so the token
  * itself can never contain the `--` delimiter run; random so it cannot appear
  * in body content by construction.
@@ -442,9 +458,32 @@ export function buildMultipartHeaders(opts: {
       `buildMultipartHeaders: totalSize must be a non-negative safe integer, got ${totalSize}`,
     );
   }
+  // The boundary is interpolated into the top-level Content-Type AND the
+  // body framing, and the Content-Length math assumes the exact string the
+  // caller will frame parts with. Silently sanitizing would desync the two,
+  // so an invalid token throws instead. RFC 2046 Section 5.1.1 grammar:
+  // 1-70 bchars, not ending in a space. {@link generateMultipartBoundary}
+  // always satisfies this; the check exists for hand-supplied boundaries.
+  if (!MULTIPART_BOUNDARY_RE.test(boundary)) {
+    throw new RangeError(
+      "buildMultipartHeaders: boundary must be 1-70 RFC 2046 boundary characters and must not end with a space",
+    );
+  }
 
   let contentLength = 0;
   for (const range of ranges) {
+    // Same guard the single-range builder applies: bounds the range parser
+    // could never produce (non-integer or unordered positions, an end at or
+    // past the total, the OPEN_ENDED sentinel) must throw rather than
+    // serialize an invalid Content-Range into a part header.
+    if (
+      !Number.isSafeInteger(range.start) || !Number.isSafeInteger(range.end)
+      || range.start < 0 || range.start > range.end || range.end >= totalSize
+    ) {
+      throw new RangeError(
+        `buildMultipartHeaders: invalid range ${range.start}-${range.end} for totalSize ${totalSize}`,
+      );
+    }
     const partHeader = buildMultipartPartHeader(boundary, range, totalSize, contentType);
     // Framing is ASCII, but Content-Type may carry obs-text; count real bytes.
     contentLength += utf8ByteLength(partHeader);
@@ -463,7 +502,7 @@ export function buildMultipartHeaders(opts: {
   // Repr-Digest covers the full representation, so it is valid on a partial
   // multipart response; Content-Digest is omitted (it would have to cover the
   // assembled parts, not the representation).
-  if (digest) emitReprDigest(headers, digest, true);
+  if (digest) emitDigestFields(headers, digest, true, false);
   if (cacheControl) headers["Cache-Control"] = sanitizeHeaderValue(cacheControl);
 
   return { status: 206, headers, contentLength };
@@ -702,7 +741,7 @@ export function isRangeFresh(
  * @returns Status code and headers dict ready to pass to `new Response()`.
  */
 export function buildRangeResponseHeaders(opts: RangeResponseHeaderOpts): RangeResponseHeaders {
-  const { totalSize, range, contentType, etag, lastModified, digest, cacheControl, contentDigest } = opts;
+  const { totalSize, range, contentType, etag, lastModified, digest, cacheControl, contentDigest, reprDigest } = opts;
 
   // Validate totalSize to prevent invalid Content-Length / Content-Range headers.
   // Content-Length MUST be a non-negative integer (RFC 9110 Section 8.6).
@@ -735,8 +774,17 @@ export function buildRangeResponseHeaders(opts: RangeResponseHeaderOpts): RangeR
     headers["Last-Modified"] = toHttpDate(lastModified) ?? sanitizeHeaderValue(lastModified);
   }
 
-  // RFC 9530: Repr-Digest covers the full representation.
-  if (digest) emitReprDigest(headers, digest, range !== null || contentDigest === false);
+  // RFC 9530: Repr-Digest covers the full representation; Content-Digest
+  // equals it only on a full-body response. Each field is gated by its own
+  // Want-* negotiation (Section 4), independently of the other.
+  if (digest) {
+    emitDigestFields(
+      headers,
+      digest,
+      reprDigest !== false,
+      range === null && contentDigest !== false,
+    );
+  }
 
   if (range) {
     // Reject bounds the parser could never produce: non-integer or unordered
@@ -899,8 +947,10 @@ export function parseContentRange(
 
 /**
  * Parse a string as a strict non-negative integer.
- * Rejects floats, scientific notation, negative values, and leading zeros
- * (except for the literal "0").
+ * Rejects floats, scientific notation, negative values, and anything past
+ * MAX_SAFE_INTEGER. Leading zeros are accepted ("007" parses as 7): the
+ * Content-Range/range-spec ABNF is `1*DIGIT`, which permits them, and the
+ * same leniency is deliberate in the sibling range-spec parser.
  */
 function parseStrictInt(s: string): number {
   if (!/^\d+$/.test(s)) return NaN;
@@ -1074,16 +1124,20 @@ export function evaluateConditionalRequest(
   if (meta.etag) headers["ETag"] = sanitizeHeaderValue(meta.etag);
   if (normalizedLastModified) headers["Last-Modified"] = normalizedLastModified;
 
-  // RFC 9530: Repr-Digest and Content-Digest.
-  // Only emit when the client accepts sha-256 (or sends no Want-* header).
-  // Content-Digest additionally requires a full GET response (a 206 slice
-  // and an empty HEAD body both diverge from the representation digest) and
-  // a client that did not decline it via Want-Content-Digest.
-  if (meta.digest && clientWantsDigest(reqHeaders)) {
-    const reprOnly = parsed !== null
-      || method === "HEAD"
-      || !clientWantsContentDigest(reqHeaders);
-    emitReprDigest(headers, meta.digest, reprOnly);
+  // RFC 9530: Repr-Digest and Content-Digest. Each field is emitted only
+  // when its own Want-* member accepts sha-256 (absent header = accept);
+  // the two negotiate independently, so a declined Repr-Digest never
+  // suppresses a wanted Content-Digest. Content-Digest additionally
+  // requires a full GET response (a 206 slice and an empty HEAD body both
+  // diverge from the representation digest).
+  if (meta.digest) {
+    const wantRepr = clientWantsDigest(reqHeaders);
+    const wantContent = parsed === null
+      && method !== "HEAD"
+      && clientWantsContentDigest(reqHeaders);
+    if (wantRepr || wantContent) {
+      emitDigestFields(headers, meta.digest, wantRepr, wantContent);
+    }
   }
 
   // Emit Cache-Control on 200/206 (not only 304) so standalone orchestrator
@@ -1374,7 +1428,7 @@ export function sanitizeHeaderValue(s: string): string {
 
 /**
  * The raw base64 of a 32-byte SHA-256: exactly 43 base64 chars plus optional
- * `=` padding. Gate for digest emission -- see {@link emitReprDigest}.
+ * `=` padding. Gate for digest emission -- see {@link emitDigestFields}.
  */
 const SHA256_BASE64_RE = /^[A-Za-z0-9+/]{43}=?$/;
 
@@ -1395,12 +1449,17 @@ const SHA256_BASE64_RE = /^[A-Za-z0-9+/]{43}=?$/;
  * HEAD `Content-Digest` over zero bytes), and when the client declined it
  * via `Want-Content-Digest`.
  */
-function emitReprDigest(headers: Record<string, string>, digest: string, reprOnly: boolean): void {
+function emitDigestFields(
+  headers: Record<string, string>,
+  digest: string,
+  emitRepr: boolean,
+  emitContent: boolean,
+): void {
   const trimmed = digest.trim();
   if (!SHA256_BASE64_RE.test(trimmed)) return;
-  const reprDigest = `sha-256=:${trimmed}:`;
-  headers["Repr-Digest"] = reprDigest;
-  if (!reprOnly) headers["Content-Digest"] = reprDigest;
+  const value = `sha-256=:${trimmed}:`;
+  if (emitRepr) headers["Repr-Digest"] = value;
+  if (emitContent) headers["Content-Digest"] = value;
 }
 
 /**
