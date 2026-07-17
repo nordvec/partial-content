@@ -1,5 +1,57 @@
 # Changelog
 
+## 2.1.0 (2026-07-17)
+
+Resumable-upload hardening from an external adversarial review of the
+protocol core and both wire dialects. Every fix is additive or a bug fix; no
+breaking changes.
+
+### Fixed
+- **Deferred-length uploads now work end to end.** A length first declared on
+  a later append (tus `creation-defer-length`, or `Upload-Length` on an IETF
+  PATCH) is persisted durably by every write store, so the upload completes,
+  the length becomes immutable, and HEAD stops reporting a deferred length
+  forever. Previously such uploads stranded and could not complete.
+- **IETF append completeness fails closed.** An absent or malformed
+  completeness header on an append is no longer treated as "completing"
+  (which could publish a truncated object): it is a 400 where the revision
+  requires the header (interop 5/6) and treated as incomplete where it does
+  not (interop 3), never as complete.
+- **Cooperative preemption is level-triggered.** A preempt that arrives
+  during lock handover or before a write starts is no longer lost, so a
+  contended resume hands over in milliseconds instead of waiting out the lock
+  timeout.
+- **Unverifiable client digests are ignored, not refused.** A `Repr-Digest` a
+  store cannot verify (non-sha256 backends) is dropped per RFC 9530 rather
+  than answered with a false integrity-mismatch error.
+- **`minSize` is enforced at completion**, closing a bypass where a
+  deferred-length upload could publish under the floor.
+- **Creation runs under the resource lock**, so a client resuming via an
+  early `Location` cannot race a still-flushing creation.
+- **tus HEAD heals an implicit completion**: an upload whose completing
+  request died after its bytes were durable is published on the next probe
+  instead of remaining a permanently unpublished 404.
+- The IETF `Location` header is sanitized; raw upload tokens are kept off
+  error messages (they remain on the error property); `Upload-Expires` is an
+  absolute deadline a long append cannot inflate.
+
+### Added
+- `AppendChunkOptions.length`: the write-store contract field carrying a
+  late-declared length for adapters to persist.
+- Construction-time validation: `createUploadOrchestrator` throws on a policy
+  with NaN/negative/fractional bounds or inverted floor/ceiling pairs, and on
+  a store reporting `atomicCompletion: false`.
+- `createUploadOrchestrator` and the write-store contract types are now
+  re-exported from both `partial-content/tus` and `partial-content/upload`
+  (via a shared module), so custom stores and dialects need no internal
+  import paths.
+
+### Changed
+- Capability-flag docs corrected to describe what the orchestrator actually
+  requires: stores must accept any append size and buffer internally;
+  `exactOffsetRecovery: false` means a resume may re-send its last chunk (a
+  durable lower bound), never corruption.
+
 ## 2.0.0 (2026-07-16)
 
 The write side. One resumable-upload engine, two wire dialects, and write

@@ -1,6 +1,6 @@
 {
   "name": "partial-content",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "RFC-compliant HTTP file serving and resumable uploads for any storage backend. Range requests (206), conditional caching (304/412), Content-Disposition, ETag generation, and a resumable-upload engine speaking tus 1.0 and the IETF resumable-uploads draft. Zero dependencies.",
   "type": "module",
   "main": "./dist/index.js",

@@ -109,6 +109,8 @@ export type UploadOutcome =
       digest?: string;
       etag?: string;
       interrupted: boolean;
+      /** Absolute expiry (epoch ms), when a max age applies. */
+      expiresAt?: number;
     }
   | {
       kind: "probed";
@@ -116,6 +118,12 @@ export type UploadOutcome =
       length?: number;
       complete: boolean;
       remainingLifetimeSeconds?: number;
+      /**
+       * Absolute expiry (epoch ms), when a max age applies. Anchored on the
+       * resource's creation time, so a dialect emits a stable deadline that a
+       * long append cannot inflate (unlike now + remainingLifetimeSeconds).
+       */
+      expiresAt?: number;
     }
   | { kind: "cancelled" }
   | { kind: "digest-mismatch" }
@@ -148,6 +156,17 @@ export interface AppendUploadRequest {
   signal?: AbortSignal;
 }
 
+/**
+ * Per-request preemption slot. `abort` is the live append's controller (only
+ * present while a write is in flight); `preempted` latches when a later
+ * acquirer asks the holder to yield, so a preempt that arrives before the
+ * controller exists is not lost.
+ */
+interface Preemptable {
+  abort?: AbortController;
+  preempted?: boolean;
+}
+
 // ─── Orchestrator ───────────────────────────────────────────────────────────
 
 export interface UploadOrchestrator {
@@ -165,12 +184,26 @@ export function createUploadOrchestrator(
   store: ResumableWriteStore,
   opts: UploadOrchestratorOptions = {},
 ): UploadOrchestrator {
+  // The orchestrator publishes on a single `completeUpload` and has no
+  // rollback of its own, so a non-atomic store could leave a torn object
+  // visible to readers. Refuse it at construction rather than corrupt later.
+  if (!store.atomicCompletion) {
+    throw new TypeError(
+      "createUploadOrchestrator: store must report atomicCompletion: true "
+      + "(the orchestrator has no completion rollback of its own)",
+    );
+  }
   const policy: UploadPolicy = { ...opts.policy };
   if (store.maxAppendSize !== undefined) {
     policy.maxAppendSize = policy.maxAppendSize === undefined
       ? store.maxAppendSize
       : Math.min(policy.maxAppendSize, store.maxAppendSize);
   }
+  // Policy is the one input class the engine trusts without a per-request
+  // gate; a NaN/negative/fractional bound would silently disable enforcement
+  // (`x > NaN` is false) or flow a NaN maxBytes to an adapter. Fail loudly at
+  // construction, matching the package's caller-bugs-fail-loudly posture.
+  validatePolicy(policy);
   const locker = opts.locker ?? memoryUploadLocker();
   const now = opts.now ?? Date.now;
   const graceMs = opts.graceMs ?? 10_000;
@@ -208,6 +241,16 @@ export function createUploadOrchestrator(
       cleanups.push(() => signal.removeEventListener("abort", startTimer));
     }
     return ctl.signal;
+  }
+
+  /** The final durable size is below the policy floor: refuse to publish. */
+  function belowMinSize(finalSize: number): boolean {
+    return policy.minSize !== undefined && finalSize < policy.minSize;
+  }
+
+  /** Absolute expiry (epoch ms) for a resource, or undefined when no max age. */
+  function expiryOf(createdAt: number): number | undefined {
+    return policy.maxAgeSeconds === undefined ? undefined : createdAt + policy.maxAgeSeconds * 1000;
   }
 
   function mapStoreError(err: unknown, uploadToken: string | undefined, operation: string): UploadOutcome {
@@ -252,12 +295,20 @@ export function createUploadOrchestrator(
   /** Run `fn` holding the resource lock, translating lock timeouts to contention. */
   async function withLock(
     uploadToken: string,
-    preemptable: { abort?: AbortController },
+    preemptable: Preemptable,
     fn: () => Promise<UploadOutcome>,
   ): Promise<UploadOutcome> {
     let lock;
     try {
-      lock = await locker.acquire(uploadToken, () => preemptable.abort?.abort(new Error("preempted")));
+      // Level-triggered: a preempt that arrives before the write's abort
+      // controller exists (the FIFO-handover and pre-stream windows) latches
+      // the flag; streamAppend aborts immediately when it installs the
+      // controller. Edge-triggering here would drop the preempt into the void
+      // and degrade the whole handover to the acquire timeout.
+      lock = await locker.acquire(uploadToken, () => {
+        preemptable.preempted = true;
+        preemptable.abort?.abort(new Error("preempted"));
+      });
     } catch (err) {
       if (isUploadLockTimeoutError(err)) return { kind: "contended", events: [] };
       throw err;
@@ -274,8 +325,9 @@ export function createUploadOrchestrator(
     atOffset: number,
     body: ReadableStream<Uint8Array> | Uint8Array,
     maxBytes: number | undefined,
+    declaredLength: number | undefined,
     signal: AbortSignal | undefined,
-    preemptable: { abort?: AbortController },
+    preemptable: Preemptable,
   ): Promise<{ bytesWritten: number; interrupted: boolean }> {
     const cleanups: Array<() => void> = [];
     // The preemption controller chains the (grace-extended) request signal:
@@ -283,6 +335,9 @@ export function createUploadOrchestrator(
     // aborts it after the grace window.
     const ctl = new AbortController();
     preemptable.abort = ctl;
+    // A preempt that already landed while we had no controller installed
+    // (handover / pre-stream window) is honored the instant one exists.
+    if (preemptable.preempted) ctl.abort(new Error("preempted"));
     const graced = graceSignal(signal, cleanups);
     const onGraced = () => ctl.abort(graced?.reason);
     if (graced) {
@@ -295,6 +350,10 @@ export function createUploadOrchestrator(
     try {
       const { bytesWritten } = await store.appendChunk(uploadToken, atOffset, body, {
         maxBytes,
+        // A length first declared on this append: the store persists it so the
+        // next getUploadState reports it and it becomes immutable (the
+        // deferred-length flow). Undefined once the length is already known.
+        length: declaredLength,
         now: now(),
         signal: ctl.signal,
       });
@@ -329,9 +388,12 @@ export function createUploadOrchestrator(
         emit(undefined, req.auditKey, verdict.events);
         return rejectOutcome(verdict);
       }
-      if (req.expectedDigest !== undefined && store.digestOnComplete !== "sha256") {
-        return { kind: "digest-mismatch" };
-      }
+      // RFC 9530: a client's Repr-Digest is advisory. A store that cannot
+      // verify sha-256 IGNORES the assertion rather than refusing the upload
+      // (refusing would 100%-fail every integrity-conscious client on a
+      // non-verifying backend, telling it its bytes are corrupt when nothing
+      // was compared). Verifying stores still enforce it at completion.
+      const expectedDigest = store.digestOnComplete === "sha256" ? req.expectedDigest : undefined;
 
       let uploadToken: string;
       try {
@@ -347,45 +409,51 @@ export function createUploadOrchestrator(
       }
       emit(uploadToken, req.auditKey, verdict.events);
 
-      let offset = 0;
-      let interrupted = false;
-      if (req.body !== undefined) {
-        const preemptable: { abort?: AbortController } = {};
-        try {
-          const written = await streamAppend(
-            uploadToken, 0, req.body, verdict.maxBytes, req.signal, preemptable,
-          );
-          interrupted = written.interrupted;
-          // Durable truth, not the writer's count: re-derive.
-          const fresh = await store.getUploadState(uploadToken, { signal: req.signal });
-          offset = fresh.offset;
-        } catch (err) {
-          return mapStoreError(err, uploadToken, "append");
-        }
-      }
-
-      let digest: string | undefined;
-      let etag: string | undefined;
-      let complete = false;
+      const preemptable: Preemptable = {};
       const declaredLength = verdict.declaredLength;
-      if (verdict.completes && !interrupted && (declaredLength === undefined || offset === declaredLength)) {
-        try {
-          ({ digest, etag } = await store.completeUpload(uploadToken, {
-            expectedDigest: req.expectedDigest,
-            now: now(),
-            signal: req.signal,
-          }));
-          complete = true;
-          emit(uploadToken, req.auditKey, [{ kind: "completed", length: offset }]);
-        } catch (err) {
-          return mapStoreError(err, uploadToken, "complete");
+      // Lock the token before streaming so a client that received an early
+      // location (a 104 via onResumptionSupported) and resumes cannot race
+      // this creation's still-flushing write with no preemption. Invariant 1.
+      return withLock(uploadToken, preemptable, async () => {
+        let offset = 0;
+        let interrupted = false;
+        if (req.body !== undefined) {
+          try {
+            const written = await streamAppend(
+              uploadToken, 0, req.body, verdict.maxBytes, undefined, req.signal, preemptable,
+            );
+            interrupted = written.interrupted;
+            const fresh = await store.getUploadState(uploadToken, { signal: req.signal });
+            offset = fresh.offset;
+          } catch (err) {
+            return mapStoreError(err, uploadToken, "append");
+          }
         }
-      }
-      return { kind: "created", uploadToken, offset, length: declaredLength, complete, digest, etag, interrupted };
+
+        let digest: string | undefined;
+        let etag: string | undefined;
+        let complete = false;
+        if (verdict.completes && !interrupted && (declaredLength === undefined || offset === declaredLength)) {
+          if (belowMinSize(offset)) {
+            emit(uploadToken, req.auditKey, [{ kind: "append-rejected", reason: "below-min-size" }]);
+            return { kind: "limit-violation", reason: "below-min-size", events: [] };
+          }
+          try {
+            ({ digest, etag } = await store.completeUpload(uploadToken, {
+              expectedDigest, now: now(), signal: req.signal,
+            }));
+            complete = true;
+            emit(uploadToken, req.auditKey, [{ kind: "completed", length: offset }]);
+          } catch (err) {
+            return mapStoreError(err, uploadToken, "complete");
+          }
+        }
+        return { kind: "created", uploadToken, offset, length: declaredLength, complete, digest, etag, interrupted };
+      });
     },
 
     async probe(uploadToken, probeOpts): Promise<UploadOutcome> {
-      const preemptable: { abort?: AbortController } = {};
+      const preemptable: Preemptable = {};
       return withLock(uploadToken, preemptable, async () => {
         let state: StoredUploadState;
         try {
@@ -402,15 +470,16 @@ export function createUploadOrchestrator(
           length: verdict.length,
           complete: verdict.complete,
           remainingLifetimeSeconds: verdict.remainingLifetimeSeconds,
+          expiresAt: expiryOf(state.createdAt),
         };
       });
     },
 
     async append(uploadToken, req): Promise<UploadOutcome> {
-      if (req.expectedDigest !== undefined && store.digestOnComplete !== "sha256") {
-        return { kind: "digest-mismatch" };
-      }
-      const preemptable: { abort?: AbortController } = {};
+      // RFC 9530: ignore an unverifiable client digest rather than refusing
+      // (see create). Verifying stores still enforce it at completion.
+      const expectedDigest = store.digestOnComplete === "sha256" ? req.expectedDigest : undefined;
+      const preemptable: Preemptable = {};
       return withLock(uploadToken, preemptable, async () => {
         let state: StoredUploadState;
         try {
@@ -429,11 +498,13 @@ export function createUploadOrchestrator(
         emit(uploadToken, req.auditKey, verdict.events);
 
         if (verdict.kind === "complete-now") {
+          if (belowMinSize(verdict.length)) {
+            emit(uploadToken, req.auditKey, [{ kind: "append-rejected", reason: "below-min-size", atOffset: req.offset }]);
+            return { kind: "limit-violation", reason: "below-min-size", events: [] };
+          }
           try {
             const done = await store.completeUpload(uploadToken, {
-              expectedDigest: req.expectedDigest,
-              now: now(),
-              signal: req.signal,
+              expectedDigest, now: now(), signal: req.signal,
             });
             return {
               kind: "appended", offset: verdict.length, length: verdict.length,
@@ -445,11 +516,16 @@ export function createUploadOrchestrator(
         }
         if (verdict.kind !== "append-allowed") return rejectOutcome(verdict);
 
+        // Persist a length first declared on a no-body PATCH too: the write
+        // path is what records it, so an empty append carries the length.
+        const bodyToWrite = req.body
+          ?? (verdict.declaredLength !== undefined ? new Uint8Array(0) : undefined);
         let interrupted = false;
-        if (req.body !== undefined) {
+        if (bodyToWrite !== undefined) {
           try {
             const written = await streamAppend(
-              uploadToken, verdict.atOffset, req.body, verdict.maxBytes, req.signal, preemptable,
+              uploadToken, verdict.atOffset, bodyToWrite, verdict.maxBytes,
+              verdict.declaredLength, req.signal, preemptable,
             );
             interrupted = written.interrupted;
           } catch (err) {
@@ -480,11 +556,16 @@ export function createUploadOrchestrator(
           && (req.contentLength === undefined || fresh.offset === verdict.atOffset + req.contentLength)
           && (length === undefined || fresh.offset === length);
         if (shouldComplete) {
+          // The streaming-completion size floor: a completing append with an
+          // unknown content size only reveals the final total here, so this
+          // is the one place minSize can gate it before publishing.
+          if (belowMinSize(fresh.offset)) {
+            emit(uploadToken, req.auditKey, [{ kind: "append-rejected", reason: "below-min-size", atOffset: verdict.atOffset }]);
+            return { kind: "limit-violation", reason: "below-min-size", events: [] };
+          }
           try {
             ({ digest, etag } = await store.completeUpload(uploadToken, {
-              expectedDigest: req.expectedDigest,
-              now: now(),
-              signal: req.signal,
+              expectedDigest, now: now(), signal: req.signal,
             }));
             complete = true;
             emit(uploadToken, req.auditKey, [{ kind: "completed", length: fresh.offset }]);
@@ -494,13 +575,13 @@ export function createUploadOrchestrator(
         }
         return {
           kind: "appended", offset: fresh.offset, length,
-          complete, digest, etag, interrupted,
+          complete, digest, etag, interrupted, expiresAt: expiryOf(fresh.createdAt),
         };
       });
     },
 
     async cancel(uploadToken, cancelOpts): Promise<UploadOutcome> {
-      const preemptable: { abort?: AbortController } = {};
+      const preemptable: Preemptable = {};
       return withLock(uploadToken, preemptable, async () => {
         let state: StoredUploadState;
         try {
@@ -523,3 +604,32 @@ export function createUploadOrchestrator(
 }
 
 export { remainingLifetimeSeconds };
+
+/**
+ * Reject a policy the engine would otherwise trust silently: every bound must
+ * be a non-negative safe integer, and the floors must not exceed the ceilings.
+ * A NaN/negative/fractional value would disable enforcement or flow a NaN
+ * byte-bound to an adapter, so this throws at construction rather than corrupt
+ * quietly at runtime.
+ */
+function validatePolicy(policy: UploadPolicy): void {
+  const fields: Array<[keyof UploadPolicy, number | undefined]> = [
+    ["maxSize", policy.maxSize],
+    ["minSize", policy.minSize],
+    ["maxAppendSize", policy.maxAppendSize],
+    ["minAppendSize", policy.minAppendSize],
+    ["maxAgeSeconds", policy.maxAgeSeconds],
+  ];
+  for (const [name, value] of fields) {
+    if (value !== undefined && (!Number.isSafeInteger(value) || value < 0)) {
+      throw new TypeError(`createUploadOrchestrator: policy.${name} must be a non-negative safe integer, got ${value}`);
+    }
+  }
+  if (policy.minSize !== undefined && policy.maxSize !== undefined && policy.minSize > policy.maxSize) {
+    throw new TypeError(`createUploadOrchestrator: policy.minSize (${policy.minSize}) exceeds maxSize (${policy.maxSize})`);
+  }
+  if (policy.minAppendSize !== undefined && policy.maxAppendSize !== undefined
+    && policy.minAppendSize > policy.maxAppendSize) {
+    throw new TypeError(`createUploadOrchestrator: policy.minAppendSize (${policy.minAppendSize}) exceeds maxAppendSize (${policy.maxAppendSize})`);
+  }
+}

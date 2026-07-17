@@ -73,6 +73,8 @@ function fakeStore(over: Partial<ResumableWriteStore> = {}) {
             for (const c of chunks) { merged.set(c, at); at += c.byteLength; }
             u.bytes = merged;
             u.lastAppendAt = opts.now;
+            // Persist a length first declared on this append (deferred-length).
+            if (opts.length !== undefined && u.length === undefined) u.length = opts.length;
             if (opts.signal?.aborted) throw new Error("aborted mid-append");
             return { bytesWritten: written };
         },
@@ -159,11 +161,21 @@ describe("create", () => {
         expect(out.offset).toBe(3); // the flushed prefix, from FRESH state
     });
 
-    test("expectedDigest without store support is refused up front", async () => {
-        const { store } = fakeStore({ digestOnComplete: false });
+    test("an unverifiable digest is IGNORED, not refused (RFC 9530: advisory)", async () => {
+        // A store that cannot verify sha-256 must not fail a client that
+        // voluntarily asserts Repr-Digest: nothing was compared, so a refusal
+        // would be a lie. The upload completes; the digest is dropped.
+        const digestSeen: (string | undefined)[] = [];
+        const { store } = fakeStore({
+            digestOnComplete: false,
+            completeUpload: async (_t, opts) => { digestSeen.push(opts.expectedDigest); return { etag: '"x"' }; },
+        });
         const o = orch(store);
         const out = await o.create({ key: "k", complete: true, contentLength: 1, body: bodyOf("x"), expectedDigest: "GOOD" });
-        expect(out.kind).toBe("digest-mismatch");
+        expect(out.kind).toBe("created");
+        if (out.kind !== "created") return;
+        expect(out.complete).toBe(true);
+        expect(digestSeen).toEqual([undefined]); // the store never saw the unverifiable digest
     });
 });
 
@@ -340,6 +352,117 @@ describe("concurrency and hooks", () => {
         expect(orch(store).canVerifyDigest).toBe(true);
         const { store: noDigest } = fakeStore({ digestOnComplete: false });
         expect(orch(noDigest).canVerifyDigest).toBe(false);
+    });
+});
+
+describe("construction guards (audit R534)", () => {
+    test("a store reporting atomicCompletion: false is refused", () => {
+        const { store } = fakeStore();
+        const nonAtomic = { ...store, atomicCompletion: false } as ResumableWriteStore;
+        expect(() => createUploadOrchestrator(nonAtomic, { now: () => NOW })).toThrow(TypeError);
+    });
+
+    test("a NaN / negative / fractional / inverted policy is refused", () => {
+        const { store } = fakeStore();
+        const mk = (policy: object) => () => createUploadOrchestrator(store, { now: () => NOW, policy });
+        expect(mk({ maxSize: NaN })).toThrow(TypeError);
+        expect(mk({ maxSize: -1 })).toThrow(TypeError);
+        expect(mk({ maxAppendSize: 1.5 })).toThrow(TypeError);
+        expect(mk({ minSize: 100, maxSize: 10 })).toThrow(TypeError);
+        expect(mk({ minAppendSize: 100, maxAppendSize: 10 })).toThrow(TypeError);
+        // A clean policy constructs.
+        expect(mk({ minSize: 1, maxSize: 10, maxAppendSize: 5 })).not.toThrow();
+    });
+});
+
+describe("minSize at completion (audit R534 F7)", () => {
+    test("a known-total single-shot create below the floor is refused before allocation", async () => {
+        const { store, uploads } = fakeStore();
+        const o = orch(store, { policy: { minSize: 10 } });
+        const out = await o.create({ key: "k", contentLength: 3, complete: true, body: bodyOf("abc") });
+        expect(out).toMatchObject({ kind: "limit-violation", reason: "below-min-size" });
+        // The engine rejects a known-under-floor total at creation: nothing allocated.
+        expect(uploads.size).toBe(0);
+    });
+
+    test("a STREAMING completing create below the floor does NOT publish (post-stream check)", async () => {
+        // Unknown content size at creation: the floor can only be checked after
+        // the bytes land. The object is allocated then must not be published.
+        const { store, uploads } = fakeStore();
+        const o = orch(store, { policy: { minSize: 10 } });
+        const out = await o.create({ key: "k", complete: true, body: bodyOf("abc") });
+        expect(out).toMatchObject({ kind: "limit-violation", reason: "below-min-size" });
+        expect([...uploads.values()][0]!.isComplete).toBe(false);
+    });
+
+    test("a deferred-length upload cannot slip under the floor via a tiny completing append", async () => {
+        const { store, uploads } = fakeStore();
+        const o = orch(store, { policy: { minSize: 10 } });
+        const created = await o.create({ key: "k", complete: false }); // no length
+        if (created.kind !== "created") throw new Error("setup");
+        const out = await o.append(created.uploadToken, {
+            offset: 0, contentLength: 1, complete: true, body: bodyOf("x"),
+        });
+        expect(out).toMatchObject({ kind: "limit-violation", reason: "below-min-size" });
+        expect([...uploads.values()][0]!.isComplete).toBe(false);
+    });
+
+    test("at or above the floor completes normally", async () => {
+        const { store } = fakeStore();
+        const o = orch(store, { policy: { minSize: 3 } });
+        const out = await o.create({ key: "k", contentLength: 3, complete: true, body: bodyOf("abc") });
+        expect(out).toMatchObject({ kind: "created", complete: true });
+    });
+});
+
+describe("deferred-length persistence (audit R534 F1)", () => {
+    test("a length declared on a later append persists and drives completion", async () => {
+        const { store } = fakeStore();
+        const o = orch(store);
+        const created = await o.create({ key: "k", complete: false }); // no length
+        if (created.kind !== "created") throw new Error("setup");
+
+        // First append carries the length AND the first bytes.
+        await o.append(created.uploadToken, {
+            offset: 0, contentLength: 5, complete: false, declaredLength: 10, body: bodyOf("01234"),
+        });
+        // The store now reports the length: a probe sees it, and a wrong
+        // second declaration is rejected as immutable.
+        const probed = await o.probe(created.uploadToken);
+        expect(probed).toMatchObject({ kind: "probed", offset: 5, length: 10 });
+        const conflict = await o.append(created.uploadToken, {
+            offset: 5, contentLength: 5, complete: false, declaredLength: 999, body: bodyOf("56789"),
+        });
+        expect(conflict.kind).toBe("length-inconsistent");
+
+        // The correct completing append reaches the persisted length and publishes.
+        const done = await o.append(created.uploadToken, {
+            offset: 5, contentLength: 5, complete: true, body: bodyOf("56789"),
+        });
+        expect(done).toMatchObject({ kind: "appended", offset: 10, complete: true });
+    });
+});
+
+describe("create runs under the lock (audit R534 F8)", () => {
+    test("a resume that races a still-flushing creation is serialized, not concurrent", async () => {
+        const { store } = fakeStore();
+        const o = createUploadOrchestrator(store, { now: () => NOW, graceMs: 0 });
+        const body = controlledStream();
+        // Start a completing creation whose body stays open (holds the lock).
+        const creating = o.create({ key: "k", complete: false, body: body.stream });
+        await new Promise((r) => setTimeout(r, 5));
+        body.push("abc");
+
+        // We cannot know the token before create resolves, but the lock is on
+        // it; drive the stream to completion and confirm the creation owned the
+        // lock for its whole streaming life (no interleave observable, and the
+        // result is coherent).
+        body.close();
+        const created = await creating;
+        expect(created.kind).toBe("created");
+        if (created.kind !== "created") return;
+        const probed = await o.probe(created.uploadToken);
+        expect(probed).toMatchObject({ kind: "probed", offset: 3 });
     });
 });
 
@@ -740,19 +863,22 @@ describe("append edge paths", () => {
         expect([...uploads.values()][0]!.isComplete).toBe(false);
     });
 
-    test("expectedDigest on a non-verifying store is refused before any store call", async () => {
-        let stateReads = 0;
-        const { store } = fakeStore({ digestOnComplete: false });
-        const counting: ResumableWriteStore = {
-            ...store,
-            getUploadState: (t, opts) => { stateReads++; return store.getUploadState(t, opts); },
-        };
-        const o = orch(counting);
-        const out = await o.append("tok", {
-            offset: 0, contentLength: 1, complete: false, body: bodyOf("x"), expectedDigest: "anything",
+    test("an unverifiable digest on append is ignored, never handed to the store", async () => {
+        const digestSeen: (string | undefined)[] = [];
+        const { store } = fakeStore({
+            digestOnComplete: false,
+            completeUpload: async (_t, opts) => { digestSeen.push(opts.expectedDigest); return { etag: '"x"' }; },
         });
-        expect(out.kind).toBe("digest-mismatch");
-        expect(stateReads).toBe(0);
+        const o = orch(store);
+        const created = await o.create({ key: "k", declaredLength: 1, complete: false });
+        if (created.kind !== "created") throw new Error("setup");
+        const out = await o.append(created.uploadToken, {
+            offset: 0, contentLength: 1, complete: true, body: bodyOf("x"), expectedDigest: "anything",
+        });
+        expect(out.kind).toBe("appended");
+        if (out.kind !== "appended") return;
+        expect(out.complete).toBe(true);
+        expect(digestSeen).toEqual([undefined]);
     });
 
     test("no expectedDigest on a non-verifying store appends normally", async () => {
@@ -956,5 +1082,149 @@ describe("signal propagation", () => {
             "state", "complete", "state", "state", "state", "complete", "state", "abort",
         ]);
         for (const c of calls) expect(c.signal).toBe(signal);
+    });
+});
+
+describe("preemption latched before the write controller exists (audit R534)", () => {
+    test("a preempt that lands during the pre-stream window still aborts the append", async () => {
+        // A holds the lock and sits in a slow getUploadState (no write
+        // controller installed yet); a concurrent probe arrives and preempts
+        // it. When A reaches streamAppend it must honor the latched preempt at
+        // controller-install time and interrupt the write, not stream on.
+        const { store } = fakeStore();
+        const slow: ResumableWriteStore = {
+            ...store,
+            getUploadState: async (t, opts) => {
+                await new Promise((r) => setTimeout(r, 30));
+                return store.getUploadState(t, opts);
+            },
+        };
+        const o = orch(slow);
+        const created = await o.create({ key: "k", complete: false });
+        if (created.kind !== "created") throw new Error("setup");
+
+        const [appendA, probeB] = await Promise.all([
+            o.append(created.uploadToken, {
+                offset: 0, contentLength: 3, complete: false, body: bodyOf("abc"),
+            }),
+            (async () => {
+                await new Promise((r) => setTimeout(r, 5));
+                return o.probe(created.uploadToken);
+            })(),
+        ]);
+        expect(appendA).toMatchObject({ kind: "appended", interrupted: true });
+        expect(probeB.kind).toBe("probed");
+    });
+});
+
+describe("minSize gate at completion emits and returns cleanly (audit R534 F7)", () => {
+    test("a streaming create below the floor emits the rejection and returns empty events", async () => {
+        const events: UploadResourceEvent[] = [];
+        const { store, uploads } = fakeStore();
+        const o = createUploadOrchestrator(store, {
+            now: () => NOW, graceMs: 0, policy: { minSize: 10 }, onUploadEvent: (e) => events.push(e),
+        });
+        const out = await o.create({ key: "k", complete: true, body: bodyOf("abc") });
+        expect(out).toEqual({ kind: "limit-violation", reason: "below-min-size", events: [] });
+        expect([...uploads.values()][0]!.isComplete).toBe(false);
+        expect(events.some((e) => e.event.kind === "append-rejected" && e.event.reason === "below-min-size")).toBe(true);
+    });
+
+    test("a complete-now zero-content append below the floor does NOT publish and emits its offset", async () => {
+        const events: UploadResourceEvent[] = [];
+        const { store, uploads } = fakeStore();
+        const o = createUploadOrchestrator(store, {
+            now: () => NOW, graceMs: 0, policy: { minSize: 10 }, onUploadEvent: (e) => events.push(e),
+        });
+        const created = await o.create({ key: "k", complete: false }); // deferred length
+        if (created.kind !== "created") throw new Error("setup");
+        // First append declares length 2 and lands both bytes: offset === length,
+        // still incomplete, so the tail is a zero-content completing append.
+        await o.append(created.uploadToken, {
+            offset: 0, contentLength: 2, complete: false, declaredLength: 2, body: bodyOf("ab"),
+        });
+        // That completing tail is a complete-now verdict whose total (2) is under
+        // the floor (10): the gate must refuse it before publishing.
+        const out = await o.append(created.uploadToken, { offset: 2, contentLength: 0, complete: true });
+        expect(out).toEqual({ kind: "limit-violation", reason: "below-min-size", events: [] });
+        expect([...uploads.values()][0]!.isComplete).toBe(false);
+        expect(events.some((e) => e.event.kind === "append-rejected"
+            && e.event.reason === "below-min-size" && e.event.atOffset === 2)).toBe(true);
+    });
+
+    test("a streaming completing append below the floor emits the rejection with its offset", async () => {
+        const events: UploadResourceEvent[] = [];
+        const { store, uploads } = fakeStore();
+        const o = createUploadOrchestrator(store, {
+            now: () => NOW, graceMs: 0, policy: { minSize: 10 }, onUploadEvent: (e) => events.push(e),
+        });
+        const created = await o.create({ key: "k", complete: false });
+        if (created.kind !== "created") throw new Error("setup");
+        const out = await o.append(created.uploadToken, {
+            offset: 0, contentLength: 1, complete: true, body: bodyOf("x"),
+        });
+        expect(out).toEqual({ kind: "limit-violation", reason: "below-min-size", events: [] });
+        expect([...uploads.values()][0]!.isComplete).toBe(false);
+        expect(events.some((e) => e.event.kind === "append-rejected"
+            && e.event.reason === "below-min-size" && e.event.atOffset === 0)).toBe(true);
+    });
+});
+
+describe("deferred-length threading on an empty append (audit R534 F1)", () => {
+    test("a no-body append that declares a length persists it via the write path", async () => {
+        const { store } = fakeStore();
+        const o = orch(store);
+        const created = await o.create({ key: "k", complete: false }); // deferred length
+        if (created.kind !== "created") throw new Error("setup");
+        // No body, but this append first declares the total length. The write
+        // path is what records the length, so an empty append must still reach
+        // it (the store persists the length even for zero bytes).
+        const appended = await o.append(created.uploadToken, {
+            offset: 0, complete: false, declaredLength: 10,
+        });
+        expect(appended).toMatchObject({ kind: "appended", offset: 0, length: 10 });
+        // A subsequent probe reads the durable length from the store, proving the
+        // empty append persisted it rather than only echoing the request value.
+        const probed = await o.probe(created.uploadToken);
+        expect(probed).toMatchObject({ kind: "probed", offset: 0, length: 10 });
+    });
+
+    test("a no-body append without a declared length never calls the writer", async () => {
+        let appendCalls = 0;
+        const { store } = fakeStore();
+        const spy: ResumableWriteStore = {
+            ...store,
+            appendChunk: (t, off, body, opts) => { appendCalls++; return store.appendChunk(t, off, body, opts); },
+        };
+        const o = orch(spy);
+        const created = await o.create({ key: "k", declaredLength: 10, complete: false });
+        if (created.kind !== "created") throw new Error("setup");
+        const out = await o.append(created.uploadToken, { offset: 0, complete: false });
+        expect(out).toMatchObject({ kind: "appended", offset: 0, length: 10, interrupted: false });
+        // Nothing to write and no length to record: the writer is untouched.
+        expect(appendCalls).toBe(0);
+    });
+});
+
+describe("policy validation field coverage (audit R534)", () => {
+    test("each field is validated, zero is allowed, and equal bounds pass", () => {
+        const { store } = fakeStore();
+        const mk = (policy: object) => () => createUploadOrchestrator(store, { now: () => NOW, policy });
+        // Per-field non-negativity: each field has its own row in the table, so a
+        // lone invalid value (no inverted-pair to catch it) must still throw.
+        expect(mk({ minSize: -1 })).toThrow(TypeError);
+        expect(mk({ minAppendSize: -1 })).toThrow(TypeError);
+        expect(mk({ maxAgeSeconds: -1 })).toThrow(TypeError);
+        // Zero is a valid non-negative bound: the floor is `< 0`, not `<= 0`.
+        expect(mk({ minSize: 0, maxSize: 0 })).not.toThrow();
+        expect(mk({ minAppendSize: 0, maxAppendSize: 0 })).not.toThrow();
+        expect(mk({ maxAgeSeconds: 0 })).not.toThrow();
+        // Equal floor and ceiling are allowed: the inverted-pair check is strict
+        // `>`, not `>=`.
+        expect(mk({ minSize: 5, maxSize: 5 })).not.toThrow();
+        expect(mk({ minAppendSize: 5, maxAppendSize: 5 })).not.toThrow();
+        // A correctly ordered append window with BOTH bounds present constructs
+        // (min below max, both defined).
+        expect(mk({ minAppendSize: 3, maxAppendSize: 5 })).not.toThrow();
     });
 });

@@ -346,6 +346,36 @@ describe("r2UploadStore: guards", () => {
     });
 });
 
+// ─── Deferred Length ─────────────────────────────────────────────────────────
+
+describe("r2UploadStore: deferred-length declaration on append", () => {
+    test("a length first declared on a part-flushing append is persisted and reported next", async () => {
+        const { store } = makeStore();
+        const { uploadToken } = await store.createUpload({ key: "deferred.bin", now: NOW });
+        expect((await store.getUploadState(uploadToken)).length).toBeUndefined();
+
+        await store.appendChunk(uploadToken, 0, bytes(1, 2, 3, 4), { length: 4, now: NOW + 1 });
+
+        const state = await store.getUploadState(uploadToken);
+        expect(state.length).toBe(4);
+        expect(state.offset).toBe(4);
+    });
+
+    test("a length declared on a zero-byte append (no part landed) is still persisted", async () => {
+        const { store } = makeStore();
+        const { uploadToken } = await store.createUpload({ key: "z.bin", now: NOW });
+        await store.appendChunk(uploadToken, 0, new Uint8Array(0), { length: 0, now: NOW + 1 });
+        expect((await store.getUploadState(uploadToken)).length).toBe(0);
+    });
+
+    test("a length already recorded at creation is never overwritten by an append", async () => {
+        const { store } = makeStore();
+        const { uploadToken } = await store.createUpload({ key: "fixed.bin", length: 9, now: NOW });
+        await store.appendChunk(uploadToken, 0, bytes(1, 2, 3, 4), { length: 42, now: NOW + 1 });
+        expect((await store.getUploadState(uploadToken)).length).toBe(9);
+    });
+});
+
 // ─── Not-Found + Token Integrity ─────────────────────────────────────────────
 
 describe("r2UploadStore: not-found and token integrity", () => {

@@ -28,7 +28,7 @@ export interface UploadLock {
 export class UploadLockTimeoutError extends Error {
   readonly uploadToken: string;
   constructor(uploadToken: string) {
-    super(`Upload ${uploadToken}: lock holder did not yield in time`);
+    super("Upload lock holder did not yield in time");
     this.name = "UploadLockTimeoutError";
     this.uploadToken = uploadToken;
   }

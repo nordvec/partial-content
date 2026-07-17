@@ -204,6 +204,27 @@ describe("memoryUploadStore: create / state / append / complete round trip", () 
     });
 });
 
+describe("memoryUploadStore: deferred-length declaration on append", () => {
+    test("a length first declared on an append is persisted and reported by the next state", async () => {
+        const store = memoryUploadStore({ objects: {} });
+        const { uploadToken } = await store.createUpload({ key: "k", now: 0 });
+        expect((await store.getUploadState(uploadToken)).length).toBeUndefined();
+
+        await store.appendChunk(uploadToken, 0, enc.encode("hello"), { length: 5, now: 1 });
+
+        const state = await store.getUploadState(uploadToken);
+        expect(state.length).toBe(5);
+        expect(state.offset).toBe(5);
+    });
+
+    test("a length already recorded at creation is never overwritten by an append", async () => {
+        const store = memoryUploadStore({ objects: {} });
+        const { uploadToken } = await store.createUpload({ key: "k", length: 9, now: 0 });
+        await store.appendChunk(uploadToken, 0, enc.encode("abc"), { length: 42, now: 1 });
+        expect((await store.getUploadState(uploadToken)).length).toBe(9);
+    });
+});
+
 describe("memoryUploadStore: offset conflicts and dead resources", () => {
     test("a mismatched claimed offset throws with the durable offset attached", async () => {
         const store = memoryUploadStore({ objects: {} });

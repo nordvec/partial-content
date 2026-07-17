@@ -206,6 +206,30 @@ describe("fsUploadStore: restart simulation (no in-memory state)", () => {
     });
 });
 
+describe("fsUploadStore: deferred-length declaration on append", () => {
+    test("a length first declared on an append is fsynced and survives a fresh instance", async () => {
+        const writer = fsUploadStore({ root });
+        const { uploadToken } = await writer.createUpload({ key: "k.bin", now: 0 });
+        expect((await writer.getUploadState(uploadToken)).length).toBeUndefined();
+
+        await writer.appendChunk(uploadToken, 0, enc.encode("hello"), { length: 5, now: 1 });
+
+        // A brand-new instance over the same root proves the length was durably
+        // written into the sidecar, not just held in memory.
+        const resumed = fsUploadStore({ root });
+        const state = await resumed.getUploadState(uploadToken);
+        expect(state.length).toBe(5);
+        expect(state.offset).toBe(5);
+    });
+
+    test("a length already recorded at creation is never overwritten by an append", async () => {
+        const store = fsUploadStore({ root });
+        const { uploadToken } = await store.createUpload({ key: "k.bin", length: 9, now: 0 });
+        await store.appendChunk(uploadToken, 0, enc.encode("abc"), { length: 42, now: 1 });
+        expect((await fsUploadStore({ root }).getUploadState(uploadToken)).length).toBe(9);
+    });
+});
+
 describe("fsUploadStore: offset conflicts", () => {
     test("a mismatched claimed offset throws with the durable offset and writes nothing", async () => {
         const store = fsUploadStore({ root });

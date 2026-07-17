@@ -875,7 +875,17 @@ export function gcsUploadStore(opts: GcsUploadStoreOptions): ResumableWriteStore
         stream.end();
         await finished;
       }
-      await saveState({ ...state, lastAppendAt: appendOpts.now }, id);
+      // Deferred-length declaration: the first append to carry a length records
+      // it in the `.info` object so the next getUploadState reports it and it
+      // turns immutable. Only ever set once (the orchestrator guarantees it, and
+      // the guard makes it safe): a length already recorded is never
+      // overwritten. saveState is awaited, so the length is durable before the ack.
+      const declaresLength = appendOpts.length !== undefined && state.length === undefined;
+      await saveState({
+        ...state,
+        ...(declaresLength ? { length: appendOpts.length } : {}),
+        lastAppendAt: appendOpts.now,
+      }, id);
       return { bytesWritten: stream ? written : 0 };
     },
 

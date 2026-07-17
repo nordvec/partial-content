@@ -614,6 +614,17 @@ export function fsUploadStore(opts: FsUploadStoreOptions): ResumableWriteStore {
           throw new UploadOffsetConflictError(uploadToken, durableOffset);
         }
 
+        // Deferred-length declaration: the first append to carry a length
+        // records it in the sidecar so the next getUploadState (which derives
+        // length from the sidecar) reports it and it turns immutable. Only ever
+        // set once (the orchestrator guarantees it, and the guard makes it
+        // safe): a length already recorded is never overwritten. The write
+        // below is fsynced when this fires, matching create/complete durability.
+        const lengthDeclared = appendOpts.length !== undefined && sidecar.length === undefined;
+        if (lengthDeclared) {
+          sidecar.length = appendOpts.length;
+        }
+
         let flushed = 0;
         let crossedBound = false;
         /** Write as much of `chunk` as the byte bound allows; false = crossed. */
@@ -670,7 +681,10 @@ export function fsUploadStore(opts: FsUploadStoreOptions): ResumableWriteStore {
           sidecar.isInvalidated = true;
           await writeSidecar(paths.sidecar, sidecar, true);
         } else {
-          await writeSidecar(paths.sidecar, sidecar, false);
+          // A newly declared length is a creation fact: fsync it so a crash
+          // after the ack cannot lose it (an un-synced length would strand the
+          // upload just as its absence did).
+          await writeSidecar(paths.sidecar, sidecar, lengthDeclared);
         }
         return { bytesWritten: flushed };
       } finally {

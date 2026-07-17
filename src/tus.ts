@@ -49,6 +49,7 @@ import {
 import type { UploadPolicy } from "./upload-engine.ts";
 import type { ResumableWriteStore } from "./upload-store.ts";
 import type { UploadLocker } from "./upload-locker.ts";
+import { UPLOAD_ERROR_HEADERS } from "./upload-shared.ts";
 import { sanitizeHeaderValue } from "./index.ts";
 
 // ─── Constants ───────────────────────────────────────────────────────────────
@@ -74,12 +75,6 @@ const OFFSET_CONTENT_TYPE = "application/offset+octet-stream";
  * active content no origin to execute in. Mirrors the read side's deny
  * headers so both halves of the package fail closed identically.
  */
-const DENY_HEADERS = {
-  "Content-Security-Policy": "default-src 'none'",
-  "X-Content-Type-Options": "nosniff",
-  "Cache-Control": "no-store",
-} as const;
-
 /** One reusable UTF-8 encoder for plain-text error bodies. */
 const UTF8_ENCODER = new TextEncoder();
 /** Fatal decoder: a metadata value that is not valid UTF-8 is rejected, not laundered. */
@@ -304,7 +299,7 @@ export function createTusHandler(
     return respond(status, statusText, {
       "Content-Type": "text/plain; charset=utf-8",
       "Content-Length": String(body === null ? 0 : body.byteLength),
-      ...DENY_HEADERS,
+      ...UPLOAD_ERROR_HEADERS,
       ...opts.headers,
       "Tus-Resumable": TUS_VERSION,
     }, body);
@@ -353,8 +348,12 @@ export function createTusHandler(
         // Success kinds are handled by each method before mapping, and
         // digest-mismatch is unreachable while the checksum extension is
         // descoped (this dialect never asserts a digest). Reaching here is
-        // an internal invariant breach: fail closed, never mislabel it as a
-        // client error.
+        // an internal invariant breach: report it (an operator must see a
+        // breach), then fail closed without mislabeling it a client error.
+        onError?.(
+          new Error(`tus dialect: unexpected orchestrator outcome "${outcome.kind}"`),
+          { operation: "reject" },
+        );
         return errorResponse(500, "Internal Server Error", "internal error", { isHead });
     }
   }
@@ -482,8 +481,23 @@ export function createTusHandler(
   /** HEAD: offset probe (tus 1.0 core, HEAD). */
   async function handleHead(req: Request, uploadToken: string): Promise<Response> {
     const auditKey = options.auditKey?.(uploadToken);
-    const outcome = await orchestrator.probe(uploadToken, { auditKey, signal: req.signal });
+    let outcome = await orchestrator.probe(uploadToken, { auditKey, signal: req.signal });
     if (outcome.kind !== "probed") return rejectResponse(outcome, true);
+
+    // Heal a crash window: if the completing request died after its bytes
+    // went durable but before completion (a killed handler on a
+    // request-cancelling runtime), the resource sits at offset === length but
+    // unpublished. A tus client seeing offset == length concludes "done" and
+    // stops, so without this the assembled object is never published and
+    // 404s forever. Publish it here, on the very probe that would otherwise
+    // mislead the client. (The IETF dialect needs no equivalent: explicit
+    // completeness keeps an offset==length probe with `?0` coherent.)
+    if (!outcome.complete && outcome.length !== undefined && outcome.offset === outcome.length) {
+      const healed = await healImplicitCompletion(uploadToken, outcome.offset, auditKey);
+      if (healed.kind === "appended" || healed.kind === "already-complete") {
+        outcome = { ...outcome, complete: true };
+      }
+    }
 
     const headers: Record<string, string> = {
       "Tus-Resumable": TUS_VERSION,
@@ -503,8 +517,8 @@ export function createTusHandler(
     // metadata was stored); the orchestrator's probed outcome does not carry
     // stored metadata and the dialect never reads the store directly;
     // revisit when the probed UploadOutcome exposes creation metadata.
-    if (outcome.remainingLifetimeSeconds !== undefined && !outcome.complete) {
-      headers["Upload-Expires"] = imfFixdate(now() + outcome.remainingLifetimeSeconds * 1000);
+    if (outcome.expiresAt !== undefined && !outcome.complete) {
+      headers["Upload-Expires"] = imfFixdate(outcome.expiresAt);
     }
     return respond(200, "OK", headers);
   }
@@ -588,10 +602,11 @@ export function createTusHandler(
       "Upload-Offset": String(outcome.offset),
     };
     // Every PATCH response on an upload that will expire MUST say when
-    // (expiration extension). Expiry is anchored at creation, so the
-    // pre-append probe's remaining lifetime still holds.
-    if (probed.remainingLifetimeSeconds !== undefined && !isComplete) {
-      headers["Upload-Expires"] = imfFixdate(now() + probed.remainingLifetimeSeconds * 1000);
+    // (expiration extension). The absolute deadline comes from the append
+    // outcome (createdAt + max age), so a long-running append cannot inflate
+    // it the way `now + remaining` measured before the append would.
+    if (outcome.expiresAt !== undefined && !isComplete) {
+      headers["Upload-Expires"] = imfFixdate(outcome.expiresAt);
     }
     return respond(204, "No Content", headers);
   }
@@ -663,33 +678,5 @@ export function createTusHandler(
 
 // ─── Shared upload surface (re-exported for consumers) ──────────────────────
 // The write-store contract, errors, locking, and the dialect-agnostic
-// orchestrator (for custom wire dialects), so consumers never import
-// internal module paths.
-export {
-  UploadNotFoundError,
-  UploadOffsetConflictError,
-  UploadDigestMismatchError,
-  isUploadNotFoundError,
-  isUploadOffsetConflictError,
-  isUploadDigestMismatchError,
-} from "./upload-store.ts";
-export type {
-  ResumableWriteStore,
-  StoredUploadState,
-  CreateUploadOptions,
-  AppendChunkOptions,
-  CompleteUploadOptions,
-  CompletedUpload,
-} from "./upload-store.ts";
-export { memoryUploadLocker, UploadLockTimeoutError } from "./upload-locker.ts";
-export type { UploadLocker, UploadLock } from "./upload-locker.ts";
-export { createUploadOrchestrator } from "./upload-orchestrator.ts";
-export type {
-  UploadOrchestrator,
-  UploadOrchestratorOptions,
-  UploadOutcome,
-  UploadResourceEvent,
-  CreateUploadRequest,
-  AppendUploadRequest,
-} from "./upload-orchestrator.ts";
-export type { UploadPolicy, UploadAuditEvent } from "./upload-engine.ts";
+// orchestrator, from one shared module so /tus and /upload never diverge.
+export * from "./upload-shared.ts";

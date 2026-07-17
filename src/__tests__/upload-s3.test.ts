@@ -493,6 +493,56 @@ describe("s3UploadStore: appendChunk", () => {
     });
 });
 
+// ─── Deferred length ────────────────────────────────────────────────────────
+
+describe("s3UploadStore: deferred-length declaration on append", () => {
+    test("a length first declared on an append is written to .info and reported next", async () => {
+        let storedInfo = JSON.stringify({ createdAt: NOW });
+        const { store, uploadToken } = await createStoreWithUpload(
+            {
+                GetObjectCommand: routeGetObject({
+                    info: () => ({ Body: new TextEncoder().encode(storedInfo) }),
+                }),
+                PutObjectCommand: (input) => {
+                    if (String(input.Key).endsWith(".info")) storedInfo = String(input.Body);
+                    return {};
+                },
+                ListPartsCommand: () => ({ Parts: [], IsTruncated: false }),
+                HeadObjectCommand: () => { throw notFound("NotFound"); },
+            },
+            { storeOpts: { minPartSize: 8 } },
+        );
+
+        // Created without a length; the sub-part-size body parks a tail sidecar.
+        await store.appendChunk(uploadToken, 0, bytesOf("abc"), { length: 12, now: NOW + 1 });
+        expect(JSON.parse(storedInfo).length).toBe(12);
+
+        const state = await store.getUploadState(uploadToken);
+        expect(state.length).toBe(12);
+    });
+
+    test("a length already recorded at creation is never overwritten by an append", async () => {
+        let storedInfo = JSON.stringify({ createdAt: NOW, length: 5 });
+        const { store, uploadToken } = await createStoreWithUpload(
+            {
+                GetObjectCommand: routeGetObject({
+                    info: () => ({ Body: new TextEncoder().encode(storedInfo) }),
+                }),
+                PutObjectCommand: (input) => {
+                    if (String(input.Key).endsWith(".info")) storedInfo = String(input.Body);
+                    return {};
+                },
+                ListPartsCommand: () => ({ Parts: [], IsTruncated: false }),
+                HeadObjectCommand: () => { throw notFound("NotFound"); },
+            },
+            { storeOpts: { minPartSize: 8 }, length: 5 },
+        );
+
+        await store.appendChunk(uploadToken, 0, bytesOf("abc"), { length: 42, now: NOW + 1 });
+        expect(JSON.parse(storedInfo).length).toBe(5);
+    });
+});
+
 // ─── Completion ─────────────────────────────────────────────────────────────
 
 describe("s3UploadStore: completeUpload", () => {

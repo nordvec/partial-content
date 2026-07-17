@@ -999,7 +999,18 @@ export function azureUploadStore(opts: AzureUploadStoreOptions): ResumableWriteS
         if (pendingBytes >= blockSize) await stagePending();
       }
       await stagePending();
-      await persistState(infoClient, { ...state, lastAppendAt: appendOpts.now });
+      // Deferred-length declaration: the first append to carry a length records
+      // it in the info blob's metadata so the next getUploadState reports it and
+      // it turns immutable. Only ever set once (the orchestrator guarantees it,
+      // and the guard makes it safe): a length already recorded is never
+      // overwritten. persistState (setMetadata) is awaited, so it is durable
+      // before the ack.
+      const declaresLength = appendOpts.length !== undefined && state.length === undefined;
+      await persistState(infoClient, {
+        ...state,
+        ...(declaresLength ? { length: appendOpts.length } : {}),
+        lastAppendAt: appendOpts.now,
+      });
       return { bytesWritten: written };
     },
 

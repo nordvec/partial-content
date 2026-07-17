@@ -182,7 +182,7 @@
   {
     "name": "/tus",
     "path": "dist/tus.js",
-    "limit": "5.5 kB",
+    "limit": "6 kB",
     "ignore": [
       "node:fs/promises",
       "node:path",

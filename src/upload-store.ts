@@ -34,7 +34,10 @@ export class UploadNotFoundError extends Error {
   readonly status = 404 as const;
   readonly uploadToken: string;
   constructor(uploadToken: string, cause?: unknown) {
-    super(`Upload not found: ${uploadToken}`);
+    // The token is a capability handle and a candidate log line via onError;
+    // keep it OFF the message string (it lives on the property for callers
+    // that need it), matching the read side's PII-in-logs discipline.
+    super("Upload not found");
     this.name = "UploadNotFoundError";
     this.uploadToken = uploadToken;
     if (cause !== undefined) (this as { cause?: unknown }).cause = cause;
@@ -51,7 +54,7 @@ export class UploadOffsetConflictError extends Error {
   readonly uploadToken: string;
   readonly durableOffset: number;
   constructor(uploadToken: string, durableOffset: number) {
-    super(`Upload ${uploadToken}: claimed offset lost to durable offset ${durableOffset}`);
+    super(`Upload append: claimed offset lost to durable offset ${durableOffset}`);
     this.name = "UploadOffsetConflictError";
     this.uploadToken = uploadToken;
     this.durableOffset = durableOffset;
@@ -70,7 +73,7 @@ export class UploadDigestMismatchError extends Error {
   readonly expectedDigest: string;
   readonly actualDigest?: string;
   constructor(uploadToken: string, expectedDigest: string, actualDigest?: string) {
-    super(`Upload ${uploadToken}: assembled bytes do not match the asserted digest`);
+    super("Upload completion: assembled bytes do not match the asserted digest");
     this.name = "UploadDigestMismatchError";
     this.uploadToken = uploadToken;
     this.expectedDigest = expectedDigest;
@@ -132,6 +135,15 @@ export interface AppendChunkOptions {
    * spec's terminal fault, and only the adapter sees the stream.
    */
   maxBytes?: number;
+  /**
+   * A total representation length FIRST declared on this append (the
+   * deferred-length flow: creation left it unknown, a later append states
+   * it). When present the adapter MUST persist it durably so a subsequent
+   * `getUploadState` reports it as `length` and it becomes immutable. The
+   * orchestrator only ever sets this once, and only when the resource had no
+   * length yet, so an adapter never has to reconcile a conflicting value.
+   */
+  length?: number;
   /** Append time, epoch ms (recorded as lastAppendAt). */
   now: number;
   /**
@@ -220,21 +232,35 @@ export interface ResumableWriteStore {
   sweepExpired?(olderThanMs: number, opts?: { signal?: AbortSignal }): Promise<{ removed: number }>;
 
   // ── Capability flags (honest, per backend) ──
+  //
+  // Every adapter MUST accept an `appendChunk` of ANY size and buffer to its
+  // backend's real granularity internally (S3 parks a sub-minimum tail, R2
+  // buffers to a fixed part size, etc.). The orchestrator therefore does NOT
+  // re-chunk; these two flags are efficiency HINTS a caller or CDN may use to
+  // align chunk sizes, not constraints the orchestrator honors.
   /**
-   * Backend append granularity in bytes: appends the backend can only
-   * accept in multiples/minimums of this size force orchestrator-side
-   * buffering. `undefined` = byte-exact appends.
+   * The backend's natural part size in bytes: aligning appends to a multiple
+   * of it avoids the adapter's internal tail buffering. `undefined` = the
+   * backend takes arbitrary byte-exact appends with no alignment benefit.
    */
   readonly appendGranularity?: number;
-  /** Every non-final part must be the same size (R2's stricter rule). */
+  /** The backend prefers every non-final part to be the same size (R2). */
   readonly uniformPartSize?: boolean;
   /**
-   * The offset from `getUploadState` is byte-exact and crash-durable. When
-   * `false` the orchestrator must not advertise exact resume: it re-anchors
-   * on its own bookkeeping instead of the backend's answer.
+   * The offset from `getUploadState` is byte-exact and crash-durable.
+   * `false` means it is a durable LOWER BOUND instead: after a crash the
+   * backend may report an offset a few bytes behind the last acknowledged
+   * write (e.g. a part landed but its manifest entry did not), so a resume
+   * re-sends that tail. This is never corruption (the client re-appends from
+   * a real durable offset); it only costs a redundant chunk on recovery.
    */
   readonly exactOffsetRecovery: boolean;
-  /** `completeUpload` is all-or-nothing (no torn object ever visible). */
+  /**
+   * `completeUpload` is all-or-nothing: no torn object is ever visible to
+   * readers. REQUIRED by the orchestrator (it publishes on a single
+   * `completeUpload` and has no rollback of its own); `createUploadOrchestrator`
+   * refuses a store that reports `false`.
+   */
   readonly atomicCompletion: boolean;
   /** Integrity primitive available at completion, or `false`. */
   readonly digestOnComplete: "sha256" | "crc32c" | false;

@@ -691,7 +691,7 @@ export function s3UploadStore(opts: S3UploadStoreOptions): ResumableWriteStore {
       appendOpts: AppendChunkOptions,
     ): Promise<{ bytesWritten: number }> {
       const { key, uploadId } = decodeUploadToken(uploadToken);
-      const { maxBytes, now, signal } = appendOpts;
+      const { maxBytes, length: declaredLength, now, signal } = appendOpts;
 
       const info = await readInfo(uploadToken, signal);
       if (info === undefined) throw new UploadNotFoundError(uploadToken);
@@ -788,7 +788,17 @@ export function s3UploadStore(opts: S3UploadStoreOptions): ResumableWriteStore {
         flushed += remainder.length;
       }
 
-      await writeInfo(uploadToken, { ...info, lastAppendAt: now });
+      // Deferred-length declaration: the first append to carry a length records
+      // it in the `.info` sidecar so the next getUploadState reports it and it
+      // turns immutable. Only ever set once (the orchestrator guarantees it, and
+      // the guard makes it safe): a length already recorded is never overwritten.
+      // The PutObject below is awaited, so the length is durable before the ack.
+      const declaresLength = declaredLength !== undefined && info.length === undefined;
+      await writeInfo(uploadToken, {
+        ...info,
+        ...(declaresLength ? { length: declaredLength } : {}),
+        lastAppendAt: now,
+      });
 
       // The prepended tail was durable before this call; only the incoming
       // prefix that actually flushed counts. (A flush failure right after

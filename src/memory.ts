@@ -280,6 +280,14 @@ export function memoryUploadStore(opts: MemoryUploadStoreOptions): ResumableWrit
         throw new UploadOffsetConflictError(uploadToken, record.size);
       }
 
+      // Deferred-length declaration: the first append to carry a length records
+      // it durably so the next getUploadState reports it and it turns immutable.
+      // Only ever set once (the orchestrator guarantees it, and the guard makes
+      // it safe): a length already on the record is never overwritten.
+      if (appendOpts.length !== undefined && record.length === undefined) {
+        record.length = appendOpts.length;
+      }
+
       const accepted: Uint8Array[] = [];
       let flushed = 0;
       let crossedBound = false;

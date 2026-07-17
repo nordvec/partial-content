@@ -357,17 +357,22 @@ for (const version of VERSIONS) {
         });
 
         test("contended resource answers 423, distinct from the 409 re-anchor", async () => {
+            // The setup creation legitimately holds the lock (it streams a
+            // body); arm the timeout only afterward so the CONTENTION path
+            // (a later append/probe that cannot acquire) is what returns 423.
+            let armed = false;
             const locker: UploadLocker = {
                 async acquire(uploadToken) {
-                    throw new UploadLockTimeoutError(uploadToken);
+                    if (armed) throw new UploadLockTimeoutError(uploadToken);
+                    return { release() { /* no-op setup lock */ } };
                 },
             };
             const { handler } = harness({ locker });
-            // Creation takes no resource lock; appends and probes do.
             const created = await handler(createRequest(version, {
                 completeness: w.incomplete,
                 body: bytes("hello"),
             }));
+            armed = true;
             expect(created.status).toBe(201);
             const token = created.headers.get("Location")!.slice("/uploads/".length);
             const append = await handler(
@@ -675,7 +680,10 @@ describe("handler plumbing", () => {
         expect(errors.some((e) => e.operation === "handle")).toBe(true);
     });
 
-    test("append without a completeness header is a completing request", async () => {
+    test("interop 6 append MISSING the required completeness header is a 400, never a silent completion", async () => {
+        // Fail closed: defaulting an absent (or malformed) completeness header
+        // to "completing" would publish a truncated object as done. Interop
+        // 5/6 require the header on append, so absent is a client error.
         const { handler } = harness();
         const { token } = await createIncomplete(handler, 6);
         const res = await handler(
@@ -686,13 +694,33 @@ describe("handler plumbing", () => {
                     "Upload-Offset": "5",
                     "Content-Type": "application/partial-upload",
                     "Content-Length": "5",
+                    // no Upload-Complete header
                 },
                 body: bytes("world"),
             }),
             { uploadToken: token },
         );
-        expect(res.status).toBe(201);
-        expect(res.headers.get("Upload-Complete")).toBe("?1");
+        expect(res.status).toBe(400);
+    });
+
+    test("a malformed completeness value is a 400 at every version, never coerced", async () => {
+        const { handler } = harness();
+        const { token } = await createIncomplete(handler, 6);
+        const res = await handler(
+            new Request("http://test/uploads/x", {
+                method: "PATCH",
+                headers: {
+                    [VERSION_HEADER]: "6",
+                    "Upload-Offset": "5",
+                    "Content-Type": "application/partial-upload",
+                    "Content-Length": "5",
+                    "Upload-Complete": "true", // not an RFC 8941 boolean
+                },
+                body: bytes("world"),
+            }),
+            { uploadToken: token },
+        );
+        expect(res.status).toBe(400);
     });
 });
 
@@ -732,5 +760,352 @@ describe("digest verification", () => {
             headers: { "Repr-Digest": "sha-512=:AAAA:" },
         }));
         expect(res.status).toBe(201);
+    });
+});
+
+// ─── Repr-Digest parsing precision (audit R534) ─────────────────────────────
+// The parser is exercised through completing creations: a WELL-FORMED sha-256
+// that does not match the body's real digest is rejected 400 (parsed + used);
+// any input the parser cannot read is IGNORED, so the upload completes 201.
+
+describe("Repr-Digest parsing", () => {
+    /** Complete a creation of "hello" carrying the given Repr-Digest header. */
+    async function withReprDigest(reprDigest: string): Promise<Response> {
+        const { handler } = harness();
+        return handler(new Request("http://test/upload", {
+            method: "POST",
+            headers: { [VERSION_HEADER]: "6", "Upload-Complete": "?1", "Repr-Digest": reprDigest },
+            body: bytes("hello"),
+        }));
+    }
+
+    // A well-formed 44-char base64 that is NOT the digest of "hello".
+    let WRONG: string;
+    // eslint-disable-next-line @typescript-eslint/no-floating-promises
+    const wrongReady = sha256Base64("a-different-payload-entirely").then((d) => { WRONG = d; });
+
+    test("a well-formed but wrong sha-256 is parsed and rejected 400", async () => {
+        await wrongReady;
+        expect((await withReprDigest(`sha-256=:${WRONG}:`)).status).toBe(400);
+    });
+
+    test("a matching sha-256 among several members is picked and verified", async () => {
+        const right = await sha256Base64("hello");
+        expect((await withReprDigest(`unixsum=:AAAA:, sha-256=:${right}:`)).status).toBe(201);
+    });
+
+    test("the sha-256 algorithm name is matched case-insensitively", async () => {
+        await wrongReady;
+        // Wrong digest under an upper-case name is still recognized as sha-256,
+        // parsed, and rejected (never silently ignored on casing).
+        expect((await withReprDigest(`SHA-256=:${WRONG}:`)).status).toBe(400);
+    });
+
+    test("a wrong digest under a non-sha-256 algorithm name is ignored", async () => {
+        await wrongReady;
+        // The name gate must hold: a valid 44-char digest labelled sha-512 must
+        // NOT be treated as the sha-256 assertion.
+        expect((await withReprDigest(`sha-512=:${WRONG}:`)).status).toBe(201);
+    });
+
+    test("surrounding whitespace on the algorithm name and the value is tolerated", async () => {
+        await wrongReady;
+        // A space before '=' (name side) and after '=' (value side) must be
+        // trimmed, so the wrong digest is still parsed and rejected.
+        expect((await withReprDigest(`sha-256 =:${WRONG}:`)).status).toBe(400);
+        expect((await withReprDigest(`sha-256= :${WRONG}:`)).status).toBe(400);
+    });
+
+    test("a value missing its colon delimiters is ignored", async () => {
+        await wrongReady;
+        // Wrapped in arbitrary non-colon characters so the inner 44 chars are a
+        // valid digest: only the colon guard keeps it from being used.
+        expect((await withReprDigest(`sha-256=x${WRONG}x`)).status).toBe(201);
+    });
+
+    test("a value with only ONE colon delimiter is ignored (both ends are required)", async () => {
+        await wrongReady;
+        // A leading colon but no trailing one, and vice versa: each end is guarded
+        // independently, so a half-wrapped 44-char quantum must not be used.
+        expect((await withReprDigest(`sha-256=:${WRONG}?`)).status).toBe(201);
+        expect((await withReprDigest(`sha-256=x${WRONG}:`)).status).toBe(201);
+    });
+
+    test("a value that is not a 44-char base64 quantum is ignored", async () => {
+        // Short, syntactically wrong inner value: parsed as no digest, completes.
+        expect((await withReprDigest("sha-256=:hello:")).status).toBe(201);
+    });
+
+    test("extra characters around a 44-char quantum are rejected by the length anchors", async () => {
+        await wrongReady;
+        // Leading and trailing junk inside the colons: the ^…$ anchors must
+        // reject both, so the assertion is ignored and the upload completes.
+        expect((await withReprDigest(`sha-256=:AB${WRONG}:`)).status).toBe(201);
+        expect((await withReprDigest(`sha-256=:${WRONG}AB:`)).status).toBe(201);
+    });
+});
+
+// ─── Content-Length parsing precision (audit R534) ──────────────────────────
+
+describe("Content-Length parsing", () => {
+    // A creation-with-upload whose Content-Length crosses maxSize is caught
+    // up-front (413) only when Content-Length actually parses.
+    async function appendCL(contentLength: string): Promise<Response> {
+        const { handler } = harness({ policy: { maxSize: 4 } });
+        // Deferred length so the empty creation itself is under the maximum; the
+        // append's Content-Length is what the size check must catch.
+        const created = await handler(createRequest(6, { completeness: "?0" }));
+        const token = created.headers.get("Location")!.slice("/uploads/".length);
+        return handler(
+            new Request("http://test/uploads/x", {
+                method: "PATCH",
+                headers: {
+                    [VERSION_HEADER]: "6",
+                    "Upload-Offset": "0",
+                    "Upload-Complete": "?0",
+                    "Content-Type": "application/partial-upload",
+                    "Content-Length": contentLength,
+                },
+                body: bytes("0123456789"),
+            }),
+            { uploadToken: token },
+        );
+    }
+
+    test("a numeric Content-Length over the maximum is parsed and rejected 413", async () => {
+        // Real: parsed as 10 > maxSize 4 -> engine size-exceeded before writing.
+        expect((await appendCL("10")).status).toBe(413);
+    });
+
+    test("a non-numeric Content-Length is ignored (parsed as absent)", async () => {
+        // "abc" is not the digits-only grammar: it parses to undefined, so the
+        // up-front size check is skipped and the append is bounded while
+        // streaming instead (never a 400 from a NaN Content-Length).
+        const res = await appendCL("abc");
+        expect(res.status).not.toBe(400);
+    });
+
+    test("a Content-Length with trailing or leading non-digits does not parse to NaN", async () => {
+        // The ^…$ anchors reject "10x" and "x10" outright rather than letting
+        // Number() coerce a NaN into the engine (which would 400 as inconsistent).
+        expect((await appendCL("10x")).status).not.toBe(400);
+        expect((await appendCL("x10")).status).not.toBe(400);
+    });
+});
+
+// ─── Completeness fail-closed at every version (audit R534) ─────────────────
+
+describe("append completeness by version", () => {
+    async function appendNoCompleteness(version: Version, headers: Record<string, string> = {}): Promise<Response> {
+        const { handler } = harness();
+        const { token } = await createIncomplete(handler, version);
+        const w = WIRE[version];
+        const reqHeaders: Record<string, string> = {
+            [VERSION_HEADER]: String(version),
+            "Upload-Offset": "5",
+            ...(w.patchType !== undefined ? { "Content-Type": w.patchType } : {}),
+            ...headers,
+        };
+        return handler(
+            new Request("http://test/uploads/x", { method: "PATCH", headers: reqHeaders, body: bytes("world") }),
+            { uploadToken: token },
+        );
+    }
+
+    test("interop 3 treats an ABSENT completeness header as incomplete, never a 400", async () => {
+        // draft-01 predates the requirement: absent means "not complete".
+        const res = await appendNoCompleteness(3);
+        expect(res.status).toBe(201);
+        // Incomplete: the response asserts the not-complete polarity, not a publish.
+        expect(res.headers.get("Upload-Incomplete")).toBe("?1");
+    });
+
+    test("interop 5 REQUIRES the completeness header on append: absent is a 400", async () => {
+        const res = await appendNoCompleteness(5);
+        expect(res.status).toBe(400);
+    });
+
+    test("interop 3 rejects a malformed completeness value, never coercing it", async () => {
+        // Present-but-unparseable is a client error at every version.
+        const res = await appendNoCompleteness(3, { "Upload-Incomplete": "true" });
+        expect(res.status).toBe(400);
+    });
+});
+
+// ─── Handler plumbing precision (audit R534) ────────────────────────────────
+
+describe("handler plumbing edges", () => {
+    test("interopVersions are sorted so the newest echoed version is the true maximum", async () => {
+        // Passed out of order: the echo on an unsupported version must be the
+        // sorted maximum (6), not the last one supplied.
+        const { handler } = harness({ interopVersions: [6, 3] });
+        const res = await handler(createRequest(6, {
+            completeness: "?0",
+            omitVersion: true,
+            headers: { [VERSION_HEADER]: "9" },
+        }));
+        expect(res.status).toBe(400);
+        expect(res.headers.get(VERSION_HEADER)).toBe("6");
+    });
+
+    test("the construction error names the wire-mapped versions it knows", () => {
+        const store = memoryUploadStore({ objects: {} });
+        expect(() => createUploadHandler(store, {
+            key: () => "k",
+            location: (t) => `/u/${t}`,
+            interopVersions: [9],
+        })).toThrow(/3, 5, 6/);
+    });
+
+    test("an oversized single append answers 413 (append-too-large), distinct from a 400 floor", async () => {
+        const { handler } = harness({ policy: { maxAppendSize: 2 } });
+        // A bare incomplete upload (no creation body, so the append bound is not
+        // tripped at creation); the oversized append is what must 413.
+        const created = await handler(createRequest(6, {
+            completeness: "?0",
+            headers: { "Upload-Length": "10" },
+        }));
+        const token = created.headers.get("Location")!.slice("/uploads/".length);
+        const res = await handler(
+            patchRequest(6, {
+                offset: "0",
+                completeness: "?0",
+                body: bytes("world"),
+                headers: { "Content-Length": "5" },
+            }),
+            { uploadToken: token },
+        );
+        expect(res.status).toBe(413);
+    });
+
+    test("a probe carrying only Upload-Length is rejected 400", async () => {
+        // Upload-Length alone must count as an upload-state header on a probe.
+        const { handler } = harness();
+        const { token } = await createIncomplete(handler, 6);
+        const res = await handler(
+            resourceRequest(6, "HEAD", { "Upload-Length": "10" }),
+            { uploadToken: token },
+        );
+        expect(res.status).toBe(400);
+    });
+
+    test("a creation with no representation metadata records none (not an empty object)", async () => {
+        const { handler, store } = harness();
+        // A completing creation with neither Content-Type nor Content-Disposition.
+        const res = await handler(new Request("http://test/upload", {
+            method: "POST",
+            headers: { [VERSION_HEADER]: "6", "Upload-Complete": "?0" },
+        }));
+        expect(res.status).toBe(201);
+        const token = res.headers.get("Location")!.slice("/uploads/".length);
+        const state = await store.getUploadState(token);
+        expect(state.metadata).toBeUndefined();
+    });
+
+    test("the key callback receives the request, version, declared length, and completeness", async () => {
+        const seen: Array<{ interopVersion: number; declaredLength?: number; complete: boolean }> = [];
+        const { handler } = harness({
+            key: (creation) => {
+                seen.push({
+                    interopVersion: creation.interopVersion,
+                    declaredLength: creation.declaredLength,
+                    complete: creation.complete,
+                });
+                return "k";
+            },
+        });
+        await handler(createRequest(6, {
+            completeness: "?1",
+            body: bytes("hi"),
+            headers: { "Upload-Length": "2" },
+        }));
+        expect(seen).toHaveLength(1);
+        expect(seen[0]).toEqual({ interopVersion: 6, declaredLength: 2, complete: true });
+    });
+
+    test("onResumptionSupported is NOT invoked when the option is absent", async () => {
+        // Guard the presence check: an absent hook must not be called (which
+        // would surface as a resumption-hook error to onError).
+        const operations: string[] = [];
+        const { handler } = harness({ onError: (_e, ctx) => operations.push(ctx.operation) });
+        const res = await handler(createRequest(6, { completeness: "?0", body: bytes("x") }));
+        expect(res.status).toBe(201);
+        expect(operations).not.toContain("resumption-hook");
+    });
+
+    test("a throwing resumption hook with NO onError still completes the creation", async () => {
+        const { handler } = harness({
+            onResumptionSupported: () => { throw new Error("hook boom"); },
+        });
+        const res = await handler(createRequest(6, { completeness: "?0", body: bytes("x") }));
+        expect(res.status).toBe(201);
+    });
+
+    test("a throwing key callback with NO onError answers a hardened 500, never an escaped throw", async () => {
+        const { handler } = harness({ key: () => { throw new Error("key boom"); } });
+        const res = await handler(createRequest(6, { completeness: "?0", body: bytes("x") }));
+        expect(res.status).toBe(500);
+        expectErrorHardening(res);
+    });
+
+    test("interop 6 HEAD on a deferred-length upload omits Upload-Length", async () => {
+        // probeAnnouncesLength is on, but an unknown length must not surface as
+        // "Upload-Length: undefined".
+        const { handler } = harness();
+        const created = await handler(createRequest(6, { completeness: "?0", body: bytes("hi") }));
+        const token = created.headers.get("Location")!.slice("/uploads/".length);
+        const res = await handler(resourceRequest(6, "HEAD"), { uploadToken: token });
+        expect(res.status).toBe(204);
+        expect(res.headers.get("Upload-Length")).toBeNull();
+    });
+
+    test("interop 6 append with NO Content-Type is rejected 400, not a 500", async () => {
+        // The media-type gate must treat an absent Content-Type as a clean 400.
+        const { handler } = harness();
+        const { token } = await createIncomplete(handler, 6);
+        const res = await handler(
+            new Request("http://test/uploads/x", {
+                method: "PATCH",
+                headers: {
+                    [VERSION_HEADER]: "6",
+                    "Upload-Offset": "5",
+                    "Upload-Complete": "?0",
+                },
+                body: bytes("x"),
+            }),
+            { uploadToken: token },
+        );
+        expect(res.status).toBe(400);
+        expect(await res.text()).toContain("application/partial-upload");
+    });
+
+    test("a probe with an already-aborted request signal surfaces the store abort as 500", async () => {
+        // The request signal must reach the store read: an aborted probe fails
+        // rather than answering from an unsignalled read.
+        const { handler } = harness();
+        const { token } = await createIncomplete(handler, 6);
+        const res = await handler(
+            new Request("http://test/uploads/x", {
+                method: "HEAD",
+                headers: { [VERSION_HEADER]: "6" },
+                signal: AbortSignal.abort(),
+            }),
+            { uploadToken: token },
+        );
+        expect(res.status).toBe(500);
+    });
+
+    test("a cancel with an already-aborted request signal surfaces the store abort as 500", async () => {
+        const { handler } = harness();
+        const { token } = await createIncomplete(handler, 6);
+        const res = await handler(
+            new Request("http://test/uploads/x", {
+                method: "DELETE",
+                headers: { [VERSION_HEADER]: "6" },
+                signal: AbortSignal.abort(),
+            }),
+            { uploadToken: token },
+        );
+        expect(res.status).toBe(500);
     });
 });

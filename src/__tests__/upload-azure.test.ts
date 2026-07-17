@@ -365,6 +365,31 @@ describe("azureUploadStore: guards", () => {
     });
 });
 
+// ─── Deferred Length ─────────────────────────────────────────────────────────
+
+describe("azureUploadStore: deferred-length declaration on append", () => {
+    test("a length first declared on an append is persisted and reported by the next state", async () => {
+        const mock = mockUploadContainer();
+        const store = azureUploadStore({ containerClient: mock.container });
+        const { uploadToken } = await store.createUpload({ key: "deferred.bin", now: NOW });
+        expect((await store.getUploadState(uploadToken)).length).toBeUndefined();
+
+        await store.appendChunk(uploadToken, 0, bytes(1, 2, 3), { length: 3, now: NOW + 1 });
+
+        const state = await store.getUploadState(uploadToken);
+        expect(state.length).toBe(3);
+        expect(state.offset).toBe(3);
+    });
+
+    test("a length already recorded at creation is never overwritten by an append", async () => {
+        const mock = mockUploadContainer();
+        const store = azureUploadStore({ containerClient: mock.container });
+        const { uploadToken } = await store.createUpload({ key: "fixed.bin", length: 9, now: NOW });
+        await store.appendChunk(uploadToken, 0, bytes(1, 2, 3), { length: 42, now: NOW + 1 });
+        expect((await store.getUploadState(uploadToken)).length).toBe(9);
+    });
+});
+
 // ─── Not-Found + Token Integrity ─────────────────────────────────────────────
 
 describe("azureUploadStore: not-found and token integrity", () => {

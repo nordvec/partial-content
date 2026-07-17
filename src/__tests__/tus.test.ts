@@ -588,11 +588,19 @@ describe("PATCH", () => {
     });
 
     test("a contended resource answers 423", async () => {
+        // Arm the lock timeout only after the setup creation has taken (and
+        // released) the resource lock, so the 423 comes from the PATCH's
+        // failed acquire, not from creation.
+        let armed = false;
         const { handler, token } = await withUpload({
             locker: {
-                acquire: async (uploadToken) => { throw new UploadLockTimeoutError(uploadToken); },
+                acquire: async (uploadToken) => {
+                    if (armed) throw new UploadLockTimeoutError(uploadToken);
+                    return { release() { /* no-op setup lock */ } };
+                },
             },
         });
+        armed = true;
         const res = await handler(tusRequest("PATCH", {
             headers: { "Content-Type": OFFSET_TYPE, "Upload-Offset": "0", "Content-Length": "1" },
             body: bodyOf("x"),
@@ -1016,13 +1024,19 @@ describe("policy bounds", () => {
 
 describe("HEAD error shapes", () => {
     test("a contended HEAD answers a bodyless 423", async () => {
+        // Arm the timeout after the setup creation so the 423 is the HEAD's
+        // failed acquire, not creation's (which now takes the lock too).
+        let armed = false;
         const { handler } = makeHandler({
             locker: {
-                acquire: async (uploadToken) => { throw new UploadLockTimeoutError(uploadToken); },
+                acquire: async (uploadToken) => {
+                    if (armed) throw new UploadLockTimeoutError(uploadToken);
+                    return { release() { /* no-op setup lock */ } };
+                },
             },
         });
-        // Creation takes no resource lock, so it succeeds under this locker.
         const token = await createUpload(handler, { "Upload-Length": "5" });
+        armed = true;
         const res = await handler(tusRequest("HEAD"), { uploadToken: token });
         expect(res.status).toBe(423);
         expect(await res.text()).toBe("");
@@ -1220,5 +1234,102 @@ describe("override and never-throw edges", () => {
         const res = await handler(tusRequest("POST", { headers: { "Upload-Length": "5" } }));
         expect(res.status).toBe(500);
         expect(await res.text()).toBe("internal error");
+    });
+});
+
+// ─── HEAD implicit-completion healing (audit R534) ──────────────────────────
+// A completing request whose bytes went durable but whose handler died before
+// completion leaves the resource at offset === length, unpublished. A tus
+// client seeing offset == length concludes "done" and stops, so the HEAD that
+// would otherwise mislead it must publish the assembled object instead.
+
+describe("HEAD implicit-completion healing", () => {
+    /** Force the crash-window state: durable offset === length, not completed. */
+    function crashWindow(uploads: Map<string, FakeUpload>, token: string, size: number) {
+        const rec = uploads.get(token)!;
+        rec.bytes = new Uint8Array(size);
+        rec.length = size;
+        rec.isComplete = false;
+    }
+
+    test("HEAD publishes an upload stuck at offset === length and reports it complete", async () => {
+        const { handler, uploads } = makeHandler();
+        const token = await createUpload(handler, { "Upload-Length": "3" });
+        crashWindow(uploads, token, 3);
+        const res = await handler(tusRequest("HEAD"), { uploadToken: token });
+        expect(res.status).toBe(200);
+        expect(res.headers.get("upload-offset")).toBe("3");
+        expect(res.headers.get("upload-length")).toBe("3");
+        // The healing publish ran on the very probe that would have misled the client.
+        expect(uploads.get(token)!.isComplete).toBe(true);
+    });
+
+    test("a healed HEAD with a max age drops Upload-Expires (the upload is now complete)", async () => {
+        const { handler, uploads } = makeHandler({ maxAgeSeconds: 3600 });
+        const token = await createUpload(handler, { "Upload-Length": "3" });
+        crashWindow(uploads, token, 3);
+        const res = await handler(tusRequest("HEAD"), { uploadToken: token });
+        expect(res.status).toBe(200);
+        // Healed to complete: a completed upload no longer expires.
+        expect(res.headers.get("upload-expires")).toBeNull();
+        expect(uploads.get(token)!.isComplete).toBe(true);
+    });
+
+    test("HEAD does NOT heal an upload still short of its length", async () => {
+        // offset < length: genuinely incomplete. The heal must not fire, and with
+        // a max age Upload-Expires still rides the HEAD.
+        const { handler, uploads } = makeHandler({ maxAgeSeconds: 3600 });
+        const token = await createUpload(handler, { "Upload-Length": "10" });
+        const rec = uploads.get(token)!;
+        rec.bytes = new Uint8Array(4);
+        rec.length = 10;
+        rec.isComplete = false;
+        const res = await handler(tusRequest("HEAD"), { uploadToken: token });
+        expect(res.status).toBe(200);
+        expect(res.headers.get("upload-offset")).toBe("4");
+        expect(res.headers.get("upload-expires")).not.toBeNull();
+        expect(uploads.get(token)!.isComplete).toBe(false);
+    });
+});
+
+// ─── Completeness derivation on creation and append (audit R534) ────────────
+
+describe("completeness derivation", () => {
+    test("a deferred-length creation-with-upload of unknown size stays incomplete", async () => {
+        // Upload-Defer-Length + a chunked body (no Content-Length): the total is
+        // unknown, so the creation must NOT be marked complete (there is no length
+        // to reach yet), and no heal applies while the length is deferred.
+        const { handler, uploads } = makeHandler();
+        const body = controlledStream();
+        const pending = handler(tusRequest("POST", {
+            headers: { "Upload-Defer-Length": "1", "Content-Type": OFFSET_TYPE },
+            body: body.stream,
+        }));
+        body.push("abc");
+        body.close();
+        const res = await pending;
+        expect(res.status).toBe(201);
+        const token = locationToken(res);
+        expect(uploads.get(token)!.isComplete).toBe(false);
+        const head = await handler(tusRequest("HEAD"), { uploadToken: token });
+        expect(head.headers.get("upload-defer-length")).toBe("1");
+    });
+
+    test("a chunked PATCH on a deferred-length upload (no Content-Length) does not complete it", async () => {
+        // No known length and no Content-Length: the total is still unknown, so a
+        // body-bearing PATCH advances the offset but cannot complete the upload.
+        const { handler, uploads } = makeHandler();
+        const token = await createUpload(handler, { "Upload-Defer-Length": "1" });
+        const body = controlledStream();
+        const pending = handler(tusRequest("PATCH", {
+            headers: { "Content-Type": OFFSET_TYPE, "Upload-Offset": "0" },
+            body: body.stream,
+        }), { uploadToken: token });
+        body.push("abc");
+        body.close();
+        const res = await pending;
+        expect(res.status).toBe(204);
+        expect(res.headers.get("upload-offset")).toBe("3");
+        expect(uploads.get(token)!.isComplete).toBe(false);
     });
 });

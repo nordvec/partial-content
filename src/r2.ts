@@ -604,6 +604,15 @@ export function r2UploadStore(opts: R2UploadStoreOptions): ResumableWriteStore {
       if (offset !== durableOffset) {
         throw new UploadOffsetConflictError(uploadToken, durableOffset);
       }
+      // Deferred-length declaration: the first append to carry a length records
+      // it in the manifest so the next getUploadState reports it and it turns
+      // immutable. Only ever set once (the orchestrator guarantees it, and the
+      // guard makes it safe): a length already recorded is never overwritten.
+      // The mutation rides whichever putManifest below fires (a flushed part, or
+      // the no-part-landed write), so it is durable before the ack either way.
+      if (appendOpts.length !== undefined && manifest.length === undefined) {
+        manifest.length = appendOpts.length;
+      }
       const mpu = bucket.resumeMultipartUpload(manifest.key, manifest.uploadId);
       let nextPartNumber = manifest.parts.reduce((max, part) => Math.max(max, part.partNumber), 0) + 1;
       const uniformSize = manifest.partSize;

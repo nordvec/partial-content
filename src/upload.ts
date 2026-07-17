@@ -41,6 +41,8 @@ import {
 import type { UploadPolicy } from "./upload-engine.ts";
 import type { ResumableWriteStore } from "./upload-store.ts";
 import type { UploadLocker } from "./upload-locker.ts";
+import { UPLOAD_ERROR_HEADERS } from "./upload-shared.ts";
+import { sanitizeHeaderValue } from "./kernel.ts";
 
 // ─── Per-version wire mapping ───────────────────────────────────────────────
 
@@ -72,6 +74,15 @@ interface InteropWireFormat {
    * (a MUST from draft-05 onward; earlier revisions lack the field).
    */
   probeAnnouncesLength: boolean;
+  /**
+   * The completeness header is REQUIRED on an append (draft-04/-05 = interop
+   * 5/6). When it is required, an append missing it is a 400 rather than a
+   * silent default: defaulting an absent-or-malformed completeness to
+   * "completing" would publish a truncated object as done, the worst upload
+   * failure. Earlier revisions (interop 3) predate the requirement and treat
+   * an absent header as INCOMPLETE (never complete).
+   */
+  completenessRequiredOnAppend: boolean;
 }
 
 /**
@@ -86,6 +97,7 @@ const INTEROP_WIRE_FORMATS: ReadonlyMap<number, InteropWireFormat> = new Map([
     requiresPartialUploadMediaType: false,
     mismatchProblemDetails: false,
     probeAnnouncesLength: false,
+    completenessRequiredOnAppend: false,
   }],
   [5, {
     completenessHeader: "Upload-Complete" as const,
@@ -93,6 +105,7 @@ const INTEROP_WIRE_FORMATS: ReadonlyMap<number, InteropWireFormat> = new Map([
     requiresPartialUploadMediaType: false,
     mismatchProblemDetails: false,
     probeAnnouncesLength: false,
+    completenessRequiredOnAppend: true,
   }],
   [6, {
     completenessHeader: "Upload-Complete" as const,
@@ -100,6 +113,7 @@ const INTEROP_WIRE_FORMATS: ReadonlyMap<number, InteropWireFormat> = new Map([
     requiresPartialUploadMediaType: true,
     mismatchProblemDetails: true,
     probeAnnouncesLength: true,
+    completenessRequiredOnAppend: true,
   }],
 ]);
 
@@ -253,17 +267,6 @@ export type UploadHandler = (req: Request, ctx?: UploadHandlerContext) => Promis
 
 // ─── Response builders ──────────────────────────────────────────────────────
 
-/**
- * Hardening for every error answer, mirroring the read side: `nosniff` and
- * a deny-all CSP so an error body can never be sniffed or execute anything,
- * `no-store` so a transient failure can never be cached past its cause.
- */
-const ERROR_HEADERS: Readonly<Record<string, string>> = {
-  "Cache-Control": "no-store",
-  "X-Content-Type-Options": "nosniff",
-  "Content-Security-Policy": "default-src 'none'",
-};
-
 const UTF8_ENCODER = new TextEncoder();
 
 function textResponse(
@@ -277,7 +280,7 @@ function textResponse(
     headers: {
       "Content-Type": "text/plain; charset=utf-8",
       "Content-Length": String(bytes.byteLength),
-      ...ERROR_HEADERS,
+      ...UPLOAD_ERROR_HEADERS,
       ...extraHeaders,
     },
   });
@@ -359,7 +362,7 @@ export function createUploadHandler(
       [INTEROP_VERSION_HEADER]: String(version),
       "Upload-Offset": String(correctOffset),
       [wire.completenessHeader]: encodeCompleteness(wire, complete),
-      ...ERROR_HEADERS,
+      ...UPLOAD_ERROR_HEADERS,
     };
     if (!wire.mismatchProblemDetails) {
       return emptyResponse(409, { ...headers, "Content-Length": "0" });
@@ -404,7 +407,7 @@ export function createUploadHandler(
       case "not-found":
         // The draft folds every dead resource (unknown, cancelled, expired,
         // invalidated) into "not active": 404, empty body.
-        return emptyResponse(404, { ...echo, "Content-Length": "0", ...ERROR_HEADERS });
+        return emptyResponse(404, { ...echo, "Content-Length": "0", ...UPLOAD_ERROR_HEADERS });
       case "contended":
         // Deliberately distinct from 409: deployed clients retry 423 as-is
         // and re-probe on 409, and contention must not trigger a re-anchor.
@@ -487,7 +490,10 @@ export function createUploadHandler(
     });
     if (outcome.kind !== "created") return rejectResponse(outcome, version);
 
-    const location = options.location(outcome.uploadToken);
+    // A caller's location() output is header-sanitized like every other
+    // caller-derived header value (the tus dialect does the same): a stray
+    // CR/LF cannot split the response, it is stripped.
+    const location = sanitizeHeaderValue(options.location(outcome.uploadToken));
     if (options.onResumptionSupported) {
       try {
         options.onResumptionSupported({
@@ -557,11 +563,24 @@ export function createUploadHandler(
     if (offset === undefined) {
       return textResponse(400, "upload append requires the Upload-Offset header field", echo);
     }
-    // An append without the completeness header is a completing request in
-    // every supported revision (the header is only REQUIRED when false).
-    const completenessValue = parseStructuredBoolean(req.headers.get(wire.completenessHeader));
+    // Completeness must fail CLOSED, never open: defaulting an absent or
+    // malformed completeness header to "completing" would publish a truncated
+    // object as done (worst case: a deferred-length upload where the engine's
+    // length sums cannot catch it). A present-but-unparseable value is a
+    // client error (400) at every version; an ABSENT header is a 400 where
+    // the revision requires it (interop 5/6) and INCOMPLETE where it does not
+    // (interop 3), never complete.
+    const completenessRaw = req.headers.get(wire.completenessHeader);
+    const completenessValue = parseStructuredBoolean(completenessRaw);
+    if (completenessValue === undefined) {
+      if (completenessRaw !== null || wire.completenessRequiredOnAppend) {
+        return textResponse(
+          400, `upload append requires a valid ${wire.completenessHeader} header field`, echo,
+        );
+      }
+    }
     const complete = completenessValue === undefined
-      ? true
+      ? false
       : decodeCompleteness(wire, completenessValue);
 
     const outcome = await orchestrator.append(uploadToken, {
@@ -676,33 +695,5 @@ export function createUploadHandler(
 
 // ─── Shared upload surface (re-exported for consumers) ──────────────────────
 // The write-store contract, errors, locking, and the dialect-agnostic
-// orchestrator (for custom wire dialects), so consumers never import
-// internal module paths.
-export {
-  UploadNotFoundError,
-  UploadOffsetConflictError,
-  UploadDigestMismatchError,
-  isUploadNotFoundError,
-  isUploadOffsetConflictError,
-  isUploadDigestMismatchError,
-} from "./upload-store.ts";
-export type {
-  ResumableWriteStore,
-  StoredUploadState,
-  CreateUploadOptions,
-  AppendChunkOptions,
-  CompleteUploadOptions,
-  CompletedUpload,
-} from "./upload-store.ts";
-export { memoryUploadLocker, UploadLockTimeoutError } from "./upload-locker.ts";
-export type { UploadLocker, UploadLock } from "./upload-locker.ts";
-export { createUploadOrchestrator } from "./upload-orchestrator.ts";
-export type {
-  UploadOrchestrator,
-  UploadOrchestratorOptions,
-  UploadOutcome,
-  UploadResourceEvent,
-  CreateUploadRequest,
-  AppendUploadRequest,
-} from "./upload-orchestrator.ts";
-export type { UploadPolicy, UploadAuditEvent } from "./upload-engine.ts";
+// orchestrator, from one shared module so /tus and /upload never diverge.
+export * from "./upload-shared.ts";
