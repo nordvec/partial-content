@@ -348,8 +348,8 @@ export interface ServeObjectOptions {
    * overlapping ranges would otherwise force a large multipart response.
    * Overlapping/adjacent ranges are coalesced first, and if the result still
    * exceeds this cap (or already covers the whole object) the full 200 is
-   * served instead. Matches the intent of nginx `max_ranges` and Go's
-   * sum-of-ranges check.
+   * served instead (RFC 9110 Section 14.2 permits ignoring an abusive range
+   * set).
    *
    * @default 50
    */

@@ -1,10 +1,13 @@
 /**
  * tus 1.0 wire dialect for partial-content resumable uploads.
  *
- * Translates tus 1.0 requests (core protocol + creation, creation-with-upload,
- * creation-defer-length, termination, and expiration extensions) into upload
- * orchestrator calls, and orchestrator outcomes back into tus statuses and
- * headers. The dialect never touches storage or the protocol engine directly:
+ * Translates tus 1.0 requests (core protocol + the creation,
+ * creation-with-upload, creation-defer-length, and termination extensions,
+ * plus expiration and checksum when configured) into upload orchestrator
+ * calls, and orchestrator outcomes back into tus statuses and headers. The
+ * advertised extension set is honest: `expiration` appears only when a max age
+ * is set, `checksum` only when a verifier is supplied. The dialect never
+ * touches storage or the protocol engine directly:
  * every byte and every decision flows through the orchestrator, which owns
  * locking, fresh-state sequencing, and the post-abort grace window.
  *
@@ -57,10 +60,13 @@ import { sanitizeHeaderValue } from "./index.ts";
 const TUS_VERSION = "1.0.0";
 
 /**
- * Extensions this handler implements, advertised verbatim on OPTIONS
- * (tus 1.0 core, Tus-Extension: comma-separated, omitted when none).
+ * Extensions this handler ALWAYS implements, regardless of configuration
+ * (tus 1.0 core, Tus-Extension: comma-separated, omitted when none). Two more
+ * are advertised conditionally: `expiration` only when a max age is configured
+ * (advertising it with nothing to expire is a false capability), and
+ * `checksum` only when a checksum verifier is supplied.
  */
-const TUS_EXTENSIONS = "creation,creation-with-upload,creation-defer-length,termination,expiration";
+const TUS_BASE_EXTENSIONS = "creation,creation-with-upload,creation-defer-length,termination";
 
 /**
  * The only Content-Type upload content may travel under, on PATCH (tus 1.0
@@ -392,7 +398,13 @@ export function createTusHandler(
       );
     }
   }
-  const extensions = checksum ? `${TUS_EXTENSIONS},checksum` : TUS_EXTENSIONS;
+  // Advertise only what this configuration can actually honor: a server with
+  // no max age never sends Upload-Expires, so it must not claim `expiration`.
+  const extensions = [
+    TUS_BASE_EXTENSIONS,
+    maxAgeSeconds !== undefined ? "expiration" : undefined,
+    checksum ? "checksum" : undefined,
+  ].filter(Boolean).join(",");
 
   /** Compose a response: caller extras first, protocol headers win. */
   function respond(

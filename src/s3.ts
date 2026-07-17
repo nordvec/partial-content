@@ -372,6 +372,16 @@ const s3Classifiers: StoreErrorClassifiers = {
 /** The multipart part-size floor S3 enforces for every non-final part: 5 MiB. */
 const S3_MIN_PART_SIZE = 5 * 1024 * 1024;
 
+/**
+ * S3's hard ceiling on parts per multipart upload. The largest object this
+ * store can assemble is `S3_MAX_MULTIPART_PARTS * minPartSize` (~48.8 GiB at
+ * the 5 MiB default); past it, S3 rejects `CompleteMultipartUpload` with an
+ * opaque error. The store instead fails at the crossing part with a message
+ * that names the `minPartSize` knob, so the ceiling is diagnosable and liftable
+ * (raise `minPartSize` for larger objects) rather than a mystery completion 400.
+ */
+const S3_MAX_MULTIPART_PARTS = 10_000;
+
 export interface S3UploadStoreOptions {
   /** Pre-configured S3Client instance (BYOC, no config coupling). */
   client: S3Client;
@@ -738,6 +748,15 @@ export function s3UploadStore(opts: S3UploadStoreOptions): ResumableWriteStore {
       // flush is allowed to finish so already-received bytes become durable
       // (the orchestrator owns the post-disconnect grace window).
       const flushPart = async (bytes: Uint8Array): Promise<void> => {
+        // Fail at the crossing part, not at completion: past the ceiling S3
+        // rejects CompleteMultipartUpload opaquely, so surface the real cause
+        // and the lever (a larger minPartSize) while the token still resolves.
+        if (nextPartNumber > S3_MAX_MULTIPART_PARTS) {
+          throw new Error(
+            `Upload ${uploadToken}: exceeds S3's ${S3_MAX_MULTIPART_PARTS}-part limit `
+            + `(max object ~= ${S3_MAX_MULTIPART_PARTS} x minPartSize); raise minPartSize`,
+          );
+        }
         await classified(key, () => client.send(new UploadPartCommand({
           Bucket: bucket,
           Key: key,

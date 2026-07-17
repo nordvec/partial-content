@@ -1,5 +1,8 @@
 import { describe, test, expect } from "bun:test";
-import { createTusHandler, parseUploadMetadata, webCryptoChecksum, type TusHandlerOptions } from "../tus";
+import {
+    createTusHandler, parseUploadMetadata, webCryptoChecksum,
+    TUS_EXPOSED_HEADERS, UPLOAD_EXPOSED_HEADERS, type TusHandlerOptions,
+} from "../tus";
 import { UploadNotFoundError, type ResumableWriteStore, type StoredUploadState } from "../upload-store";
 import { UploadLockTimeoutError } from "../upload-locker";
 import type { UploadResourceEvent } from "../upload-orchestrator";
@@ -206,16 +209,72 @@ describe("version negotiation", () => {
 
 // ─── OPTIONS (core) ──────────────────────────────────────────────────────────
 
+describe("CORS exposed headers", () => {
+    test("TUS_EXPOSED_HEADERS covers the resume-critical headers, immutably", () => {
+        for (const h of ["Location", "Upload-Offset", "Upload-Length", "Upload-Expires", "Tus-Resumable"]) {
+            expect(TUS_EXPOSED_HEADERS).toContain(h);
+        }
+        // Frozen: a caller cannot accidentally mutate the shared list.
+        expect(Object.isFrozen(TUS_EXPOSED_HEADERS)).toBe(true);
+    });
+
+    test("UPLOAD_EXPOSED_HEADERS covers the IETF dialect's resume-critical headers", () => {
+        for (const h of ["Location", "Upload-Offset", "Upload-Limit", "Upload-Draft-Interop-Version"]) {
+            expect(UPLOAD_EXPOSED_HEADERS).toContain(h);
+        }
+        expect(Object.isFrozen(UPLOAD_EXPOSED_HEADERS)).toBe(true);
+    });
+
+    test("every header actually emitted by a full upload flow is in the exposed list", async () => {
+        // Drive create -> HEAD -> PATCH-complete with expiration on and collect
+        // every response header; each must be exposable or a CORS client breaks.
+        const { handler } = makeHandler({ maxAgeSeconds: 3600 });
+        const seen = new Set<string>();
+        const collect = (res: Response) => res.headers.forEach((_v, k) => seen.add(k.toLowerCase()));
+
+        const created = await handler(tusRequest("POST", { headers: { "Upload-Length": "4" } }));
+        collect(created);
+        const token = locationToken(created);
+        collect(await handler(tusRequest("HEAD", {}), { uploadToken: token }));
+        collect(await handler(tusRequest("PATCH", {
+            headers: { "Content-Type": OFFSET_TYPE, "Upload-Offset": "0", "Content-Length": "4" },
+            body: bodyOf("abcd"),
+        }), { uploadToken: token }));
+
+        const exposable = new Set(TUS_EXPOSED_HEADERS.map((h) => h.toLowerCase()));
+        // Transport/generic headers a browser reads without CORS exposure.
+        const alwaysReadable = new Set([
+            "content-type", "content-length", "cache-control", "date",
+            "x-content-type-options", "content-security-policy",
+        ]);
+        const protocolHeaders = [...seen].filter((h) => h.startsWith("tus-") || h.startsWith("upload-") || h === "location");
+        for (const h of protocolHeaders) {
+            expect(exposable.has(h) || alwaysReadable.has(h)).toBe(true);
+        }
+    });
+});
+
 describe("OPTIONS", () => {
-    test("advertises version, extensions, and echoes Tus-Resumable", async () => {
+    test("advertises version, base extensions, and echoes Tus-Resumable", async () => {
         const { handler } = makeHandler();
         const res = await handler(tusRequest("OPTIONS", { noVersion: true }));
         expect(res.status).toBe(204);
         expect(res.headers.get("tus-resumable")).toBe("1.0.0");
         expect(res.headers.get("tus-version")).toBe("1.0.0");
+        // Honest advertising: no max age configured, so `expiration` is absent.
         expect(res.headers.get("tus-extension"))
-            .toBe("creation,creation-with-upload,creation-defer-length,termination,expiration");
+            .toBe("creation,creation-with-upload,creation-defer-length,termination");
         expect(res.headers.get("tus-max-size")).toBeNull();
+    });
+
+    test("advertises `expiration` only when a max age is configured", async () => {
+        const { handler: withAge } = makeHandler({ maxAgeSeconds: 3600 });
+        const withRes = await withAge(tusRequest("OPTIONS", { noVersion: true }));
+        expect(withRes.headers.get("tus-extension")).toContain("expiration");
+
+        const { handler: without } = makeHandler();
+        const withoutRes = await without(tusRequest("OPTIONS", { noVersion: true }));
+        expect(withoutRes.headers.get("tus-extension")).not.toContain("expiration");
     });
 
     test("advertises Tus-Max-Size when a maximum size is configured", async () => {

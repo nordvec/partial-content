@@ -88,6 +88,6 @@ export type {
 export { ObjectNotFoundError, ObjectChangedError, StoreUnavailableError, nodeStreamToWeb, guardStreamLength, resolveServedRange, classifyStoreRead, parseRetryAfterSeconds } from "./object-store.ts";
 
 // ─── Content-Disposition (RFC 6266 / RFC 8187) ──────────────────────────────
-export { buildContentDisposition } from "./content-disposition.ts";
+export { buildContentDisposition, isInlineSafeMediaType } from "./content-disposition.ts";
 export type { ContentDispositionOptions } from "./content-disposition.ts";
 

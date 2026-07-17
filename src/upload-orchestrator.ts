@@ -24,7 +24,6 @@
 import {
   evaluateUploadCreation,
   evaluateUploadIntent,
-  remainingLifetimeSeconds,
   type AppendIntent,
   type CreateIntent,
   type UploadAuditEvent,
@@ -78,7 +77,7 @@ export interface UploadOrchestratorOptions {
 // ─── Outcomes ───────────────────────────────────────────────────────────────
 
 /** Reject verdicts pass through to the dialect unchanged. */
-export type UploadRejectOutcome = Extract<
+type UploadRejectOutcome = Extract<
   UploadVerdict,
   | { kind: "offset-mismatch" }
   | { kind: "limit-violation" }
@@ -639,8 +638,6 @@ export function createUploadOrchestrator(
     },
   };
 }
-
-export { remainingLifetimeSeconds };
 
 /**
  * Reject a policy the engine would otherwise trust silently: every bound must

@@ -230,7 +230,7 @@ Both handlers are thin header translations over the same wire-agnostic engine: a
 - **A post-abort grace window** (default 10 s) lets storage finish flushing bytes that already arrived when the client vanished, so the next offset probe answers truthfully.
 - **Digest verification at completion where the backend honestly can**: the filesystem and memory stores hash the assembled bytes and refuse to publish on a mismatch. S3 multipart SHA-256 checksums are composite (a hash of per-part hashes), so whole-object verification is impossible server-side and the S3 store declines the capability instead of faking it; the optional `checksums` flag still gives per-part transport integrity.
 
-See [docs/DESIGN.md](docs/DESIGN.md#resumable-uploads) for the design rationale and [docs/API.md](docs/API.md#resumable-uploads) for the full option reference.
+See [docs/DESIGN.md](docs/DESIGN.md#resumable-uploads) for the design rationale, [docs/API.md](docs/API.md#resumable-uploads) for the full option reference, and [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for reverse-proxy, CORS, multi-instance, and object-storage-part-limit guidance when self-hosting.
 
 ## Real-world example: authorized proxy from object storage
 
@@ -318,7 +318,7 @@ Full HTTP serving vs `send` and `sirv` (Node 24, loopback, out-of-process autoca
 
 - At payload sizes where file serving actually spends its time (1 MB bodies), all contenders converge on I/O parity.
 - Small bodies, ranged serves, and revalidations run at parity-to-modest-lead while doing strictly more per request (digest negotiation, audit hooks, pinned-read plumbing, storage abstraction). Ranges lead because a plain range is a single round-trip: the fs store's one open handle stats, clamps, and reads (`authoritativeRange`).
-- The `cache` column is the opt-in fs hot-object cache (nginx `open_file_cache` semantics: TTL revalidation, `maxEntries` + `maxBytes` LRU bounds). \* sirv's 304 figure comes from a boot-time directory snapshot that 404s files created after startup; in the mode that can serve runtime uploads it measures 5,676 req/s.
+- The `cache` column is the opt-in fs hot-object cache (TTL revalidation, `maxEntries` + `maxBytes` LRU bounds). \* sirv's 304 figure comes from a boot-time directory snapshot that 404s files created after startup; in the mode that can serve runtime uploads it measures 5,676 req/s.
 
 Kernel micro-benchmarks, the Bun.serve numbers (38k req/s revalidation with cache), and the full fairness notes are in **[docs/BENCHMARKS.md](docs/BENCHMARKS.md)**.
 

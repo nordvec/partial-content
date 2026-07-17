@@ -43,7 +43,7 @@ round-trip with bounds, validators, and bytes coherent by construction --
 strictly stronger than a validating HEAD, and faster than it too.
 
 The `cache` column is `fsStore({ root, cache: { ttlMs: 1000 } })`: an opt-in
-hot-object cache with nginx `open_file_cache` semantics (TTL revalidation,
+hot-object cache (TTL revalidation,
 metadata + bytes captured atomically, bodies only at or below 128 KiB,
 LRU-evicted under both an entry cap (`maxEntries`, default 1024) and a body
 byte budget (`maxBytes`, default 64 MiB; `0` = metadata-only)). Hot small
@@ -95,4 +95,5 @@ are node-stream libraries and cannot ride `Bun.serve` natively. Reproduce:
   spec-compliant fetch clients (undici, browsers) auto-append exactly that
   header to manually-conditional requests -- so `send` never answers 304 to
   a fetch()-based revalidation. partial-content deliberately ignores request
-  cache directives here (matching Go stdlib and nginx; see DESIGN.md).
+  cache directives here (they address caches, not origin conditional
+  evaluation; see DESIGN.md).

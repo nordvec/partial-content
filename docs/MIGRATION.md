@@ -125,8 +125,8 @@ Two behavioral differences worth knowing before you flip traffic:
 - **`Cache-Control: no-cache` on the request**: send honors it during
   conditional evaluation, which means spec-compliant `fetch()` clients never
   get a 304 from send. partial-content ignores request cache directives
-  (matching Go's stdlib and nginx). Your revalidation rate will go up, that
-  is the intended fix.
+  (they address caches, not origin conditional evaluation). Your
+  revalidation rate will go up, that is the intended fix.
 - **Weak validators under If-Range**: partial-content requires a strong
   validator on BOTH sides (RFC 7233 §3.2) and refuses the range when only a
   weak ETag exists server-side, falling back to a full 200 rather than

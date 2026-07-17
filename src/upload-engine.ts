@@ -84,7 +84,7 @@ export interface CreateIntent {
 }
 
 /** Read the current offset/completeness (HEAD/GET on the upload resource). */
-export interface ProbeIntent {
+interface ProbeIntent {
   kind: "probe";
 }
 
@@ -102,7 +102,7 @@ export interface AppendIntent {
 }
 
 /** Cancel the upload resource (DELETE). */
-export interface CancelIntent {
+interface CancelIntent {
   kind: "cancel";
 }
 
@@ -138,7 +138,7 @@ export type UploadAuditEvent =
   | { kind: "cancelled" }
   | { kind: "expired" };
 
-export type UploadRejectReason =
+type UploadRejectReason =
   | "offset-mismatch"
   | "length-inconsistent"
   | "size-exceeded"

@@ -20,7 +20,9 @@ The complete export surface. Everything is typed; your editor's IntelliSense mir
 
 **`generateETag(source)`** - Derive an entity-tag from storage metadata. Returns a strong `"<hash>"` when a content digest is available, a weak `W/"<size>-<mtime>"` when only size and modification time are known, or `undefined` when there is insufficient metadata.
 
-**`buildContentDisposition(filename, options?)`** - Security-hardened `Content-Disposition` header builder with CRLF injection prevention, path traversal protection, bidi override stripping, and RFC 8187 non-ASCII encoding.
+**`buildContentDisposition(filename, options?)`** - Security-hardened `Content-Disposition` header builder with CRLF injection prevention, path traversal protection, bidi override stripping, and RFC 8187 non-ASCII encoding. Defaults to `attachment` (the safe disposition for untrusted content).
+
+**`isInlineSafeMediaType(mediaType)`** - Allow-list predicate for choosing `inline` vs `attachment` when the CONTENT is untrusted (user uploads, third-party payloads). Returns `true` only for types a browser cannot be driven to execute script while rendering: images except `image/svg+xml`, `video/*`, `audio/*`, and a short inert-text allow-list (`text/plain`, `application/json`, `text/csv`, `text/markdown`). `text/html`, `application/xhtml+xml`, and `application/pdf` are excluded on purpose (serve PDF inline only from a CSP-sandboxed viewer route). Compose it: `buildContentDisposition(name, { type: isInlineSafeMediaType(mime) ? "inline" : "attachment" })`.
 
 **`fromNodeHeaders(headers)`** - Convert Node.js `IncomingHttpHeaders` to the `{ get(name) }` interface.
 
@@ -92,7 +94,7 @@ const store = httpStore({
 
 **`azureStore({ containerClient })`** (`partial-content/azure`) - Azure Blob Storage via `@azure/storage-blob`. Single-call `download()` (metadata and body are one response by construction); pinned reads via `conditions.ifMatch`; `createSignedUrl` mints a read-only SAS URL (requires a shared-key credential on the client) with sanitized Content-Disposition, inert content type, and the Cache-Control response override.
 
-**`fsStore({ root, cache? })`** (`partial-content/fs`) - Local filesystem with path-traversal/null-byte/Windows-device-name hardening, nanosecond-mtime weak ETags, an fd-coherent stat+stream (no stat-then-reopen race), `authoritativeRange` single-round-trip range serving (the one open handle stats, clamps, and reads, so bounds, validators, and bytes are coherent by construction), a single-read fast path for bodies <= 128 KiB, and an opt-in TTL/LRU hot-object cache (nginx `open_file_cache` semantics; see Benchmarks).
+**`fsStore({ root, cache? })`** (`partial-content/fs`) - Local filesystem with path-traversal/null-byte/Windows-device-name hardening, nanosecond-mtime weak ETags, an fd-coherent stat+stream (no stat-then-reopen race), `authoritativeRange` single-round-trip range serving (the one open handle stats, clamps, and reads, so bounds, validators, and bytes are coherent by construction), a single-read fast path for bodies <= 128 KiB, and an opt-in TTL/LRU hot-object cache (see Benchmarks).
 
 The cloud SDKs are optional peer dependencies: install only the one your store uses.
 
@@ -266,7 +268,9 @@ Capability flags (readonly fields, honest per backend, never assumed): `appendGr
 
 Interactions on one upload resource are serialized by a lock, probes included (deriving an offset can be a multi-call backend read, and a torn snapshot would hand the client an offset its next request fails on). The lock is **cooperatively preempted**, not a plain mutex: a new acquirer asks the current holder to stop, the holder aborts its append at the next chunk boundary (flushing what it has, so the offset stays truthful), and the lock hands over in milliseconds. The interface is one method: `acquire(uploadToken, onPreemptRequested, { timeoutMs? })` -> `Promise<UploadLock>` (`{ release() }`); a holder that does not yield within `timeoutMs` (default 15 s) rejects with `UploadLockTimeoutError`, which the dialects answer as 423.
 
-The default locker is in-process and correct for a single process. **Supply a shared locker via the `locker` option when more than one server instance can receive requests for the same upload resource** (horizontally scaled deployments without upload-affinity routing).
+The default locker is in-process and correct for a single process. **Supply a shared locker via the `locker` option when more than one server instance can receive requests for the same upload resource** (horizontally scaled deployments without upload-affinity routing). See [DEPLOYMENT.md](DEPLOYMENT.md) for the reverse-proxy, CORS, and multi-instance operational checklist.
+
+**CORS exposed headers.** A cross-origin browser upload cannot resume unless the browser is allowed to READ the protocol response headers. This package ships no CORS middleware (the origin/credential policy is yours), but it publishes the exact header list so you never assemble it by hand and drop one: `TUS_EXPOSED_HEADERS` (from `partial-content/tus`) and `UPLOAD_EXPOSED_HEADERS` (from `partial-content/upload`), both frozen `string[]`. Spread into `Access-Control-Expose-Headers`: expose `Location` but forget `Upload-Offset` and every resume silently fails.
 
 **`redisUploadLocker(client, options?)`** (`partial-content/redis-locker`) - The shared locker for Redis-protocol servers (Redis, Valkey, KeyDB, Dragonfly), with the same cooperative-preemption semantics as the in-process one. Zero dependencies: the caller passes a client behind the four-command `RedisLockerClient` interface (`set` NX PX, `eval` for the module's two static compare-and-delete/compare-and-expire Lua scripts, `publish`, `subscribe`), which any client library adapts in a few lines:
 

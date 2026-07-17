@@ -40,6 +40,9 @@ const FLOORS = {
     "cache-control.ts": 96,     // baseline 100.00 (80 mutants; tolerates ~3 survivors)
     "object-store.ts": 92,
     "http.ts": 92,
+    "open-retry.ts": 88,        // baseline 91.30 (23 mutants; the 2 survivors are
+                                // backoff-delay arithmetic (baseDelayMs * attempt),
+                                // equivalent within one retry round)
     "upload-engine.ts": 90,     // baseline 91.73 (344 mutants; survivors are
                                 // undefined-comparison no-ops in optional-bound
                                 // guards, provably outcome-equivalent)

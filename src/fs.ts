@@ -15,8 +15,8 @@
  * Security: all keys are resolved relative to a fixed root directory.
  * Path traversal attempts (`..`), absolute paths, and null bytes are
  * rejected with ObjectNotFoundError. Symbolic links inside the root ARE
- * followed (matching nginx/caddy defaults); do not place untrusted
- * symlinks under the root if it must be a strict sandbox.
+ * followed by design; do not place untrusted symlinks under the root if it
+ * must be a strict sandbox.
  *
  * @example
  * ```typescript
@@ -33,6 +33,7 @@
  */
 
 import { mkdir, open, readdir, readFile, rename, rm, stat, type FileHandle } from "node:fs/promises";
+import { openWithRetry } from "./open-retry.ts";
 import { createHash, randomUUID } from "node:crypto";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
@@ -68,10 +69,9 @@ export interface FsStoreOptions {
    */
   root: string;
   /**
-   * Opt-in hot-object cache (metadata + small bodies), following the
-   * nginx `open_file_cache` model: entries revalidate on a TTL rather
-   * than a change watcher, so a served representation can lag a
-   * filesystem overwrite by up to `ttlMs`. Metadata and bytes are always
+   * Opt-in hot-object cache (metadata + small bodies): entries revalidate
+   * on a TTL rather than a change watcher, so a served representation can
+   * lag a filesystem overwrite by up to `ttlMs`. Metadata and bytes are always
    * captured together from one read, so responses are internally
    * coherent (headers always describe the bytes actually sent).
    *
@@ -536,8 +536,9 @@ export function fsUploadStore(opts: FsUploadStoreOptions): ResumableWriteStore {
       const uploadToken = randomUUID();
       const paths = requireTokenPaths(uploadToken);
       await mkdir(uploadsDir, { recursive: true });
-      // "wx": a token collision must fail loudly, never adopt foreign bytes.
-      const handle = await open(paths.data, "wx");
+      // "wx": a token collision must fail loudly, never adopt foreign bytes
+      // (EEXIST is non-transient and rethrows on the first attempt).
+      const handle = await openWithRetry(paths.data, "wx");
       try {
         await handle.sync();
       } finally {
@@ -600,9 +601,10 @@ export function fsUploadStore(opts: FsUploadStoreOptions): ResumableWriteStore {
 
       let handle: FileHandle;
       try {
-        handle = await open(paths.data, "r+");
+        handle = await openWithRetry(paths.data, "r+");
       } catch (err) {
-        // Data file lost under a live sidecar: nothing to append to.
+        // Data file lost under a live sidecar: nothing to append to
+        // (ENOENT is non-transient and rethrows on the first attempt).
         if (isFileNotFound(err)) throw new UploadNotFoundError(uploadToken, err);
         throw err;
       }
@@ -900,7 +902,7 @@ async function readSidecar(sidecarPath: string, uploadToken: string): Promise<Up
 
 /** Write the sidecar; `durable` fsyncs it (create/complete/invalidate facts). */
 async function writeSidecar(sidecarPath: string, sidecar: UploadSidecar, durable: boolean): Promise<void> {
-  const handle = await open(sidecarPath, "w");
+  const handle = await openWithRetry(sidecarPath, "w");
   try {
     await handle.writeFile(JSON.stringify(sidecar));
     if (durable) await handle.sync();

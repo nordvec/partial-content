@@ -62,7 +62,7 @@ A `Range` with several parts (`bytes=0-100,200-300`) is served as a
 `multipart/byteranges` 206. The single-range case keeps its own fast path
 (`parseRangeHeader` + the single-round-trip Path B); multi-range takes a
 separate path that never touches the hot single-seek code. Two things make this
-safe rather than a DoS vector, informed by Go `net/http.ServeContent` and nginx:
+safe rather than a DoS vector:
 
 - **Coalescing.** Overlapping, adjacent, and near-adjacent ranges are merged
   before serving: gaps smaller than the ~80-byte per-part framing overhead are
@@ -107,8 +107,7 @@ ETag is weak-prefixed, we ignore the range and serve a full 200.
 
 **If-Range date comparison is exact match, plus the strong-validator rule.**
 RFC 9110 Section 13.1.5 requires exact match for If-Range HTTP-date comparison
-(unlike If-Unmodified-Since which uses `<=`), and Go stdlib enforces the same
-equality. The failure modes are asymmetric: a strict mismatch costs at worst
+(unlike If-Unmodified-Since which uses `<=`). The failure modes are asymmetric: a strict mismatch costs at worst
 one full 200 re-download, while a lenient `<=` would honor the range precisely
 when the dates differ -- the one case where byte identity cannot be
 guaranteed -- splicing mismatched bytes onto the client's cached body. Both
@@ -117,9 +116,8 @@ emitted IMF-fixdate verbatim, so exact match never misfires for correct
 revalidation. Step 1 of the 13.1.5 evaluation is enforced too: a Last-Modified
 whose second has not yet fully elapsed is not a strong validator (Section
 8.8.2.2 -- the representation could have been written twice within that
-second), so the range is ignored until the second passes. Go stdlib skips this
-step; the cost of honoring it is at worst one full 200 for a file modified
-under a second ago.
+second), so the range is ignored until the second passes. Honoring this step
+costs at worst one full 200 for a file modified under a second ago.
 
 **Case-insensitive range units.** Per RFC 9110 Section 14.1, range units are
 compared case-insensitively. `Bytes=0-499` and `BYTES=0-499` are both valid.
@@ -174,10 +172,10 @@ and the final header builder). Without this, the orchestrator would call
 this be unsatisfiable (416), but an empty 200 is the pragmatic response since
 there are zero bytes to serve either way.
 
-**Request `Cache-Control` is ignored during conditional evaluation.** Matching
-Go stdlib and nginx: request cache directives (RFC 9111 Section 5.2.1) address
-caches, not origin conditional evaluation, and a 304 IS the end-to-end
-revalidation the client asked for. This matters in practice: spec-compliant
+**Request `Cache-Control` is ignored during conditional evaluation.** Request
+cache directives (RFC 9111 Section 5.2.1) address caches, not origin
+conditional evaluation, and a 304 IS the end-to-end revalidation the client
+asked for. This matters in practice: spec-compliant
 fetch clients (undici, browsers) automatically append `Cache-Control: no-cache`
 to any request that carries manually-set conditional headers, so honoring the
 directive would make 304 unreachable for every programmatic revalidation
@@ -203,14 +201,13 @@ correct 206/200 for the actual object.
 **Suffix ranges larger than the file serve the full body as 206.** RFC 9110
 Section 14.1.2 resolves `bytes=-N` where N >= size to the entire
 representation; we emit it as a 206 with full bounds rather than degrading
-to 200, matching Go stdlib.
+to 200.
 
 **A `Range` on a zero-length representation serves 200, not 416.** A strict
 reading of RFC 9110 Section 14.1.2 could call any range on a 0-byte object
-unsatisfiable (416), but Go `net/http.ServeContent` and nginx both serve the
-empty 200, and returning 416 for `bytes=0-` on an empty file breaks real
-clients. We match the battle-tested behavior: the range parser treats a
-zero-size representation as "not a range request" and serves the empty 200.
+unsatisfiable (416), but returning 416 for `bytes=0-` on an empty file breaks
+real clients. The range parser treats a zero-size representation as "not a
+range request" and serves the empty 200.
 
 **`Want-Repr-Digest` negotiation is parsed for `sha-256`, not as a full
 Structured Fields document.** RFC 9530 digest negotiation is read with a
@@ -289,7 +286,7 @@ and when the client declined it via `Want-Content-Digest`.
 ⁶ Omitted on 304 whenever an `ETag` is emitted: RFC 9110 Section 15.4.5 has a
 304 sender generate representation metadata beyond the listed fields only for
 cache-update purposes and names `Last-Modified` as useful when there is no
-ETag; one strong validator suffices and this matches Go stdlib. Of the
+ETag; one strong validator suffices. Of the
 Section 15.4.5 MUST-generate list (`Content-Location`, `Date`, `ETag`,
 `Vary`, `Cache-Control`, `Expires`): `ETag` and `Cache-Control` are the
 library's job, `Date` is the server runtime's, and `Vary` /

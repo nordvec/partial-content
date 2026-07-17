@@ -663,7 +663,7 @@ describe("isConditionalFresh", () => {
         ).toBe(true);
     });
 
-    // ── Request Cache-Control is ignored (matches Go stdlib / nginx) ─────
+    // ── Request Cache-Control is ignored during conditional evaluation ──
     // RFC 9111 aims request cache directives at CACHES, not origin
     // conditional evaluation; a 304 IS the revalidation the client asked
     // for. Spec-compliant fetch clients (undici, browsers) auto-append
@@ -1447,8 +1447,8 @@ describe("isConditionalFresh (RFC 7232 edge cases)", () => {
     });
 
     test("request Cache-Control never affects conditional evaluation (any directive shape)", () => {
-        // Matching Go stdlib / nginx: cache directives address caches, not
-        // origin conditional evaluation. A matching validator is fresh no
+        // Request cache directives address caches, not origin conditional
+        // evaluation. A matching validator is fresh no
         // matter what Cache-Control says (undici auto-appends no-cache to
         // manually-conditional requests; honoring it would kill 304s).
         const shapes = [
@@ -1912,8 +1912,8 @@ describe("RFC 9110 coverage completion", () => {
         // RFC 9110 §13.1.5: "Note that this comparison by exact match,
         // including when the validator is an HTTP-date, differs from the
         // 'earlier than or equal to' comparison used when evaluating an
-        // If-Unmodified-Since conditional." Go stdlib checkIfRange enforces
-        // the same equality. A lenient <= would honor the range whenever the
+        // If-Unmodified-Since conditional." Exact equality is required here.
+        // A lenient <= would honor the range whenever the
         // dates differ -- which is exactly when byte identity cannot be
         // guaranteed, risking spliced content in the client's cache. A
         // well-behaved client echoes our emitted IMF-fixdate verbatim, so

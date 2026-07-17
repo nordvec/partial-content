@@ -13,7 +13,7 @@
  *   - Null/empty/undefined fallback behavior
  */
 import { expect, test, describe } from "bun:test";
-import { buildContentDisposition } from "../index";
+import { buildContentDisposition, isInlineSafeMediaType } from "../index";
 
 // ─── Basic Type Handling ────────────────────────────────────────────────────
 
@@ -506,5 +506,56 @@ describe("buildContentDisposition ASCII fallback transliteration", () => {
         const result = buildContentDisposition("høj.pdf");
         expect(result).toContain('filename="h?j.pdf"');
         expect(result).toContain("filename*=UTF-8''h%C3%B8j.pdf");
+    });
+});
+
+describe("isInlineSafeMediaType", () => {
+    test("images are inline-safe except SVG", () => {
+        expect(isInlineSafeMediaType("image/png")).toBe(true);
+        expect(isInlineSafeMediaType("image/jpeg")).toBe(true);
+        expect(isInlineSafeMediaType("image/webp")).toBe(true);
+        expect(isInlineSafeMediaType("image/svg+xml")).toBe(false);
+    });
+
+    test("audio and video are inline-safe", () => {
+        expect(isInlineSafeMediaType("video/mp4")).toBe(true);
+        expect(isInlineSafeMediaType("audio/mpeg")).toBe(true);
+    });
+
+    test("script-capable document types are NOT inline-safe", () => {
+        expect(isInlineSafeMediaType("text/html")).toBe(false);
+        expect(isInlineSafeMediaType("application/xhtml+xml")).toBe(false);
+        // PDF is excluded by default: serve it inline only from a CSP-sandboxed route.
+        expect(isInlineSafeMediaType("application/pdf")).toBe(false);
+    });
+
+    test("a small allow-list of inert text/data types is inline-safe", () => {
+        expect(isInlineSafeMediaType("text/plain")).toBe(true);
+        expect(isInlineSafeMediaType("application/json")).toBe(true);
+        expect(isInlineSafeMediaType("text/csv")).toBe(true);
+        expect(isInlineSafeMediaType("text/markdown")).toBe(true);
+    });
+
+    test("parameters and casing are ignored (essence match)", () => {
+        expect(isInlineSafeMediaType("TEXT/PLAIN; charset=utf-8")).toBe(true);
+        expect(isInlineSafeMediaType("Image/PNG")).toBe(true);
+        expect(isInlineSafeMediaType("image/svg+xml; charset=utf-8")).toBe(false);
+    });
+
+    test("unknown, empty, and nullish types default to NOT inline-safe", () => {
+        expect(isInlineSafeMediaType("application/octet-stream")).toBe(false);
+        expect(isInlineSafeMediaType("application/zip")).toBe(false);
+        expect(isInlineSafeMediaType("")).toBe(false);
+        expect(isInlineSafeMediaType("   ")).toBe(false);
+        expect(isInlineSafeMediaType(null)).toBe(false);
+        expect(isInlineSafeMediaType(undefined)).toBe(false);
+    });
+
+    test("composes with buildContentDisposition for untrusted content", () => {
+        const forUntrusted = (name: string, mime: string) =>
+            buildContentDisposition(name, { type: isInlineSafeMediaType(mime) ? "inline" : "attachment" });
+        expect(forUntrusted("a.png", "image/png")).toStartWith("inline");
+        expect(forUntrusted("x.svg", "image/svg+xml")).toStartWith("attachment");
+        expect(forUntrusted("p.html", "text/html")).toStartWith("attachment");
     });
 });

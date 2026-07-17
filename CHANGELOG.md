@@ -1,5 +1,47 @@
 # Changelog
 
+## 2.3.1 (2026-07-17)
+
+Documentation only; no code change from 2.3.0. Corrects changelog and
+doc wording. Prefer this over 2.3.0.
+
+## 2.3.0 (2026-07-17)
+
+Operational hardening for self-hosted and multi-instance deployments: CORS,
+reverse-proxy body streaming, honest capability advertising, and safer failure
+modes on the filesystem and S3 stores.
+
+### Added
+- **`TUS_EXPOSED_HEADERS` / `UPLOAD_EXPOSED_HEADERS`**: the exact response
+  headers a cross-origin browser upload must be allowed to read, published as
+  frozen `string[]` for `Access-Control-Expose-Headers`. The package ships no
+  CORS middleware (the policy is yours), but assembling this list by hand is
+  the step that silently drops `Upload-Offset` and breaks every resume.
+- **`isInlineSafeMediaType(mediaType)`**: an allow-list predicate for choosing
+  `inline` vs `attachment` when serving untrusted content, excluding the
+  script-capable types (`text/html`, `image/svg+xml`, `application/pdf`) that
+  a deny-list forgets. Stored-XSS hardening for the download path.
+- **`docs/DEPLOYMENT.md`**: reverse-proxy configuration (nginx/Apache/Caddy)
+  that streams `PATCH` bodies instead of buffering them (the most common
+  self-host failure), CORS, multi-instance locking, and object-storage part
+  limits.
+
+### Changed
+- **Honest extension advertising.** The tus handler advertises the
+  `expiration` extension on `OPTIONS` only when a max age is configured;
+  claiming it with nothing to expire was a false capability.
+- The filesystem store retries transient file-open failures (`EMFILE`,
+  `ENFILE`, `EBUSY`, `EAGAIN`) with a short backoff, so a momentary share
+  violation on a network volume, or descriptor exhaustion under load, no
+  longer sinks a whole `PATCH`. The `wx`/`r+` open semantics are unchanged
+  (a real collision or missing file still fails on the first attempt).
+
+### Fixed
+- The S3 store now fails loudly at the append that would cross S3's 10,000-part
+  limit, naming the `minPartSize` knob to raise, instead of letting
+  `CompleteMultipartUpload` reject the finished object with an opaque error.
+  (The R2 store already guarded this.)
+
 ## 2.2.0 (2026-07-17)
 
 ### Added
@@ -89,8 +131,8 @@ breaking changes.
 
 The write side. One resumable-upload engine, two wire dialects, and write
 support across every storage adapter, alongside the existing read-side
-serving. Design grounded in the current IETF resumable-uploads draft, the
-deployed client ecosystem, and the write primitives each backend really has.
+serving. Built to the tus 1.0 spec and the current IETF resumable-uploads
+draft, and to the write primitives each storage backend actually provides.
 
 ### Added
 - **`partial-content/tus`**: a tus 1.0 server handler (`createTusHandler`)
@@ -254,8 +296,7 @@ range/digest readers need.
 ## 1.2.0 (2026-07-10)
 
 Feature release: content-coding negotiation, per-request egress offload, and
-serving-policy primitives, informed by a sweep of production file-serving
-implementations.
+serving-policy primitives.
 
 ### Precompressed variant negotiation
 - `precompressed: true | ["br", "zstd", "gzip"]` on the serve options: probes
@@ -381,7 +422,7 @@ Initial public release. Zero-dependency, ESM-only HTTP file-serving protocol lay
 
 ### Storage adapters
 - `/s3` (AWS S3, R2 S3-mode, Hetzner, MinIO, Wasabi), `/r2` (native bindings), `/gcs`, `/azure`, `/fs`, `/http` (any range-capable origin), `/memory`.
-- `/fs`: opt-in hot-object cache (nginx `open_file_cache` semantics): TTL revalidation, coherent metadata + small-body capture, LRU eviction under both an entry cap (`maxEntries`) and a body byte budget (`maxBytes`; `0` = metadata-only).
+- `/fs`: opt-in hot-object cache: TTL revalidation, coherent metadata + small-body capture, LRU eviction under both an entry cap (`maxEntries`) and a body byte budget (`maxBytes`; `0` = metadata-only).
 - Atomic pinned reads (TOCTOU elimination) via each backend's native conditional read; `authoritativeRange` single-round-trip fast path for media seeking.
 - Backend failures map to truthful status: `404` (not found), `503` + `Retry-After` (transient throttle/overload, `StoreUnavailableError`; the `/azure` and `/http` adapters surface the backend's advised `Retry-After`), `502` (malformed upstream).
 - `classifyStoreRead` + `StoreErrorClassifiers`: the shared error-classification primitive, exported for custom adapters; a throttle classifier may return `{ retryAfterSeconds }` to propagate a back-off hint.

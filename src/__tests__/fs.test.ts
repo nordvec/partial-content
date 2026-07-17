@@ -289,7 +289,7 @@ describe("fsStore: opt-in hot-object cache", () => {
         expect(revalidated.contentLength).toBe(20);
     });
 
-    test("stale reads are bounded by ttlMs (nginx open_file_cache semantics)", async () => {
+    test("stale reads are bounded by ttlMs (TTL-revalidated hot-object cache)", async () => {
         const dir = await mkdtemp(join(tmpdir(), "pc-fs-cache-"));
         try {
             await writeFile(join(dir, "mut.txt"), "version-one!");

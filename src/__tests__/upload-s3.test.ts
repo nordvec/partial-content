@@ -412,6 +412,34 @@ describe("s3UploadStore: appendChunk", () => {
         expect(state.isInvalidated).toBe(true);
     });
 
+    test("crossing S3's 10,000-part limit fails loudly, naming the minPartSize knob, before completion", async () => {
+        // One committed part already sits at the ceiling; the next flush would
+        // be part 10,001, which S3 rejects opaquely at completion. The store
+        // must surface it here instead, with the liftable cause.
+        const { store, sent, uploadToken } = await createStoreWithUpload(
+            {
+                GetObjectCommand: routeGetObject({ info: () => infoResponse({ createdAt: NOW }) }),
+                ListPartsCommand: () => ({
+                    Parts: [{ PartNumber: 10_000, Size: 8, ETag: '"e"' }],
+                    IsTruncated: false,
+                }),
+                UploadPartCommand: () => ({ ETag: '"p"' }),
+                HeadObjectCommand: () => { throw notFound("NotFound"); },
+            },
+            { storeOpts: { minPartSize: 8 } },
+        );
+
+        // Offset 8 matches the one committed part; 8 more bytes flush one part.
+        const err = await store
+            .appendChunk(uploadToken, 8, new Uint8Array(8), { now: NOW })
+            .catch((e: unknown) => e);
+        expect(err).toBeInstanceOf(Error);
+        expect((err as Error).message).toMatch(/10,?000-part limit/);
+        expect((err as Error).message).toMatch(/minPartSize/);
+        // The crossing part was never uploaded.
+        expect(sent.filter((c) => c.name === "UploadPartCommand")).toHaveLength(0);
+    });
+
     test("a body ending exactly at maxBytes is accepted", async () => {
         const { store, uploadToken } = await createStoreWithUpload(
             {

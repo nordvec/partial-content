@@ -154,6 +154,61 @@ export function buildContentDisposition(
     return `${type}${buildFilenameParams(sanitized)}`;
 }
 
+/**
+ * Whether a media type is safe to serve `inline` when the CONTENT is
+ * untrusted (user uploads, third-party integration payloads). This is an
+ * allow-list, not a deny-list: a type is inline-safe only if the browser
+ * cannot be driven to execute script while rendering it. Anything not on the
+ * list, including any unrecognized or client-declared type, is attachment.
+ *
+ * Excluded on purpose even though a browser will happily render them inline:
+ * - `text/html`, `application/xhtml+xml`: script execution, the canonical
+ *   stored-XSS vector.
+ * - `image/svg+xml`: SVG carries `<script>`, `on*` handlers, and external
+ *   references; it renders as an image but executes as a document.
+ * - `application/pdf`: historically a rich source of parser and JS-in-PDF
+ *   vulnerabilities. Serve it inline only from a hardened viewer route with
+ *   its own `Content-Security-Policy` sandbox, never by content-type alone;
+ *   this default keeps it an attachment.
+ *
+ * Use it to choose the disposition for an untrusted object:
+ * ```typescript
+ * buildContentDisposition(name, {
+ *   type: isInlineSafeMediaType(mime) ? "inline" : "attachment",
+ * })
+ * ```
+ * A trusted first-party asset you control can pass `type: "inline"` directly;
+ * this helper exists for the multi-tenant case where the content, its type,
+ * and its filename all came from someone else.
+ */
+export function isInlineSafeMediaType(mediaType: string | null | undefined): boolean {
+    if (!mediaType) return false;
+    // Essence only: drop any `; charset=...` / `; boundary=...` parameters and
+    // normalize case before matching (RFC 9110 media-type comparison).
+    const semi = mediaType.indexOf(";");
+    const essence = (semi === -1 ? mediaType : mediaType.slice(0, semi)).trim().toLowerCase();
+    if (essence === "") return false;
+    // Images render as pixels, EXCEPT SVG, which is an executable document.
+    if (essence.startsWith("image/")) return essence !== "image/svg+xml";
+    // Media plays in a media element; no document/script surface.
+    if (essence.startsWith("video/") || essence.startsWith("audio/")) return true;
+    // A short allow-list of inert text/data types browsers render as plain
+    // content. `text/html` and `application/xhtml+xml` are deliberately absent.
+    return INLINE_SAFE_ESSENCES.has(essence);
+}
+
+/**
+ * Non-media essences a browser renders inline without a script surface. Kept
+ * deliberately small: adding a type here is asserting the browser cannot be
+ * driven to execute code while displaying it.
+ */
+const INLINE_SAFE_ESSENCES: ReadonlySet<string> = new Set([
+    "text/plain",
+    "application/json",
+    "text/csv",
+    "text/markdown",
+]);
+
 // ─── Internal Helpers ───────────────────────────────────────────────────────
 
 /**

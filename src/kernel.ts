@@ -271,8 +271,7 @@ export interface RangeSet {
  *                        coalesced): serve 206 (single) or multipart (>1).
  *
  * Amplification defenses (RFC 9110 Section 14.2 explicitly permits ignoring
- * abusive range sets; approach mirrors Go `net/http.ServeContent`'s
- * sum-of-ranges check and nginx `max_ranges` + coalescing):
+ * abusive range sets; a sum-of-ranges cap plus coalescing):
  *   1. Overlapping, adjacent, and near-adjacent ranges are coalesced (gaps
  *      smaller than the ~80-byte multipart part overhead are bridged, which
  *      Section 15.3.7.2 sanctions and which strictly shrinks the response),
@@ -543,8 +542,8 @@ export function isConditionalFresh(
   // No conditional headers -> not a conditional request
   if (!ifNoneMatch && !ifModifiedSince) return false;
 
-  // Request `Cache-Control: no-cache` is deliberately IGNORED here, matching
-  // Go stdlib and nginx. RFC 9111 aims that directive at caches, not origin
+  // Request `Cache-Control: no-cache` is deliberately IGNORED here.
+  // RFC 9111 aims that directive at caches, not origin
   // conditional evaluation, and a 304 IS the end-to-end revalidation the
   // client asked for. Critically, spec-compliant fetch clients (undici,
   // browsers) auto-append `Cache-Control: no-cache` to any request carrying
@@ -1004,7 +1003,8 @@ export function build304Headers(
   // for the purpose of guiding cache updates (e.g., Last-Modified might be
   // useful if the response does not have an ETag field)."
   // When ETag is present, Last-Modified is redundant (ETag is the stronger
-  // validator). Omitting it reduces 304 size and matches Go stdlib behavior.
+  // validator). Omitting it reduces 304 size (RFC 9110 Section 15.4.5 asks a
+  // 304 sender for representation metadata only for cache-update purposes).
   if (lastModified && !etag) {
     headers["Last-Modified"] = toHttpDate(lastModified) ?? sanitizeHeaderValue(lastModified);
   }
@@ -1489,8 +1489,8 @@ function stripWeakPrefix(etag: string): string {
  * `.split(",")` would incorrectly split `"ver,1", "ver,2"` into four
  * fragments instead of two ETags.
  *
- * Uses character-by-character parsing with quote boundary tracking
- * (modeled on Go stdlib `scanETag()` from `net/http/fs.go`).
+ * Uses character-by-character parsing with quote boundary tracking, to the
+ * `entity-tag` grammar of RFC 9110 Section 8.8.3.
  */
 function parseETagList(header: string): string[] {
   const tags: string[] = [];
@@ -1520,7 +1520,7 @@ function parseETagList(header: string): string[] {
     // Scan for closing quote, validating each character is a valid etagc.
     // RFC 9110 Section 8.8.3: etagc = %x21 / %x23-7E / obs-text
     // obs-text = %x80-FF (extended ASCII / UTF-8 continuation bytes)
-    // This matches Go stdlib scanETag() which rejects invalid characters.
+    // Characters outside the etagc grammar are rejected, not laundered.
     let valid = true;
     while (i < len && header[i] !== '"') {
       const c = header.charCodeAt(i);
