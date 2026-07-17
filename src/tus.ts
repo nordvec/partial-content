@@ -14,10 +14,9 @@
  *
  * Not implemented: the concatenation extension (a parallel-upload pattern
  * with substantial storage surface, outside this dialect's scope).
- * // descope: tus checksum extension (Upload-Checksum request header); the
- * // package is zero-dependency and runtime-agnostic, so per-append hashing
- * // needs a caller-injected hasher; revisit when a caller-injected hasher
- * // API lands on the orchestrator.
+ * // descope: the checksum-trailer variant (Upload-Checksum as an HTTP
+ * // trailer); fetch Requests expose no portable trailer API across the
+ * // runtimes this package supports; revisit when WHATWG fetch grows one.
  *
  * @example
  * ```typescript
@@ -95,6 +94,92 @@ const BASE64_RE = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=
  */
 const METADATA_KEY_RE = /^[\x21-\x2b\x2d-\x7e]+$/;
 
+// ─── Checksum extension ──────────────────────────────────────────────────────
+
+/**
+ * Per-request integrity verification (tus checksum extension,
+ * `Upload-Checksum: <algorithm> <base64>`). The dialect BUFFERS a
+ * checksummed request's content and verifies it before any byte reaches the
+ * store: the extension's "the chunk MUST be discarded" on mismatch is only
+ * honest when unverified bytes were never made durable. The buffer is hard-
+ * capped (`maxBufferBytes`, defaulting to the effective max append size), so
+ * a caller always bounds the memory cost explicitly.
+ */
+export interface TusChecksumOptions {
+  /**
+   * Algorithm tokens accepted and advertised via `Tus-Checksum-Algorithm`,
+   * lowercase (the extension's tokens: `sha1`, `md5`, ...). Must be
+   * non-empty.
+   */
+  algorithms: readonly string[];
+  /**
+   * One-shot digest of the buffered content under an advertised algorithm.
+   * May be async (WebCrypto). A throwing digest is routed to `onError` and
+   * answered as an internal error, never a mismatch.
+   */
+  digest(algorithm: string, content: Uint8Array): Uint8Array | Promise<Uint8Array>;
+  /**
+   * Hard cap in bytes on the verification buffer. Defaults to the effective
+   * max append size (policy or store); when neither exists the handler
+   * refuses construction rather than buffer unboundedly.
+   */
+  maxBufferBytes?: number;
+}
+
+/**
+ * Ready-made {@link TusChecksumOptions} over WebCrypto (`crypto.subtle`),
+ * which every supported runtime ships: covers `sha1` (the algorithm the
+ * extension requires of servers) plus the SHA-2 family. Inject a custom
+ * {@link TusChecksumOptions} instead when clients need `md5` or `crc32`.
+ */
+export function webCryptoChecksum(opts?: { maxBufferBytes?: number }): TusChecksumOptions {
+  const SUBTLE_NAMES: Record<string, string> = {
+    sha1: "SHA-1", sha256: "SHA-256", sha384: "SHA-384", sha512: "SHA-512",
+  };
+  return {
+    algorithms: ["sha1", "sha256", "sha384", "sha512"],
+    maxBufferBytes: opts?.maxBufferBytes,
+    async digest(algorithm, content) {
+      // subtle.digest() rejects SharedArrayBuffer-backed views (and lib.dom
+      // types it so): the handler always passes a dialect-allocated buffer,
+      // and a shared-backed view from any other caller is copied out first.
+      const safe = content.buffer instanceof ArrayBuffer
+        ? (content as Uint8Array<ArrayBuffer>)
+        : new Uint8Array(content);
+      return new Uint8Array(await crypto.subtle.digest(SUBTLE_NAMES[algorithm]!, safe));
+    },
+  };
+}
+
+/** Parsed Upload-Checksum header: algorithm token + asserted digest bytes. */
+interface ParsedChecksum {
+  algorithm: string;
+  digest: Uint8Array;
+}
+
+/**
+ * Parse `Upload-Checksum: <algorithm> <base64>`. Returns null when malformed
+ * (missing space, empty parts, or sloppy base64), which the caller answers
+ * with a 400: an integrity assertion is the last header to guess about.
+ */
+function parseUploadChecksum(header: string): ParsedChecksum | null {
+  const sp = header.indexOf(" ");
+  if (sp <= 0 || sp === header.length - 1) return null;
+  const algorithm = header.slice(0, sp).toLowerCase();
+  const digest = decodeBase64Bytes(header.slice(sp + 1).trim());
+  if (digest === null || digest.byteLength === 0) return null;
+  return { algorithm, digest };
+}
+
+/** Byte equality (integrity check, not a secret comparison). */
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.byteLength !== b.byteLength) return false;
+  for (let i = 0; i < a.byteLength; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+
 // ─── Options ─────────────────────────────────────────────────────────────────
 
 /** What the {@link TusHandlerOptions.key} callback sees for a creation request. */
@@ -139,6 +224,16 @@ export interface TusHandlerOptions extends UploadPolicy {
   auditKey?: (uploadToken: string, metadata?: Record<string, string>) => string;
   /** Policy object form; flat {@link UploadPolicy} fields on these options win. */
   policy?: UploadPolicy;
+  /**
+   * Enable the tus checksum extension (per-request `Upload-Checksum`
+   * verification). {@link webCryptoChecksum} covers the spec's mandatory
+   * `sha1` on every supported runtime; inject custom hashing for `md5` and
+   * friends. Absent: the extension is not advertised and an unsolicited
+   * `Upload-Checksum` header is IGNORED, mirroring how the completion path
+   * treats an integrity assertion nothing can verify (RFC 9530 posture),
+   * rather than failing bytes that were never compared.
+   */
+  checksum?: TusChecksumOptions;
   /** Lock provider, passed to the orchestrator. */
   locker?: UploadLocker;
   /** Structured, content-free audit events, passed to the orchestrator. */
@@ -174,8 +269,8 @@ function parseNonNegativeInt(value: string | null): number | undefined | null {
   return Number.isSafeInteger(n) ? n : null;
 }
 
-/** Decode one base64 Upload-Metadata value to a UTF-8 string, or null if malformed. */
-function decodeBase64Utf8(value: string): string | null {
+/** Decode strict standard base64 to bytes, or null if malformed. */
+function decodeBase64Bytes(value: string): Uint8Array | null {
   if (!BASE64_RE.test(value)) return null;
   let raw: string;
   try {
@@ -185,6 +280,13 @@ function decodeBase64Utf8(value: string): string | null {
   }
   const bytes = new Uint8Array(raw.length);
   for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+  return bytes;
+}
+
+/** Decode one base64 Upload-Metadata value to a UTF-8 string, or null if malformed. */
+function decodeBase64Utf8(value: string): string | null {
+  const bytes = decodeBase64Bytes(value);
+  if (bytes === null) return null;
   try {
     return UTF8_DECODER.decode(bytes);
   } catch {
@@ -271,6 +373,27 @@ export function createTusHandler(
   const maxAgeSeconds = orchestrator.policy.maxAgeSeconds;
   const extraHeaders = options.extraHeaders;
 
+  // Checksum extension wiring: the verification buffer MUST be bounded (an
+  // unbounded buffer is a memory amplification primitive), so construction
+  // refuses a config where neither the checksum options nor the append
+  // policy caps it. Caller bugs fail loudly, here as everywhere.
+  const checksum = options.checksum;
+  const checksumCap = checksum
+    ? checksum.maxBufferBytes ?? orchestrator.policy.maxAppendSize
+    : undefined;
+  if (checksum) {
+    if (checksum.algorithms.length === 0) {
+      throw new TypeError("createTusHandler: checksum.algorithms must not be empty");
+    }
+    if (checksumCap === undefined) {
+      throw new TypeError(
+        "createTusHandler: checksum verification buffers each request; bound it "
+        + "via checksum.maxBufferBytes or a maxAppendSize policy",
+      );
+    }
+  }
+  const extensions = checksum ? `${TUS_EXTENSIONS},checksum` : TUS_EXTENSIONS;
+
   /** Compose a response: caller extras first, protocol headers win. */
   function respond(
     status: number,
@@ -346,16 +469,78 @@ export function createTusHandler(
         return errorResponse(502, "Bad Gateway", "storage backend error", { isHead });
       default:
         // Success kinds are handled by each method before mapping, and
-        // digest-mismatch is unreachable while the checksum extension is
-        // descoped (this dialect never asserts a digest). Reaching here is
-        // an internal invariant breach: report it (an operator must see a
-        // breach), then fail closed without mislabeling it a client error.
+        // digest-mismatch is unreachable: Upload-Checksum verification is
+        // dialect-local (content verifies BEFORE it is appended), so this
+        // dialect never hands the orchestrator a digest assertion. Reaching
+        // here is an internal invariant breach: report it (an operator must
+        // see a breach), then fail closed without mislabeling it a client error.
         onError?.(
           new Error(`tus dialect: unexpected orchestrator outcome "${outcome.kind}"`),
           { operation: "reject" },
         );
         return errorResponse(500, "Internal Server Error", "internal error", { isHead });
     }
+  }
+
+  /**
+   * Verify an `Upload-Checksum` assertion against the request content, fully
+   * buffered first: bytes reach the store only after they verify, which is
+   * the sole honest reading of the extension's discard-on-mismatch. Returns
+   * the verified content to append, or the error response. An absent header,
+   * or any header while the extension is unconfigured, passes the raw body
+   * through untouched.
+   */
+  async function verifyChecksum(
+    req: Request,
+  ): Promise<{ body: Uint8Array | ReadableStream<Uint8Array> | undefined } | { response: Response }> {
+    const header = req.headers.get("upload-checksum");
+    if (header === null || !checksum) return { body: req.body ?? undefined };
+    const parsed = parseUploadChecksum(header);
+    if (parsed === null) {
+      return { response: errorResponse(400, "Bad Request", "invalid Upload-Checksum header") };
+    }
+    if (!checksum.algorithms.includes(parsed.algorithm)) {
+      // The extension's 400 for an algorithm the server did not advertise.
+      return { response: errorResponse(400, "Bad Request", "unsupported checksum algorithm") };
+    }
+    let content = new Uint8Array(0);
+    if (req.body !== null) {
+      const chunks: Uint8Array[] = [];
+      let total = 0;
+      const reader = req.body.getReader();
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          total += value.byteLength;
+          if (total > checksumCap!) {
+            await reader.cancel().catch(() => {});
+            return {
+              response: errorResponse(413, "Request Entity Too Large",
+                "checksummed content exceeds the verification buffer cap"),
+            };
+          }
+          chunks.push(value);
+        }
+      } catch {
+        // A torn body cannot be verified, and none of it reached the store:
+        // upload state is unchanged, exactly what a resuming client expects.
+        return {
+          response: errorResponse(400, "Bad Request",
+            "request content ended before the checksummed chunk completed"),
+        };
+      }
+      content = new Uint8Array(total);
+      let at = 0;
+      for (const c of chunks) { content.set(c, at); at += c.byteLength; }
+    }
+    const actual = await checksum.digest(parsed.algorithm, content);
+    if (!bytesEqual(actual, parsed.digest)) {
+      // 460 Checksum Mismatch (the extension's own status). The chunk was
+      // never appended, so the client's next HEAD sees the pre-PATCH offset.
+      return { response: errorResponse(460, "Checksum Mismatch", "content does not match Upload-Checksum") };
+    }
+    return { body: content };
   }
 
   /**
@@ -392,9 +577,11 @@ export function createTusHandler(
     const headers: Record<string, string> = {
       "Tus-Resumable": TUS_VERSION,
       "Tus-Version": TUS_VERSION,
-      "Tus-Extension": TUS_EXTENSIONS,
+      "Tus-Extension": extensions,
     };
     if (maxSize !== undefined) headers["Tus-Max-Size"] = String(maxSize);
+    // Checksum extension MUST: advertise the verifiable algorithms.
+    if (checksum) headers["Tus-Checksum-Algorithm"] = checksum.algorithms.join(",");
     return respond(204, "No Content", headers);
   }
 
@@ -440,13 +627,21 @@ export function createTusHandler(
       : true
     );
 
+    // creation-with-upload content is checksummable like any PATCH content.
+    let body: Uint8Array | ReadableStream<Uint8Array> | undefined;
+    if (hasContent) {
+      const verified = await verifyChecksum(req);
+      if ("response" in verified) return verified.response;
+      body = verified.body;
+    }
+
     const key = options.key({ metadata, request: req });
     const outcome = await orchestrator.create({
       key,
       declaredLength,
       contentLength,
       complete,
-      body: hasContent ? req.body ?? undefined : undefined,
+      body,
       metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
       signal: req.signal,
     });
@@ -547,28 +742,21 @@ export function createTusHandler(
     }
 
     const auditKey = options.auditKey?.(uploadToken);
-    // Pre-append probe: tus has no completion flag on the wire, so whether
-    // THIS append completes the upload is derived from the durable length
-    // (or the length this request declares). The probe also anchors
-    // Upload-Expires. It is advisory only: the engine re-validates offset,
-    // length, and bounds against fresh state under the append's own lock.
-    const probed = await orchestrator.probe(uploadToken, { auditKey, signal: req.signal });
-    if (probed.kind !== "probed") return rejectResponse(probed, false);
+    // Checksum extension: verify before a single byte can reach the store.
+    const verified = await verifyChecksum(req);
+    if ("response" in verified) return verified.response;
 
-    const knownLength = declaredLength ?? probed.length;
-    const body = req.body ?? undefined;
-    const complete = knownLength !== undefined && (
-      contentLength !== undefined
-        ? claimedOffset + contentLength === knownLength
-        : body !== undefined
-    );
-
+    // tus has no completion flag on the wire: whether THIS append completes
+    // the upload is implicit at offset == length. The orchestrator infers it
+    // from the fresh durable state it reads under the append's own lock, so
+    // the PATCH hot path costs a single locked state read (a dialect-side
+    // pre-probe would double it and could still go stale before the lock).
     const outcome = await orchestrator.append(uploadToken, {
       offset: claimedOffset,
       contentLength,
-      complete,
+      complete: "infer",
       declaredLength,
-      body,
+      body: verified.body,
       auditKey,
       signal: req.signal,
     });
@@ -584,7 +772,7 @@ export function createTusHandler(
     if (outcome.kind !== "appended") return rejectResponse(outcome, false);
 
     let isComplete = outcome.complete;
-    if (!isComplete && knownLength !== undefined && outcome.offset === knownLength) {
+    if (!isComplete && outcome.length !== undefined && outcome.offset === outcome.length) {
       const healed = await healImplicitCompletion(uploadToken, outcome.offset, auditKey);
       if (healed.kind !== "appended" && healed.kind !== "already-complete") {
         return rejectResponse(healed, false);

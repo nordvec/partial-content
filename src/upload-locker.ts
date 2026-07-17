@@ -14,8 +14,9 @@
  * mid-flight would hand the client an offset its very next request fails on.
  *
  * The in-memory implementation is correct for a single process. Multi
- * -instance deployments supply their own {@link UploadLocker} backed by
- * shared infrastructure; the interface is deliberately tiny so that stays a
+ * -instance deployments use `redisUploadLocker` (the `redis-locker` subpath,
+ * any Redis-protocol server, client injected) or supply their own
+ * {@link UploadLocker}; the interface is deliberately tiny so that stays a
  * page of code.
  */
 

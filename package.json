@@ -1,6 +1,6 @@
 {
   "name": "partial-content",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "description": "RFC-compliant HTTP file serving and resumable uploads for any storage backend. Range requests (206), conditional caching (304/412), Content-Disposition, ETag generation, and a resumable-upload engine speaking tus 1.0 and the IETF resumable-uploads draft. Zero dependencies.",
   "type": "module",
   "main": "./dist/index.js",
@@ -79,6 +79,12 @@
       "default": "./dist/memory.js"
     },
     "./package.json": "./package.json",
+    "./redis-locker": {
+      "types": "./dist/redis-locker.d.ts",
+      "bun": "./src/redis-locker.ts",
+      "import": "./dist/redis-locker.js",
+      "default": "./dist/redis-locker.js"
+    },
     "./tus": {
       "types": "./dist/tus.d.ts",
       "bun": "./src/tus.ts",

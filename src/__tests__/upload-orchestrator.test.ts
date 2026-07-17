@@ -783,15 +783,34 @@ describe("create edge paths", () => {
         expect(errors).toEqual(["create"]);
     });
 
-    test("a failing post-stream state read on create maps to store-error", async () => {
+    test("a failing durable re-read after an INTERRUPTED create maps to store-error", async () => {
+        // Only an interruption leaves the durable prefix unknown; the clean
+        // path derives the offset from the write's return and never re-reads.
         const { store } = fakeStore({
             getUploadState: async () => { throw new Error("state read failed"); },
         });
         const o = orch(store);
+        const ctl = new AbortController();
+        ctl.abort();
         const out = await o.create({
-            key: "k", contentLength: 3, complete: false, body: bodyOf("abc"),
+            key: "k", contentLength: 3, complete: false, body: bodyOf("abc"), signal: ctl.signal,
         });
         expect(out.kind).toBe("store-error");
+    });
+
+    test("a clean create with a body never issues a state read", async () => {
+        let reads = 0;
+        const { store } = fakeStore();
+        const spy: ResumableWriteStore = {
+            ...store,
+            getUploadState: (t, opts) => { reads++; return store.getUploadState(t, opts); },
+        };
+        const o = orch(spy);
+        const out = await o.create({
+            key: "k", contentLength: 5, complete: true, body: bodyOf("hello"),
+        });
+        expect(out).toMatchObject({ kind: "created", offset: 5, complete: true });
+        expect(reads).toBe(0);
     });
 
     test("a completing create short of its declared length does NOT complete", async () => {
@@ -905,7 +924,7 @@ describe("append edge paths", () => {
         expect(errors).toEqual(["head"]);
     });
 
-    test("a failing post-stream state read on append maps to store-error", async () => {
+    test("a failing durable re-read after an INTERRUPTED append maps to store-error", async () => {
         const { store } = fakeStore();
         let reads = 0;
         const flaky: ResumableWriteStore = {
@@ -919,10 +938,35 @@ describe("append edge paths", () => {
         const o = orch(flaky);
         const created = await o.create({ key: "k", complete: false });
         if (created.kind !== "created") throw new Error("setup");
+        const ctl = new AbortController();
+        ctl.abort();
         const out = await o.append(created.uploadToken, {
-            offset: 0, contentLength: 2, complete: false, body: bodyOf("ab"),
+            offset: 0, contentLength: 2, complete: false, body: bodyOf("ab"), signal: ctl.signal,
         });
         expect(out.kind).toBe("store-error");
+    });
+
+    test("a clean append answers from the write's return: exactly one state read, correct outcome", async () => {
+        const { store } = fakeStore();
+        let reads = 0;
+        const spy: ResumableWriteStore = {
+            ...store,
+            getUploadState: (t, opts) => { reads++; return store.getUploadState(t, opts); },
+        };
+        const o = orch(spy, { policy: { maxAgeSeconds: 60 } });
+        const created = await o.create({ key: "k", declaredLength: 10, complete: false });
+        if (created.kind !== "created") throw new Error("setup");
+        reads = 0;
+        const out = await o.append(created.uploadToken, {
+            offset: 0, contentLength: 4, complete: false, body: bodyOf("wxyz"),
+        });
+        // The single pre-evaluation read under the lock; offset, length, and
+        // the expiry anchor all come from it plus the write's own return.
+        expect(reads).toBe(1);
+        expect(out).toMatchObject({
+            kind: "appended", offset: 4, length: 10, complete: false,
+            interrupted: false, expiresAt: NOW + 60_000,
+        });
     });
 
     test("an append without a body answers the durable offset without touching the writer", async () => {
@@ -1042,6 +1086,105 @@ describe("cancel edge paths", () => {
     });
 });
 
+describe("implicit completion inference (complete: 'infer')", () => {
+    test("an append whose math reaches the stored length completes and publishes", async () => {
+        const { store, uploads } = fakeStore();
+        const o = orch(store);
+        const created = await o.create({ key: "k", declaredLength: 5, complete: false });
+        if (created.kind !== "created") throw new Error("setup");
+        const out = await o.append(created.uploadToken, {
+            offset: 0, contentLength: 5, complete: "infer", body: bodyOf("hello"),
+        });
+        expect(out).toMatchObject({ kind: "appended", offset: 5, complete: true, etag: '"done"' });
+        expect([...uploads.values()][0]!.isComplete).toBe(true);
+    });
+
+    test("an append whose math falls short of the length stays incomplete", async () => {
+        const { store, uploads } = fakeStore();
+        const o = orch(store);
+        const created = await o.create({ key: "k", declaredLength: 10, complete: false });
+        if (created.kind !== "created") throw new Error("setup");
+        const out = await o.append(created.uploadToken, {
+            offset: 0, contentLength: 5, complete: "infer", body: bodyOf("hello"),
+        });
+        expect(out).toMatchObject({ kind: "appended", offset: 5, complete: false });
+        expect([...uploads.values()][0]!.isComplete).toBe(false);
+    });
+
+    test("inference uses a length declared ON this append (deferred-length fixing PATCH)", async () => {
+        const { store, uploads } = fakeStore();
+        const o = orch(store);
+        const created = await o.create({ key: "k", complete: false });
+        if (created.kind !== "created") throw new Error("setup");
+        const out = await o.append(created.uploadToken, {
+            offset: 0, contentLength: 3, complete: "infer", declaredLength: 3, body: bodyOf("abc"),
+        });
+        expect(out).toMatchObject({ kind: "appended", offset: 3, length: 3, complete: true });
+        expect([...uploads.values()][0]!.isComplete).toBe(true);
+    });
+
+    test("no known length means no completion, however much lands", async () => {
+        const { store, uploads } = fakeStore();
+        const o = orch(store);
+        const created = await o.create({ key: "k", complete: false });
+        if (created.kind !== "created") throw new Error("setup");
+        const out = await o.append(created.uploadToken, {
+            offset: 0, contentLength: 3, complete: "infer", body: bodyOf("abc"),
+        });
+        expect(out).toMatchObject({ kind: "appended", offset: 3, complete: false });
+        expect([...uploads.values()][0]!.isComplete).toBe(false);
+    });
+
+    test("an unknown-sized body that delivers exactly through the length completes", async () => {
+        const { store, uploads } = fakeStore();
+        const o = orch(store);
+        const created = await o.create({ key: "k", declaredLength: 5, complete: false });
+        if (created.kind !== "created") throw new Error("setup");
+        const body = controlledStream();
+        body.push("hello");
+        body.close();
+        const out = await o.append(created.uploadToken, {
+            offset: 0, complete: "infer", body: body.stream,
+        });
+        expect(out).toMatchObject({ kind: "appended", offset: 5, complete: true });
+        expect([...uploads.values()][0]!.isComplete).toBe(true);
+    });
+
+    test("an unknown-sized body that stops short of the length stays incomplete", async () => {
+        const { store, uploads } = fakeStore();
+        const o = orch(store);
+        const created = await o.create({ key: "k", declaredLength: 10, complete: false });
+        if (created.kind !== "created") throw new Error("setup");
+        const body = controlledStream();
+        body.push("hello");
+        body.close();
+        const out = await o.append(created.uploadToken, {
+            offset: 0, complete: "infer", body: body.stream,
+        });
+        expect(out).toMatchObject({ kind: "appended", offset: 5, complete: false });
+        expect([...uploads.values()][0]!.isComplete).toBe(false);
+    });
+
+    test("a zero-content inferred retry at offset == length publishes the crash-window object", async () => {
+        // The completing request died after its bytes went durable but before
+        // completeUpload: the client's zero-byte PATCH retry (or the dialect's
+        // heal) at offset == length must publish, not answer offset-mismatch.
+        const { store, uploads } = fakeStore();
+        const o = orch(store);
+        const created = await o.create({ key: "k", declaredLength: 3, complete: false });
+        if (created.kind !== "created") throw new Error("setup");
+        await o.append(created.uploadToken, {
+            offset: 0, contentLength: 3, complete: false, body: bodyOf("abc"),
+        });
+        expect([...uploads.values()][0]!.isComplete).toBe(false);
+        const out = await o.append(created.uploadToken, {
+            offset: 3, contentLength: 0, complete: "infer",
+        });
+        expect(out).toMatchObject({ kind: "appended", offset: 3, complete: true });
+        expect([...uploads.values()][0]!.isComplete).toBe(true);
+    });
+});
+
 describe("signal propagation", () => {
     test("the request signal reaches every store read, completion, and abort", async () => {
         const calls: Array<{ op: string; signal: AbortSignal | undefined }> = [];
@@ -1076,10 +1219,11 @@ describe("signal propagation", () => {
         });
         await o.cancel(created.uploadToken, { signal });
 
-        // create fresh-read + complete, probe, append head + fresh + complete,
-        // cancel head + abort: every store touchpoint carries the caller signal.
+        // create complete (clean streams derive their offset, no state read),
+        // probe, append head + complete, cancel head + abort: every store
+        // touchpoint carries the caller signal.
         expect(calls.map((c) => c.op)).toEqual([
-            "state", "complete", "state", "state", "state", "complete", "state", "abort",
+            "complete", "state", "state", "complete", "state", "abort",
         ]);
         for (const c of calls) expect(c.signal).toBe(signal);
     });

@@ -51,6 +51,7 @@ partial-content              Zero-dep kernel (RFC 7232/7233/9110 evaluation)
 partial-content/web          Fetch API handler (Next.js, SvelteKit, Remix, Workers)
 partial-content/tus          Resumable uploads: tus 1.0 dialect (Fetch handler)
 partial-content/upload       Resumable uploads: IETF draft dialect (Fetch handler)
+partial-content/redis-locker Multi-instance upload locking (Redis/Valkey, client injected)
 partial-content/s3           AWS S3, R2 (S3 mode), Hetzner, MinIO, Wasabi
 partial-content/r2           Cloudflare R2 native bindings (no AWS SDK)
 partial-content/gcs          Google Cloud Storage
@@ -65,7 +66,7 @@ partial-content/mime         Curated zero-dep MIME lookup
 
 Every storage backend ships both sides of the protocol from the same subpath: an `ObjectStore` for serving and a `ResumableWriteStore` for uploads. `s3Store` + `s3UploadStore` (multipart), `r2Store` + `r2UploadStore` (native multipart), `gcsStore` + `gcsUploadStore` (compose), `azureStore` + `azureUploadStore` (uncommitted blocks), `fsStore` + `fsUploadStore` (fsync + atomic rename), `memoryStore` + `memoryUploadStore`. `/http` is read-side only: a generic HTTP origin cannot accept resumable writes.
 
-Cloud SDKs are **optional peer dependencies**: `@aws-sdk/client-s3` for `/s3` (plus `@aws-sdk/s3-request-presigner` only if you use `createSignedUrl()`), `@google-cloud/storage` for `/gcs`, `@azure/storage-blob` for `/azure`, `hono` for `/hono`. The kernel, `/web`, `/node`, `/fs`, `/http`, `/r2`, `/memory`, `/mime`, `/tus`, and `/upload` need nothing beyond the platform.
+Cloud SDKs are **optional peer dependencies**: `@aws-sdk/client-s3` for `/s3` (plus `@aws-sdk/s3-request-presigner` only if you use `createSignedUrl()`), `@google-cloud/storage` for `/gcs`, `@azure/storage-blob` for `/azure`, `hono` for `/hono`. The kernel, `/web`, `/node`, `/fs`, `/http`, `/r2`, `/memory`, `/mime`, `/tus`, and `/upload` need nothing beyond the platform, and `/redis-locker` takes whatever Redis client you already run behind a four-command interface instead of depending on one.
 
 ## Features
 
@@ -74,11 +75,11 @@ Cloud SDKs are **optional peer dependencies**: `@aws-sdk/client-s3` for `/s3` (p
 - **RFC 9530 Repr-Digest**: End-to-end integrity verification via `sha-256=:<base64>:` header, with `Want-Repr-Digest` negotiation -- first-class support that `send`, `sirv`, and the framework static middlewares lack
 - **Built-in storage adapters**: S3-compatible (AWS, R2 S3-mode, Hetzner, MinIO, Backblaze, Wasabi), R2 native, GCS, Azure, local filesystem, any range-capable HTTP origin, in-memory
 - **Built-in framework adapters**: Fetch API (Next.js, SvelteKit, Remix, Nuxt, Astro, Workers, Bun.serve, Deno.serve), Node.js (Express/Fastify/Koa/raw http), Hono
-- **Resumable uploads, one engine, two dialects**: `createTusHandler` (`/tus`: tus 1.0 core plus the creation, creation-with-upload, creation-defer-length, termination, and expiration extensions) and `createUploadHandler` (`/upload`: IETF resumable-uploads draft, interop versions 3, 5, and 6) translate the wire; one shared, wire-agnostic state machine makes every protocol decision
+- **Resumable uploads, one engine, two dialects**: `createTusHandler` (`/tus`: tus 1.0 core plus the creation, creation-with-upload, creation-defer-length, termination, expiration, and opt-in checksum extensions) and `createUploadHandler` (`/upload`: IETF resumable-uploads draft, interop versions 3, 5, and 6) translate the wire; one shared, wire-agnostic state machine makes every protocol decision
 - **Upload write stores for every backend**: in-memory, filesystem (fsynced appends, atomic-rename publish), S3 multipart, Azure uncommitted blocks, GCS compose, R2 native multipart -- each declaring honest capability flags the engine adapts to
 - **Crash-safe upload offsets**: the offset a probe reports is always derived from storage's own bookkeeping (part listings, block lists, an fsynced file size), never from a stored counter that can drift from the bytes after a crash
 - **Upload policy enforced before bytes land**: max/min total size, per-append bounds, and max age are evaluated against fresh state before any byte reaches storage, and streaming appends are hard-capped mid-flight
-- **Cooperative-preemption upload locking** plus a post-abort grace window: a dropped connection resumes in milliseconds instead of stalling behind a zombie request, and bytes received before the drop still become durable
+- **Cooperative-preemption upload locking** plus a post-abort grace window: a dropped connection resumes in milliseconds instead of stalling behind a zombie request, and bytes received before the drop still become durable; `/redis-locker` ships the same semantics for multi-instance deployments over any Redis-protocol server (client injected, still zero dependencies)
 - Range requests (206, 416), including multi-range `multipart/byteranges` with overlapping/adjacent-range coalescing and range-amplification defense (`maxRanges`)
 - **Precompressed variant negotiation** (`precompressed: true`): serves `<key>.br`/`<key>.zst`/`<key>.gz` siblings via Accept-Encoding (RFC 9110 12.5.3) with `Content-Encoding` + `Vary`, the variant's OWN validators and digest, and byte ranges computed against the encoded bytes -- the correctness detail naive precompressed serving gets wrong
 - **Per-request egress offload** (`preferSignedUrl`): split one route by request shape -- proxy ranges, revalidations, and HEAD probes, 302 large full-file downloads to a signed URL that carries your `Cache-Control` (S3 `response-cache-control`; signed URLs also mint on GCS and Azure)

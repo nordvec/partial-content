@@ -397,4 +397,6 @@ resource: the orchestrator serializes every interaction (probes included)
 under a cooperative-preemption lock and re-derives fresh state before each
 decision. Your store's job is durability and honesty, not coordination --
 just remember the default lock is in-process, so multi-instance deployments
-supply a shared `locker` (see API.md, Locking).
+supply a shared `locker`: `redisUploadLocker` from
+`partial-content/redis-locker` for any Redis-protocol server, or your own
+(see API.md, Locking).

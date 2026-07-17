@@ -1,5 +1,5 @@
 import { describe, test, expect } from "bun:test";
-import { createTusHandler, parseUploadMetadata, type TusHandlerOptions } from "../tus";
+import { createTusHandler, parseUploadMetadata, webCryptoChecksum, type TusHandlerOptions } from "../tus";
 import { UploadNotFoundError, type ResumableWriteStore, type StoredUploadState } from "../upload-store";
 import { UploadLockTimeoutError } from "../upload-locker";
 import type { UploadResourceEvent } from "../upload-orchestrator";
@@ -473,6 +473,34 @@ describe("PATCH", () => {
         expect(res.headers.get("tus-resumable")).toBe("1.0.0");
     });
 
+    test("a clean non-final PATCH costs exactly one state read (no dialect pre-probe)", async () => {
+        let reads = 0;
+        const { store, uploads } = fakeStore();
+        const spy: ResumableWriteStore = {
+            ...store,
+            getUploadState: (t, opts) => { reads++; return store.getUploadState(t, opts); },
+        };
+        const handler = createTusHandler(spy, {
+            key: () => "server-key.bin",
+            location: (tok) => `/files/${tok}`,
+            now: () => NOW,
+            graceMs: 0,
+        });
+        const token = await createUpload(handler, { "Upload-Length": "10" });
+        reads = 0;
+        const res = await handler(tusRequest("PATCH", {
+            headers: { "Content-Type": OFFSET_TYPE, "Upload-Offset": "0", "Content-Length": "4" },
+            body: bodyOf("abcd"),
+        }), { uploadToken: token });
+        expect(res.status).toBe(204);
+        expect(res.headers.get("upload-offset")).toBe("4");
+        // The orchestrator's single locked pre-evaluation read is the whole
+        // per-PATCH state cost: completion inference happens there, and the
+        // clean write derives the response offset from its own return.
+        expect(reads).toBe(1);
+        expect(uploads.get(token)!.isComplete).toBe(false);
+    });
+
     test("the final PATCH publishes the upload", async () => {
         const { handler, token, uploads } = await withUpload();
         await handler(tusRequest("PATCH", {
@@ -749,6 +777,209 @@ describe("creation-defer-length", () => {
 });
 
 // ─── Termination (extension: termination) ────────────────────────────────────
+
+describe("checksum extension", () => {
+    async function sha1b64(text: string): Promise<string> {
+        const digest = await crypto.subtle.digest("SHA-1", bodyOf(text));
+        return Buffer.from(digest).toString("base64");
+    }
+
+    function checksumHandler(opts: Partial<TusHandlerOptions> = {}) {
+        return makeHandler({ checksum: webCryptoChecksum(), maxAppendSize: 1024, ...opts });
+    }
+
+    test("OPTIONS advertises the extension and its algorithms", async () => {
+        const { handler } = checksumHandler();
+        const res = await handler(tusRequest("OPTIONS", { noVersion: true }));
+        expect(res.headers.get("tus-extension")).toContain("checksum");
+        expect(res.headers.get("tus-checksum-algorithm")).toBe("sha1,sha256,sha384,sha512");
+    });
+
+    test("OPTIONS without checksum config advertises neither", async () => {
+        const { handler } = makeHandler();
+        const res = await handler(tusRequest("OPTIONS", { noVersion: true }));
+        expect(res.headers.get("tus-extension")).not.toContain("checksum");
+        expect(res.headers.get("tus-checksum-algorithm")).toBeNull();
+    });
+
+    test("a PATCH with a matching sha1 checksum appends normally", async () => {
+        const { handler, uploads } = checksumHandler();
+        const token = await createUpload(handler, { "Upload-Length": "4" });
+        const res = await handler(tusRequest("PATCH", {
+            headers: {
+                "Content-Type": OFFSET_TYPE, "Upload-Offset": "0", "Content-Length": "4",
+                "Upload-Checksum": `sha1 ${await sha1b64("abcd")}`,
+            },
+            body: bodyOf("abcd"),
+        }), { uploadToken: token });
+        expect(res.status).toBe(204);
+        expect(res.headers.get("upload-offset")).toBe("4");
+        expect(uploads.get(token)!.isComplete).toBe(true);
+    });
+
+    test("a mismatch answers 460 and the chunk never reaches the store", async () => {
+        const { handler, uploads } = checksumHandler();
+        const token = await createUpload(handler, { "Upload-Length": "4" });
+        const res = await handler(tusRequest("PATCH", {
+            headers: {
+                "Content-Type": OFFSET_TYPE, "Upload-Offset": "0", "Content-Length": "4",
+                "Upload-Checksum": `sha1 ${await sha1b64("NOT-abcd")}`,
+            },
+            body: bodyOf("abcd"),
+        }), { uploadToken: token });
+        expect(res.status).toBe(460);
+        expect(res.statusText).toBe("Checksum Mismatch");
+        // Discarded means DISCARDED: durable state is untouched, the client's
+        // next probe sees the pre-PATCH offset.
+        expect(uploads.get(token)!.bytes.byteLength).toBe(0);
+        expect(uploads.get(token)!.isComplete).toBe(false);
+    });
+
+    test("an unadvertised algorithm answers 400", async () => {
+        const { handler } = checksumHandler();
+        const token = await createUpload(handler, { "Upload-Length": "4" });
+        const res = await handler(tusRequest("PATCH", {
+            headers: {
+                "Content-Type": OFFSET_TYPE, "Upload-Offset": "0", "Content-Length": "4",
+                "Upload-Checksum": "md5 1B2M2Y8AsgTpgAmY7PhCfg==",
+            },
+            body: bodyOf("abcd"),
+        }), { uploadToken: token });
+        expect(res.status).toBe(400);
+        expect(await res.text()).toBe("unsupported checksum algorithm");
+    });
+
+    test("malformed Upload-Checksum headers answer 400", async () => {
+        const { handler } = checksumHandler();
+        const token = await createUpload(handler, { "Upload-Length": "4" });
+        for (const value of ["sha1", "sha1 ", " sha1", "sha1 not-base64!!", "sha1 ===="]) {
+            const res = await handler(tusRequest("PATCH", {
+                headers: {
+                    "Content-Type": OFFSET_TYPE, "Upload-Offset": "0", "Content-Length": "4",
+                    "Upload-Checksum": value,
+                },
+                body: bodyOf("abcd"),
+            }), { uploadToken: token });
+            expect(res.status).toBe(400);
+            expect(await res.text()).toBe("invalid Upload-Checksum header");
+        }
+    });
+
+    test("content over the verification buffer cap answers 413 before hashing", async () => {
+        let digested = 0;
+        const { handler, uploads } = checksumHandler({
+            checksum: {
+                algorithms: ["sha1"],
+                maxBufferBytes: 3,
+                digest: (_a, bytes) => { digested++; return bytes; },
+            },
+        });
+        const token = await createUpload(handler, { "Upload-Length": "8" });
+        const res = await handler(tusRequest("PATCH", {
+            headers: {
+                "Content-Type": OFFSET_TYPE, "Upload-Offset": "0", "Content-Length": "8",
+                "Upload-Checksum": `sha1 ${await sha1b64("abcdefgh")}`,
+            },
+            body: bodyOf("abcdefgh"),
+        }), { uploadToken: token });
+        expect(res.status).toBe(413);
+        expect(digested).toBe(0);
+        expect(uploads.get(token)!.bytes.byteLength).toBe(0);
+    });
+
+    test("without checksum config an Upload-Checksum header is ignored, not enforced", async () => {
+        // Mirrors the completion-digest posture: an assertion nothing can
+        // verify is dropped, never answered as if the bytes were compared.
+        const { handler, uploads } = makeHandler();
+        const token = await createUpload(handler, { "Upload-Length": "4" });
+        const res = await handler(tusRequest("PATCH", {
+            headers: {
+                "Content-Type": OFFSET_TYPE, "Upload-Offset": "0", "Content-Length": "4",
+                "Upload-Checksum": `sha1 ${await sha1b64("SOMETHING-ELSE")}`,
+            },
+            body: bodyOf("abcd"),
+        }), { uploadToken: token });
+        expect(res.status).toBe(204);
+        expect(uploads.get(token)!.isComplete).toBe(true);
+    });
+
+    test("creation-with-upload content verifies too, mismatch included", async () => {
+        const { handler, uploads } = checksumHandler();
+        const good = await handler(tusRequest("POST", {
+            headers: {
+                "Upload-Length": "4", "Content-Type": OFFSET_TYPE, "Content-Length": "4",
+                "Upload-Checksum": `sha1 ${await sha1b64("abcd")}`,
+            },
+            body: bodyOf("abcd"),
+        }));
+        expect(good.status).toBe(201);
+        expect(good.headers.get("upload-offset")).toBe("4");
+
+        const bad = await handler(tusRequest("POST", {
+            headers: {
+                "Upload-Length": "4", "Content-Type": OFFSET_TYPE, "Content-Length": "4",
+                "Upload-Checksum": `sha1 ${await sha1b64("WRONG")}`,
+            },
+            body: bodyOf("abcd"),
+        }));
+        expect(bad.status).toBe(460);
+        // Only the good creation produced a resource with bytes.
+        const withBytes = [...uploads.values()].filter((u) => u.bytes.byteLength > 0);
+        expect(withBytes).toHaveLength(1);
+    });
+
+    test("a torn body under a checksum answers 400 with durable state untouched", async () => {
+        const { handler, uploads } = checksumHandler();
+        const token = await createUpload(handler, { "Upload-Length": "8" });
+        const body = controlledStream();
+        const pending = handler(tusRequest("PATCH", {
+            headers: {
+                "Content-Type": OFFSET_TYPE, "Upload-Offset": "0",
+                "Upload-Checksum": `sha1 ${await sha1b64("abcdefgh")}`,
+            },
+            body: body.stream,
+        }), { uploadToken: token });
+        body.push("abcd");
+        body.error(new Error("connection reset"));
+        const res = await pending;
+        expect(res.status).toBe(400);
+        expect(uploads.get(token)!.bytes.byteLength).toBe(0);
+    });
+
+    test("construction refuses an unbounded verification buffer and empty algorithms", () => {
+        const { store } = fakeStore();
+        expect(() => createTusHandler(store, {
+            key: () => "k", location: (t) => `/f/${t}`, checksum: webCryptoChecksum(),
+        })).toThrow(TypeError);
+        expect(() => createTusHandler(store, {
+            key: () => "k", location: (t) => `/f/${t}`, maxAppendSize: 1024,
+            checksum: { algorithms: [], digest: (_a, b) => b },
+        })).toThrow(TypeError);
+    });
+
+    test("a throwing digest is a hardened 500 to onError, never a mismatch", async () => {
+        const errors: string[] = [];
+        const { handler, uploads } = checksumHandler({
+            checksum: {
+                algorithms: ["sha1"],
+                maxBufferBytes: 64,
+                digest: () => { throw new Error("hasher exploded"); },
+            },
+            onError: (_e, ctx) => errors.push(ctx.operation),
+        });
+        const token = await createUpload(handler, { "Upload-Length": "4" });
+        const res = await handler(tusRequest("PATCH", {
+            headers: {
+                "Content-Type": OFFSET_TYPE, "Upload-Offset": "0", "Content-Length": "4",
+                "Upload-Checksum": `sha1 ${await sha1b64("abcd")}`,
+            },
+            body: bodyOf("abcd"),
+        }), { uploadToken: token });
+        expect(res.status).toBe(500);
+        expect(errors).toEqual(["handler"]);
+        expect(uploads.get(token)!.bytes.byteLength).toBe(0);
+    });
+});
 
 describe("termination", () => {
     test("DELETE answers 204 and the resource then answers 404", async () => {

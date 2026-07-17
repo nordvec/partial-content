@@ -180,9 +180,24 @@
     ]
   },
   {
+    "name": "/redis-locker",
+    "path": "dist/redis-locker.js",
+    "limit": "2 kB",
+    "ignore": [
+      "node:fs/promises",
+      "node:path",
+      "node:stream",
+      "node:buffer",
+      "node:crypto",
+      "node:os",
+      "node:http",
+      "node:events"
+    ]
+  },
+  {
     "name": "/tus",
     "path": "dist/tus.js",
-    "limit": "6 kB",
+    "limit": "6.75 kB",
     "ignore": [
       "node:fs/promises",
       "node:path",
@@ -197,7 +212,7 @@
   {
     "name": "/upload",
     "path": "dist/upload.js",
-    "limit": "5.5 kB",
+    "limit": "5.75 kB",
     "ignore": [
       "node:fs/promises",
       "node:path",

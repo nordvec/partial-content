@@ -743,11 +743,19 @@ declares capability flags the orchestrator reads instead of assuming:
 - **No concatenation extension** (tus): a parallel-upload pattern with
   substantial storage surface (partial uploads merged server-side), outside
   the dialect's scope.
-- **No per-request checksum extension yet** (tus `Upload-Checksum`): the
-  package is zero-dependency and runtime-agnostic, so per-append hashing
-  needs a caller-injected hasher; the extension waits on that API rather than
-  shipping a runtime-coupled hash. Whole-representation verification at
-  completion (the IETF dialect's `Repr-Digest`) exists where the store can
+- **The checksum extension verifies BUFFERED content** (tus
+  `Upload-Checksum`, opt-in via `checksum` on the tus handler): the
+  extension's discard-on-mismatch is only honest when unverified bytes never
+  reach the store, and a streamed append is durable as it flows, so a
+  checksummed request is buffered (hard-capped, construction-enforced),
+  verified, and only then appended. Streaming verification would need a
+  store-level "un-append" (truncate-to-offset) capability; if the contract
+  ever grows one, the buffer becomes an optimization instead of a
+  requirement. Hashing is caller-injected (`TusChecksumOptions`) with a
+  WebCrypto default (`webCryptoChecksum`) covering the spec-mandatory
+  `sha1`; the trailer variant (checksum-trailer) is descoped because Fetch
+  exposes no portable Request trailer API. Whole-representation verification
+  at completion (the IETF dialect's `Repr-Digest`) exists where the store can
   honestly provide it.
 - **No `104 (Upload Resumption Supported)` interim responses** from the Fetch
   handlers: a Fetch `Response` cannot carry interim responses, and the draft

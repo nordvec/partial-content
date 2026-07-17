@@ -43,16 +43,23 @@ const FLOORS = {
     "upload-engine.ts": 90,     // baseline 91.73 (344 mutants; survivors are
                                 // undefined-comparison no-ops in optional-bound
                                 // guards, provably outcome-equivalent)
-    "upload-orchestrator.ts": 92, // baseline 94.26 (defer-length + minSize +
-                                  // create-under-lock grew the module; residuals
-                                  // are post-settle cleanup closures, once:true
-                                  // hygiene, undefined-comparison no-ops in the
-                                  // policy guards, and a defensive unreachable throw)
+    "upload-orchestrator.ts": 92, // baseline 93.85 (completion inference +
+                                  // derived clean-append outcome joined the
+                                  // R534 growth; residuals are post-settle
+                                  // cleanup closures, once:true hygiene,
+                                  // undefined-comparison no-ops in the policy
+                                  // guards, and a defensive unreachable throw)
     "upload-locker.ts": 96,     // baseline 100.00 (55 mutants; headroom for
                                 // timer-jitter timeout mutants)
-    "tus.ts": 88,               // baseline 90.25 (implicit-completion healing added
-                                // survivors masked by the heal safety net; isHead
-                                // flags on outcomes a HEAD can never produce)
+    "redis-locker.ts": 84,      // baseline 86.00 (100 mutants; survivors are
+                                // optional-chained onError sinks, poll-jitter
+                                // and 1ms-deadline arithmetic, and the
+                                // watchdog-interval floor, all equivalent
+                                // within one poll round)
+    "tus.ts": 88,               // baseline 90.62 (checksum extension landed
+                                // well-covered; residuals are completeness
+                                // derivations masked by the heal safety net and
+                                // isHead flags on outcomes a HEAD never produces)
     "upload.ts": 94,            // baseline 96.44 (309 mutants; the 11 survivors are
                                 // provably equivalent: .trim() on values Headers
                                 // already OWS-strips, a defensive unreachable

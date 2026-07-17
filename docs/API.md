@@ -178,7 +178,7 @@ Both dialect subpaths re-export the whole shared surface, so custom stores and c
 
 ### tus dialect (`partial-content/tus`)
 
-**`createTusHandler(store, options)`** - A tus 1.0 endpoint: core protocol plus the creation, creation-with-upload, creation-defer-length, termination, and expiration extensions (advertised on OPTIONS via `Tus-Extension`). Method surface: `POST` creates (optionally carrying first bytes under `Content-Type: application/offset+octet-stream`), `HEAD` probes the offset, `PATCH` appends, `DELETE` terminates, `OPTIONS` discovers capabilities; `X-HTTP-Method-Override` tunnels PATCH/DELETE through POST for environments that cannot send them. Every non-OPTIONS request is version-gated on `Tus-Resumable: 1.0.0` (412 otherwise). tus completion is implicit (an upload is complete when its offset reaches its length), and the handler publishes the assembled object the moment that happens, including when the final bytes arrived from a connection that died mid-request.
+**`createTusHandler(store, options)`** - A tus 1.0 endpoint: core protocol plus the creation, creation-with-upload, creation-defer-length, termination, expiration, and (when `checksum` is configured) checksum extensions (advertised on OPTIONS via `Tus-Extension`). Method surface: `POST` creates (optionally carrying first bytes under `Content-Type: application/offset+octet-stream`), `HEAD` probes the offset, `PATCH` appends, `DELETE` terminates, `OPTIONS` discovers capabilities; `X-HTTP-Method-Override` tunnels PATCH/DELETE through POST for environments that cannot send them. Every non-OPTIONS request is version-gated on `Tus-Resumable: 1.0.0` (412 otherwise). tus completion is implicit (an upload is complete when its offset reaches its length), and the handler publishes the assembled object the moment that happens, including when the final bytes arrived from a connection that died mid-request.
 
 Options (flat `UploadPolicy` fields may ride the options object directly; they win over the `policy` object form):
 
@@ -187,6 +187,7 @@ Options (flat `UploadPolicy` fields may ride the options object directly; they w
 - **`resolveToken(req)`** - Extract the upload token from a resource request when the caller does not pass `ctx.uploadToken` (e.g. parse the URL path). `undefined` means "no token here" and the request is answered 404.
 - **`auditKey(uploadToken, metadata?)`** - Audit-safe identifier reported on upload events instead of the raw token, called per resource request (HEAD/PATCH/DELETE). Creation events fire before any token exists to map, so they carry only the token.
 - **`policy`** - `UploadPolicy` object form (see below).
+- **`checksum`** - Enable the tus checksum extension (`Upload-Checksum: <algorithm> <base64>` verified per request). `webCryptoChecksum()` is the ready-made config: `sha1` (the spec's server-MUST) plus SHA-2 over `crypto.subtle`, available on every supported runtime; inject a custom `TusChecksumOptions` (`algorithms` + one-shot `digest(algorithm, content)`) for `md5` and friends. A checksummed request is BUFFERED, verified, and only then appended, because discard-on-mismatch is only honest when unverified bytes never become durable; the buffer is hard-capped by `checksum.maxBufferBytes` (default: the effective `maxAppendSize`; construction throws when neither bounds it). Mismatch answers `460 Checksum Mismatch` with durable state untouched; an unadvertised algorithm or malformed header answers 400; content over the cap answers 413 before hashing. Unconfigured, the extension is not advertised and an unsolicited `Upload-Checksum` is ignored (an assertion nothing can verify is dropped, mirroring the completion-digest posture).
 - **`locker`** - Lock provider (see Locking below). Default: in-process cooperative-preemption locker.
 - **`onUploadEvent(event)`** - Structured, content-free audit events (see Upload audit events below).
 - **`onError(error, { uploadToken?, operation })`** - Error sink for storage failures, throwing hooks, and dialect-level failures (a throwing `key`/`location`/`resolveToken` callback reports with operation `"handler"`). Must not throw.
@@ -194,7 +195,7 @@ Options (flat `UploadPolicy` fields may ride the options object directly; they w
 - **`now`** - Clock injection (tests); also anchors `Upload-Expires`.
 - **`extraHeaders`** - Extra headers on EVERY response (CORS exposure, tracing). Protocol headers win on collision.
 
-Status mapping: `409` offset mismatch (recover via HEAD re-probe; tus defines no offset header on the 409), `410` expired/invalidated, `404` unknown resource or missing token, `413` size violations (with `Tus-Max-Size` when configured), `400` other policy floors and length conflicts, `423` contended (kept distinct from 409 so retry-later never looks like re-probe-now), `415` PATCH without `application/offset+octet-stream`, `502` storage failure (details only to `onError`). Not implemented: the concatenation extension, and the checksum extension (the package is zero-dependency, so per-append hashing needs a caller-injected hasher; not yet surfaced).
+Status mapping: `409` offset mismatch (recover via HEAD re-probe; tus defines no offset header on the 409), `410` expired/invalidated, `404` unknown resource or missing token, `413` size violations (with `Tus-Max-Size` when configured), `400` other policy floors and length conflicts, `423` contended (kept distinct from 409 so retry-later never looks like re-probe-now), `415` PATCH without `application/offset+octet-stream`, `502` storage failure (details only to `onError`), `460 Checksum Mismatch` when a configured checksum fails to verify. Not implemented: the concatenation extension, and the checksum-trailer variant (Fetch exposes no portable Request trailer API).
 
 **`parseUploadMetadata(header)`** - Parse an `Upload-Metadata` header (creation extension) into decoded key/value pairs. Strict: standard base64 with canonical padding, printable-ASCII keys, unique keys, UTF-8 values; returns `null` for malformed input (the handler answers 400), `{}` for an absent header.
 
@@ -265,7 +266,30 @@ Capability flags (readonly fields, honest per backend, never assumed): `appendGr
 
 Interactions on one upload resource are serialized by a lock, probes included (deriving an offset can be a multi-call backend read, and a torn snapshot would hand the client an offset its next request fails on). The lock is **cooperatively preempted**, not a plain mutex: a new acquirer asks the current holder to stop, the holder aborts its append at the next chunk boundary (flushing what it has, so the offset stays truthful), and the lock hands over in milliseconds. The interface is one method: `acquire(uploadToken, onPreemptRequested, { timeoutMs? })` -> `Promise<UploadLock>` (`{ release() }`); a holder that does not yield within `timeoutMs` (default 15 s) rejects with `UploadLockTimeoutError`, which the dialects answer as 423.
 
-The default locker is in-process and correct for a single process. **Supply your own via the `locker` option when more than one server instance can receive requests for the same upload resource** (horizontally scaled deployments without upload-affinity routing), backed by shared infrastructure; the interface is deliberately tiny so that stays a page of code.
+The default locker is in-process and correct for a single process. **Supply a shared locker via the `locker` option when more than one server instance can receive requests for the same upload resource** (horizontally scaled deployments without upload-affinity routing).
+
+**`redisUploadLocker(client, options?)`** (`partial-content/redis-locker`) - The shared locker for Redis-protocol servers (Redis, Valkey, KeyDB, Dragonfly), with the same cooperative-preemption semantics as the in-process one. Zero dependencies: the caller passes a client behind the four-command `RedisLockerClient` interface (`set` NX PX, `eval` for the module's two static compare-and-delete/compare-and-expire Lua scripts, `publish`, `subscribe`), which any client library adapts in a few lines:
+
+```typescript
+// node-redis v4/v5 (subscribe needs its own connection, as Redis requires):
+import { createClient } from "redis";
+import { redisUploadLocker } from "partial-content/redis-locker";
+
+const redis = await createClient({ url }).connect();
+const locker = redisUploadLocker({
+  set: (key, value, opts) => redis.set(key, value, opts),
+  eval: (script, keys, args) => redis.eval(script, { keys: [...keys], arguments: [...args] }),
+  publish: (channel, message) => redis.publish(channel, message),
+  subscribe: async (channel, onMessage) => {
+    const sub = redis.duplicate();
+    await sub.connect();
+    await sub.subscribe(channel, onMessage);
+    return () => sub.destroy();
+  },
+});
+```
+
+Mechanics: the lock is `SET key <fencing-id> NX PX ttl` (`ttlMs`, default 30 s, is the crash-recovery bound); a live holder renews at ttl/3 via a watchdog, and a renewal that cannot confirm the hold fires the holder's preempt callback, because a holder that cannot prove its lock must stop writing. Waiters publish a preempt request on the resource's channel and RE-publish it every poll round (`pollIntervalMs`, default 50 ms, jittered), so a request landing in the holder's subscribe gap is re-delivered, never lost; release and renewal compare the fencing id in Lua, so an instance can only ever release its own hold. `onError` observes absorbed failures (failed renewal/release/unsubscribe). Honesty about fencing: an expiry-based lock can be stolen from a holder that stalls past its TTL and resumes; the write store takes no fencing token, so what makes that non-corrupting is the same defense the engine has in-process, fresh-state validation under the new holder's lock plus the stores' own at-write offset checks, which turn a zombie's late append into a loud `UploadOffsetConflictError`.
 
 ### Upload audit events (`onUploadEvent`)
 

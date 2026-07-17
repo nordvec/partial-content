@@ -1,6 +1,39 @@
 # Changelog
 
-## 2.1.0 (2026-07-17)
+## 2.2.0 (2026-07-17)
+
+### Added
+- **tus checksum extension** (opt-in via `checksum` on `createTusHandler`):
+  `Upload-Checksum` verified per request, advertised via `Tus-Extension` and
+  `Tus-Checksum-Algorithm`. A checksummed request is buffered (hard-capped;
+  construction refuses an unbounded buffer), verified, and only then
+  appended, so a mismatch (`460 Checksum Mismatch`) leaves durable state
+  untouched, the only honest reading of the extension's
+  discard-on-mismatch. Hashing is caller-injected (`TusChecksumOptions`);
+  `webCryptoChecksum()` ships ready-made `sha1`/SHA-2 over `crypto.subtle`
+  on every supported runtime. Unconfigured, an unsolicited `Upload-Checksum`
+  is ignored, mirroring the completion-digest posture for assertions nothing
+  can verify.
+- **`partial-content/redis-locker`**: multi-instance upload locking over any
+  Redis-protocol server (Redis, Valkey, KeyDB, Dragonfly) with the same
+  cooperative-preemption semantics as the in-process locker. Zero
+  dependencies: the caller passes a client behind a four-command interface
+  (`RedisLockerClient`). `SET NX PX` with a per-acquire fencing id, watchdog
+  renewal at ttl/3 (a renewal that cannot confirm the hold preempts the
+  holder), waiter-republished preempt pub/sub (level-triggered, so a
+  subscribe-gap request is never lost), and compare-and-delete release that
+  can only ever release its own hold.
+
+### Changed
+- **The PATCH/append hot path costs one state read instead of three.** The
+  tus dialect no longer pre-probes before every PATCH: implicit-completion
+  inference moved into the orchestrator (`AppendUploadRequest.complete`
+  accepts `"infer"`), computed against the fresh state read under the
+  append's own lock, which is also strictly more accurate than a pre-probe
+  whose answer can go stale before the lock. And a clean append no longer
+  re-reads state afterwards: the store contract pins `getUploadState` to
+  agree with the write's own return, so the outcome derives from it; only an
+  interrupted write still re-reads for the durable prefix.
 
 Resumable-upload hardening from an external adversarial review of the
 protocol core and both wire dialects. Every fix is additive or a bug fix; no

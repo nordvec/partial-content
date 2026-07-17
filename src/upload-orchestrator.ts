@@ -148,7 +148,16 @@ export interface CreateUploadRequest {
 export interface AppendUploadRequest {
   offset: number;
   contentLength?: number;
-  complete: boolean;
+  /**
+   * Whether this append finishes the representation. `"infer"` is the tus
+   * model (completion is implicit at offset == length, nothing on the wire):
+   * the orchestrator derives it from the FRESH durable state it reads under
+   * the append's own lock (a known length is reached by `offset +
+   * contentLength`, or an unknown-sized body delivers through it), so a
+   * dialect never needs a pre-append probe whose answer can go stale before
+   * the lock is held.
+   */
+  complete: boolean | "infer";
   declaredLength?: number;
   body?: ReadableStream<Uint8Array> | Uint8Array;
   expectedDigest?: string;
@@ -423,8 +432,13 @@ export function createUploadOrchestrator(
               uploadToken, 0, req.body, verdict.maxBytes, undefined, req.signal, preemptable,
             );
             interrupted = written.interrupted;
-            const fresh = await store.getUploadState(uploadToken, { signal: req.signal });
-            offset = fresh.offset;
+            // Clean stream: the store contract pins the durable offset to the
+            // write's own return. An interruption re-reads for the flushed prefix.
+            offset = written.bytesWritten;
+            if (interrupted) {
+              const fresh = await store.getUploadState(uploadToken, { signal: req.signal });
+              offset = fresh.offset;
+            }
           } catch (err) {
             return mapStoreError(err, uploadToken, "append");
           }
@@ -487,11 +501,21 @@ export function createUploadOrchestrator(
         } catch (err) {
           return mapStoreError(err, uploadToken, "head");
         }
+        // tus-style implicit completion, derived HERE from the same fresh
+        // state the engine evaluates (never from a dialect's earlier probe):
+        // a known total is reached by this append's math, or an unknown-sized
+        // body streams through it (the post-write size check confirms).
+        const knownLength = req.declaredLength ?? state.length;
+        const complete = req.complete === "infer"
+          ? knownLength !== undefined && (req.contentLength !== undefined
+              ? req.offset + req.contentLength === knownLength
+              : req.body !== undefined)
+          : req.complete;
         const intent: AppendIntent = {
           kind: "append",
           offset: req.offset,
           contentLength: req.contentLength,
-          complete: req.complete,
+          complete,
           declaredLength: req.declaredLength,
         };
         const verdict = evaluateUploadIntent(intent, toStateShape(state), policy, { now: now() });
@@ -521,6 +545,7 @@ export function createUploadOrchestrator(
         const bodyToWrite = req.body
           ?? (verdict.declaredLength !== undefined ? new Uint8Array(0) : undefined);
         let interrupted = false;
+        let bytesWritten = 0;
         if (bodyToWrite !== undefined) {
           try {
             const written = await streamAppend(
@@ -528,6 +553,7 @@ export function createUploadOrchestrator(
               verdict.declaredLength, req.signal, preemptable,
             );
             interrupted = written.interrupted;
+            bytesWritten = written.bytesWritten;
           } catch (err) {
             if (isUploadOffsetConflictError(err)) {
               return {
@@ -541,25 +567,36 @@ export function createUploadOrchestrator(
             return mapStoreError(err, uploadToken, "append");
           }
         }
-        let fresh: StoredUploadState;
-        try {
-          fresh = await store.getUploadState(uploadToken, { signal: req.signal });
-        } catch (err) {
-          return mapStoreError(err, uploadToken, "head");
+        // A clean append needs no trailing re-probe: the store contract pins
+        // `getUploadState` to agree with `atOffset + bytesWritten` after a
+        // clean return, the length is the pre-read state's (or the one this
+        // append just persisted), and `createdAt` is immutable. Only an
+        // interruption leaves the durable prefix unknown and re-reads.
+        let durableOffset = verdict.atOffset + bytesWritten;
+        let length = state.length ?? verdict.declaredLength;
+        let createdAt = state.createdAt;
+        if (interrupted) {
+          try {
+            const fresh = await store.getUploadState(uploadToken, { signal: req.signal });
+            durableOffset = fresh.offset;
+            length = fresh.length ?? req.declaredLength;
+            createdAt = fresh.createdAt;
+          } catch (err) {
+            return mapStoreError(err, uploadToken, "head");
+          }
         }
 
-        const length = fresh.length ?? req.declaredLength;
         let digest: string | undefined;
         let etag: string | undefined;
-        let complete = false;
+        let publishedComplete = false;
         const shouldComplete = verdict.completes && !interrupted
-          && (req.contentLength === undefined || fresh.offset === verdict.atOffset + req.contentLength)
-          && (length === undefined || fresh.offset === length);
+          && (req.contentLength === undefined || durableOffset === verdict.atOffset + req.contentLength)
+          && (length === undefined || durableOffset === length);
         if (shouldComplete) {
           // The streaming-completion size floor: a completing append with an
           // unknown content size only reveals the final total here, so this
           // is the one place minSize can gate it before publishing.
-          if (belowMinSize(fresh.offset)) {
+          if (belowMinSize(durableOffset)) {
             emit(uploadToken, req.auditKey, [{ kind: "append-rejected", reason: "below-min-size", atOffset: verdict.atOffset }]);
             return { kind: "limit-violation", reason: "below-min-size", events: [] };
           }
@@ -567,15 +604,15 @@ export function createUploadOrchestrator(
             ({ digest, etag } = await store.completeUpload(uploadToken, {
               expectedDigest, now: now(), signal: req.signal,
             }));
-            complete = true;
-            emit(uploadToken, req.auditKey, [{ kind: "completed", length: fresh.offset }]);
+            publishedComplete = true;
+            emit(uploadToken, req.auditKey, [{ kind: "completed", length: durableOffset }]);
           } catch (err) {
             return mapStoreError(err, uploadToken, "complete");
           }
         }
         return {
-          kind: "appended", offset: fresh.offset, length,
-          complete, digest, etag, interrupted, expiresAt: expiryOf(fresh.createdAt),
+          kind: "appended", offset: durableOffset, length,
+          complete: publishedComplete, digest, etag, interrupted, expiresAt: expiryOf(createdAt),
         };
       });
     },
