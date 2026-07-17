@@ -364,7 +364,7 @@ for (const version of VERSIONS) {
             const locker: UploadLocker = {
                 async acquire(uploadToken) {
                     if (armed) throw new UploadLockTimeoutError(uploadToken);
-                    return { release() { /* no-op setup lock */ } };
+                    return { release() { /* no-op setup lock */ }, signal: new AbortController().signal };
                 },
             };
             const { handler } = harness({ locker });

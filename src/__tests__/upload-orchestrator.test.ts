@@ -723,8 +723,9 @@ describe("locking", () => {
         const o = orch(slow);
         const created = await o.create({ key: "k", complete: false });
         if (created.kind !== "created") throw new Error("setup");
-        // The second probe preempts the first while it only READS: the
-        // preempt callback must tolerate the absent abort controller.
+        // The second probe aborts the first holder's lock signal while it only
+        // READS: a probe never threads the signal into a write, so the abort is
+        // a harmless no-op and both probes answer the truth.
         const [p1, p2] = await Promise.all([
             o.probe(created.uploadToken),
             o.probe(created.uploadToken),
@@ -1229,12 +1230,12 @@ describe("signal propagation", () => {
     });
 });
 
-describe("preemption latched before the write controller exists (audit R534)", () => {
+describe("preemption latches before the write begins", () => {
     test("a preempt that lands during the pre-stream window still aborts the append", async () => {
-        // A holds the lock and sits in a slow getUploadState (no write
-        // controller installed yet); a concurrent probe arrives and preempts
-        // it. When A reaches streamAppend it must honor the latched preempt at
-        // controller-install time and interrupt the write, not stream on.
+        // A holds the lock and sits in a slow getUploadState (its write has not
+        // started); a concurrent probe arrives and aborts A's lock signal. When
+        // A reaches its write, the composed signal is already aborted (latched
+        // state, not a lost edge), so the append interrupts rather than streams.
         const { store } = fakeStore();
         const slow: ResumableWriteStore = {
             ...store,

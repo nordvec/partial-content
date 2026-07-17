@@ -38,7 +38,7 @@
  * @packageDocumentation
  */
 
-import { UploadLockTimeoutError, type UploadLock, type UploadLocker } from "./upload-locker.ts";
+import { UploadLockTimeoutError, UPLOAD_PREEMPTED, type UploadLock, type UploadLocker } from "./upload-locker.ts";
 
 /**
  * The four commands the locker needs, shaped after node-redis v4/v5. Any
@@ -114,15 +114,15 @@ export function redisUploadLocker(
     uploadToken: string,
     key: string,
     fencingId: string,
-    onPreemptRequested: () => void,
   ): Promise<UploadLock> {
     const channel = `${keyPrefix}preempt:${uploadToken}`;
-    let preempted = false;
     let released = false;
+    // The lock's preemption signal: aborted when a waiter asks the holder to
+    // yield, or when the watchdog can no longer prove the hold. `abort()` is
+    // idempotent and latches, so no separate "preempted" flag is needed.
+    const controller = new AbortController();
     const preempt = () => {
-      if (preempted || released) return;
-      preempted = true;
-      onPreemptRequested();
+      if (!released && !controller.signal.aborted) controller.abort(UPLOAD_PREEMPTED);
     };
 
     // Subscribed AFTER the SET: a preempt published into that gap is
@@ -149,6 +149,7 @@ export function redisUploadLocker(
     }, Math.max(1, Math.floor(ttlMs / 3)));
 
     return {
+      signal: controller.signal,
       release(): void {
         if (released) return;
         released = true;
@@ -165,7 +166,7 @@ export function redisUploadLocker(
   }
 
   return {
-    async acquire(uploadToken, onPreemptRequested, acquireOpts): Promise<UploadLock> {
+    async acquire(uploadToken, acquireOpts): Promise<UploadLock> {
       const timeoutMs = acquireOpts?.timeoutMs ?? defaultAcquireTimeoutMs;
       const key = keyPrefix + uploadToken;
       const channel = `${keyPrefix}preempt:${uploadToken}`;
@@ -175,7 +176,7 @@ export function redisUploadLocker(
       for (;;) {
         const taken = await client.set(key, fencingId, { NX: true, PX: ttlMs });
         if (taken !== null) {
-          return takeLock(uploadToken, key, fencingId, onPreemptRequested);
+          return takeLock(uploadToken, key, fencingId);
         }
         if (Date.now() >= deadline) throw new UploadLockTimeoutError(uploadToken);
         // Ask the holder to yield, EVERY round: repetition is what makes the
@@ -192,5 +193,5 @@ export function redisUploadLocker(
 }
 
 // ─── Shared locking surface (re-exported for consumers) ─────────────────────
-export { UploadLockTimeoutError, isUploadLockTimeoutError, memoryUploadLocker } from "./upload-locker.ts";
+export { UploadLockTimeoutError, isUploadLockTimeoutError, memoryUploadLocker, UPLOAD_PREEMPTED } from "./upload-locker.ts";
 export type { UploadLock, UploadLocker, AcquireOptions } from "./upload-locker.ts";

@@ -683,7 +683,7 @@ describe("PATCH", () => {
             locker: {
                 acquire: async (uploadToken) => {
                     if (armed) throw new UploadLockTimeoutError(uploadToken);
-                    return { release() { /* no-op setup lock */ } };
+                    return { release() { /* no-op setup lock */ }, signal: new AbortController().signal };
                 },
             },
         });
@@ -1321,7 +1321,7 @@ describe("HEAD error shapes", () => {
             locker: {
                 acquire: async (uploadToken) => {
                     if (armed) throw new UploadLockTimeoutError(uploadToken);
-                    return { release() { /* no-op setup lock */ } };
+                    return { release() { /* no-op setup lock */ }, signal: new AbortController().signal };
                 },
             },
         });

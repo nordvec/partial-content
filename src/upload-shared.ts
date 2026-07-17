@@ -24,8 +24,8 @@ export type {
   CompleteUploadOptions,
   CompletedUpload,
 } from "./upload-store.ts";
-export { memoryUploadLocker, UploadLockTimeoutError } from "./upload-locker.ts";
-export type { UploadLocker, UploadLock } from "./upload-locker.ts";
+export { memoryUploadLocker, UploadLockTimeoutError, UPLOAD_PREEMPTED } from "./upload-locker.ts";
+export type { UploadLocker, UploadLock, AcquireOptions } from "./upload-locker.ts";
 export { createUploadOrchestrator } from "./upload-orchestrator.ts";
 export type {
   UploadOrchestrator,

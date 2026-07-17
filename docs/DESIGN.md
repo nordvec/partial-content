@@ -663,16 +663,25 @@ corruption into protocol answers.
 The race that shapes the lock design: a client's connection drops mid-append,
 and the client resumes (probe, then append) BEFORE the server has noticed the
 dead socket. A plain acquire-or-wait mutex would stall every resume behind
-the zombie holder's timeout. Cooperative preemption inverts it: the new
-acquirer asks the HOLDER to stop, the holder aborts its append at the next
-chunk boundary (flushing what it has, so the offset stays truthful), and the
-lock hands over in milliseconds. Probes take the lock too: deriving an offset
+the zombie holder's timeout. Cooperative preemption inverts it: `acquire`
+hands the holder a `lock.signal` (an `AbortSignal`), a later acquirer aborts
+it, and the holder, which threads that signal into its store write, yields at
+the next chunk boundary (flushing what it has, so the offset stays truthful).
+The lock hands over in milliseconds. Modelling the yield as a signal rather
+than a callback is deliberate: the holder cannot silently ignore a
+cancellation it has to pass into every write, and because an `AbortSignal`
+carries latched state (not just a one-shot event), a preempt that lands during
+hand-over, before the holder starts its next write, is honored the instant the
+write begins rather than lost. Probes take the lock too: deriving an offset
 can be a multi-call read against the backend, and answering from a torn
 snapshot while an append is mid-flight would hand the client an offset its
 very next request fails on. A holder that cannot be interrupted surfaces as a
 retryable 423 after the acquire timeout, never an indefinite hang. The
 default locker is in-process; multi-instance deployments supply their own
-through the same tiny interface.
+through the same tiny interface (`partial-content/redis-locker` is one).
+Cooperative cancellation has an observation-latency ceiling: a holder stalled
+past the point it should have yielded can still land one write, which the
+stores make non-corrupting by re-checking the claimed offset at write time.
 
 ### The post-abort grace window
 

@@ -15,6 +15,19 @@
  *    the storage signal by `graceMs`.
  * 5. Hooks are guarded: an observability failure is reported to `onError`,
  *    never allowed to corrupt an upload.
+ * 6. Preemption is signal-based: the lock hands the holder a
+ *    `lock.signal` that aborts when a later acquirer wants the resource, and
+ *    the holder threads it into its store write so it yields at once. There is
+ *    no callback and no separate "was I preempted" flag; the signal's latched
+ *    `.aborted` IS that state, so a preempt landing during hand-over is never
+ *    lost. Cooperative preemption has an observation-latency ceiling: a holder
+ *    stalled (GC/event-loop) past the point it should have yielded can still
+ *    land one write after a later acquirer believes it holds the lock. The
+ *    stores bound the damage by re-checking the claimed offset at write time
+ *    (`UploadOffsetConflictError`), so a stale write is refused, not merged.
+ *    // descope: no lock-independent fencing token on completion; the at-write
+ *    // offset check is the guard. Revisit if a store ever needs stronger
+ *    // isolation than optimistic offset-CAS under the lock.
  *
  * Dialects (tus 1.0, IETF draft) translate requests into intents, call one
  * orchestrator method, and translate the returned OUTCOME into statuses and
@@ -38,7 +51,7 @@ import {
   type ResumableWriteStore,
   type StoredUploadState,
 } from "./upload-store.ts";
-import { memoryUploadLocker, isUploadLockTimeoutError, type UploadLocker } from "./upload-locker.ts";
+import { memoryUploadLocker, isUploadLockTimeoutError, type UploadLocker, type UploadLock } from "./upload-locker.ts";
 
 // ─── Options ────────────────────────────────────────────────────────────────
 
@@ -164,17 +177,6 @@ export interface AppendUploadRequest {
   signal?: AbortSignal;
 }
 
-/**
- * Per-request preemption slot. `abort` is the live append's controller (only
- * present while a write is in flight); `preempted` latches when a later
- * acquirer asks the holder to yield, so a preempt that arrives before the
- * controller exists is not lost.
- */
-interface Preemptable {
-  abort?: AbortController;
-  preempted?: boolean;
-}
-
 // ─── Orchestrator ───────────────────────────────────────────────────────────
 
 export interface UploadOrchestrator {
@@ -270,10 +272,10 @@ export function createUploadOrchestrator(
 
   /**
    * Narrow an engine verdict to the reject outcomes dialects render. The
-   * action verdicts are all handled before this runs, and the concurrency
-   * verdicts never occur here at all: the LOCKER owns contention (the engine
-   * is evaluated with no `hasInFlight`), so `contended` only ever enters via
-   * a lock timeout and `preempt-then-retry` never does.
+   * action verdicts are all handled before this runs, and the engine never
+   * produces `contended` itself: the LOCKER owns contention end to end, so
+   * `contended` only ever enters as the orchestrator's own answer to a lock
+   * acquire timeout.
    */
   function rejectOutcome(verdict: UploadVerdict): UploadOutcome {
     switch (verdict.kind) {
@@ -300,29 +302,42 @@ export function createUploadOrchestrator(
     };
   }
 
+  /**
+   * A signal that aborts as soon as ANY input aborts, propagating the first
+   * input's reason. Latched: an already-aborted input aborts the result at
+   * once (this is what carries a preempt that landed before the write began).
+   * Composed ONCE per append, never per chunk, to keep it leak-free. Cleanup
+   * of its listeners is registered into `cleanups`.
+   */
+  function linkAbort(signals: Array<AbortSignal | undefined>, cleanups: Array<() => void>): AbortSignal {
+    const ctl = new AbortController();
+    for (const s of signals) {
+      if (!s) continue;
+      if (s.aborted) {
+        ctl.abort(s.reason);
+        return ctl.signal;
+      }
+      const onAbort = () => ctl.abort(s.reason);
+      s.addEventListener("abort", onAbort, { once: true });
+      cleanups.push(() => s.removeEventListener("abort", onAbort));
+    }
+    return ctl.signal;
+  }
+
   /** Run `fn` holding the resource lock, translating lock timeouts to contention. */
   async function withLock(
     uploadToken: string,
-    preemptable: Preemptable,
-    fn: () => Promise<UploadOutcome>,
+    fn: (lock: UploadLock) => Promise<UploadOutcome>,
   ): Promise<UploadOutcome> {
-    let lock;
+    let lock: UploadLock;
     try {
-      // Level-triggered: a preempt that arrives before the write's abort
-      // controller exists (the FIFO-handover and pre-stream windows) latches
-      // the flag; streamAppend aborts immediately when it installs the
-      // controller. Edge-triggering here would drop the preempt into the void
-      // and degrade the whole handover to the acquire timeout.
-      lock = await locker.acquire(uploadToken, () => {
-        preemptable.preempted = true;
-        preemptable.abort?.abort(new Error("preempted"));
-      });
+      lock = await locker.acquire(uploadToken);
     } catch (err) {
       if (isUploadLockTimeoutError(err)) return { kind: "contended", events: [] };
       throw err;
     }
     try {
-      return await fn();
+      return await fn(lock);
     } finally {
       lock.release();
     }
@@ -335,26 +350,15 @@ export function createUploadOrchestrator(
     maxBytes: number | undefined,
     declaredLength: number | undefined,
     signal: AbortSignal | undefined,
-    preemptable: Preemptable,
+    lockSignal: AbortSignal,
   ): Promise<{ bytesWritten: number; interrupted: boolean }> {
     const cleanups: Array<() => void> = [];
-    // The preemption controller chains the (grace-extended) request signal:
-    // a preempt aborts the write at the next chunk boundary; a client abort
-    // aborts it after the grace window.
-    const ctl = new AbortController();
-    preemptable.abort = ctl;
-    // A preempt that already landed while we had no controller installed
-    // (handover / pre-stream window) is honored the instant one exists.
-    if (preemptable.preempted) ctl.abort(new Error("preempted"));
+    // Two independent yield triggers, composed into the one signal the store
+    // sees: `lockSignal` aborts the write AT ONCE (a later acquirer is waiting,
+    // so yield now); a client disconnect aborts it only after the grace window
+    // (so its already-received bytes still flush and the offset stays truthful).
     const graced = graceSignal(signal, cleanups);
-    const onGraced = () => ctl.abort(graced?.reason);
-    if (graced) {
-      if (graced.aborted) onGraced();
-      else {
-        graced.addEventListener("abort", onGraced, { once: true });
-        cleanups.push(() => graced.removeEventListener("abort", onGraced));
-      }
-    }
+    const writeSignal = linkAbort([lockSignal, graced], cleanups);
     try {
       const { bytesWritten } = await store.appendChunk(uploadToken, atOffset, body, {
         maxBytes,
@@ -363,7 +367,7 @@ export function createUploadOrchestrator(
         // deferred-length flow). Undefined once the length is already known.
         length: declaredLength,
         now: now(),
-        signal: ctl.signal,
+        signal: writeSignal,
       });
       return { bytesWritten, interrupted: false };
     } catch (err) {
@@ -371,10 +375,9 @@ export function createUploadOrchestrator(
       // error: the spec's model is "append as much as possible". The store
       // reports durable bytes via fresh state; anything else rethrows to the
       // caller's error mapping.
-      if (ctl.signal.aborted) return { bytesWritten: 0, interrupted: true };
+      if (writeSignal.aborted) return { bytesWritten: 0, interrupted: true };
       throw err;
     } finally {
-      preemptable.abort = undefined;
       for (const fn of cleanups) fn();
     }
   }
@@ -417,18 +420,17 @@ export function createUploadOrchestrator(
       }
       emit(uploadToken, req.auditKey, verdict.events);
 
-      const preemptable: Preemptable = {};
       const declaredLength = verdict.declaredLength;
       // Lock the token before streaming so a client that received an early
       // location (a 104 via onResumptionSupported) and resumes cannot race
       // this creation's still-flushing write with no preemption. Invariant 1.
-      return withLock(uploadToken, preemptable, async () => {
+      return withLock(uploadToken, async (lock) => {
         let offset = 0;
         let interrupted = false;
         if (req.body !== undefined) {
           try {
             const written = await streamAppend(
-              uploadToken, 0, req.body, verdict.maxBytes, undefined, req.signal, preemptable,
+              uploadToken, 0, req.body, verdict.maxBytes, undefined, req.signal, lock.signal,
             );
             interrupted = written.interrupted;
             // Clean stream: the store contract pins the durable offset to the
@@ -466,8 +468,7 @@ export function createUploadOrchestrator(
     },
 
     async probe(uploadToken, probeOpts): Promise<UploadOutcome> {
-      const preemptable: Preemptable = {};
-      return withLock(uploadToken, preemptable, async () => {
+      return withLock(uploadToken, async () => {
         let state: StoredUploadState;
         try {
           state = await store.getUploadState(uploadToken, { signal: probeOpts?.signal });
@@ -492,8 +493,7 @@ export function createUploadOrchestrator(
       // RFC 9530: ignore an unverifiable client digest rather than refusing
       // (see create). Verifying stores still enforce it at completion.
       const expectedDigest = store.digestOnComplete === "sha256" ? req.expectedDigest : undefined;
-      const preemptable: Preemptable = {};
-      return withLock(uploadToken, preemptable, async () => {
+      return withLock(uploadToken, async (lock) => {
         let state: StoredUploadState;
         try {
           state = await store.getUploadState(uploadToken, { signal: req.signal });
@@ -549,7 +549,7 @@ export function createUploadOrchestrator(
           try {
             const written = await streamAppend(
               uploadToken, verdict.atOffset, bodyToWrite, verdict.maxBytes,
-              verdict.declaredLength, req.signal, preemptable,
+              verdict.declaredLength, req.signal, lock.signal,
             );
             interrupted = written.interrupted;
             bytesWritten = written.bytesWritten;
@@ -617,8 +617,7 @@ export function createUploadOrchestrator(
     },
 
     async cancel(uploadToken, cancelOpts): Promise<UploadOutcome> {
-      const preemptable: Preemptable = {};
-      return withLock(uploadToken, preemptable, async () => {
+      return withLock(uploadToken, async () => {
         let state: StoredUploadState;
         try {
           state = await store.getUploadState(uploadToken, { signal: cancelOpts?.signal });

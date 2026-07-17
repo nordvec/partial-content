@@ -19,7 +19,7 @@ function state(over: Partial<UploadState> = {}): UploadState {
     };
 }
 
-const opts = (over: Partial<{ now: number; hasInFlight: boolean; preemptInFlight: boolean }> = {}) =>
+const opts = (over: Partial<{ now: number }> = {}) =>
     ({ now: NOW, ...over });
 
 // ─── Creation ────────────────────────────────────────────────────────────────
@@ -241,45 +241,6 @@ describe("terminal states answer everything first", () => {
 
     test("remainingLifetimeSeconds floors at zero", () => {
         expect(remainingLifetimeSeconds({ createdAt: NOW - 120_000 }, { maxAgeSeconds: 60 }, NOW)).toBe(0);
-    });
-});
-
-// ─── Concurrency ─────────────────────────────────────────────────────────────
-
-describe("concurrency gate", () => {
-    test("default strategy preempts the in-flight holder", () => {
-        const v = evaluateUploadIntent(
-            { kind: "append", offset: 0, complete: false },
-            state(),
-            {},
-            opts({ hasInFlight: true }),
-        );
-        expect(v.kind).toBe("preempt-then-retry");
-    });
-
-    test("opt-out strategy refuses with contended (distinct from offset mismatch)", () => {
-        const v = evaluateUploadIntent(
-            { kind: "append", offset: 0, complete: false },
-            state(),
-            {},
-            opts({ hasInFlight: true, preemptInFlight: false }),
-        );
-        expect(v.kind).toBe("contended");
-    });
-
-    test("probes are gated too: a torn offset read must not be answered", () => {
-        const v = evaluateUploadIntent(
-            { kind: "probe" },
-            state(),
-            {},
-            opts({ hasInFlight: true, preemptInFlight: false }),
-        );
-        expect(v.kind).toBe("contended");
-    });
-
-    test("cancel bypasses the gate: cancellation preempts by definition", () => {
-        const v = evaluateUploadIntent({ kind: "cancel" }, state(), {}, opts({ hasInFlight: true }));
-        expect(v.kind).toBe("cancel-accepted");
     });
 });
 
@@ -827,12 +788,6 @@ describe("audit event contract", () => {
         );
         expect((mismatched as { events: unknown }).events).toEqual(at("offset-mismatch", 100));
 
-        const contended = evaluateUploadIntent(
-            { kind: "append", offset: 0, complete: false },
-            state(), {}, opts({ hasInFlight: true, preemptInFlight: false }),
-        );
-        expect((contended as { events: unknown }).events).toEqual(at("contended"));
-
         const invalidated = evaluateUploadIntent(
             { kind: "append", offset: 0, complete: false },
             state({ isInvalidated: true }), {}, opts(),
@@ -843,11 +798,6 @@ describe("audit event contract", () => {
     test("non-mutating verdicts emit no events", () => {
         const probe = evaluateUploadIntent({ kind: "probe" }, state(), {}, opts());
         expect((probe as { events: unknown }).events).toEqual([]);
-
-        const preempt = evaluateUploadIntent(
-            { kind: "probe" }, state(), {}, opts({ hasInFlight: true }),
-        );
-        expect((preempt as { events: unknown }).events).toEqual([]);
 
         const replay = evaluateUploadIntent(
             { kind: "append", offset: 10, complete: true },

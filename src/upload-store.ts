@@ -262,8 +262,14 @@ export interface ResumableWriteStore {
    * refuses a store that reports `false`.
    */
   readonly atomicCompletion: boolean;
-  /** Integrity primitive available at completion, or `false`. */
-  readonly digestOnComplete: "sha256" | "crc32c" | false;
+  /**
+   * Whether the backend can verify a client-asserted SHA-256 over the whole
+   * assembled representation at completion (`"sha256"`), or cannot (`false`).
+   * SHA-256 is the only algorithm the orchestrator and the read-side
+   * `Repr-Digest` wiring speak end to end, so this is a two-value capability,
+   * not an algorithm menu.
+   */
+  readonly digestOnComplete: "sha256" | false;
   /** Largest single append the backend accepts, when bounded. */
   readonly maxAppendSize?: number;
 }

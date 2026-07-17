@@ -108,23 +108,16 @@ interface CancelIntent {
 
 export type UploadIntent = ProbeIntent | AppendIntent | CancelIntent;
 
-/** Evaluation options: injected clock + concurrency snapshot. */
+/**
+ * Evaluation options: just the injected clock. Concurrency is NOT an engine
+ * concern: the locker owns it end to end (it serializes every interaction on
+ * a resource and preempts a stalled holder), so the engine always evaluates
+ * fresh, uncontended state. A lock timeout surfaces as `contended` from the
+ * orchestrator, never from here.
+ */
 export interface UploadEvaluateOptions {
   /** Current time, epoch milliseconds. Injected: the engine reads no clock. */
   now: number;
-  /**
-   * Another request is mid-flight on this resource. The engine then decides
-   * preempt-vs-refuse per `preemptInFlight`.
-   */
-  hasInFlight?: boolean;
-  /**
-   * Concurrency strategy when `hasInFlight` is set: `true` (default, the
-   * spec-recommended behavior) asks the orchestrator to terminate the prior
-   * request and re-evaluate; `false` refuses with `contended` (dialects map
-   * it to 423, which the dominant client treats as retry-later, keeping it
-   * distinct from the re-probe signal an offset mismatch sends).
-   */
-  preemptInFlight?: boolean;
 }
 
 // ─── Verdicts ───────────────────────────────────────────────────────────────
@@ -147,8 +140,7 @@ type UploadRejectReason =
   | "below-min-size"
   | "already-complete"
   | "invalidated"
-  | "expired"
-  | "contended";
+  | "expired";
 
 /**
  * Wire-agnostic outcome of an evaluation. Dialects map each variant to a
@@ -210,9 +202,8 @@ export type UploadVerdict =
   /** Valid re-interaction with a completed upload (idempotent retry). */
   | { kind: "already-complete"; length?: number; events: UploadAuditEvent[] }
   /** Another request is active and preemption is disabled. */
+  /** The locker could not hand over in time (a stalled holder); retry later. */
   | { kind: "contended"; events: UploadAuditEvent[] }
-  /** Preemption chosen: terminate the holder, then re-evaluate fresh. */
-  | { kind: "preempt-then-retry"; events: UploadAuditEvent[] }
   /** Policy bound violated before any byte moved. */
   | {
       kind: "limit-violation";
@@ -394,16 +385,6 @@ export function evaluateUploadIntent(
   if (intent.kind === "cancel") {
     // Cancels preempt whatever is running; that is their point.
     return { kind: "cancel-accepted", events: [{ kind: "cancelled" }] };
-  }
-
-  // Concurrency gate. Probes are included deliberately: reading a torn
-  // multi-call offset (a part listing raced by an in-flight append) would
-  // answer with a stale offset the very next append must then reject.
-  if (opts.hasInFlight) {
-    if (opts.preemptInFlight ?? true) {
-      return { kind: "preempt-then-retry", events: [] };
-    }
-    return { kind: "contended", events: [{ kind: "append-rejected", reason: "contended" }] };
   }
 
   if (intent.kind === "probe") {

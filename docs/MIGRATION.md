@@ -1,5 +1,37 @@
 # Migration
 
+## partial-content 2.x to 3.0
+
+Two breaking changes, both on the write-side extension points. If you use the
+built-in lockers (`memoryUploadLocker`, `redisUploadLocker`) and the built-in
+stores, nothing changes for you.
+
+- **Custom `UploadLocker`**: `acquire` loses its `onPreemptRequested` callback
+  parameter (`acquire(uploadToken, opts?)`), and the returned `UploadLock` must
+  now carry a `signal`: `{ signal: AbortSignal; release(): void }`. Instead of
+  invoking a callback to ask the holder to yield, create an `AbortController` at
+  acquire time and abort it (reason `UPLOAD_PREEMPTED`, exported) when a later
+  acquirer wants the lock; expose `controller.signal` as `lock.signal`. The
+  orchestrator threads that signal into the holder's store write, so preemption
+  is a real cancellation rather than an advisory call.
+
+  ```typescript
+  // before
+  acquire(token, onPreemptRequested, opts) { /* ... call onPreemptRequested() ... */
+    return { release() {} };
+  }
+  // after
+  acquire(token, opts) {
+    const controller = new AbortController();
+    // ...abort(UPLOAD_PREEMPTED) it when a later acquirer arrives...
+    return { signal: controller.signal, release() {} };
+  }
+  ```
+
+- **Custom `ResumableWriteStore`**: `digestOnComplete` is now `"sha256" |
+  false` (the `"crc32c"` option is gone). A store that cannot verify a whole-
+  representation SHA-256 reports `false`.
+
 ## partial-content 1.x to 2.0
 
 2.0 adds the resumable-upload surface (`partial-content/tus`,

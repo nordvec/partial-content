@@ -52,8 +52,16 @@ const FLOORS = {
                                   // cleanup closures, once:true hygiene,
                                   // undefined-comparison no-ops in the policy
                                   // guards, and a defensive unreachable throw)
-    "upload-locker.ts": 96,     // baseline 100.00 (55 mutants; headroom for
-                                // timer-jitter timeout mutants)
+    "upload-locker.ts": 93,     // baseline 95.35 (43 mutants; the 2 survivors are
+                                // provably equivalent: the `if (!holder)` guard in
+                                // release() (only one unreleased lock exists per
+                                // token at a time, and the Map entry outlives every
+                                // live holder, so holder is never missing on a live
+                                // release) and the `if (idx !== -1)` guard on the
+                                // timeout timer (a shifted entry always has its timer
+                                // cleared, so a firing timer always finds its entry
+                                // queued). Both are defensive belts on paths the
+                                // signal-based redesign structurally prevents.
     "redis-locker.ts": 84,      // baseline 86.00 (100 mutants; survivors are
                                 // optional-chained onError sinks, poll-jitter
                                 // and 1ms-deadline arithmetic, and the

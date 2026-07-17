@@ -22,6 +22,18 @@
 
 /** A held lock. Release exactly once; further calls are no-ops. */
 export interface UploadLock {
+  /**
+   * Aborts the instant a LATER acquirer wants this lock (and, in a
+   * distributed locker, if the holder can no longer prove it still holds the
+   * lease). The holder MUST thread this signal into its long-running store
+   * work (the append write) so it yields at the next safe boundary, flushing
+   * what it has. Because an `AbortSignal` carries latched state (`.aborted`),
+   * a preempt that lands before the holder starts its write is not lost: the
+   * write sees an already-aborted signal and yields at once. Non-cooperation
+   * is then a visible omission (a write that ignores the signal), not a
+   * silent breach of a callback convention.
+   */
+  readonly signal: AbortSignal;
   release(): void;
 }
 
@@ -51,26 +63,30 @@ export interface AcquireOptions {
 
 export interface UploadLocker {
   /**
-   * Acquire the lock for one upload resource. `onPreemptRequested` is
-   * invoked (at most once) if a LATER acquirer wants the lock: the holder
-   * must abort its work at the next safe boundary and release.
+   * Acquire the lock for one upload resource. The returned lock carries a
+   * {@link UploadLock.signal} that aborts when a LATER acquirer wants the
+   * lock; the holder threads it into its store work to yield promptly.
    */
-  acquire(
-    uploadToken: string,
-    onPreemptRequested: () => void,
-    opts?: AcquireOptions,
-  ): Promise<UploadLock>;
+  acquire(uploadToken: string, opts?: AcquireOptions): Promise<UploadLock>;
 }
 
 const DEFAULT_ACQUIRE_TIMEOUT_MS = 15_000;
 
+/** The abort reason on a lock signal, so a preempt is distinguishable from a client disconnect. */
+export const UPLOAD_PREEMPTED = "upload-lock-preempted";
+
 interface Holder {
-  preempt: () => void;
-  preempted: boolean;
+  /**
+   * Aborted when a later acquirer wants the lock. Created at ACQUIRE time and
+   * replaced on each hand-over, so it exists for the holder's full tenure:
+   * there is no window where a preempt has nowhere to land, which is what
+   * lets the holder rely on the signal's latched `.aborted` state instead of
+   * a separate flag.
+   */
+  controller: AbortController;
   queue: Array<{
     resolve: (lock: UploadLock) => void;
     reject: (err: Error) => void;
-    preempt: () => void;
     timer: ReturnType<typeof setTimeout>;
   }>;
 }
@@ -79,9 +95,10 @@ interface Holder {
 export function memoryUploadLocker(): UploadLocker {
   const holders = new Map<string, Holder>();
 
-  function makeLock(token: string): UploadLock {
+  function makeLock(token: string, controller: AbortController): UploadLock {
     let released = false;
     return {
+      signal: controller.signal,
       release(): void {
         if (released) return;
         released = true;
@@ -93,34 +110,31 @@ export function memoryUploadLocker(): UploadLocker {
           return;
         }
         clearTimeout(next.timer);
-        holder.preempt = next.preempt;
-        holder.preempted = false;
-        // Hand-over wakes the next waiter as the new holder. If more
-        // waiters remain, the new holder is preempted immediately: the
-        // queue only grows when callers keep arriving, and each is served
-        // in FIFO order with the same yield pressure.
-        next.resolve(makeLock(token));
-        if (holder.queue.length > 0 && !holder.preempted) {
-          holder.preempted = true;
-          holder.preempt();
-        }
+        // Hand over to the next waiter with a FRESH signal (the previous
+        // holder's was already aborted). If more waiters remain behind it,
+        // preempt the new holder at once, in FIFO order with the same yield
+        // pressure every holder gets.
+        const nextController = new AbortController();
+        holder.controller = nextController;
+        next.resolve(makeLock(token, nextController));
+        if (holder.queue.length > 0) nextController.abort(UPLOAD_PREEMPTED);
       },
     };
   }
 
   return {
-    acquire(token, onPreemptRequested, opts): Promise<UploadLock> {
+    acquire(token, opts): Promise<UploadLock> {
       const timeoutMs = opts?.timeoutMs ?? DEFAULT_ACQUIRE_TIMEOUT_MS;
       const holder = holders.get(token);
       if (!holder) {
-        holders.set(token, { preempt: onPreemptRequested, preempted: false, queue: [] });
-        return Promise.resolve(makeLock(token));
+        const controller = new AbortController();
+        holders.set(token, { controller, queue: [] });
+        return Promise.resolve(makeLock(token, controller));
       }
       return new Promise<UploadLock>((resolve, reject) => {
         const entry = {
           resolve,
           reject,
-          preempt: onPreemptRequested,
           timer: setTimeout(() => {
             const idx = holder.queue.indexOf(entry);
             if (idx !== -1) holder.queue.splice(idx, 1);
@@ -128,10 +142,9 @@ export function memoryUploadLocker(): UploadLocker {
           }, timeoutMs),
         };
         holder.queue.push(entry);
-        if (!holder.preempted) {
-          holder.preempted = true;
-          holder.preempt();
-        }
+        // Ask the current holder to yield. `abort()` is idempotent, so a
+        // second waiter arriving needs no "already preempted" flag.
+        holder.controller.abort(UPLOAD_PREEMPTED);
       });
     },
   };

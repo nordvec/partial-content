@@ -1,5 +1,33 @@
 # Changelog
 
+## 3.0.0 (2026-07-17)
+
+A concurrency-ownership cleanup: the locker owns preemption end to end, via a
+cancellation signal rather than a callback. Breaking only for custom
+`UploadLocker` or `ResumableWriteStore` implementers; consumers using the
+built-in lockers, dialects, and stores are unaffected.
+
+### Changed (breaking)
+- **`UploadLocker` preempts through a returned `AbortSignal`.** `acquire` drops
+  its `onPreemptRequested` callback parameter (`acquire(token, opts?)`), and the
+  returned `UploadLock` is now `{ signal: AbortSignal; release(): void }`. A
+  later acquirer aborts `lock.signal` (reason `UPLOAD_PREEMPTED`); the holder
+  threads it into its store write and yields at the next boundary. Because an
+  `AbortSignal` carries latched state, a preempt landing during hand-over is
+  never lost, which retires the internal "was I preempted" flag entirely. A
+  custom locker now creates an `AbortController` at acquire time, aborts it when
+  a later acquirer arrives, and exposes its `signal`. `UPLOAD_PREEMPTED` is
+  exported for distinguishing a preempt from a client disconnect on the
+  composed signal.
+- **`ResumableWriteStore.digestOnComplete` narrows to `"sha256" | false`.** The
+  `"crc32c"` member is removed: SHA-256 is the only algorithm verified end to
+  end, so a custom store must report `false` rather than `"crc32c"`.
+
+### Removed
+- The engine's unreachable concurrency surface (`UploadEvaluateOptions`'s
+  `hasInFlight`/`preemptInFlight` and the `preempt-then-retry` verdict). These
+  were internal; the locker has owned contention since the orchestrator landed.
+
 ## 2.3.1 (2026-07-17)
 
 Documentation only; no code change from 2.3.0. Corrects changelog and
