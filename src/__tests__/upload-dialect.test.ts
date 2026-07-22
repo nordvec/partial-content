@@ -763,7 +763,7 @@ describe("digest verification", () => {
     });
 });
 
-// ─── Repr-Digest parsing precision (audit R534) ─────────────────────────────
+// ─── Repr-Digest parsing precision ──────────────────────────────────────────
 // The parser is exercised through completing creations: a WELL-FORMED sha-256
 // that does not match the body's real digest is rejected 400 (parsed + used);
 // any input the parser cannot read is IGNORED, so the upload completes 201.
@@ -845,7 +845,7 @@ describe("Repr-Digest parsing", () => {
     });
 });
 
-// ─── Content-Length parsing precision (audit R534) ──────────────────────────
+// ─── Content-Length parsing precision ───────────────────────────────────────
 
 describe("Content-Length parsing", () => {
     // A creation-with-upload whose Content-Length crosses maxSize is caught
@@ -893,7 +893,7 @@ describe("Content-Length parsing", () => {
     });
 });
 
-// ─── Completeness fail-closed at every version (audit R534) ─────────────────
+// ─── Completeness fail-closed at every version ──────────────────────────────
 
 describe("append completeness by version", () => {
     async function appendNoCompleteness(version: Version, headers: Record<string, string> = {}): Promise<Response> {
@@ -932,7 +932,7 @@ describe("append completeness by version", () => {
     });
 });
 
-// ─── Handler plumbing precision (audit R534) ────────────────────────────────
+// ─── Handler plumbing precision ─────────────────────────────────────────────
 
 describe("handler plumbing edges", () => {
     test("interopVersions are sorted so the newest echoed version is the true maximum", async () => {

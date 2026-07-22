@@ -53,9 +53,18 @@ export interface UploadState {
  * Server policy for one upload surface. All fields optional: an absent bound
  * is simply not enforced. Dialects advertise these (e.g. as `Upload-Limit`
  * members); the engine enforces them BEFORE any byte reaches an adapter.
+ *
+ * OPERATIONAL SECURITY: an upload surface with NEITHER `maxSize` NOR
+ * `maxAgeSeconds` accepts unbounded bytes AND never expires abandoned
+ * resources, so a client can grow storage without limit. Set at least one on
+ * any surface reachable by untrusted clients. Note that `maxAgeSeconds` only
+ * makes a resource ELIGIBLE for expiry; storage is reclaimed only when you
+ * periodically call the store's `sweepExpired()` (e.g. from a cron), so pair
+ * the two. `maxSize` caps the total per resource; `maxAppendSize` additionally
+ * bounds a single request.
  */
 export interface UploadPolicy {
-  /** Maximum total representation size in bytes. */
+  /** Maximum total representation size in bytes. Unset = no per-upload cap. */
   maxSize?: number;
   /** Minimum total representation size in bytes. */
   minSize?: number;
@@ -66,7 +75,11 @@ export interface UploadPolicy {
    * creation with no content, and an append that completes the upload.
    */
   minAppendSize?: number;
-  /** Maximum resource lifetime in seconds, measured from creation. */
+  /**
+   * Maximum resource lifetime in seconds, measured from creation. Unset =
+   * resources never expire. Enforced lazily on access AND, for actual storage
+   * reclamation of abandoned uploads, by a periodic `sweepExpired()` sweep.
+   */
   maxAgeSeconds?: number;
 }
 

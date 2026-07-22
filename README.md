@@ -204,6 +204,8 @@ export { route as OPTIONS }; // capability discovery
 
 Point any tus 1.0 client at the creation URL and resumable uploads work end to end: pause, disconnect, resume from the durable offset. On frameworks that route the token as a path parameter, pass it explicitly instead of using `resolveToken`: `handler(req, { uploadToken: params.token })`.
 
+On any surface reachable by untrusted clients, set at least one of `maxSize` and `maxAgeSeconds`: with neither, an upload accepts unbounded bytes and abandoned resources never expire. `maxAgeSeconds` marks a resource eligible for expiry, but storage is reclaimed only when you run the store's `sweepExpired()` on a schedule (e.g. a cron), so pair the two.
+
 ### IETF resumable-uploads draft
 
 The same store works under the IETF dialect (`draft-ietf-httpbis-resumable-upload`), which speaks the draft revisions actual clients implement, identified by interop versions 3, 5, and 6, including the `Upload-Complete`/`Upload-Incomplete` header flip between them. A request may assert a whole-representation SHA-256 via `Repr-Digest`; it is verified before publication on stores that can hash the assembled bytes.

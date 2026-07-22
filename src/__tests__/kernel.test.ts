@@ -623,6 +623,58 @@ describe("isConditionalFresh", () => {
         ).toBe(false);
     });
 
+    // Calendar/clock-invalid dates: the HTTP-date grammars admit digit shapes
+    // the calendar does not (e.g. "31 Feb", "12:00:99"), and JS date
+    // construction silently ROLLS those over ("31 Feb" -> Mar 3). RFC 9110
+    // Sections 13.1.3/13.1.4/13.1.5 require an invalid HTTP-date to be IGNORED,
+    // not shifted -- a shift would fabricate a spurious 304/412/range honor.
+    describe("calendar/clock-invalid HTTP-dates are ignored, not rolled over", () => {
+        const LM = "Sun, 05 Mar 2025 12:00:00 GMT"; // after any Feb rollover target
+
+        test("If-Unmodified-Since: IMF-fixdate impossible day -> ignored (no 412)", () => {
+            // Would roll to Mar 3, which is < Mar 5, so a rolled date would
+            // spuriously PASS the precondition; ignoring it must return false.
+            expect(
+                isPreconditionFailure(mockHeaders({ "If-Unmodified-Since": "Fri, 31 Feb 2025 12:00:00 GMT" }), undefined, LM),
+            ).toBe(false);
+        });
+
+        test("If-Unmodified-Since: RFC 850 impossible day -> ignored (no 412)", () => {
+            expect(
+                isPreconditionFailure(mockHeaders({ "If-Unmodified-Since": "Friday, 31-Feb-25 12:00:00 GMT" }), undefined, LM),
+            ).toBe(false);
+        });
+
+        test("If-Unmodified-Since: asctime impossible day -> ignored (no 412)", () => {
+            expect(
+                isPreconditionFailure(mockHeaders({ "If-Unmodified-Since": "Fri Feb 30 12:00:00 2025" }), undefined, LM),
+            ).toBe(false);
+        });
+
+        test("If-Modified-Since: asctime impossible day -> not fresh (no spurious 304)", () => {
+            expect(
+                isConditionalFresh(mockHeaders({ "If-Modified-Since": "Fri Feb 30 12:00:00 2025" }), undefined, LM),
+            ).toBe(false);
+        });
+
+        test("out-of-range time component -> ignored", () => {
+            // Second 99 rolls the minute; the date must be rejected instead.
+            expect(
+                isPreconditionFailure(mockHeaders({ "If-Unmodified-Since": "Sun, 05 Mar 2025 12:00:99 GMT" }), undefined, LM),
+            ).toBe(false);
+        });
+
+        test("a genuinely valid date on the same paths still evaluates", () => {
+            // Guard against over-rejection: a real "30 Jan" must still work.
+            expect(
+                isPreconditionFailure(mockHeaders({ "If-Unmodified-Since": "Thu, 30 Jan 2025 12:00:00 GMT" }), undefined, LM),
+            ).toBe(true); // Mar 5 > Jan 30 -> modified after -> precondition fails
+            expect(
+                isConditionalFresh(mockHeaders({ "If-Modified-Since": "Wed, 05 Mar 2025 12:00:00 GMT" }), undefined, LM),
+            ).toBe(true); // not modified since -> 304
+        });
+    });
+
     test("If-Modified-Since: unparseable date -> not fresh (ignores header)", () => {
         // Malformed If-Modified-Since: both Date.parse() calls produce NaN,
         // the condition fails, and we fall through to return false.

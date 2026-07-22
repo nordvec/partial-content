@@ -48,7 +48,7 @@ const FLOORS = {
                                 // guards, provably outcome-equivalent)
     "upload-orchestrator.ts": 92, // baseline 93.85 (completion inference +
                                   // derived clean-append outcome joined the
-                                  // R534 growth; residuals are post-settle
+                                  // covered set; residuals are post-settle
                                   // cleanup closures, once:true hygiene,
                                   // undefined-comparison no-ops in the policy
                                   // guards, and a defensive unreachable throw)

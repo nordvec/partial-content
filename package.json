@@ -1,6 +1,6 @@
 {
   "name": "partial-content",
-  "version": "3.0.0",
+  "version": "3.0.1",
   "description": "RFC-compliant HTTP file serving and resumable uploads for any storage backend. Range requests (206), conditional caching (304/412), Content-Disposition, ETag generation, and a resumable-upload engine speaking tus 1.0 and the IETF resumable-uploads draft. Zero dependencies.",
   "type": "module",
   "main": "./dist/index.js",
@@ -161,6 +161,7 @@
     "test:mutation:ci": "node scripts/mutation-ci.mjs",
     "prepublishOnly": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc && node -e \"const t=require('child_process').execSync('npm pack --dry-run --json',{encoding:'utf8'});const f=JSON.parse(t)[0].files.map(f=>f.path);const bad=f.filter(p=>/\\.(map|env|test|spec)/.test(p)&&!p.endsWith('.d.ts.map')&&!p.endsWith('.js.map'));if(bad.length){console.error('BLOCKED: tarball contains suspicious files:',bad);process.exit(1)}\"",
     "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
+    "typecheck": "tsc --noEmit",
     "bench": "npm run build && node bench/run.mjs",
     "smoke": "npm run build && node smoke/smoke.mjs",
     "check:exports": "npm run build && attw --pack . --profile esm-only",

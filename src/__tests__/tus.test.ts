@@ -1527,7 +1527,7 @@ describe("override and never-throw edges", () => {
     });
 });
 
-// ─── HEAD implicit-completion healing (audit R534) ──────────────────────────
+// ─── HEAD implicit-completion healing ───────────────────────────────────────
 // A completing request whose bytes went durable but whose handler died before
 // completion leaves the resource at offset === length, unpublished. A tus
 // client seeing offset == length concludes "done" and stops, so the HEAD that
@@ -1582,7 +1582,7 @@ describe("HEAD implicit-completion healing", () => {
     });
 });
 
-// ─── Completeness derivation on creation and append (audit R534) ────────────
+// ─── Completeness derivation on creation and append ─────────────────────────
 
 describe("completeness derivation", () => {
     test("a deferred-length creation-with-upload of unknown size stays incomplete", async () => {

@@ -355,7 +355,7 @@ describe("concurrency and hooks", () => {
     });
 });
 
-describe("construction guards (audit R534)", () => {
+describe("construction guards", () => {
     test("a store reporting atomicCompletion: false is refused", () => {
         const { store } = fakeStore();
         const nonAtomic = { ...store, atomicCompletion: false } as ResumableWriteStore;
@@ -375,7 +375,7 @@ describe("construction guards (audit R534)", () => {
     });
 });
 
-describe("minSize at completion (audit R534 F7)", () => {
+describe("minSize at completion", () => {
     test("a known-total single-shot create below the floor is refused before allocation", async () => {
         const { store, uploads } = fakeStore();
         const o = orch(store, { policy: { minSize: 10 } });
@@ -415,7 +415,7 @@ describe("minSize at completion (audit R534 F7)", () => {
     });
 });
 
-describe("deferred-length persistence (audit R534 F1)", () => {
+describe("deferred-length persistence", () => {
     test("a length declared on a later append persists and drives completion", async () => {
         const { store } = fakeStore();
         const o = orch(store);
@@ -443,7 +443,7 @@ describe("deferred-length persistence (audit R534 F1)", () => {
     });
 });
 
-describe("create runs under the lock (audit R534 F8)", () => {
+describe("create runs under the lock", () => {
     test("a resume that races a still-flushing creation is serialized, not concurrent", async () => {
         const { store } = fakeStore();
         const o = createUploadOrchestrator(store, { now: () => NOW, graceMs: 0 });
@@ -611,6 +611,44 @@ describe("grace window", () => {
         });
         expect(sawAbortedSignal).toBe(false);
         expect(out.kind).toBe("appended");
+    });
+
+    test("the interrupted re-read is NOT gated on the aborted client signal", async () => {
+        // Regression: an interruption IS often the client abort, and the
+        // built-in stores throw on an aborted signal, so gating the durable
+        // re-read on req.signal downgraded a truthful `interrupted` response to
+        // a spurious store error and fired a mislabeled AbortError to onError.
+        // Same torn-partial-append shape as the interrupted test above, but
+        // with a store that honors the signal exactly like memory/fs do.
+        const errors: string[] = [];
+        const { store } = fakeStore();
+        const origGetState = store.getUploadState.bind(store);
+        store.getUploadState = async (token: string, stateOpts?: { signal?: AbortSignal }) => {
+            stateOpts?.signal?.throwIfAborted();
+            return origGetState(token, stateOpts);
+        };
+        const o = createUploadOrchestrator(store, {
+            now: () => NOW, graceMs: 0,
+            onError: (_e, ctx) => errors.push(ctx.operation),
+        });
+        const created = await o.create({ key: "k", declaredLength: 10, complete: false });
+        if (created.kind !== "created") throw new Error("setup");
+
+        const ctl = new AbortController();
+        const body = controlledStream();
+        const pending = o.append(created.uploadToken, {
+            offset: 0, contentLength: 10, complete: true, body: body.stream, signal: ctl.signal,
+        });
+        body.push("abc");
+        await new Promise((r) => setTimeout(r, 5));
+        ctl.abort();
+        body.error(new Error("gone"));
+        const out = await pending;
+
+        // The re-read reported the flushed offset instead of throwing on the
+        // aborted signal: a truthful interrupted response, no spurious error.
+        expect(out).toMatchObject({ kind: "appended", offset: 3, complete: false, interrupted: true });
+        expect(errors).toEqual([]);
     });
 });
 
@@ -1262,7 +1300,7 @@ describe("preemption latches before the write begins", () => {
     });
 });
 
-describe("minSize gate at completion emits and returns cleanly (audit R534 F7)", () => {
+describe("minSize gate at completion emits and returns cleanly", () => {
     test("a streaming create below the floor emits the rejection and returns empty events", async () => {
         const events: UploadResourceEvent[] = [];
         const { store, uploads } = fakeStore();
@@ -1315,7 +1353,7 @@ describe("minSize gate at completion emits and returns cleanly (audit R534 F7)",
     });
 });
 
-describe("deferred-length threading on an empty append (audit R534 F1)", () => {
+describe("deferred-length threading on an empty append", () => {
     test("a no-body append that declares a length persists it via the write path", async () => {
         const { store } = fakeStore();
         const o = orch(store);
@@ -1351,7 +1389,7 @@ describe("deferred-length threading on an empty append (audit R534 F1)", () => {
     });
 });
 
-describe("policy validation field coverage (audit R534)", () => {
+describe("policy validation field coverage", () => {
     test("each field is validated, zero is allowed, and equal bounds pass", () => {
         const { store } = fakeStore();
         const mk = (policy: object) => () => createUploadOrchestrator(store, { now: () => NOW, policy });

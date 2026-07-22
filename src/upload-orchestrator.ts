@@ -437,7 +437,14 @@ export function createUploadOrchestrator(
             // write's own return. An interruption re-reads for the flushed prefix.
             offset = written.bytesWritten;
             if (interrupted) {
-              const fresh = await store.getUploadState(uploadToken, { signal: req.signal });
+              // Deliberately NOT gated on req.signal. An interruption is often
+              // the client abort ITSELF (the grace window flushed the received
+              // prefix, then expired); passing the aborted signal here would
+              // make the store throw and turn a truthful interrupted response
+              // into a spurious store error. This read reports the bytes that
+              // were durably flushed, so it must complete even with the client
+              // gone -- consistent with the write it reconciles.
+              const fresh = await store.getUploadState(uploadToken);
               offset = fresh.offset;
             }
           } catch (err) {
@@ -576,7 +583,12 @@ export function createUploadOrchestrator(
         let createdAt = state.createdAt;
         if (interrupted) {
           try {
-            const fresh = await store.getUploadState(uploadToken, { signal: req.signal });
+            // NOT gated on req.signal: an interruption is often the client
+            // abort itself, and this re-read reports the durably-flushed
+            // offset precisely so the interrupted response is truthful. Gating
+            // it on the aborted signal would make the store throw and downgrade
+            // a truthful interrupted outcome to a spurious store error.
+            const fresh = await store.getUploadState(uploadToken);
             durableOffset = fresh.offset;
             length = fresh.length ?? req.declaredLength;
             createdAt = fresh.createdAt;

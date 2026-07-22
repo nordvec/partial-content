@@ -1,5 +1,25 @@
 # Changelog
 
+## 3.0.1 (2026-07-21)
+
+Two correctness fixes; no API change.
+
+### Fixed
+- **Calendar/clock-invalid conditional dates are ignored, not rolled over.** A
+  client `If-Modified-Since` / `If-Unmodified-Since` / `If-Range` value whose
+  digits form an impossible date or time (e.g. `31 Feb`, `12:00:99`) was
+  silently shifted to a real instant (`31 Feb` became Mar 3) instead of being
+  rejected, which could fabricate a spurious `304` or `412`. RFC 9110
+  Sections 13.1.3/13.1.4/13.1.5 require an invalid HTTP-date to be ignored, so
+  such values are now rejected across all three HTTP-date formats (IMF-fixdate,
+  RFC 850, asctime) via a round-trip validation of the parsed components.
+- **An interrupted upload append no longer downgrades to a store error.** When
+  an append was interrupted by the client disconnect itself, the durable
+  offset re-read was gated on the (now-aborted) request signal, so the truthful
+  interrupted response became a spurious store error and emitted a mislabeled
+  abort into the error hook. The re-read now completes independently of the
+  client signal, reporting the bytes that were durably flushed.
+
 ## 3.0.0 (2026-07-17)
 
 A concurrency-ownership cleanup: the locker owns preemption end to end, via a

@@ -271,7 +271,7 @@ export interface RangeSet {
  *                        coalesced): serve 206 (single) or multipart (>1).
  *
  * Amplification defenses (RFC 9110 Section 14.2 explicitly permits ignoring
- * abusive range sets; a sum-of-ranges cap plus coalescing):
+ * abusive range sets; coalescing plus a distinct-part count cap):
  *   1. Overlapping, adjacent, and near-adjacent ranges are coalesced (gaps
  *      smaller than the ~80-byte multipart part overhead are bridged, which
  *      Section 15.3.7.2 sanctions and which strictly shrinks the response),
@@ -1593,24 +1593,69 @@ function parseHttpSeconds(s: string): number {
 // and ANSI C asctime. Client-supplied conditional dates MUST be ignored when
 // they match none of these (Sections 13.1.3/13.1.4) -- bare Date.parse would
 // also honor ISO 8601 and other formats the spec requires us to reject.
+// Capture day / month / (year) / time so the parsed components can be
+// round-trip-validated: the grammars admit digit shapes the calendar does
+// not (e.g. "31 Feb", "12:00:99"), and JS date construction ROLLS those over
+// instead of rejecting them.
 const IMF_FIXDATE_RE =
-  /^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), \d{2} (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{4} \d{2}:\d{2}:\d{2} GMT$/;
+  /^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), (\d{2}) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{4} (\d{2}):(\d{2}):(\d{2}) GMT$/;
 const RFC850_DATE_RE =
-  /^(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday), \d{2}-(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-\d{2} \d{2}:\d{2}:\d{2} GMT$/;
+  /^(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday), (\d{2})-(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-\d{2} (\d{2}):(\d{2}):(\d{2}) GMT$/;
 const ASCTIME_DATE_RE =
   /^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) ([ \d]\d) (\d{2}):(\d{2}):(\d{2}) (\d{4})$/;
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
 /**
+ * Reject a timestamp whose calendar/clock components did not round-trip.
+ *
+ * RFC 9110 Sections 13.1.3/13.1.4 require an invalid HTTP-date to be IGNORED,
+ * but JS date construction silently ROLLS OVER out-of-range components:
+ * `Date.parse("... 31 Feb 2025 ...")` yields Mar 3, and `Date.UTC(y, m, d,
+ * 12, 0, 99)` yields the next minute. A rolled date would fabricate a
+ * spurious 304/412 for a request the RFC says must proceed. Reconstructing
+ * the epoch and comparing the UTC fields against what was parsed rejects any
+ * such date (returning NaN, which callers treat as "header not present").
+ *
+ * Leap-second values (ss=60) do not round-trip and are treated as invalid,
+ * which is safe: the conditional is skipped and the full representation is
+ * served. The two-digit RFC 850 year is left to the platform's pivot (only
+ * the day/time are validated), since a four-digit-or-pivoted year cannot roll
+ * the way an out-of-range day or second can.
+ *
+ * Returns whole-second-floored ms (matching {@link parseHttpSeconds}) or NaN.
+ */
+function roundTripSeconds(
+  monthIdx: number, day: number, hh: number, mm: number, ss: number, epoch: number,
+): number {
+  if (Number.isNaN(epoch)) return NaN;
+  const d = new Date(epoch);
+  if (
+    d.getUTCMonth() !== monthIdx || d.getUTCDate() !== day
+    || d.getUTCHours() !== hh || d.getUTCMinutes() !== mm || d.getUTCSeconds() !== ss
+  ) {
+    return NaN;
+  }
+  return Math.floor(epoch / 1000) * 1000;
+}
+
+/**
  * Parse a CLIENT-supplied conditional date, accepting only the three
- * HTTP-date formats. Returns NaN for anything else, which callers treat as
- * "header not present" per RFC 9110. Backend metadata keeps the lenient
- * `parseHttpSeconds` path (adapters may hand us ISO 8601; that is our own
- * input, not wire input).
+ * HTTP-date formats and only when the components form a real calendar date.
+ * Returns NaN for anything else, which callers treat as "header not present"
+ * per RFC 9110. Backend metadata keeps the lenient `parseHttpSeconds` path
+ * (adapters may hand us ISO 8601; that is our own input, not wire input).
  */
 function parseRequestHttpSeconds(s: string): number {
-  if (IMF_FIXDATE_RE.test(s) || RFC850_DATE_RE.test(s)) {
-    return parseHttpSeconds(s);
+  // IMF-fixdate and RFC 850 both carry an explicit GMT zone, so Date.parse
+  // reads them as UTC (and applies the RFC 850 two-digit-year pivot). The
+  // round-trip guard then rejects a day/time the grammar admits but the
+  // calendar rolled over.
+  const gmt = IMF_FIXDATE_RE.exec(s) ?? RFC850_DATE_RE.exec(s);
+  if (gmt) {
+    const [, day, mon, hh, mm, ss] = gmt;
+    return roundTripSeconds(
+      MONTHS.indexOf(mon!), Number(day), Number(hh), Number(mm), Number(ss), Date.parse(s),
+    );
   }
   // asctime carries no zone designator; RFC 9110 says it is UTC. Date.parse
   // would interpret it as LOCAL time, skewing comparisons by the server's
@@ -1618,7 +1663,9 @@ function parseRequestHttpSeconds(s: string): number {
   const m = ASCTIME_DATE_RE.exec(s);
   if (m) {
     const [, mon, day, hh, mm, ss, year] = m;
-    return Date.UTC(Number(year), MONTHS.indexOf(mon), Number(day), Number(hh), Number(mm), Number(ss));
+    const monthIdx = MONTHS.indexOf(mon!);
+    const epoch = Date.UTC(Number(year), monthIdx, Number(day), Number(hh), Number(mm), Number(ss));
+    return roundTripSeconds(monthIdx, Number(day), Number(hh), Number(mm), Number(ss), epoch);
   }
   return NaN;
 }

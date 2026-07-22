@@ -9,9 +9,12 @@
  * spoofing, and control character injection in filenames from untrusted
  * sources (integration APIs, user uploads).
  *
- * Emits dual filename parameters for cross-browser compatibility:
- *   - `filename="ascii-safe.pdf"` for legacy browsers
- *   - `filename*=UTF-8''%C3%85rlig.pdf` for modern browsers (RFC 8187)
+ * Filename encoding is chosen per input:
+ *   - A safe ASCII token emits a single bare `filename=report.pdf`.
+ *   - Other ASCII emits a quoted `filename="a b.pdf"` (quotes/backslashes escaped).
+ *   - A non-ASCII name emits `filename*=UTF-8''%C3%85rlig.pdf` (RFC 8187) for
+ *     modern browsers, alongside an ASCII-folded `filename=` fallback for
+ *     legacy ones.
  */
 
 // ─── Types ──────────────────────────────────────────────────────────────────
