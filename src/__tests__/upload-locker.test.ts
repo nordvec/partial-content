@@ -232,3 +232,31 @@ describe("memoryUploadLocker", () => {
         fresh.release();
     });
 });
+
+// ─── One layer owns the acquire deadline ────────────────────────────────────
+
+describe("acquire deadline configuration", () => {
+    test("the factory default applies when the caller names no deadline", async () => {
+        const locker = memoryUploadLocker({ acquireTimeoutMs: 40 });
+        const held = await locker.acquire("tok");
+
+        const started = Date.now();
+        await expect(locker.acquire("tok")).rejects.toThrow(UploadLockTimeoutError);
+        // Without a factory knob the in-memory locker's 15s default could not
+        // be changed through any public surface at all.
+        expect(Date.now() - started).toBeLessThan(2000);
+        held.release();
+    });
+
+    test("a per-acquire deadline still wins over the factory default", async () => {
+        const locker = memoryUploadLocker({ acquireTimeoutMs: 30_000 });
+        const held = await locker.acquire("tok");
+        await expect(locker.acquire("tok", { timeoutMs: 40 })).rejects.toThrow(UploadLockTimeoutError);
+        held.release();
+    });
+
+    test("a nonsensical factory deadline is refused at construction", () => {
+        expect(() => memoryUploadLocker({ acquireTimeoutMs: 0 })).toThrow(TypeError);
+        expect(() => memoryUploadLocker({ acquireTimeoutMs: -1 })).toThrow(/positive safe integer/);
+    });
+});

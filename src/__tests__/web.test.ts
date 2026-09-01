@@ -4,6 +4,22 @@ import { OPEN_ENDED, ObjectNotFoundError, StoreUnavailableError } from "../index
 import type { ObjectStore, ObjectMetadata, ObjectStream, ParsedRange } from "../index";
 import { memoryStore as kvStore } from "../memory";
 
+/**
+ * The range a store mock was called with, or a loud failure.
+ *
+ * These mocks index straight into `range.start`/`range.end`, and the previous
+ * spelling was `getOpts?.range!`, which asserts non-null on a chain designed to
+ * return undefined. If a change ever made `serveObject` call `getObject`
+ * WITHOUT a range, that assertion turned the interesting failure into
+ * "cannot read properties of undefined" several lines later, inside a mock,
+ * which reads as a broken test rather than a changed caller.
+ */
+function requireRange(getOpts?: { range?: ParsedRange }): ParsedRange {
+    const range = getOpts?.range;
+    if (!range) throw new Error("store mock was called without a range; the caller under test changed");
+    return range;
+}
+
 // ─── In-Memory Store ────────────────────────────────────────────────────────
 
 interface MemoryStoreOpts {
@@ -23,12 +39,17 @@ interface MemoryStoreOpts {
     calls?: string[];
 }
 
-function bytesOf(s: string): Uint8Array {
+/**
+ * An {@link ObjectStream} body is `ArrayBuffer`-backed so a consumer can hand
+ * it to `new Response(...)` directly, so the doubles produce that exact view
+ * rather than the wider `ArrayBufferLike` one.
+ */
+function bytesOf(s: string): Uint8Array<ArrayBuffer> {
     return new TextEncoder().encode(s);
 }
 
-function streamOf(bytes: Uint8Array): ReadableStream<Uint8Array> {
-    return new ReadableStream<Uint8Array>({
+function streamOf(bytes: Uint8Array<ArrayBuffer>): ReadableStream<Uint8Array<ArrayBuffer>> {
+    return new ReadableStream<Uint8Array<ArrayBuffer>>({
         start(controller) {
             controller.enqueue(bytes);
             controller.close();
@@ -1157,7 +1178,7 @@ describe("transfer-completion (onTransfer)", () => {
             },
             async getObject(): Promise<ObjectStream> {
                 let i = 0;
-                const body = new ReadableStream<Uint8Array>({
+                const body = new ReadableStream<Uint8Array<ArrayBuffer>>({
                     pull(controller) {
                         if (i < parts.length) controller.enqueue(parts[i++]!);
                         else controller.close();
@@ -1440,7 +1461,7 @@ describe("multi-range serving (multipart/byteranges)", () => {
                 getCalls++;
                 const range = getOpts!.range!;
                 const slice = data.subarray(range.start, range.end + 1);
-                const body = new ReadableStream<Uint8Array>({
+                const body = new ReadableStream<Uint8Array<ArrayBuffer>>({
                     start(c) { c.enqueue(slice); c.close(); },
                     cancel() { firstCancelled = true; },
                 });
@@ -2487,7 +2508,7 @@ describe("multipart per-part representation coherence", () => {
             },
             async getObject(_key, getOpts?: { range?: ParsedRange }): Promise<ObjectStream> {
                 call++;
-                const range = getOpts?.range!;
+                const range = requireRange(getOpts);
                 const slice = data.slice(range.start, range.end + 1);
                 return {
                     body: streamOf(slice), contentLength: slice.length, totalSize: data.length,
@@ -2540,7 +2561,7 @@ describe("multipart byte-body length verification", () => {
                 return { contentLength: data.length, etag: '"mb-v1"' };
             },
             async getObject(_key, getOpts?: { range?: ParsedRange }): Promise<ObjectStream> {
-                const range = getOpts?.range!;
+                const range = requireRange(getOpts);
                 const span = range.end - range.start + 1;
                 const slice = data.slice(range.start, range.end + 1);
                 // Claim the correct span but hand over truncated bytes.

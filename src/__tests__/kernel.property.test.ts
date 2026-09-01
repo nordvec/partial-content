@@ -98,7 +98,13 @@ describe("Content-Range build/parse round-trip", () => {
     test("a 206 Content-Range parses back to the exact range and total", () => {
         fc.assert(
             fc.property(validRange, ({ start, end, totalSize }) => {
-                const res = buildRangeResponseHeaders({ totalSize, range: { start, end } });
+                const res = buildRangeResponseHeaders({
+                    totalSize,
+                    range: { start, end },
+                    contentType: undefined,
+                    etag: undefined,
+                    lastModified: undefined,
+                });
                 expect(res.status).toBe(206);
                 expect(parseContentRange(res.headers["Content-Range"])).toEqual({ start, end, totalSize });
             }),
@@ -108,7 +114,13 @@ describe("Content-Range build/parse round-trip", () => {
     test("an unknown total emits `/*` and parses back to the -1 sentinel", () => {
         fc.assert(
             fc.property(validRange, ({ start, end }) => {
-                const res = buildRangeResponseHeaders({ totalSize: undefined, range: { start, end } });
+                const res = buildRangeResponseHeaders({
+                    totalSize: undefined,
+                    range: { start, end },
+                    contentType: undefined,
+                    etag: undefined,
+                    lastModified: undefined,
+                });
                 expect(res.headers["Content-Range"]).toBe(`bytes ${start}-${end}/*`);
                 expect(parseContentRange(res.headers["Content-Range"])).toEqual({ start, end, totalSize: -1 });
             }),

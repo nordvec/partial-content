@@ -301,8 +301,8 @@ describe("azureUploadStore: guards", () => {
         const { uploadToken } = await store.createUpload({ key: "d.bin", now: NOW });
 
         await expect(
-            store.appendChunk(uploadToken, 0, streamOf(bytes(1, 2, 3), bytes(4, 5, 6)), { now: NOW, maxBytes: 4 }),
-        ).rejects.toThrow(/byte bound/);
+            store.appendChunk(uploadToken, 0, streamOf(bytes(1, 2, 3), bytes(4, 5, 6)), { now: NOW, maxBytes: 4, maxBytesFatal: true }),
+        ).rejects.toThrow(/representation bound/);
 
         const state = await store.getUploadState(uploadToken);
         expect(state.isInvalidated).toBe(true);
@@ -314,7 +314,7 @@ describe("azureUploadStore: guards", () => {
         const mock = mockUploadContainer();
         const store = azureUploadStore({ containerClient: mock.container });
         const { uploadToken } = await store.createUpload({ key: "exact.bin", now: NOW });
-        const result = await store.appendChunk(uploadToken, 0, bytes(1, 2, 3, 4), { now: NOW, maxBytes: 4 });
+        const result = await store.appendChunk(uploadToken, 0, bytes(1, 2, 3, 4), { now: NOW, maxBytes: 4, maxBytesFatal: true });
         expect(result.bytesWritten).toBe(4);
         expect((await store.getUploadState(uploadToken)).isInvalidated).toBe(false);
     });
@@ -408,16 +408,26 @@ describe("azureUploadStore: not-found and token integrity", () => {
         await expect(store.getUploadState(uploadToken)).rejects.toBeInstanceOf(UploadNotFoundError);
     });
 
-    test("a token whose key was tampered answers UploadNotFoundError", async () => {
+    test("the token is the resource id and discloses nothing about the key", async () => {
         const mock = mockUploadContainer();
         const store = azureUploadStore({ containerClient: mock.container });
-        const { uploadToken } = await store.createUpload({ key: "victim.bin", now: NOW });
-        const decoded = JSON.parse(new TextDecoder().decode(
-            Uint8Array.from(atob(uploadToken.replace(/-/g, "+").replace(/_/g, "/")), (c) => c.charCodeAt(0)),
-        )) as { key: string; id: string };
-        const forged = btoa(JSON.stringify({ key: "attacker.bin", id: decoded.id }))
-            .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-        await expect(store.getUploadState(forged)).rejects.toBeInstanceOf(UploadNotFoundError);
+        const { uploadToken } = await store.createUpload({ key: "tenants/acme/payroll.csv", now: NOW });
+        expect(uploadToken).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+        expect(uploadToken).not.toContain("acme");
+    });
+
+    test("a token that is not a minted id answers UploadNotFoundError", async () => {
+        const mock = mockUploadContainer();
+        const store = azureUploadStore({ containerClient: mock.container });
+        await store.createUpload({ key: "victim.bin", now: NOW });
+        for (const forged of [
+            "00000000-0000-4000-8000-000000000000",
+            "eyJrZXkiOiJhdHRhY2tlci5iaW4ifQ",
+            "../../etc/passwd",
+            "",
+        ]) {
+            await expect(store.getUploadState(forged)).rejects.toBeInstanceOf(UploadNotFoundError);
+        }
     });
 });
 
@@ -490,6 +500,22 @@ describe("azureUploadStore: abort and sweep", () => {
 
         await store.abortUpload(uploadToken);
         expect(mock.committed.has("live.bin")).toBe(true); // live data untouched
+    });
+
+    test("aborting a COMPLETED upload discards the bookkeeping, never the published blob", async () => {
+        // Store contract: after completion the blob at the key is live data,
+        // and abort is idempotent, so an abort that reached it would destroy
+        // production data on a replayed or retried DELETE.
+        const mock = mockUploadContainer();
+        const store = azureUploadStore({ containerClient: mock.container });
+        const { uploadToken } = await store.createUpload({ key: "done.bin", now: NOW });
+        await store.appendChunk(uploadToken, 0, bytes(1, 2), { now: NOW });
+        await store.completeUpload(uploadToken, { now: NOW });
+
+        await store.abortUpload(uploadToken);
+        await store.abortUpload(uploadToken); // and again: still not destructive
+        expect(mock.committed.has("done.bin")).toBe(true);
+        await expect(store.getUploadState(uploadToken)).rejects.toBeInstanceOf(UploadNotFoundError);
     });
 
     test("sweepExpired reaps idle uploads (info + staged state) and keeps active ones", async () => {
@@ -672,14 +698,14 @@ describe("azureUploadStore: heal variants and limits", () => {
             .rejects.toThrow(/50,000-block/);
     });
 
-    test("abort with a forged (valid-id, wrong-key) token discards nothing", async () => {
+    test("abort with an id that names no resource discards nothing", async () => {
         const mock = mockUploadContainer();
         const store = azureUploadStore({ containerClient: mock.container });
         const { uploadToken } = await store.createUpload({ key: "victim.bin", now: NOW });
-        const decoded = JSON.parse(fromBase64Url(uploadToken)) as { key: string; id: string };
-        const forged = toBase64Url(JSON.stringify({ key: "attacker.bin", id: decoded.id }));
 
-        await store.abortUpload(forged);
+        await store.abortUpload("00000000-0000-4000-8000-000000000000");
+        await store.abortUpload("not-a-token");
+
         // The victim's upload is fully intact.
         expect((await store.getUploadState(uploadToken)).offset).toBe(0);
     });

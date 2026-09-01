@@ -200,18 +200,27 @@ describe("state sanity gate (adapter bugs fail loudly)", () => {
 // ─── Terminal states ─────────────────────────────────────────────────────────
 
 describe("terminal states answer everything first", () => {
-    test("invalidated resources refuse probes, appends, and cancels", () => {
+    test("invalidated resources refuse probes and appends", () => {
         const dead = state({ isInvalidated: true });
         for (const intent of [
             { kind: "probe" } as const,
             { kind: "append", offset: 0, complete: false } as const,
-            { kind: "cancel" } as const,
         ]) {
             const v = evaluateUploadIntent(intent, dead, {}, opts());
             expect(v.kind).toBe("gone");
             if (v.kind !== "gone") return;
             expect(v.reason).toBe("invalidated");
         }
+    });
+
+    test("cancel is answered ahead of the terminal refusals, so a dead resource can still be freed", () => {
+        // DELETE is the one verb that must succeed on a dead resource: the
+        // partial bytes need reclaiming, and abortUpload is idempotent.
+        const dead = state({ isInvalidated: true });
+        const v = evaluateUploadIntent({ kind: "cancel" }, dead, {}, opts());
+        expect(v.kind).toBe("cancel-accepted");
+        if (v.kind !== "cancel-accepted") return;
+        expect(v.events).toEqual([]);
     });
 
     test("expiry is enforced from policy + injected clock", () => {
@@ -495,7 +504,10 @@ describe("completion", () => {
         expect(v.kind).toBe("complete-now");
         if (v.kind !== "complete-now") return;
         expect(v.length).toBe(1024);
-        expect(v.events).toEqual([{ kind: "completed", length: 1024 }]);
+        // The verdict decides; it does not claim the publication happened. The
+        // `completed` event is the orchestrator's, emitted after completeUpload
+        // returns, so a store that throws records no completion.
+        expect(v.events).toEqual([]);
     });
 
     test("zero-content completion below the declared length is inconsistent, not silent truncation", () => {
@@ -810,20 +822,225 @@ describe("audit event contract", () => {
 // ─── Cancel ──────────────────────────────────────────────────────────────────
 
 describe("cancel", () => {
-    test("cancel on a live resource is accepted with a cancelled event", () => {
+    test("cancel on a live resource is accepted, and claims no cancellation of its own", () => {
         const v = evaluateUploadIntent({ kind: "cancel" }, state({ offset: 42 }), {}, opts());
         expect(v.kind).toBe("cancel-accepted");
         if (v.kind !== "cancel-accepted") return;
-        expect(v.events).toEqual([{ kind: "cancelled" }]);
+        // The `cancelled` event is the orchestrator's, emitted after
+        // abortUpload returns, so a store that throws records no cancellation.
+        expect(v.events).toEqual([]);
     });
 
-    test("cancel on an expired resource reports gone, not a fresh cancellation", () => {
+    test("cancel on an expired resource is accepted so its bytes are freed, not stranded", () => {
+        // An expired resource is dead to every other verb, but a DELETE must
+        // still reclaim its partial bytes rather than wait for a sweep that may
+        // never run (no sweep is scheduled when no max age applies at all).
         const v = evaluateUploadIntent(
             { kind: "cancel" },
             state({ createdAt: NOW - 3_600_000 }),
             { maxAgeSeconds: 60 },
             opts(),
         );
-        expect(v.kind).toBe("gone");
+        expect(v.kind).toBe("cancel-accepted");
+    });
+});
+
+// ─── Content against the length it declares, on both paths ──────────────────
+
+describe("a declared length and a content size that disagree", () => {
+    const create = (declaredLength: number | undefined, contentLength: number | undefined, complete = false) =>
+        evaluateUploadCreation(
+            { kind: "create", declaredLength, contentLength, hasContent: contentLength !== undefined, complete },
+            {},
+        );
+
+    test("content larger than the declared total is refused, completing or not", () => {
+        // Accepting it allocates a resource the body immediately destroys, so
+        // the client would be told 201 Created about an upload already dead.
+        expect(create(10, 11).kind).toBe("length-inconsistent");
+        expect(create(10, 11, true).kind).toBe("length-inconsistent");
+    });
+
+    test("content exactly at the declared total is accepted", () => {
+        expect(create(10, 10).kind).toBe("create-accepted");
+        expect(create(10, 10, true).kind).toBe("create-accepted");
+    });
+
+    test("content under the declared total is accepted only when more may follow", () => {
+        // A non-completing creation is a prefix; a completing one asserts this
+        // content IS the whole representation, so a shortfall contradicts it.
+        expect(create(10, 9).kind).toBe("create-accepted");
+        expect(create(10, 9, true).kind).toBe("length-inconsistent");
+    });
+
+    test("one indicator alone can never be inconsistent with the other", () => {
+        expect(create(undefined, 11).kind).toBe("create-accepted");
+        expect(create(10, undefined).kind).toBe("create-accepted");
+    });
+});
+
+// ─── A total declared on an append is still a total ─────────────────────────
+
+describe("a length first declared on an append", () => {
+    const append = (declaredLength: number | undefined, policy: UploadPolicy, over: Partial<UploadState> = {}) =>
+        evaluateUploadIntent(
+            { kind: "append", offset: 0, declaredLength, complete: false },
+            state(over),
+            policy,
+            opts(),
+        );
+
+    test("over the policy maximum is refused, as it is at creation", () => {
+        const v = append(101, { maxSize: 100 });
+        expect(v.kind).toBe("limit-violation");
+        if (v.kind !== "limit-violation") return;
+        expect(v.reason).toBe("size-exceeded");
+        expect(v.events).toEqual([{ kind: "append-rejected", reason: "size-exceeded", atOffset: 0 }]);
+    });
+
+    test("exactly at the policy maximum is accepted", () => {
+        expect(append(100, { maxSize: 100 }).kind).toBe("append-allowed");
+    });
+
+    test("no maximum means nothing to exceed", () => {
+        expect(append(101, {}).kind).toBe("append-allowed");
+    });
+
+    test("no declared length means nothing to check", () => {
+        expect(append(undefined, { maxSize: 100 }).kind).toBe("append-allowed");
+    });
+
+    test("a length already recorded is not being declared now, so the check does not apply", () => {
+        // A length accepted under an earlier policy outlives a redeploy that
+        // tightens the maximum. Refusing the resumption of an upload already
+        // holding bytes would strand them; the bound still stops the write.
+        const v = append(101, { maxSize: 100 }, { length: 101 });
+        expect(v.kind).toBe("append-allowed");
+        if (v.kind !== "append-allowed") return;
+        expect(v.maxBytes).toBe(100);
+        expect(v.fatalReason).toBe("size");
+    });
+});
+
+// ─── Which of three bounds binds, and what crossing it means ────────────────
+
+describe("appendBound classification", () => {
+    const boundOf = (policy: UploadPolicy, over: Partial<UploadState> = {}, declaredLength?: number) => {
+        const v = evaluateUploadIntent(
+            { kind: "append", offset: over.offset ?? 0, declaredLength, complete: false },
+            state(over),
+            policy,
+            opts(),
+        );
+        if (v.kind !== "append-allowed") throw new Error(`expected append-allowed, got ${v.kind}`);
+        return { maxBytes: v.maxBytes, fatal: v.maxBytesFatal, reason: v.fatalReason };
+    };
+
+    test("room toward a known length is a representation bound", () => {
+        expect(boundOf({}, { length: 10, offset: 4 }))
+            .toEqual({ maxBytes: 6, fatal: true, reason: "length" });
+    });
+
+    test("room under the policy maximum is a representation bound", () => {
+        expect(boundOf({ maxSize: 10 }, { offset: 4 }))
+            .toEqual({ maxBytes: 6, fatal: true, reason: "size" });
+    });
+
+    test("the tighter of the two representation bounds wins, and names itself", () => {
+        expect(boundOf({ maxSize: 100 }, { length: 10 }))
+            .toEqual({ maxBytes: 10, fatal: true, reason: "length" });
+        expect(boundOf({ maxSize: 10 }, { length: 100 }))
+            .toEqual({ maxBytes: 10, fatal: true, reason: "size" });
+    });
+
+    test("equal representation bounds answer as the client's own declaration", () => {
+        // Declaring exactly the maximum is allowed; sending past it breaks the
+        // declaration the client made, which is the more specific statement.
+        expect(boundOf({ maxSize: 10 }, { length: 10 }))
+            .toEqual({ maxBytes: 10, fatal: true, reason: "length" });
+    });
+
+    test("a per-request ceiling below both is this request's, and not fatal", () => {
+        expect(boundOf({ maxSize: 100, maxAppendSize: 4 }, { length: 50 }))
+            .toEqual({ maxBytes: 4, fatal: false, reason: undefined });
+    });
+
+    test("ties go to the representation bound", () => {
+        // At equal values, crossing the per-append cap crosses the total too,
+        // and that is the terminal one.
+        expect(boundOf({ maxSize: 10, maxAppendSize: 10 }, {}))
+            .toEqual({ maxBytes: 10, fatal: true, reason: "size" });
+    });
+
+    test("with no bound at all there is nothing to cross", () => {
+        expect(boundOf({}, {})).toEqual({ maxBytes: undefined, fatal: false, reason: undefined });
+    });
+
+    test("an offset already past a bound clamps to zero rather than going negative", () => {
+        expect(boundOf({ maxSize: 4 }, { offset: 10 }))
+            .toEqual({ maxBytes: 0, fatal: true, reason: "size" });
+    });
+});
+
+// ─── Reaching the declared end is not the same as saying you are done ───────
+
+describe("a bodyless append at the declared end", () => {
+    const atEnd = (complete: boolean, contentLength?: number) =>
+        evaluateUploadIntent(
+            { kind: "append", offset: 10, contentLength, complete },
+            state({ offset: 10, length: 10 }),
+            {},
+            opts(),
+        );
+
+    test("completes the upload only when the request says it is complete", () => {
+        expect(atEnd(true)).toEqual({ kind: "complete-now", length: 10, events: [] });
+    });
+
+    test("a request that does not claim completion leaves the upload open", () => {
+        // Publishing here would finish an upload on a client that never said
+        // it was finished, and the decision is not reversible.
+        const v = atEnd(false);
+        expect(v.kind).toBe("append-allowed");
+        if (v.kind !== "append-allowed") return;
+        expect(v.completes).toBe(false);
+        // No room left, and crossing what remains is the representation's fault.
+        expect(v.maxBytes).toBe(0);
+        expect(v.maxBytesFatal).toBe(true);
+    });
+
+    test("a completing request that still carries content is inconsistent, not a completion", () => {
+        // The content would land past the declared total, so the request
+        // contradicts itself and nothing is published.
+        expect(atEnd(true, 3)).toEqual({
+            kind: "length-inconsistent",
+            events: [{ kind: "append-rejected", reason: "length-inconsistent" }],
+        });
+    });
+});
+
+// ─── A refused creation is recorded, not just refused ───────────────────────
+
+describe("rejection events on creation", () => {
+    test("content past the declared total records the rejection it answers", () => {
+        // The outcome and the audit trail are two different obligations; a
+        // rejection nothing recorded is invisible to whoever reviews the log.
+        expect(evaluateUploadCreation(
+            { kind: "create", declaredLength: 10, contentLength: 50, hasContent: true, complete: false },
+            {},
+        )).toEqual({
+            kind: "length-inconsistent",
+            events: [{ kind: "append-rejected", reason: "length-inconsistent" }],
+        });
+    });
+
+    test("a malformed length indicator is recorded the same way", () => {
+        expect(evaluateUploadCreation(
+            { kind: "create", declaredLength: -1, hasContent: false, complete: false },
+            {},
+        )).toEqual({
+            kind: "length-inconsistent",
+            events: [{ kind: "append-rejected", reason: "length-inconsistent" }],
+        });
     });
 });

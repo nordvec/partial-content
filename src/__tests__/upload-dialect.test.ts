@@ -42,12 +42,21 @@ const WIRE = {
         problem409: true,
         headLength: true,
     },
+    9: {
+        header: "Upload-Complete",
+        other: "Upload-Incomplete",
+        complete: "?1",
+        incomplete: "?0",
+        patchType: "application/partial-upload" as string | undefined,
+        problem409: true,
+        headLength: true,
+    },
 } as const;
 
 type Version = keyof typeof WIRE;
-const VERSIONS: Version[] = [3, 5, 6];
+const VERSIONS: Version[] = [3, 5, 6, 9];
 
-function bytes(text: string): Uint8Array {
+function bytes(text: string): Uint8Array<ArrayBuffer> {
     return new TextEncoder().encode(text);
 }
 
@@ -356,6 +365,37 @@ for (const version of VERSIONS) {
             expect(tooSmall.status).toBe(400);
         });
 
+        test("a completion whose DURABLE size is under the floor never publishes", async () => {
+            // Distinct from the declared-length check above: nothing is
+            // declared here, so the floor can only be judged from the bytes
+            // that actually landed, at the moment of completion. Publishing an
+            // undersized object is the failure this refuses.
+            const objects: Record<string, { body: Uint8Array }> = {};
+            const { handler } = harness(
+                { policy: { minSize: 5 } },
+                memoryUploadStore({ objects }),
+            );
+            const create = await handler(createRequest(version, {
+                completeness: w.incomplete,
+                body: bytes("ab"),
+                headers: { "Content-Length": "2" },
+            }));
+            expect(create.status).toBe(201);
+            const token = create.headers.get("Location")!.slice("/uploads/".length);
+
+            const done = await handler(patchRequest(version, {
+                offset: "2",
+                completeness: w.complete,
+                body: bytes("c"),
+                headers: { "Content-Length": "1" },
+            }), { uploadToken: token });
+
+            expect(done.status).toBe(400);
+            expectErrorHardening(done);
+            // Nothing reached the published namespace.
+            expect(Object.keys(objects)).toHaveLength(0);
+        });
+
         test("contended resource answers 423, distinct from the 409 re-anchor", async () => {
             // The setup creation legitimately holds the lock (it streams a
             // body); arm the timeout only afterward so the CONTENTION path
@@ -413,7 +453,7 @@ for (const version of VERSIONS) {
             expect(await res.text()).toContain("inconsistent");
         });
 
-        test("zero-content completing retry on a completed upload replays 200", async () => {
+        test("a completing retry on a completed upload answers per the version", async () => {
             const { handler } = harness();
             const { token } = await createIncomplete(handler, version);
             await handler(
@@ -427,9 +467,19 @@ for (const version of VERSIONS) {
                 patchRequest(version, { offset: "10", completeness: w.complete }),
                 { uploadToken: token },
             );
-            expect(replay.status).toBe(200);
-            expect(replay.headers.get("Upload-Offset")).toBe("10");
-            expect(replay.headers.get(w.header)).toBe(w.complete);
+            if (version === 9) {
+                // Interop 9 permits replaying the completion answer, which is
+                // the case a client hits when the original response was lost.
+                expect(replay.status).toBe(200);
+                expect(replay.headers.get("Upload-Offset")).toBe("10");
+                expect(replay.headers.get(w.header)).toBe(w.complete);
+            } else {
+                // Interop 3, 5 and 6 require the refusal, and a client written
+                // against them uses it to learn the upload finished. Answering
+                // 200 there would be this package inventing a wire behaviour
+                // under a version number that means something else.
+                expect(replay.status).toBe(400);
+            }
         });
 
         test("expired resource answers 404", async () => {
@@ -440,14 +490,22 @@ for (const version of VERSIONS) {
             expect(res.status).toBe(404);
         });
 
-        test("GET on the upload resource answers 405 with Allow", async () => {
+        test("GET on the upload resource probes or is refused, per the version", async () => {
             const { handler } = harness();
             const { token } = await createIncomplete(handler, version);
             const res = await handler(resourceRequest(version, "GET"), { uploadToken: token });
-            expect(res.status).toBe(405);
-            expect(res.headers.get("Allow")).toContain("HEAD");
-            expect(res.headers.get("Allow")).toContain("PATCH");
-            expect(res.headers.get("Allow")).toContain("DELETE");
+            if (version === 9) {
+                // Interop 9 admits GET as an offset probe, noting HEAD is
+                // preferred because resumption needs no response content.
+                expect(res.status).toBe(204);
+                expect(res.headers.get("Upload-Offset")).toBe("5");
+            } else {
+                expect(res.status).toBe(405);
+                expect(res.headers.get("Allow")).not.toContain("GET");
+                expect(res.headers.get("Allow")).toContain("HEAD");
+                expect(res.headers.get("Allow")).toContain("PATCH");
+                expect(res.headers.get("Allow")).toContain("DELETE");
+            }
         });
     });
 }
@@ -518,15 +576,17 @@ describe("appending media type gate", () => {
 describe("version gate", () => {
     test("unlisted version answers 400 naming the supported set and echoing the newest", async () => {
         const { handler } = harness();
-        for (const bad of ["9", "4", "0", "-3", "abc", "6.0"]) {
+        for (const bad of ["10", "4", "0", "-3", "abc", "6.0"]) {
             const res = await handler(createRequest(6, {
                 completeness: "?0",
                 omitVersion: true,
                 headers: { [VERSION_HEADER]: bad },
             }));
             expect(res.status).toBe(400);
-            expect(res.headers.get(VERSION_HEADER)).toBe("6");
-            expect(await res.text()).toContain("3, 5, 6");
+            // The newest version this endpoint serves, so a client that can
+            // upgrade learns what to ask for next.
+            expect(res.headers.get(VERSION_HEADER)).toBe("9");
+            expect(await res.text()).toContain("3, 5, 6, 9");
             expectErrorHardening(res);
         }
     });
@@ -540,7 +600,7 @@ describe("version gate", () => {
             { uploadToken: "t" },
         );
         expect(probe.status).toBe(400);
-        expect(await probe.text()).toContain("3, 5, 6");
+        expect(await probe.text()).toContain("3, 5, 6, 9");
     });
 
     test("interopVersions restricts the allowlist", async () => {
@@ -558,7 +618,7 @@ describe("version gate", () => {
         expect(() => createUploadHandler(store, {
             key: () => "k",
             location: (t) => `/u/${t}`,
-            interopVersions: [9],
+            interopVersions: [10],
         })).toThrow(TypeError);
         expect(() => createUploadHandler(store, {
             key: () => "k",
@@ -680,6 +740,123 @@ describe("handler plumbing", () => {
         expect(errors.some((e) => e.operation === "handle")).toBe(true);
     });
 
+    // The token is the capability, and onError is a log surface. `auditKey`
+    // promises the capability never reaches it, which has to hold for the ERROR
+    // as well as for the context: adapters and the filesystem store both put
+    // the token into error text.
+    const CAPABILITY = "tok-abc-123";
+
+    function storeThrowingWithToken(): ResumableWriteStore {
+        const store = memoryUploadStore({ objects: {} });
+        return {
+            ...store,
+            async getUploadState() { throw new Error(`disk on fire for ${CAPABILITY}`); },
+        };
+    }
+
+    test("a store error carrying the token reports the auditKey in its place", async () => {
+        const seen: Array<{ err: unknown; ctx: { uploadToken?: string; auditKey?: string } }> = [];
+        const { handler } = harness({
+            auditKey: () => "audit-42",
+            onError: (err, ctx) => { seen.push({ err, ctx }); },
+        }, storeThrowingWithToken());
+
+        const res = await handler(resourceRequest(6, "HEAD"), { uploadToken: CAPABILITY });
+
+        expect(res.status).toBe(500);
+        expect(seen).toHaveLength(1);
+        // Gone from BOTH halves of the report, not just the context.
+        expect(seen[0]!.ctx.uploadToken).toBeUndefined();
+        expect(seen[0]!.ctx.auditKey).toBe("audit-42");
+        expect((seen[0]!.err as Error).message).not.toContain(CAPABILITY);
+        expect((seen[0]!.err as Error).message).toContain("audit-42");
+    });
+
+    test("without an auditKey the error reaches onError unchanged", async () => {
+        // Substitution is opted into. Absent one, rewriting the error would
+        // strip the only identifier the report carries.
+        const seen: Array<{ err: unknown; ctx: { uploadToken?: string } }> = [];
+        const { handler } = harness({
+            onError: (err, ctx) => { seen.push({ err, ctx }); },
+        }, storeThrowingWithToken());
+
+        const res = await handler(resourceRequest(6, "HEAD"), { uploadToken: CAPABILITY });
+
+        expect(res.status).toBe(500);
+        expect(seen).toHaveLength(1);
+        expect(seen[0]!.ctx.uploadToken).toBe(CAPABILITY);
+        expect((seen[0]!.err as Error).message).toContain(CAPABILITY);
+    });
+
+    test("an auditKey callback that throws cannot break the never-throw contract", async () => {
+        // This seam exists BECAUSE caller callbacks throw, so deriving the
+        // audit key inside it has to be guarded too; an unguarded re-derivation
+        // would throw straight out of the handler.
+        const seen: Array<{ operation: string; uploadToken?: string; auditKey?: string }> = [];
+        const { handler } = harness({
+            auditKey: () => { throw new Error("audit boom"); },
+            onError: (_err, ctx) => { seen.push(ctx); },
+        });
+
+        const res = await handler(resourceRequest(6, "HEAD"), { uploadToken: CAPABILITY });
+
+        expect(res.status).toBe(500);
+        expectErrorHardening(res);
+        const handled = seen.filter((c) => c.operation === "handle");
+        expect(handled).toHaveLength(1);
+        // No usable audit key, so the token is the only identifier left to
+        // report; reporting neither would leave the failure unattributable.
+        expect(handled[0]!.auditKey).toBeUndefined();
+        expect(handled[0]!.uploadToken).toBe(CAPABILITY);
+    });
+
+    /**
+     * Reach the last-resort catch against a REAL upload: create one with a
+     * working clock, then break the clock so the probe throws inside dispatch.
+     * A token that names nothing answers 404 long before anything can throw.
+     */
+    async function catchAllReport(over: Partial<UploadHandlerOptions>) {
+        const seen: Array<{ err: unknown; ctx: { operation: string; uploadToken?: string; auditKey?: string } }> = [];
+        // The thrown error CARRIES the token, so the reported error shows
+        // whether the capability was scrubbed from it and not only from the
+        // context beside it.
+        let boom = "";
+        const { handler } = harness({
+            now: () => { if (boom !== "") throw new Error(`clock boom for ${boom}`); return NOW; },
+            onError: (err, ctx) => { seen.push({ err, ctx }); },
+            ...over,
+        });
+        const { token } = await createIncomplete(handler, 6);
+        boom = token;
+        const res = await handler(resourceRequest(6, "HEAD"), { uploadToken: token });
+        const handled = seen.filter((s) => s.ctx.operation === "handle");
+        return { res, token, handled: handled.map((s) => s.ctx), errors: handled.map((s) => s.err) };
+    }
+
+    test("the last-resort catch reports the auditKey in the token's place", async () => {
+        const { res, token, handled, errors } = await catchAllReport({ auditKey: () => "audit-42" });
+
+        expect(res.status).toBe(500);
+        expectErrorHardening(res);
+        expect(handled).toHaveLength(1);
+        expect(handled[0]!.auditKey).toBe("audit-42");
+        expect(handled[0]!.uploadToken).toBeUndefined();
+        // Scrubbed from the error too, not just from the context beside it.
+        expect((errors[0] as Error).message).not.toContain(token);
+        expect((errors[0] as Error).message).toContain("audit-42");
+    });
+
+    test("with no auditKey at all the last-resort catch reports the token", async () => {
+        const { res, token, handled, errors } = await catchAllReport({});
+
+        expect(res.status).toBe(500);
+        expect(handled).toHaveLength(1);
+        expect(handled[0]!.uploadToken).toBe(token);
+        expect(handled[0]!.auditKey).toBeUndefined();
+        // Nothing to substitute, so the error is passed through as thrown.
+        expect((errors[0] as Error).message).toContain(token);
+    });
+
     test("interop 6 append MISSING the required completeness header is a 400, never a silent completion", async () => {
         // Fail closed: defaulting an absent (or malformed) completeness header
         // to "completing" would publish a truncated object as done. Interop
@@ -781,7 +958,9 @@ describe("Repr-Digest parsing", () => {
 
     // A well-formed 44-char base64 that is NOT the digest of "hello".
     let WRONG: string;
-    // eslint-disable-next-line @typescript-eslint/no-floating-promises
+    // Not floating: the promise is held in `wrongReady` and awaited by each
+    // test that needs it. (The directive that used to sit here named a
+    // type-aware rule this config does not enable, so it suppressed nothing.)
     const wrongReady = sha256Base64("a-different-payload-entirely").then((d) => { WRONG = d; });
 
     test("a well-formed but wrong sha-256 is parsed and rejected 400", async () => {
@@ -942,7 +1121,7 @@ describe("handler plumbing edges", () => {
         const res = await handler(createRequest(6, {
             completeness: "?0",
             omitVersion: true,
-            headers: { [VERSION_HEADER]: "9" },
+            headers: { [VERSION_HEADER]: "10" },
         }));
         expect(res.status).toBe(400);
         expect(res.headers.get(VERSION_HEADER)).toBe("6");
@@ -953,8 +1132,8 @@ describe("handler plumbing edges", () => {
         expect(() => createUploadHandler(store, {
             key: () => "k",
             location: (t) => `/u/${t}`,
-            interopVersions: [9],
-        })).toThrow(/3, 5, 6/);
+            interopVersions: [10],
+        })).toThrow(/3, 5, 6, 9/);
     });
 
     test("an oversized single append answers 413 (append-too-large), distinct from a 400 floor", async () => {
@@ -1107,5 +1286,157 @@ describe("handler plumbing edges", () => {
             { uploadToken: token },
         );
         expect(res.status).toBe(500);
+    });
+});
+
+// ─── A rejected creation that already allocated bytes names them ────────────
+
+describe("creation refused after the resource exists", () => {
+    test("a body over the per-request ceiling answers 413 WITH a Location", async () => {
+        // maxAppendSize bounds this request only, so the prefix that landed is
+        // durable and the resource is healthy: the client resumes it.
+        const { handler } = harness({ policy: { maxAppendSize: 4 } });
+        const res = await handler(createRequest(6, {
+            completeness: "?0",
+            body: bytes("0123456789"),
+        }));
+
+        expect(res.status).toBe(413);
+        const location = res.headers.get("Location");
+        // Without it the four durable bytes are unreachable: not resumable, not
+        // deletable, reclaimed only by a sweep that may never run.
+        expect(location).toMatch(/^\/uploads\/./);
+
+        const token = location!.slice("/uploads/".length);
+        const head = await handler(resourceRequest(6, "HEAD"), { uploadToken: token });
+        expect(head.status).toBe(204);
+        expect(head.headers.get("Upload-Offset")).toBe("4");
+    });
+
+    test("a creation whose content exceeds the length it declares is refused outright", async () => {
+        const { handler } = harness();
+        const res = await handler(new Request("http://test/upload", {
+            method: "POST",
+            headers: {
+                [VERSION_HEADER]: "6",
+                [WIRE[6].header]: "?0",
+                "Upload-Length": "4",
+                "Content-Length": "10",
+            },
+            body: bytes("0123456789"),
+        }));
+
+        // Refused before allocation, so there is nothing to point at: reaching
+        // the store would truncate at the bound and destroy an upload the
+        // client was about to be told it had created.
+        expect(res.status).toBe(400);
+        expect(res.headers.get("Location")).toBeNull();
+    });
+});
+
+// ─── Upload-Limit carries exactly the bounds that are set ───────────────────
+
+describe("Upload-Limit serialization", () => {
+    const limitFor = async (policy: Record<string, number>) => {
+        const { handler } = harness({ policy });
+        const created = await handler(createRequest(9, { completeness: "?0" }));
+        const token = created.headers.get("Location")!.slice("/uploads/".length);
+        const probe = await handler(resourceRequest(9, "HEAD"), { uploadToken: token });
+        return probe.headers.get("Upload-Limit");
+    };
+
+    test("every configured bound appears, and nothing else does", async () => {
+        expect(await limitFor({
+            maxSize: 1024, minSize: 2, maxAppendSize: 64, minAppendSize: 1, maxAgeSeconds: 3600,
+        })).toBe("max-size=1024, min-size=2, max-append-size=64, min-append-size=1, max-age=3600");
+    });
+
+    test("a bound that is not set is absent rather than guessed", async () => {
+        expect(await limitFor({ maxSize: 1024 })).toBe("max-size=1024, min-size=0");
+        expect(await limitFor({ maxAppendSize: 64 })).toBe("min-size=0, max-append-size=64");
+        expect(await limitFor({ minAppendSize: 1 })).toBe("min-size=0, min-append-size=1");
+        expect(await limitFor({ maxAgeSeconds: 60 })).toBe("min-size=0, max-age=60");
+    });
+
+    test("a server applying no limits still says so", async () => {
+        // An empty value is not a valid structured-field dictionary, and
+        // silence about limits is what makes a client guess a chunk size.
+        expect(await limitFor({})).toBe("min-size=0");
+    });
+
+    test("a configured minimum is reported rather than the zero default", async () => {
+        expect(await limitFor({ minSize: 7 })).toBe("min-size=7");
+    });
+
+    test("a rejection caused by a limit carries the limits", async () => {
+        // The client's retry then aims at a number instead of guessing.
+        const { handler } = harness({ policy: { maxSize: 4, maxAppendSize: 2 } });
+        const res = await handler(createRequest(9, {
+            completeness: "?0",
+            headers: { "Upload-Length": "99" },
+        }));
+        expect(res.status).toBe(413);
+        expect(res.headers.get("Upload-Limit")).toBe("max-size=4, min-size=0, max-append-size=2");
+    });
+
+    test("versions that do not define the field do not emit it", async () => {
+        const { handler } = harness({ policy: { maxSize: 1024 } });
+        const created = await handler(createRequest(6, { completeness: "?0" }));
+        const token = created.headers.get("Location")!.slice("/uploads/".length);
+        const probe = await handler(resourceRequest(6, "HEAD"), { uploadToken: token });
+        expect(probe.headers.get("Upload-Limit")).toBeNull();
+    });
+});
+
+// ─── Discovery answers what it will enforce ─────────────────────────────────
+
+describe("OPTIONS", () => {
+    test("announces the limits, so a client sizes its first request", async () => {
+        const { handler } = harness({ policy: { maxSize: 1024, maxAppendSize: 64 } });
+        const res = await handler(new Request("http://test/upload", { method: "OPTIONS" }));
+
+        expect(res.status).toBe(204);
+        // Asking is the whole point: without this a client learns the ceiling
+        // by being refused at it.
+        expect(res.headers.get("Upload-Limit")).toBe("max-size=1024, min-size=0, max-append-size=64");
+        expect(res.headers.get("Allow")).toContain("POST");
+    });
+
+    test("a server applying no limits still answers the field", async () => {
+        const { handler } = harness();
+        const res = await handler(new Request("http://test/upload", { method: "OPTIONS" }));
+        expect(res.headers.get("Upload-Limit")).toBe("min-size=0");
+    });
+});
+
+// ─── A registered problem type where the version defines one ────────────────
+
+describe("inconsistent length answers", () => {
+    const inconsistent = (version: Version) => {
+        const { handler } = harness();
+        return handler(createRequest(version, {
+            completeness: WIRE[version].complete,
+            headers: { "Upload-Length": "4", "Content-Length": "10" },
+            body: bytes("0123456789"),
+        }));
+    };
+
+    test("interop 9 carries the registered problem type as problem+json", async () => {
+        const res = await inconsistent(9);
+        expect(res.status).toBe(400);
+        expect(res.headers.get("Content-Type")).toBe("application/problem+json");
+        const body = await res.json() as { type: string; title: string };
+        expect(body.type).toBe("https://iana.org/assignments/http-problem-types#inconsistent-upload-length");
+        expect(body.title).toBe("inconsistent length values for upload");
+    });
+
+    test("versions predating the registration name the same fault in plain text", async () => {
+        for (const version of [3, 5, 6] as const) {
+            const res = await inconsistent(version);
+            expect(res.status).toBe(400);
+            // A type they cannot resolve would be worse than prose.
+            expect(res.headers.get("Content-Type")).toContain("text/plain");
+            expect(await res.text()).toContain("inconsistent");
+        }
     });
 });

@@ -9,6 +9,7 @@ import {
     ObjectNotFoundError,
     UploadNotFoundError,
     UploadOffsetConflictError,
+    UploadOverrunError,
     UploadDigestMismatchError,
 } from "../fs";
 import { isUploadOffsetConflictError } from "../upload-store";
@@ -191,10 +192,9 @@ describe("fsUploadStore: restart simulation (no in-memory state)", () => {
     test("maxBytes invalidation is durable: a fresh instance still refuses", async () => {
         const writer = fsUploadStore({ root });
         const { uploadToken } = await writer.createUpload({ key: "k.bin", now: 0 });
-        const result = await writer.appendChunk(
-            uploadToken, 0, enc.encode("0123456789"), { maxBytes: 4, now: 1 },
-        );
-        expect(result.bytesWritten).toBe(4);
+        await expect(writer.appendChunk(
+            uploadToken, 0, enc.encode("0123456789"), { maxBytes: 4, maxBytesFatal: true, now: 1 },
+        )).rejects.toBeInstanceOf(UploadOverrunError);
 
         const restarted = fsUploadStore({ root });
         const state = await restarted.getUploadState(uploadToken);
@@ -316,10 +316,9 @@ describe("fsUploadStore: maxBytes bound", () => {
     test("a stream crossing the bound mid-chunk keeps the exact prefix and invalidates durably", async () => {
         const store = fsUploadStore({ root });
         const { uploadToken } = await store.createUpload({ key: "k.bin", now: 0 });
-        const result = await store.appendChunk(
-            uploadToken, 0, streamOf("abc", "defg"), { maxBytes: 5, now: 1 },
-        );
-        expect(result.bytesWritten).toBe(5);
+        await expect(store.appendChunk(
+            uploadToken, 0, streamOf("abc", "defg"), { maxBytes: 5, maxBytesFatal: true, now: 1 },
+        )).rejects.toBeInstanceOf(UploadOverrunError);
         const state = await store.getUploadState(uploadToken);
         expect(state.offset).toBe(5);
         expect(state.isInvalidated).toBe(true);
@@ -331,7 +330,7 @@ describe("fsUploadStore: maxBytes bound", () => {
         const store = fsUploadStore({ root });
         const { uploadToken } = await store.createUpload({ key: "k.bin", now: 0 });
         const result = await store.appendChunk(
-            uploadToken, 0, enc.encode("abcd"), { maxBytes: 4, now: 1 },
+            uploadToken, 0, enc.encode("abcd"), { maxBytes: 4, maxBytesFatal: true, now: 1 },
         );
         expect(result.bytesWritten).toBe(4);
         const state = await store.getUploadState(uploadToken);
@@ -352,7 +351,8 @@ describe("fsUploadStore: maxBytes bound", () => {
                 cancelled = true;
             },
         });
-        await store.appendChunk(uploadToken, 0, body, { maxBytes: 4, now: 1 });
+        await expect(store.appendChunk(uploadToken, 0, body, { maxBytes: 4, maxBytesFatal: true, now: 1 }))
+            .rejects.toBeInstanceOf(UploadOverrunError);
         // The producer is told to stop; without the cancel it would sit on
         // an abandoned locked reader forever.
         expect(cancelled).toBe(true);
@@ -616,5 +616,88 @@ describe("fsUploadStore: abort", () => {
         await store.abortUpload(uploadToken); // second discard: no-op
         await expect(store.getUploadState(uploadToken)).rejects.toBeInstanceOf(UploadNotFoundError);
         expect(await readdir(join(root, ".uploads"))).toEqual([]);
+    });
+
+    test("aborting a completed upload discards the resource but never the published object", async () => {
+        // Store contract: once completeUpload returns, the object at the key is
+        // live data readers can already be serving, and abort is idempotent, so
+        // an abort that deleted it would destroy production data on a DELETE
+        // that arrived late, was retried, or was replayed.
+        const store = fsUploadStore({ root });
+        const { uploadToken } = await store.createUpload({ key: "k.bin", now: 0 });
+        await store.appendChunk(uploadToken, 0, enc.encode("abc"), { now: 1 });
+        await store.completeUpload(uploadToken, { now: 2 });
+
+        await store.abortUpload(uploadToken);
+        await store.abortUpload(uploadToken); // and again: still not destructive
+        await expect(store.getUploadState(uploadToken)).rejects.toBeInstanceOf(UploadNotFoundError);
+        expect((await fsStore({ root }).headObject("k.bin")).contentLength).toBe(3);
+    });
+});
+
+// ─── A read store never serves an upload store's bookkeeping ────────────────
+
+describe("fsStore: reserved upload prefix", () => {
+    test("in-flight upload bytes and their sidecar are not readable", async () => {
+        const up = fsUploadStore({ root });
+        const read = fsStore({ root });
+        const { uploadToken } = await up.createUpload({ key: "private/secret.txt", now: 0 });
+        await up.appendChunk(uploadToken, 0, enc.encode("TOPSECRET"), { now: 1 });
+
+        // The bytes of an upload nobody published, and the sidecar naming the
+        // key it is destined for, which commonly embeds a filename. Upload
+        // tokens are the only handles into that namespace and a read handler
+        // holds none.
+        await expect(read.headObject(`.uploads/${uploadToken}`))
+            .rejects.toBeInstanceOf(ObjectNotFoundError);
+        await expect(read.getObject(`.uploads/${uploadToken}`))
+            .rejects.toBeInstanceOf(ObjectNotFoundError);
+        await expect(read.getObject(`.uploads/${uploadToken}.json`))
+            .rejects.toBeInstanceOf(ObjectNotFoundError);
+        await expect(read.getObject(".uploads"))
+            .rejects.toBeInstanceOf(ObjectNotFoundError);
+    });
+
+    test("a published object sharing the root is unaffected", async () => {
+        await mkdir(join(root, "public"), { recursive: true });
+        await writeFile(join(root, "public", "ok.txt"), "PUBLISHED");
+        const read = fsStore({ root });
+        expect((await read.headObject("public/ok.txt")).contentLength).toBe(9);
+    });
+
+    test("a key that merely starts with the same letters is not reserved", async () => {
+        await writeFile(join(root, ".uploadsomething"), "FINE");
+        const read = fsStore({ root });
+        expect((await read.headObject(".uploadsomething")).contentLength).toBe(4);
+    });
+
+    test("an empty reservedPrefix serves the whole namespace", async () => {
+        const up = fsUploadStore({ root });
+        const read = fsStore({ root, reservedPrefix: "" });
+        const { uploadToken } = await up.createUpload({ key: "k.bin", now: 0 });
+        await up.appendChunk(uploadToken, 0, enc.encode("bytes"), { now: 1 });
+        // The escape hatch for a root no upload store shares.
+        expect((await read.headObject(`.uploads/${uploadToken}`)).contentLength).toBe(5);
+    });
+});
+
+// ─── A relative root points somewhere else in production ────────────────────
+
+describe("fsStore / fsUploadStore: root validation", () => {
+    test("a relative root is refused, naming why it is not merely inconvenient", () => {
+        // It resolves against process.cwd(), which is the shell's directory in
+        // development and the service manager's in production, so the same
+        // configuration addresses two different places.
+        expect(() => fsStore({ root: "./data" })).toThrow(/absolute path/);
+        expect(() => fsUploadStore({ root: "data/uploads" })).toThrow(/process\.cwd\(\)/);
+    });
+
+    test("a missing root is refused", () => {
+        expect(() => fsStore({} as never)).toThrow(/options\.root is required/);
+        expect(() => fsUploadStore({ root: "" })).toThrow(TypeError);
+    });
+
+    test("an absolute root is accepted", () => {
+        expect(() => fsUploadStore({ root })).not.toThrow();
     });
 });

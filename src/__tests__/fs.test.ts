@@ -4,7 +4,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { serveObject } from "../web";
 import { fsStore, ObjectNotFoundError } from "../fs";
+import { asStream } from "./helpers";
+import type { ObjectStream } from "../index";
 
+/**
+ * The streaming half of an {@link ObjectStream} body. This store serves
+ * files above its single-read limit as a stream, so a byte body here means the
+ * size boundary moved and the assertion is measuring the wrong path.
+ */
 let root: string;
 
 beforeAll(async () => {
@@ -237,7 +244,7 @@ describe("fsStore: large transfers (ReadStream path, above the single-read limit
         const result = await store.getObject("big.bin");
         // Cancel without reading: autoClose must release the handle so the
         // afterAll rm() does not fail with EBUSY on Windows.
-        await result.body.cancel();
+        await asStream(result.body).cancel();
     });
 
     test("a file exactly at the single-read limit takes the byte-body fast path", async () => {
@@ -538,9 +545,14 @@ describe("fsStore: opt-in hot-object cache", () => {
 
     test("large files never enter the byte cache (always stream fresh)", async () => {
         const store = fsStore({ root, cache: { ttlMs: 60_000 } });
-        await store.getObject("big.bin"); // streams; must not cache bytes
+        // Streams; must not cache bytes. Each stream is CANCELLED, never
+        // abandoned: an unconsumed stream holds its FileHandle open, and a
+        // handle collected while open is a runtime error that lands
+        // asynchronously in whichever unrelated test is running when GC fires.
+        await ((await store.getObject("big.bin")).body as ReadableStream).cancel();
         const again = await store.getObject("big.bin");
         expect(again.body).toBeInstanceOf(ReadableStream);
+        await (again.body as ReadableStream).cancel();
         // The streaming path still writes back real metadata: a follow-up
         // HEAD serves coherent values from the cache, not an empty entry.
         const meta = await store.headObject("big.bin");

@@ -32,7 +32,14 @@
  * lists, an fsynced stat), never from a separately persisted counter.
  */
 export interface UploadState {
-  /** Bytes durably committed. Monotonic; never client-supplied. */
+  /**
+   * Bytes durably committed. Never client-supplied, and monotonic except for
+   * one bounded regression: an adapter that stages a sub-minimum remainder
+   * outside the backend's own part accounting must remove it before folding
+   * it into a part, so a crash in that window drops it and the client resumes
+   * lower. Understating is the safe direction (a re-sent chunk); overstating
+   * would silently skip bytes the client believes landed.
+   */
   offset: number;
   /** Total representation length. Immutable once known; undefined = deferred. */
   length?: number;
@@ -97,7 +104,7 @@ export interface CreateIntent {
 }
 
 /** Read the current offset/completeness (HEAD/GET on the upload resource). */
-interface ProbeIntent {
+export interface ProbeIntent {
   kind: "probe";
 }
 
@@ -115,7 +122,7 @@ export interface AppendIntent {
 }
 
 /** Cancel the upload resource (DELETE). */
-interface CancelIntent {
+export interface CancelIntent {
   kind: "cancel";
 }
 
@@ -135,7 +142,17 @@ export interface UploadEvaluateOptions {
 
 // ─── Verdicts ───────────────────────────────────────────────────────────────
 
-/** Audit event synthesized by an evaluation. Content-free by construction. */
+/**
+ * Audit event synthesized by an evaluation. Content-free by construction.
+ *
+ * A verdict only ever carries DECISION events (created, append-accepted,
+ * append-rejected, expired): facts that are already true the moment the engine
+ * answers. The OUTCOME events (`completed`, `cancelled`) describe a store
+ * action the engine does not perform and cannot know the result of, so they
+ * are the orchestrator's to emit, after that action returns. Synthesizing one
+ * here would record an outcome a throwing `completeUpload`/`abortUpload` never
+ * produced.
+ */
 export type UploadAuditEvent =
   | { kind: "created"; declaredLength?: number }
   | { kind: "append-accepted"; atOffset: number; completes: boolean }
@@ -144,6 +161,12 @@ export type UploadAuditEvent =
   | { kind: "cancelled" }
   | { kind: "expired" };
 
+/**
+ * Which representation bound a fatal append crossed: the length the client
+ * declared, or the policy's total maximum.
+ */
+export type FatalBoundReason = "length" | "size";
+
 type UploadRejectReason =
   | "offset-mismatch"
   | "length-inconsistent"
@@ -151,7 +174,6 @@ type UploadRejectReason =
   | "append-too-small"
   | "append-too-large"
   | "below-min-size"
-  | "already-complete"
   | "invalidated"
   | "expired";
 
@@ -168,6 +190,13 @@ export type UploadVerdict =
       declaredLength?: number;
       /** Bytes this request may append at offset 0 (policy-clamped bound). */
       maxBytes?: number;
+      /** Whether crossing `maxBytes` is the representation's terminal fault. */
+      maxBytesFatal: boolean;
+      /**
+       * Which representation bound `maxBytes` came from, when crossing it is
+       * fatal. Both invalidate; they differ only in what the client is told.
+       */
+      fatalReason?: FatalBoundReason;
       /** The request also completes the upload once content is processed. */
       completes: boolean;
       events: UploadAuditEvent[];
@@ -189,10 +218,22 @@ export type UploadVerdict =
       /**
        * Hard byte bound for this append: remaining space toward a known
        * length and/or the per-append cap. The orchestrator MUST enforce it
-       * while streaming when the content size was not known up front;
-       * exceeding it means the resource is invalidated.
+       * while streaming when the content size was not known up front.
        */
       maxBytes?: number;
+      /**
+       * Whether crossing `maxBytes` is the representation's terminal fault
+       * (invalidate) or merely this request's ceiling (stop at the bound and
+       * let the client resume). See {@link appendBound}: the two are different
+       * constraints and only one of them means the upload can never be
+       * completed coherently.
+       */
+      maxBytesFatal: boolean;
+      /**
+       * Which representation bound `maxBytes` came from, when crossing it is
+       * fatal. Both invalidate; they differ only in what the client is told.
+       */
+      fatalReason?: FatalBoundReason;
       /** Length to record when this request declared it for the first time. */
       declaredLength?: number;
       /** Whether full processing of this content completes the upload. */
@@ -214,8 +255,11 @@ export type UploadVerdict =
     }
   /** Valid re-interaction with a completed upload (idempotent retry). */
   | { kind: "already-complete"; length?: number; events: UploadAuditEvent[] }
-  /** Another request is active and preemption is disabled. */
-  /** The locker could not hand over in time (a stalled holder); retry later. */
+  /**
+   * The locker could not hand over in time (a stalled holder); retry later.
+   * Produced by the orchestrator, which owns the lock, never by an engine
+   * decision; the arm lives here so a dialect maps one verdict union.
+   */
   | { kind: "contended"; events: UploadAuditEvent[] }
   /** Policy bound violated before any byte moved. */
   | {
@@ -315,6 +359,20 @@ export function evaluateUploadCreation(
     };
   }
 
+  // Content larger than the total it declares is the same inconsistency
+  // whether or not the request completes: the surplus bytes have nowhere to
+  // go, and letting them reach the store trades a 400 for a dead resource.
+  if (
+    intent.declaredLength !== undefined
+    && intent.contentLength !== undefined
+    && intent.contentLength > intent.declaredLength
+  ) {
+    return {
+      kind: "length-inconsistent",
+      events: [{ kind: "append-rejected", reason: "length-inconsistent" }],
+    };
+  }
+
   const knownTotal = intent.declaredLength
     ?? (intent.complete ? intent.contentLength : undefined);
 
@@ -365,7 +423,7 @@ export function evaluateUploadCreation(
   return {
     kind: "create-accepted",
     declaredLength: knownTotal,
-    maxBytes: appendBound(0, knownTotal, policy),
+    ...appendBound(0, knownTotal, policy),
     completes: intent.complete,
     events: [{ kind: "created", declaredLength: knownTotal }],
   };
@@ -375,9 +433,10 @@ export function evaluateUploadCreation(
 
 /**
  * Evaluate an interaction with an EXISTING upload resource against freshly
- * adapter-derived state. The verdict's ordering rules are load-bearing:
- * terminal states first, then contention, then per-intent logic, so a dead
- * or contended resource can never leak an `append-allowed`.
+ * adapter-derived state. The verdict's ordering rules are load-bearing: cancel
+ * is answered first (a DELETE must free a dead resource's bytes), then terminal
+ * states, then per-intent logic, so a dead resource can never leak an
+ * `append-allowed` yet can always be reclaimed.
  */
 export function evaluateUploadIntent(
   intent: UploadIntent,
@@ -385,19 +444,27 @@ export function evaluateUploadIntent(
   policy: UploadPolicy,
   opts: UploadEvaluateOptions,
 ): UploadVerdict {
+  // DELETE is the one verb that must succeed on a dead resource: a client
+  // told its upload is invalidated or expired still needs to free the partial
+  // bytes, and abortUpload is idempotent, so cancel is answered BEFORE the
+  // terminal refusals that gate every other interaction. Refusing a cancel
+  // post-invalidation would strand the bytes until a sweep (forever without a
+  // max age). Cancels also preempt whatever is running; that is their point.
+  // The `cancelled` event belongs to whoever discards the bytes, not to this
+  // decision, so the verdict carries none.
+  if (intent.kind === "cancel") {
+    return { kind: "cancel-accepted", events: [] };
+  }
+
+  // Everything else reads the state's numbers, so they must be numbers.
   assertSaneState(state);
 
-  // Terminal states answer everything, including cancels.
+  // Terminal states answer everything else.
   if (state.isInvalidated) {
     return { kind: "gone", reason: "invalidated", events: [{ kind: "append-rejected", reason: "invalidated" }] };
   }
   if (isExpired(state, policy, opts.now)) {
     return { kind: "gone", reason: "expired", events: [{ kind: "expired" }] };
-  }
-
-  if (intent.kind === "cancel") {
-    // Cancels preempt whatever is running; that is their point.
-    return { kind: "cancel-accepted", events: [{ kind: "cancelled" }] };
   }
 
   if (intent.kind === "probe") {
@@ -441,6 +508,23 @@ function evaluateAppend(
     };
   }
   const length = state.length ?? intent.declaredLength;
+
+  // A length this request is the first to declare is a total, and a total over
+  // the policy maximum is refused wherever it is declared. Creation checks the
+  // same thing; without this, a deferred-length upload could name a size the
+  // policy forbids and only discover it while streaming, as a dead resource.
+  if (
+    state.length === undefined
+    && intent.declaredLength !== undefined
+    && policy.maxSize !== undefined
+    && intent.declaredLength > policy.maxSize
+  ) {
+    return {
+      kind: "limit-violation",
+      reason: "size-exceeded",
+      events: [{ kind: "append-rejected", reason: "size-exceeded", atOffset: intent.offset }],
+    };
+  }
 
   // A completing request with a known content size fixes the total; it must
   // agree with any known length.
@@ -513,20 +597,20 @@ function evaluateAppend(
     }
   }
 
-  // Zero-content completion of an upload already at its declared length.
-  if (intent.complete && !intent.contentLength && length !== undefined && state.offset === length) {
-    return {
-      kind: "complete-now",
-      length,
-      events: [{ kind: "completed", length }],
-    };
+  // Zero-content completion of an upload already at its declared length. The
+  // `completed` event belongs to whoever publishes, not to this decision.
+  if (
+    intent.complete && !intent.contentLength
+    && state.length !== undefined && state.offset === state.length
+  ) {
+    return { kind: "complete-now", length: state.length, events: [] };
   }
 
   const completes = intent.complete;
   return {
     kind: "append-allowed",
     atOffset: state.offset,
-    maxBytes: appendBound(state.offset, length, policy),
+    ...appendBound(state.offset, length, policy),
     declaredLength: state.length === undefined ? intent.declaredLength : undefined,
     completes,
     events: [{ kind: "append-accepted", atOffset: state.offset, completes }],
@@ -544,19 +628,51 @@ function mismatch(claimedOffset: number, state: UploadState): UploadVerdict {
 }
 
 /**
- * Hard byte bound for one append: remaining room toward a known length,
- * remaining room under the policy maximum, and the per-append cap, whichever
- * is smallest. Undefined when nothing bounds the append.
+ * Hard byte bound for one append, and whether crossing it is fatal.
+ *
+ * Three different constraints can bind, and they do NOT deserve the same
+ * consequence. Room toward a known length and room under `maxSize` are bounds
+ * on the REPRESENTATION: bytes past either are the spec's terminal fault, the
+ * resource can never be completed coherently, and invalidation is the honest
+ * answer. `maxAppendSize` bounds only THIS REQUEST (a server nicety, or a
+ * backend's own per-call ceiling), and a body that runs past it has done
+ * nothing wrong to the representation, so destroying the upload over it turns
+ * a resumable situation into a lost one. That case stops at the bound and lets
+ * the client resume from the truthful offset.
+ *
+ * A known content size never reaches here: the engine rejects an oversized
+ * append up front with `append-too-large`, so the non-fatal path exists for
+ * the case that cannot be checked in advance, an unknown-length (chunked) body.
  */
 function appendBound(
   offset: number,
   length: number | undefined,
   policy: UploadPolicy,
-): number | undefined {
-  const bounds: number[] = [];
-  if (length !== undefined) bounds.push(length - offset);
-  if (policy.maxSize !== undefined) bounds.push(policy.maxSize - offset);
-  if (policy.maxAppendSize !== undefined) bounds.push(policy.maxAppendSize);
-  if (bounds.length === 0) return undefined;
-  return Math.max(0, Math.min(...bounds));
+): { maxBytes: number | undefined; maxBytesFatal: boolean; fatalReason?: FatalBoundReason } {
+  // Representation bounds: crossing one is terminal.
+  const roomToLength = length === undefined ? undefined : Math.max(0, length - offset);
+  const roomToMax = policy.maxSize === undefined ? undefined : Math.max(0, policy.maxSize - offset);
+  const totalBound = roomToLength === undefined
+    ? roomToMax
+    : (roomToMax === undefined ? roomToLength : Math.min(roomToLength, roomToMax));
+  const perAppend = policy.maxAppendSize;
+
+  if (totalBound === undefined) {
+    return { maxBytes: perAppend, maxBytesFatal: false };
+  }
+  // Ties go to the representation bound: at equal values, crossing the
+  // per-append cap crosses the total too, and that is the terminal one.
+  if (perAppend === undefined || totalBound <= perAppend) {
+    // Which of the two representation bounds binds decides the ANSWER, not the
+    // consequence: both invalidate, but a body past the length the client
+    // itself declared is that inconsistency, while a body past the server's
+    // ceiling is a size violation. A tie means the client declared exactly the
+    // maximum, so its own declaration is the one it broke.
+    const fatalReason: FatalBoundReason =
+      roomToLength !== undefined && (roomToMax === undefined || roomToLength <= roomToMax)
+        ? "length"
+        : "size";
+    return { maxBytes: totalBound, maxBytesFatal: true, fatalReason };
+  }
+  return { maxBytes: perAppend, maxBytesFatal: false };
 }

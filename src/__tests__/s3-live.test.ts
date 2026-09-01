@@ -8,6 +8,8 @@ import {
 import { s3Store } from "../s3";
 import { serveObject } from "../web";
 import { ObjectChangedError } from "../object-store";
+import { asStream } from "./helpers";
+import type { ObjectStream } from "../index";
 
 /**
  * LIVE integration tests against a real S3-compatible endpoint.
@@ -73,6 +75,11 @@ describe.skipIf(!configured)("s3Store: LIVE S3-compatible endpoint", () => {
         client.destroy();
     });
 
+    /**
+     * The streaming half of an {@link ObjectStream} body. This store hands back
+     * the SDK's own body, which is always a stream, so a byte body means the
+     * adapter stopped streaming and the assertion is measuring the wrong path.
+     */
     async function drain(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
         const chunks: Uint8Array[] = [];
         for await (const chunk of stream) chunks.push(chunk);
@@ -91,7 +98,7 @@ describe.skipIf(!configured)("s3Store: LIVE S3-compatible endpoint", () => {
     test("getObject full: exact bytes and matching validators", async () => {
         const result = await store.getObject(KEY);
 
-        expect(await drain(result.body)).toEqual(Buffer.from(CONTENT));
+        expect(await drain(asStream(result.body))).toEqual(Buffer.from(CONTENT));
         expect(result.totalSize).toBe(36);
         expect(result.contentLength).toBe(36);
         expect(result.range).toBeUndefined();
@@ -100,7 +107,7 @@ describe.skipIf(!configured)("s3Store: LIVE S3-compatible endpoint", () => {
     test("getObject range: real backend Content-Range parsed into structured bounds", async () => {
         const result = await store.getObject(KEY, { range: { start: 10, end: 19 } });
 
-        expect(new TextDecoder().decode(await drain(result.body))).toBe("abcdefghij");
+        expect(new TextDecoder().decode(await drain(asStream(result.body)))).toBe("abcdefghij");
         expect(result.range).toEqual({ start: 10, end: 19 });
         expect(result.totalSize).toBe(36);
         expect(result.contentLength).toBe(10);
@@ -109,7 +116,7 @@ describe.skipIf(!configured)("s3Store: LIVE S3-compatible endpoint", () => {
     test("pinned read: real If-Match honors the current etag and rejects a stale one", async () => {
         const meta = await store.headObject(KEY);
         const pinned = await store.getObject(KEY, { range: { start: 0, end: 4 }, ifMatch: meta.etag });
-        expect(new TextDecoder().decode(await drain(pinned.body))).toBe("01234");
+        expect(new TextDecoder().decode(await drain(asStream(pinned.body)))).toBe("01234");
 
         await expect(
             store.getObject(KEY, { ifMatch: '"0123456789abcdef0123456789abcdef"' }),

@@ -105,6 +105,10 @@ const DEFAULT_WRITE_STALL_MS = 60_000;
  * web adapter's `serveObject`, then writes the Fetch `Response` back to the
  * Node.js `ServerResponse`.
  */
+export type { ServeObjectOptions, ServeContext } from "./web.ts";
+export type { ObjectStore } from "./index.ts";
+export { ObjectNotFoundError, ObjectChangedError, StoreUnavailableError } from "./index.ts";
+
 export function serveObject<Req extends IncomingMessage = IncomingMessage>(
   store: ObjectStore,
   opts: NodeServeOptions<Req>,

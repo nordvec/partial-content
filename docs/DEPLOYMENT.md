@@ -113,6 +113,7 @@ server can receive requests for the same upload (a horizontally scaled
 deployment without upload-affinity routing), supply a shared locker:
 
 ```typescript
+// doc-check: fragment
 import { redisUploadLocker } from "partial-content/redis-locker";
 
 const handler = createTusHandler(store, {
@@ -121,10 +122,38 @@ const handler = createTusHandler(store, {
 });
 ```
 
-See the API reference (Locking) for the client-adapter shape and the fencing /
+See the API reference (Locking) for the client-adapter shape and the hold-id /
 watchdog / preemption semantics. Alternatively, route all requests for one
 upload resource to the same instance (sticky sessions keyed on the upload
 `Location`) and keep the in-process locker.
+
+How long a request waits for a contended resource before answering `423` is
+`UploadOrchestratorOptions.lockTimeoutMs` (15 s by default, from whichever
+locker is installed). The dialect factories do not expose it, so a deployment
+that wants a shorter wait than the default builds its orchestrator directly,
+or lowers the locker's own `acquireTimeoutMs`.
+
+## Verifying a custom store before it carries traffic
+
+`createUploadOrchestrator` refuses a store that declares
+`atomicCompletion: false` or `enforcesOffsetCheck: false`, and it cannot do
+more than that: a store which declares the at-write offset check and does not
+perform it constructs cleanly and serves uploads correctly until a lock is
+stolen from a holder that stalled past its TTL. Run
+`checkResumableWriteStore` from `partial-content/conformance` against a
+staging bucket as a CI step or a startup self-test. It needs no test framework
+and no dependencies, and it reports every gap in one run rather than the
+first. `restartable: false` is for a store that is in-process by
+construction; it SKIPS the cross-instance durability checks rather than
+passing them, and the report says so.
+
+A custom read store has its own harness, `checkObjectStore`, over the same
+report shape. It pins the head length, a byte-identical full read, the exact
+window a ranged read was asked for, an honest total size on that partial read,
+and a not-found the adapter can tell from an outage. It only reads, so unlike
+the write-side run it needs no disposable keys: point it at an object the
+staging bucket already serves, and pass that object's exact bytes. See the API
+reference (Store conformance) for both check lists and the options.
 
 ## Storage on a network volume
 

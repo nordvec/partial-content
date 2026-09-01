@@ -165,3 +165,23 @@ describe("memoryStore: authoritative-range fast path", () => {
         expect(res.headers.get("Content-Range")).toBe("bytes */10");
     });
 });
+
+// ─── Both memory factories refuse a missing publish map ─────────────────────
+
+describe("memoryStore: construction", () => {
+    test("every shape that is not a map is refused, not just an absent one", () => {
+        // A missing map is the common mistake, but a null or a primitive slips
+        // past a bare truthiness check and fails later, at the first request.
+        for (const bad of [undefined, null, { objects: null }, { objects: 42 }, { objects: "x" }]) {
+            expect(() => memoryStore(bad as never)).toThrow(TypeError);
+        }
+    });
+
+    test("the message names the option that is missing", () => {
+        expect(() => memoryStore({} as never)).toThrow(/options\.objects is required/);
+    });
+
+    test("a map is accepted", () => {
+        expect(() => memoryStore({ objects: { "a.txt": { body: "hi" } } })).not.toThrow();
+    });
+});

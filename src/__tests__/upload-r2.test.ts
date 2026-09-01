@@ -1,4 +1,5 @@
 import { describe, test, expect } from "bun:test";
+import { checkResumableWriteStore } from "../conformance";
 import { r2UploadStore, UploadNotFoundError, UploadOffsetConflictError } from "../r2";
 
 // ─── Mock R2 Bucket (multipart upload surface) ──────────────────────────────
@@ -318,8 +319,8 @@ describe("r2UploadStore: guards", () => {
         const { uploadToken } = await store.createUpload({ key: "g.bin", now: NOW });
 
         await expect(
-            store.appendChunk(uploadToken, 0, streamOf(bytes(1, 2, 3), bytes(4, 5, 6)), { now: NOW, maxBytes: 5 }),
-        ).rejects.toThrow(/byte bound/);
+            store.appendChunk(uploadToken, 0, streamOf(bytes(1, 2, 3), bytes(4, 5, 6)), { now: NOW, maxBytes: 5, maxBytesFatal: true }),
+        ).rejects.toThrow(/representation bound/);
 
         const state = await store.getUploadState(uploadToken);
         expect(state.isInvalidated).toBe(true);
@@ -394,15 +395,24 @@ describe("r2UploadStore: not-found and token integrity", () => {
         await expect(store.getUploadState(uploadToken)).rejects.toBeInstanceOf(UploadNotFoundError);
     });
 
-    test("a token whose key was tampered answers UploadNotFoundError", async () => {
+    test("the token is the resource id and discloses nothing about the key", async () => {
         const { store } = makeStore();
-        const { uploadToken } = await store.createUpload({ key: "victim.bin", now: NOW });
-        const decoded = JSON.parse(new TextDecoder().decode(
-            Uint8Array.from(atob(uploadToken.replace(/-/g, "+").replace(/_/g, "/")), (c) => c.charCodeAt(0)),
-        )) as { key: string; id: string };
-        const forged = btoa(JSON.stringify({ key: "attacker.bin", id: decoded.id }))
-            .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-        await expect(store.getUploadState(forged)).rejects.toBeInstanceOf(UploadNotFoundError);
+        const { uploadToken } = await store.createUpload({ key: "tenants/acme/payroll.csv", now: NOW });
+        expect(uploadToken).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+        expect(uploadToken).not.toContain("acme");
+    });
+
+    test("a token that is not a minted id answers UploadNotFoundError", async () => {
+        const { store } = makeStore();
+        await store.createUpload({ key: "victim.bin", now: NOW });
+        for (const forged of [
+            "00000000-0000-4000-8000-000000000000",
+            "eyJrZXkiOiJhdHRhY2tlci5iaW4ifQ",
+            "../../etc/passwd",
+            "",
+        ]) {
+            await expect(store.getUploadState(forged)).rejects.toBeInstanceOf(UploadNotFoundError);
+        }
     });
 });
 
@@ -588,7 +598,7 @@ describe("r2UploadStore: limits and completion bookkeeping", () => {
     test("a body of exactly maxBytes is accepted", async () => {
         const { store } = makeStore();
         const { uploadToken } = await store.createUpload({ key: "exact.bin", now: NOW });
-        const result = await store.appendChunk(uploadToken, 0, bytes(1, 2, 3, 4), { now: NOW, maxBytes: 4 });
+        const result = await store.appendChunk(uploadToken, 0, bytes(1, 2, 3, 4), { now: NOW, maxBytes: 4, maxBytesFatal: true });
         expect(result.bytesWritten).toBe(4);
         expect((await store.getUploadState(uploadToken)).isInvalidated).toBe(false);
     });
@@ -641,13 +651,13 @@ describe("r2UploadStore: limits and completion bookkeeping", () => {
         expect(objects.get("empty2.bin")!.content.length).toBe(0);
     });
 
-    test("abort with a forged (valid-id, wrong-key) token discards nothing", async () => {
+    test("abort with an id that names no resource discards nothing", async () => {
         const { store, mpus } = makeStore();
         const { uploadToken } = await store.createUpload({ key: "victim.bin", now: NOW });
-        const decoded = JSON.parse(fromBase64Url(uploadToken)) as { key: string; id: string };
-        const forged = toBase64Url(JSON.stringify({ key: "attacker.bin", id: decoded.id }));
 
-        await store.abortUpload(forged);
+        await store.abortUpload("00000000-0000-4000-8000-000000000000");
+        await store.abortUpload("not-a-token");
+
         expect(mpus.size).toBe(1); // the victim's multipart upload survives
         expect((await store.getUploadState(uploadToken)).offset).toBe(0);
     });
@@ -692,5 +702,46 @@ describe("r2UploadStore: capability flags", () => {
     test("rejects a nonsensical partSize at construction", () => {
         const { bucket } = mockUploadBucket();
         expect(() => r2UploadStore({ bucket, partSize: -1 })).toThrow(RangeError);
+    });
+});
+
+// ─── The bookkeeping namespace is not a publish destination ─────────────────
+
+describe("r2UploadStore: reserved upload prefix", () => {
+    test("a publish key inside the bookkeeping prefix is refused at creation", async () => {
+        const { store } = makeStore();
+        // A key() that derives from user input would otherwise let a caller
+        // name another upload's manifest as its own destination and overwrite
+        // it at completion. Tokens are the only handles into that namespace.
+        await expect(store.createUpload({ key: ".partial-content-uploads/other.manifest", now: 0 }))
+            .rejects.toBeInstanceOf(TypeError);
+        await expect(store.createUpload({ key: ".partial-content-uploads", now: 0 }))
+            .rejects.toBeInstanceOf(TypeError);
+    });
+
+    test("a key that merely starts with the same letters is fine", async () => {
+        const { store } = makeStore();
+        const { uploadToken } = await store.createUpload({ key: ".partial-content-uploadsomething", now: 0 });
+        expect(uploadToken).toBeTruthy();
+    });
+});
+
+// ─── The contract holds for a part-based backend too ────────────────────────
+
+describe("r2UploadStore: write-store conformance", () => {
+    test("passes every obligation, part-size rule included", async () => {
+        // One bucket across both instances, so the restart obligations are
+        // exercised rather than skipped: a part-based store derives its offset
+        // from a durable ledger, which is exactly what must survive.
+        const mock = mockUploadBucket();
+        const report = await checkResumableWriteStore(
+            () => r2UploadStore({ bucket: mock.bucket, partSize: PART_SIZE }),
+            { key: (n) => `conformance/${n}.bin` },
+        );
+
+        const failed = report.checks.filter((c) => !c.ok && !c.skipped);
+        expect(failed.map((c) => `${c.name}: ${c.detail}`)).toEqual([]);
+        expect(report.skipped).toBe(0);
+        expect(report.ok).toBe(true);
     });
 });

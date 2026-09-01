@@ -11,9 +11,13 @@
 export {
   UploadNotFoundError,
   UploadOffsetConflictError,
+  UploadAppendBoundError,
+  UploadOverrunError,
   UploadDigestMismatchError,
   isUploadNotFoundError,
   isUploadOffsetConflictError,
+  isUploadAppendBoundError,
+  isUploadOverrunError,
   isUploadDigestMismatchError,
 } from "./upload-store.ts";
 export type {
@@ -24,7 +28,12 @@ export type {
   CompleteUploadOptions,
   CompletedUpload,
 } from "./upload-store.ts";
-export { memoryUploadLocker, UploadLockTimeoutError, UPLOAD_PREEMPTED } from "./upload-locker.ts";
+export {
+  memoryUploadLocker,
+  UploadLockTimeoutError,
+  isUploadLockTimeoutError,
+  UPLOAD_PREEMPTED,
+} from "./upload-locker.ts";
 export type { UploadLocker, UploadLock, AcquireOptions } from "./upload-locker.ts";
 export { createUploadOrchestrator } from "./upload-orchestrator.ts";
 export type {
@@ -35,7 +44,7 @@ export type {
   CreateUploadRequest,
   AppendUploadRequest,
 } from "./upload-orchestrator.ts";
-export type { UploadPolicy, UploadAuditEvent } from "./upload-engine.ts";
+export type { UploadPolicy, UploadAuditEvent, FatalBoundReason } from "./upload-engine.ts";
 
 /**
  * Hardening headers on every dialect error response (4xx/5xx): no MIME
@@ -87,7 +96,7 @@ export const TUS_EXPOSED_HEADERS: readonly string[] = Object.freeze([
 /**
  * The {@link TUS_EXPOSED_HEADERS} equivalent for the IETF resumable-uploads
  * dialect (`partial-content/upload`): the response headers a cross-origin
- * client must be allowed to read across interop versions 3/5/6.
+ * client must be allowed to read across every supported interop version.
  */
 export const UPLOAD_EXPOSED_HEADERS: readonly string[] = Object.freeze([
   "Location",

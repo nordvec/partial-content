@@ -29,7 +29,7 @@
  * const handler = createTusHandler(store, {
  *   key: ({ metadata }) => crypto.randomUUID(),   // server-generated, never the client filename
  *   location: (token) => `/files/${token}`,
- *   maxSize: 1024 * 1024 * 1024,
+ *   policy: { maxSize: 1024 * 1024 * 1024 },
  * });
  *
  * // Creation endpoint (POST /files) needs no token:
@@ -46,6 +46,7 @@
 import {
   createUploadOrchestrator,
   type UploadOutcome,
+  type UploadOrchestratorOptions,
   type UploadResourceEvent,
 } from "./upload-orchestrator.ts";
 import type { UploadPolicy } from "./upload-engine.ts";
@@ -53,6 +54,7 @@ import type { ResumableWriteStore } from "./upload-store.ts";
 import type { UploadLocker } from "./upload-locker.ts";
 import { UPLOAD_ERROR_HEADERS } from "./upload-shared.ts";
 import { sanitizeHeaderValue } from "./index.ts";
+import { bytesToBase64 } from "./upload-internals.ts";
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -196,11 +198,8 @@ export interface TusCreation {
   request: Request;
 }
 
-/**
- * Options for {@link createTusHandler}. Policy bounds may be given flat
- * (`maxSize: n`) or as a {@link UploadPolicy} object; flat fields win.
- */
-export interface TusHandlerOptions extends UploadPolicy {
+/** Options for {@link createTusHandler}. */
+export interface TusHandlerOptions {
   /**
    * Decide the final storage key for a new upload. The callback receives the
    * client's decoded metadata (commonly `filename`/`filetype`) plus the raw
@@ -221,14 +220,14 @@ export interface TusHandlerOptions extends UploadPolicy {
    */
   resolveToken?: (req: Request) => string | undefined;
   /**
-   * Audit-safe identifier reported on upload events instead of the raw
-   * token. Called per resource request (HEAD/PATCH/DELETE). Creation events
-   * fire before any token exists to map, so they carry only the token; the
-   * `metadata` parameter is reserved for callers that derive audit ids from
-   * creation metadata via their own `onUploadEvent` correlation.
+   * Audit-safe identifier reported on upload events and error contexts
+   * instead of the raw token, which is the capability. Called per resource
+   * request (HEAD/PATCH/DELETE). Creation events fire before any token exists
+   * to map, so they carry the token itself; a caller that needs an audit id
+   * for creation correlates it in its own `onUploadEvent`.
    */
-  auditKey?: (uploadToken: string, metadata?: Record<string, string>) => string;
-  /** Policy object form; flat {@link UploadPolicy} fields on these options win. */
+  auditKey?: (uploadToken: string) => string;
+  /** Size, append and lifetime bounds this endpoint enforces. */
   policy?: UploadPolicy;
   /**
    * Enable the tus checksum extension (per-request `Upload-Checksum`
@@ -249,7 +248,28 @@ export interface TusHandlerOptions extends UploadPolicy {
    * failures (a throwing `key`/`location`/`resolveToken` callback reports
    * with operation `"handler"`). Must not throw.
    */
-  onError?: (error: unknown, context: { uploadToken?: string; operation: string }) => void;
+  /**
+   * The upload published. The one hook carrying the storage key, so a caller
+   * can record which object an upload became; the key is chosen before a
+   * token exists, and pairing them by position across the creation call is a
+   * race. Awaited before the response goes out, so a throw answers a backend
+   * error rather than acknowledging an object the caller's records never saw.
+   *
+   * Deliberately not the audit stream, which is content-free by design: a
+   * storage key commonly embeds a filename.
+   */
+  onUploadComplete?: UploadOrchestratorOptions["onUploadComplete"];
+  /** How long a request waits for the upload lock before answering busy. */
+  lockTimeoutMs?: number;
+  /**
+   * Must not throw (there is no sink for a failing error sink). `auditKey`
+   * arrives in place of `uploadToken` whenever one was supplied.
+   */
+  onError?: (error: unknown, context: {
+    uploadToken?: string;
+    auditKey?: string;
+    operation: string;
+  }) => void;
   /** Post-abort flush window in ms, passed to the orchestrator. */
   graceMs?: number;
   /** Clock injection (tests), passed to the orchestrator and used for Upload-Expires. */
@@ -330,6 +350,35 @@ export function parseUploadMetadata(header: string | null): Record<string, strin
   return Object.fromEntries(out);
 }
 
+/** Encode a UTF-8 string as standard base64, the Upload-Metadata value form. */
+function encodeBase64Utf8(value: string): string {
+  return bytesToBase64(UTF8_ENCODER.encode(value));
+}
+
+/**
+ * Render stored metadata as an Upload-Metadata header value (creation
+ * extension): `key <base64>` pairs joined by commas, an empty value rendered
+ * as the bare key, exactly the grammar {@link parseUploadMetadata} accepts.
+ * Undefined when nothing is representable, so the caller omits the header
+ * rather than sending an empty one.
+ *
+ * A key outside the header grammar is skipped rather than emitted. Metadata
+ * that arrived through this dialect cannot contain one (the parser rejects it
+ * at creation), but a resource created through the other dialect or through
+ * the orchestrator directly can carry any key its caller chose, and the tus
+ * grammar has no escaping mechanism: a key holding a comma, a space, or a
+ * control byte cannot be expressed here, and guessing an encoding for it
+ * would let the value rewrite the header around it.
+ */
+function encodeUploadMetadata(metadata: Record<string, string>): string | undefined {
+  const pairs: string[] = [];
+  for (const [key, value] of Object.entries(metadata)) {
+    if (!METADATA_KEY_RE.test(key)) continue;
+    pairs.push(value === "" ? key : `${key} ${encodeBase64Utf8(value)}`);
+  }
+  return pairs.length > 0 ? pairs.join(",") : undefined;
+}
+
 /** True when a Content-Type's essence is the tus upload content type. */
 function isOffsetOctetStream(contentType: string | null): boolean {
   if (contentType === null) return false;
@@ -357,13 +406,7 @@ export function createTusHandler(
   store: ResumableWriteStore,
   options: TusHandlerOptions,
 ) {
-  // Effective policy: object form first, flat fields override.
   const policy: UploadPolicy = { ...options.policy };
-  if (options.maxSize !== undefined) policy.maxSize = options.maxSize;
-  if (options.minSize !== undefined) policy.minSize = options.minSize;
-  if (options.maxAppendSize !== undefined) policy.maxAppendSize = options.maxAppendSize;
-  if (options.minAppendSize !== undefined) policy.minAppendSize = options.minAppendSize;
-  if (options.maxAgeSeconds !== undefined) policy.maxAgeSeconds = options.maxAgeSeconds;
 
   const now = options.now ?? Date.now;
   const onError = options.onError;
@@ -373,6 +416,8 @@ export function createTusHandler(
     onUploadEvent: options.onUploadEvent,
     onError,
     graceMs: options.graceMs,
+    onUploadComplete: options.onUploadComplete,
+    lockTimeoutMs: options.lockTimeoutMs,
     now,
   });
   const maxSize = orchestrator.policy.maxSize;
@@ -411,7 +456,11 @@ export function createTusHandler(
     status: number,
     statusText: string,
     headers: Record<string, string>,
-    body: Uint8Array | null = null,
+    // ArrayBuffer-backed, not ArrayBufferLike: the DOM lib's BodyInit excludes
+    // a SharedArrayBuffer-backed view, and this package is compiled under that
+    // lib by its Deno, Workers and browser consumers. The read side pins the
+    // same argument on every stream it hands out.
+    body: Uint8Array<ArrayBuffer> | null = null,
   ): Response {
     return new Response(body, {
       status,
@@ -457,28 +506,32 @@ export function createTusHandler(
    *   re-probe-now.
    * - store-error: hardened 502, details only to `onError`.
    */
-  function rejectResponse(outcome: UploadOutcome, isHead: boolean): Response {
+  function rejectResponse(
+    outcome: UploadOutcome,
+    isHead: boolean,
+    extra?: Record<string, string>,
+  ): Response {
     switch (outcome.kind) {
       case "not-found":
-        return errorResponse(404, "Not Found", "upload not found", { isHead });
+        return errorResponse(404, "Not Found", "upload not found", { isHead, headers: extra });
       case "gone":
-        return errorResponse(410, "Gone", `upload ${outcome.reason}`, { isHead });
+        return errorResponse(410, "Gone", `upload ${outcome.reason}`, { isHead, headers: extra });
       case "offset-mismatch":
-        return errorResponse(409, "Conflict", "mismatched Upload-Offset", { isHead });
+        return errorResponse(409, "Conflict", "mismatched Upload-Offset", { isHead, headers: extra });
       case "length-inconsistent":
-        return errorResponse(400, "Bad Request", "inconsistent upload length", { isHead });
+        return errorResponse(400, "Bad Request", "inconsistent upload length", { isHead, headers: extra });
       case "limit-violation":
         if (outcome.reason === "size-exceeded" || outcome.reason === "append-too-large") {
-          return errorResponse(413, "Request Entity Too Large", "maximum size exceeded", {
+          return errorResponse(413, "Content Too Large", "maximum size exceeded", {
             isHead,
-            headers: maxSize !== undefined ? { "Tus-Max-Size": String(maxSize) } : undefined,
+            headers: { ...extra, ...(maxSize !== undefined ? { "Tus-Max-Size": String(maxSize) } : {}) },
           });
         }
-        return errorResponse(400, "Bad Request", "upload violates a size policy", { isHead });
+        return errorResponse(400, "Bad Request", "upload violates a size policy", { isHead, headers: extra });
       case "contended":
-        return errorResponse(423, "Locked", "upload is currently locked by another request", { isHead });
+        return errorResponse(423, "Locked", "upload is currently locked by another request", { isHead, headers: extra });
       case "store-error":
-        return errorResponse(502, "Bad Gateway", "storage backend error", { isHead });
+        return errorResponse(502, "Bad Gateway", "storage backend error", { isHead, headers: extra });
       default:
         // Success kinds are handled by each method before mapping, and
         // digest-mismatch is unreachable: Upload-Checksum verification is
@@ -490,7 +543,7 @@ export function createTusHandler(
           new Error(`tus dialect: unexpected orchestrator outcome "${outcome.kind}"`),
           { operation: "reject" },
         );
-        return errorResponse(500, "Internal Server Error", "internal error", { isHead });
+        return errorResponse(500, "Internal Server Error", "internal error", { isHead, headers: extra });
     }
   }
 
@@ -528,7 +581,7 @@ export function createTusHandler(
           if (total > checksumCap!) {
             await reader.cancel().catch(() => {});
             return {
-              response: errorResponse(413, "Request Entity Too Large",
+              response: errorResponse(413, "Content Too Large",
                 "checksummed content exceeds the verification buffer cap"),
             };
           }
@@ -657,7 +710,16 @@ export function createTusHandler(
       metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
       signal: req.signal,
     });
-    if (outcome.kind !== "created") return rejectResponse(outcome, false);
+    if (outcome.kind !== "created") {
+      // A rejection that names a resource landed AFTER creation allocated it,
+      // so bytes may already be durable. The Location is how the client
+      // resumes them or deletes them; without it they are unreachable and
+      // only a sweep (optional, and meaningless with no max age) reclaims them.
+      const stranded = "uploadToken" in outcome ? outcome.uploadToken : undefined;
+      return rejectResponse(outcome, false, stranded === undefined
+        ? undefined
+        : { Location: sanitizeHeaderValue(options.location(stranded)) });
+    }
 
     let isComplete = outcome.complete;
     if (!isComplete && declaredLength !== undefined && outcome.offset === declaredLength) {
@@ -678,9 +740,12 @@ export function createTusHandler(
     // bytes; a plain creation carries no offset (there was no data).
     if (hasContent) headers["Upload-Offset"] = String(outcome.offset);
     // Expiration known at creation MUST ride the creation response
-    // (expiration extension); a completed upload no longer expires.
-    if (maxAgeSeconds !== undefined && !isComplete) {
-      headers["Upload-Expires"] = imfFixdate(now() + maxAgeSeconds * 1000);
+    // (expiration extension); a completed upload no longer expires. The
+    // deadline is anchored at creation start (outcome.expiresAt), so a slow
+    // streaming create does not advertise a deadline inflated by its own
+    // duration, which would let a client resume past the real expiry into a 404.
+    if (outcome.expiresAt !== undefined && !isComplete) {
+      headers["Upload-Expires"] = imfFixdate(outcome.expiresAt);
     }
     return respond(201, "Created", headers);
   }
@@ -720,10 +785,14 @@ export function createTusHandler(
       // Length still deferred: every HEAD says so (creation-defer-length MUST).
       headers["Upload-Defer-Length"] = "1";
     }
-    // descope: Upload-Metadata echo on HEAD (creation extension MUST when
-    // metadata was stored); the orchestrator's probed outcome does not carry
-    // stored metadata and the dialect never reads the store directly;
-    // revisit when the probed UploadOutcome exposes creation metadata.
+    // Metadata the creation carried rides every HEAD (creation extension
+    // MUST, when the upload has any), re-encoded from the values that
+    // creation decoded, so a client resuming from a cold start recovers the
+    // filename and type it no longer holds.
+    if (outcome.metadata !== undefined) {
+      const encoded = encodeUploadMetadata(outcome.metadata);
+      if (encoded !== undefined) headers["Upload-Metadata"] = encoded;
+    }
     if (outcome.expiresAt !== undefined && !outcome.complete) {
       headers["Upload-Expires"] = imfFixdate(outcome.expiresAt);
     }
@@ -755,6 +824,19 @@ export function createTusHandler(
 
     const auditKey = options.auditKey?.(uploadToken);
     // Checksum extension: verify before a single byte can reach the store.
+    //
+    // Verification buffers and hashes the whole request, up to the cap, and
+    // that work is worth doing only for a token that names something. Without
+    // this gate a bogus token buys a full buffer plus digest on every attempt,
+    // memory times concurrency and CPU per request, before the append fails
+    // 404 anyway. The check is lock-free precisely so it cannot preempt an
+    // append the way a probe would, and it costs one state read on the path
+    // that was about to pay far more.
+    if (req.headers.get("upload-checksum") !== null && checksum) {
+      if (!await orchestrator.resourceExists(uploadToken, { auditKey, signal: req.signal })) {
+        return errorResponse(404, "Not Found", "upload not found", { isHead: false });
+      }
+    }
     const verified = await verifyChecksum(req);
     if ("response" in verified) return verified.response;
 
@@ -811,7 +893,12 @@ export function createTusHandler(
     return respond(204, "No Content", headers);
   }
 
-  /** DELETE: termination extension (204, resource then answers 404/410). */
+  /**
+   * DELETE: termination extension (204, resource then answers 404/410).
+   * Terminates the UPLOAD, never an object it already published: the store
+   * contract bars an abort from touching published bytes, so a DELETE that
+   * arrives after completion frees bookkeeping and leaves live data alone.
+   */
   async function handleDelete(req: Request, uploadToken: string): Promise<Response> {
     const auditKey = options.auditKey?.(uploadToken);
     const outcome = await orchestrator.cancel(uploadToken, { auditKey, signal: req.signal });

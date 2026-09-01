@@ -28,7 +28,8 @@ export {
 } from "./kernel.ts";
 
 // ─── Header Safety ──────────────────────────────────────────────────────────
-export { sanitizeHeaderValue } from "./kernel.ts";
+export { sanitizeHeaderValue, isSha256Base64 } from "./kernel.ts";
+export { reservedKeyGuard } from "./object-store.ts";
 
 // ─── Conditional Requests (RFC 9110 / RFC 7232) ─────────────────────────────
 export {
@@ -73,7 +74,6 @@ export type {
 
 // ─── Storage Contract ───────────────────────────────────────────────────────
 export type {
-  CancelSignal,
   ObjectStore,
   ObjectMetadata,
   ObjectStream,
@@ -85,7 +85,10 @@ export type {
 } from "./object-store.ts";
 
 // ─── Storage Primitives ─────────────────────────────────────────────────────
-export { ObjectNotFoundError, ObjectChangedError, StoreUnavailableError, nodeStreamToWeb, guardStreamLength, resolveServedRange, classifyStoreRead, parseRetryAfterSeconds } from "./object-store.ts";
+export {
+  ObjectNotFoundError, ObjectChangedError, StoreUnavailableError,
+  isObjectNotFoundError, isObjectChangedError, isStoreUnavailableError,
+  nodeStreamToWeb, guardStreamLength, resolveServedRange, classifyStoreRead, parseRetryAfterSeconds } from "./object-store.ts";
 
 // ─── Content-Disposition (RFC 6266 / RFC 8187) ──────────────────────────────
 export { buildContentDisposition, isInlineSafeMediaType } from "./content-disposition.ts";

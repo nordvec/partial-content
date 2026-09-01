@@ -33,21 +33,47 @@ import {
   type ObjectStream,
   type ParsedRange,
   type StoreErrorClassifiers,
+  reservedKeyGuard,
 } from "./index.ts";
 import {
   UploadNotFoundError,
   UploadOffsetConflictError,
+  UploadAppendBoundError,
+  UploadOverrunError,
   type ResumableWriteStore,
+  type SweepingWriteStore,
   type StoredUploadState,
   type CreateUploadOptions,
   type AppendChunkOptions,
   type CompleteUploadOptions,
   type CompletedUpload,
 } from "./upload-store.ts";
+import {
+  base64UrlToBytes,
+  bytesToBase64Url,
+  decodeUploadId,
+  newUploadId,
+  openUploadBody,
+  publishKeyGuard,
+  toStoredState,
+  validatePersistedUploadShape,
+  type PersistedUpload,
+} from "./upload-internals.ts";
 
 // Re-export for convenience
 export { ObjectNotFoundError, ObjectChangedError, StoreUnavailableError };
 export { UploadNotFoundError, UploadOffsetConflictError };
+export { UploadAppendBoundError, UploadOverrunError };
+export type {
+  ResumableWriteStore,
+  SweepingWriteStore,
+  StoredUploadState,
+  CreateUploadOptions,
+  AppendChunkOptions,
+  CompleteUploadOptions,
+  CompletedUpload,
+} from "./upload-store.ts";
+
 
 // ─── Azure Types ────────────────────────────────────────────────────────────
 
@@ -58,11 +84,11 @@ export { UploadNotFoundError, UploadOffsetConflictError };
  * Users who import `partial-content/azure` will have it installed as an
  * optional peer dependency.
  */
-interface AzureContainerClient {
+export interface AzureContainerClient {
   getBlobClient(blobName: string): AzureBlobClient;
 }
 
-interface AzureBlobClient {
+export interface AzureBlobClient {
   getProperties(options?: { abortSignal?: AbortSignal }): Promise<AzureBlobProperties>;
   download(
     offset?: number,
@@ -77,7 +103,7 @@ interface AzureBlobClient {
  * content* / cacheControl fields are the SAS response-header overrides
  * (`rscd`/`rsct`/`rscc` query parameters) honored on the signed GET.
  */
-interface AzureGenerateSasUrlOptions {
+export interface AzureGenerateSasUrlOptions {
   /**
    * SAS permission set. The SDK normalizes this by calling `toString()` and
    * re-parsing (`BlobSASPermissions.parse`, which validates the characters),
@@ -91,13 +117,13 @@ interface AzureGenerateSasUrlOptions {
   cacheControl?: string;
 }
 
-interface AzureBlobProperties {
+export interface AzureBlobProperties {
   contentLength?: number;
   etag?: string;
   lastModified?: Date;
 }
 
-interface AzureBlobDownloadResponse {
+export interface AzureBlobDownloadResponse {
   readableStreamBody?: NodeJS.ReadableStream & AsyncIterable<Buffer> & { destroy?: () => void };
   blobBody?: Promise<Blob>;
   contentLength?: number;
@@ -110,6 +136,14 @@ interface AzureBlobDownloadResponse {
 // ─── Options ────────────────────────────────────────────────────────────────
 
 export interface AzureStoreOptions {
+  /**
+   * Key prefix this store refuses to serve, because it is where an upload
+   * store sharing this location keeps its in-flight bytes and the sidecars
+   * naming their destination keys. Keys at or under it answer
+   * {@link ObjectNotFoundError}. Set to `""` when no upload store shares it.
+   * @default ".partial-content-uploads/"
+   */
+  reservedPrefix?: string;
   /** Pre-configured Azure ContainerClient. */
   containerClient: AzureContainerClient;
 }
@@ -134,6 +168,7 @@ export interface AzureStoreOptions {
  */
 export function azureStore(opts: AzureStoreOptions): ObjectStore {
   const { containerClient } = opts;
+  const assertReadable = reservedKeyGuard(opts.reservedPrefix ?? ".partial-content-uploads/");
 
   return {
     supportsRange: true,
@@ -142,6 +177,7 @@ export function azureStore(opts: AzureStoreOptions): ObjectStore {
     authoritativeRange: true,
 
     async headObject(key: string, opts?: { signal?: AbortSignal }): Promise<ObjectMetadata> {
+      assertReadable(key);
       opts?.signal?.throwIfAborted();
       // Forward the signal so a client disconnect during the request/header
       // phase cancels the Azure call (the pre-check only covers already-aborted;
@@ -160,6 +196,7 @@ export function azureStore(opts: AzureStoreOptions): ObjectStore {
     },
 
     async getObject(key: string, opts?: { range?: ParsedRange; signal?: AbortSignal; ifMatch?: string }): Promise<ObjectStream> {
+      assertReadable(key);
       const { range, signal, ifMatch } = opts ?? {};
       signal?.throwIfAborted();
 
@@ -240,6 +277,7 @@ export function azureStore(opts: AzureStoreOptions): ObjectStore {
     },
 
     async createSignedUrl(key, signOpts) {
+      assertReadable(key);
       // A signed URL is a 302 redirect target: the client fetches bytes
       // DIRECTLY from Azure, bypassing the serve route's security headers
       // (nosniff, CSP, CORP). Force a download disposition AND an inert
@@ -517,70 +555,8 @@ function azureParseDataBlockIndex(name: string | undefined): number | null {
   return parseInt(digits, 10);
 }
 
-function bytesToBase64Url(bytes: Uint8Array): string {
-  let binary = "";
-  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]!);
-  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-}
-
-function base64UrlToBytes(value: string): Uint8Array {
-  const binary = atob(value.replace(/-/g, "+").replace(/_/g, "/"));
-  const out = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
-  return out;
-}
-
-/** What the opaque upload token folds in (base64url JSON). */
-interface AzureUploadToken {
-  key: string;
-  id: string;
-}
-
-function encodeAzureUploadToken(token: AzureUploadToken): string {
-  return bytesToBase64Url(new TextEncoder().encode(JSON.stringify(token)));
-}
-
-/**
- * Decode + validate a token. The `id` is interpolated into blob names, so
- * only the exact UUID shape minted at creation is accepted: a forged token
- * cannot traverse into foreign blobs. Garbage decodes to
- * {@link UploadNotFoundError} (dialects answer 404, never a parse crash).
- */
-function decodeAzureUploadToken(uploadToken: string): AzureUploadToken {
-  try {
-    const parsed: unknown = JSON.parse(
-      new TextDecoder().decode(base64UrlToBytes(uploadToken)),
-    );
-    if (typeof parsed === "object" && parsed !== null) {
-      const candidate = parsed as Record<string, unknown>;
-      if (
-        typeof candidate.key === "string" && candidate.key.length > 0 &&
-        typeof candidate.id === "string" && UPLOAD_ID_RE.test(candidate.id)
-      ) {
-        return { key: candidate.key, id: candidate.id };
-      }
-    }
-  } catch (err) {
-    throw new UploadNotFoundError(uploadToken, err);
-  }
-  throw new UploadNotFoundError(uploadToken);
-}
-
-/** The UUID shape `createUpload` mints; nothing else may name an info blob. */
-const UPLOAD_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
-
 /** Durable upload bookkeeping, persisted as info-blob metadata. */
-interface AzurePersistedUpload {
-  key: string;
-  length?: number;
-  metadata?: Record<string, string>;
-  createdAt: number;
-  lastAppendAt?: number;
-  isComplete: boolean;
-  isInvalidated: boolean;
-  /** Recorded at completion for idempotent-retry answers. */
-  etag?: string;
-}
+type AzurePersistedUpload = PersistedUpload;
 
 function encodeAzurePersistedUpload(state: AzurePersistedUpload): string {
   return bytesToBase64Url(new TextEncoder().encode(JSON.stringify(state)));
@@ -597,55 +573,7 @@ function decodeAzurePersistedUpload(raw: string | undefined): AzurePersistedUplo
   }
 }
 
-/**
- * Shape gate for persisted upload state. Numbers feed offset math and expiry
- * policy, so only non-negative safe integers pass; a forged or corrupt value
- * yields null and the caller answers not-found rather than flowing bad state
- * into the engine.
- */
-function validatePersistedUploadShape(parsed: unknown): AzurePersistedUpload | null {
-  if (typeof parsed !== "object" || parsed === null) return null;
-  const c = parsed as Record<string, unknown>;
-  const isCount = (v: unknown): v is number =>
-    typeof v === "number" && Number.isSafeInteger(v) && v >= 0;
-  if (
-    typeof c.key === "string" && c.key.length > 0 &&
-    (c.length === undefined || isCount(c.length)) &&
-    isCount(c.createdAt) &&
-    (c.lastAppendAt === undefined || isCount(c.lastAppendAt)) &&
-    typeof c.isComplete === "boolean" &&
-    typeof c.isInvalidated === "boolean" &&
-    (c.etag === undefined || typeof c.etag === "string") &&
-    (c.metadata === undefined ||
-      (typeof c.metadata === "object" && c.metadata !== null &&
-        Object.values(c.metadata).every((v) => typeof v === "string")))
-  ) {
-    return c as unknown as AzurePersistedUpload;
-  }
-  return null;
-}
-
-// ─── Resumable Upload: Shared Body Iteration ────────────────────────────────
-
-/** Normalize an append body to an async chunk sequence. */
-async function* uploadBodyChunks(
-  body: ReadableStream<Uint8Array> | Uint8Array,
-): AsyncGenerator<Uint8Array> {
-  if (body instanceof Uint8Array) {
-    if (body.length > 0) yield body;
-    return;
-  }
-  const reader = body.getReader();
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) return;
-      if (value && value.length > 0) yield value;
-    }
-  } finally {
-    reader.releaseLock();
-  }
-}
+// ─── Resumable Upload: Body Assembly ────────────────────────────────────────
 
 function concatUploadChunks(chunks: Uint8Array[], total: number): Uint8Array {
   if (chunks.length === 1) return chunks[0]!;
@@ -754,9 +682,10 @@ function deriveAzureBlocks(list: AzureBlockList): AzureDerivedBlocks {
  * });
  * ```
  */
-export function azureUploadStore(opts: AzureUploadStoreOptions): ResumableWriteStore {
+export function azureUploadStore(opts: AzureUploadStoreOptions): SweepingWriteStore {
   const container = opts.containerClient;
   const prefix = (opts.uploadPrefix ?? AZURE_DEFAULT_UPLOAD_PREFIX).replace(/\/+$/, "");
+  const assertPublishable = publishKeyGuard(`${prefix}/`);
   const blockSize = opts.blockSize ?? AZURE_DEFAULT_BLOCK_SIZE;
   if (!Number.isSafeInteger(blockSize) || blockSize <= 0) {
     throw new RangeError(`azureUploadStore: blockSize must be a positive integer, got ${blockSize}`);
@@ -769,8 +698,8 @@ export function azureUploadStore(opts: AzureUploadStoreOptions): ResumableWriteS
     uploadToken: string,
     signal?: AbortSignal,
   ): Promise<{ state: AzurePersistedUpload; infoClient: AzureBlockBlobClient }> {
-    const token = decodeAzureUploadToken(uploadToken);
-    const infoClient = container.getBlockBlobClient(infoBlobName(token.id));
+    const id = decodeUploadId(uploadToken);
+    const infoClient = container.getBlockBlobClient(infoBlobName(id));
     let props;
     try {
       props = await infoClient.getProperties({ abortSignal: signal });
@@ -779,12 +708,9 @@ export function azureUploadStore(opts: AzureUploadStoreOptions): ResumableWriteS
       throw err;
     }
     const state = decodeAzurePersistedUpload(props.metadata?.[AZURE_STATE_METADATA_KEY]);
-    // Corrupt bookkeeping, or a token whose key was tampered to point at a
-    // different blob than the one recorded at creation: both answer 404. The
-    // PERSISTED key is authoritative for every backend operation.
-    if (!state || state.key !== token.key) {
-      throw new UploadNotFoundError(uploadToken);
-    }
+    // Corrupt bookkeeping answers 404. There is no key to reconcile here: the
+    // token carries none, so the persisted key is the only one that exists.
+    if (!state) throw new UploadNotFoundError(uploadToken);
     return { state, infoClient };
   }
 
@@ -797,18 +723,6 @@ export function azureUploadStore(opts: AzureUploadStoreOptions): ResumableWriteS
       { [AZURE_STATE_METADATA_KEY]: encodeAzurePersistedUpload(state) },
       { abortSignal: signal },
     );
-  }
-
-  function toStoredState(state: AzurePersistedUpload, offset: number): StoredUploadState {
-    return {
-      offset,
-      length: state.length,
-      isComplete: state.isComplete,
-      isInvalidated: state.isInvalidated,
-      createdAt: state.createdAt,
-      lastAppendAt: state.lastAppendAt,
-      metadata: state.metadata,
-    };
   }
 
   /**
@@ -832,11 +746,14 @@ export function azureUploadStore(opts: AzureUploadStoreOptions): ResumableWriteS
   return {
     exactOffsetRecovery: true,
     atomicCompletion: true,
+    /** Every append verifies the claimed offset against durable state before writing. */
+    enforcesOffsetCheck: true,
     digestOnComplete: false,
 
     async createUpload(createOpts: CreateUploadOptions): Promise<{ uploadToken: string }> {
       createOpts.signal?.throwIfAborted();
-      const id = crypto.randomUUID();
+      assertPublishable(createOpts.key);
+      const id = newUploadId();
       const target = container.getBlockBlobClient(createOpts.key);
       // Sentinel FIRST, info second: if the info write crashes, the caller
       // retries creation and the orphaned sentinel ages out natively; the
@@ -857,14 +774,15 @@ export function azureUploadStore(opts: AzureUploadStoreOptions): ResumableWriteS
         metadata: { [AZURE_STATE_METADATA_KEY]: encodeAzurePersistedUpload(state) },
         abortSignal: createOpts.signal,
       });
-      return { uploadToken: encodeAzureUploadToken({ key: createOpts.key, id }) };
+      return { uploadToken: id };
     },
 
     async getUploadState(uploadToken: string, stateOpts?: { signal?: AbortSignal }): Promise<StoredUploadState> {
       stateOpts?.signal?.throwIfAborted();
       const { state, infoClient } = await readUpload(uploadToken, stateOpts?.signal);
       if (state.isInvalidated) {
-        // Terminal: the offset is moot (the engine refuses everything anyway).
+        // Terminal: the offset is moot (the engine refuses every probe and
+        // append, and the one verb still allowed, cancel, does not read it).
         return toStoredState(state, 0);
       }
       const target = container.getBlockBlobClient(state.key);
@@ -918,10 +836,10 @@ export function azureUploadStore(opts: AzureUploadStoreOptions): ResumableWriteS
     ): Promise<{ bytesWritten: number }> {
       const { state, infoClient } = await readUpload(uploadToken, appendOpts.signal);
       if (state.isInvalidated) {
-        throw new Error(`Upload ${uploadToken} is invalidated; nothing may be appended`);
+        throw new Error(`Upload is invalidated; nothing may be appended`);
       }
       if (state.isComplete) {
-        throw new Error(`Upload ${uploadToken} is already complete; nothing may be appended`);
+        throw new Error(`Upload is already complete; nothing may be appended`);
       }
       const target = container.getBlockBlobClient(state.key);
       let list: AzureBlockList;
@@ -931,19 +849,21 @@ export function azureUploadStore(opts: AzureUploadStoreOptions): ResumableWriteS
         if (!isAzureNotFound(err)) throw err;
         await persistState(infoClient, { ...state, isInvalidated: true });
         throw new Error(
-          `Upload ${uploadToken}: staged blocks are gone (aged out or the blob was replaced); resource invalidated`,
+          `Upload staged blocks are gone (aged out or the blob was replaced); resource invalidated`,
         );
       }
       const derived = deriveAzureBlocks(list);
       if (!derived.sentinelPresent) {
         await persistState(infoClient, { ...state, isInvalidated: true });
         throw new Error(
-          `Upload ${uploadToken}: creation sentinel is gone (uncommitted state lost); resource invalidated`,
+          `Upload creation sentinel is gone (uncommitted state lost); resource invalidated`,
         );
       }
-      // Cheap defense-in-depth under the orchestrator's lock: the block list
-      // was needed anyway (next sequence number), so the claimed offset is
-      // verified against the durable sum for free.
+      // Required by the store contract: the lock serializes writers but cannot
+      // prove the writer still holds it, so verifying the claim here is what
+      // makes a stolen-lock write loud instead of silently interleaved. The
+      // block list was needed anyway (next sequence number), so the check
+      // against the durable sum costs nothing.
       if (offset !== derived.uncommittedSum) {
         throw new UploadOffsetConflictError(uploadToken, derived.uncommittedSum);
       }
@@ -953,6 +873,7 @@ export function azureUploadStore(opts: AzureUploadStoreOptions): ResumableWriteS
         : 0;
       let written = 0;
       let consumed = 0;
+      let ceilingHit = false;
       let pending: Uint8Array[] = [];
       let pendingBytes = 0;
 
@@ -960,7 +881,7 @@ export function azureUploadStore(opts: AzureUploadStoreOptions): ResumableWriteS
         if (pendingBytes === 0) return;
         if (nextIndex > AZURE_MAX_BLOCK_INDEX) {
           throw new Error(
-            `Upload ${uploadToken}: exceeds Azure's 50,000-block limit; raise blockSize`,
+            `Upload exceeds Azure's 50,000-block limit; raise blockSize`,
           );
         }
         const block = concatUploadChunks(pending, pendingBytes);
@@ -973,7 +894,7 @@ export function azureUploadStore(opts: AzureUploadStoreOptions): ResumableWriteS
         written += block.length;
       };
 
-      const iterator = uploadBodyChunks(body)[Symbol.asyncIterator]();
+      const { iterator, finalize } = openUploadBody(body, { cancelBody: true });
       while (true) {
         if (appendOpts.signal?.aborted) break;
         let next: IteratorResult<Uint8Array>;
@@ -987,12 +908,18 @@ export function azureUploadStore(opts: AzureUploadStoreOptions): ResumableWriteS
         if (next.done) break;
         consumed += next.value.length;
         if (appendOpts.maxBytes !== undefined && consumed > appendOpts.maxBytes) {
-          // Bytes past the engine's hard bound are the terminal fault: record
+          if (!appendOpts.maxBytesFatal) {
+            // This request's ceiling, not the representation's. Stop reading
+            // and fall through to the normal stagePending tail so the accepted
+            // prefix lands and the resource stays healthy.
+            ceilingHit = true;
+            break;
+          }
+          // Bytes past a REPRESENTATION bound are the terminal fault: record
           // it durably so every later interaction refuses, then fail loudly.
           await persistState(infoClient, { ...state, isInvalidated: true });
-          throw new Error(
-            `Upload ${uploadToken}: body crossed the ${appendOpts.maxBytes}-byte bound; resource invalidated`,
-          );
+          await finalize();
+          throw new UploadOverrunError(uploadToken, appendOpts.maxBytes);
         }
         pending.push(next.value);
         pendingBytes += next.value.length;
@@ -1011,6 +938,10 @@ export function azureUploadStore(opts: AzureUploadStoreOptions): ResumableWriteS
         ...(declaresLength ? { length: appendOpts.length } : {}),
         lastAppendAt: appendOpts.now,
       });
+      // Reported only after the accepted prefix is durable: the resource is
+      // untouched, so the client resumes from here in smaller chunks.
+      await finalize();
+      if (ceilingHit) throw new UploadAppendBoundError(uploadToken, derived.uncommittedSum + written);
       return { bytesWritten: written };
     },
 
@@ -1018,7 +949,7 @@ export function azureUploadStore(opts: AzureUploadStoreOptions): ResumableWriteS
       completeOpts.signal?.throwIfAborted();
       const { state, infoClient } = await readUpload(uploadToken, completeOpts.signal);
       if (state.isInvalidated) {
-        throw new Error(`Upload ${uploadToken} is invalidated; it cannot be completed`);
+        throw new Error(`Upload is invalidated; it cannot be completed`);
       }
       if (state.isComplete) {
         return { etag: state.etag };
@@ -1039,7 +970,7 @@ export function azureUploadStore(opts: AzureUploadStoreOptions): ResumableWriteS
         if (!isAzureNotFound(err)) throw err;
         await persistState(infoClient, { ...state, isInvalidated: true });
         throw new Error(
-          `Upload ${uploadToken}: staged blocks are gone (aged out or the blob was replaced); resource invalidated`,
+          `Upload staged blocks are gone (aged out or the blob was replaced); resource invalidated`,
         );
       }
       const derived = deriveAzureBlocks(list);
@@ -1064,7 +995,7 @@ export function azureUploadStore(opts: AzureUploadStoreOptions): ResumableWriteS
         if (!(derived.committed.count === 0 && (state.length ?? 0) === 0)) {
           await persistState(infoClient, { ...state, isInvalidated: true });
           throw new Error(
-            `Upload ${uploadToken}: creation sentinel is gone (uncommitted state lost); resource invalidated`,
+            `Upload creation sentinel is gone (uncommitted state lost); resource invalidated`,
           );
         }
       }
@@ -1080,13 +1011,13 @@ export function azureUploadStore(opts: AzureUploadStoreOptions): ResumableWriteS
 
     async abortUpload(uploadToken: string, abortOpts?: { signal?: AbortSignal }): Promise<void> {
       abortOpts?.signal?.throwIfAborted();
-      let token: AzureUploadToken;
+      let id: string;
       try {
-        token = decodeAzureUploadToken(uploadToken);
+        id = decodeUploadId(uploadToken);
       } catch {
         return; // idempotent: a token that never named a resource has nothing to discard
       }
-      const infoClient = container.getBlockBlobClient(infoBlobName(token.id));
+      const infoClient = container.getBlockBlobClient(infoBlobName(id));
       let props;
       try {
         props = await infoClient.getProperties({ abortSignal: abortOpts?.signal });
@@ -1094,13 +1025,8 @@ export function azureUploadStore(opts: AzureUploadStoreOptions): ResumableWriteS
         if (isAzureNotFound(err)) return; // already aborted/swept
         throw err;
       }
+      // Corrupt state (null) is garbage bookkeeping: only the info blob goes.
       const state = decodeAzurePersistedUpload(props.metadata?.[AZURE_STATE_METADATA_KEY]);
-      // A token whose key disagrees with the recorded one is forged: it is
-      // not this resource's handle, so it may discard NOTHING (state reads
-      // answer 404 for it; deleting here would let a tampered token destroy
-      // a live upload's bookkeeping). Corrupt state (null) is garbage
-      // bookkeeping and only the info blob itself goes.
-      if (state && state.key !== token.key) return;
       // Never touch the key's blob for a COMPLETED upload: that blob is the
       // published object now.
       if (state && !state.isComplete) {

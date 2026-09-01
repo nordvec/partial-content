@@ -38,7 +38,7 @@ function memoryStore(): ObjectStore {
             const range = getOpts?.range;
             const slice = range ? CONTENT.slice(range.start, range.end + 1) : CONTENT;
             return {
-                body: new ReadableStream<Uint8Array>({
+                body: new ReadableStream<Uint8Array<ArrayBuffer>>({
                     start(c) { c.enqueue(slice); c.close(); },
                 }),
                 contentLength: slice.length,
@@ -94,5 +94,28 @@ describe("hono adapter", () => {
             honoContext({ headers: { "If-None-Match": '"hono-etag"' } }),
         );
         expect(res.status).toBe(304);
+    });
+});
+
+// ─── A throwing extractor is consumer code failing, on every adapter ────────
+
+describe("serveObject (hono): a throwing key extractor", () => {
+    test("answers a hardened 500 and reports the context operation", async () => {
+        const reported: Array<{ key: string; operation: string }> = [];
+        const handler = serveObject(memoryStore(), {
+            key: () => { throw new Error("route param missing"); },
+            onError: (_err, ctx) => reported.push(ctx as { key: string; operation: string }),
+        });
+
+        const res = await handler(honoContext({}));
+
+        expect(res.status).toBe(500);
+        // The body stays generic; the detail belongs in consumer telemetry.
+        expect(await res.text()).toBe("Internal Server Error");
+        expect(res.headers.get("x-content-type-options")).toBe("nosniff");
+        expect(res.headers.get("cache-control")).toBe("no-store");
+        // Reported the way every adapter reports it, so a consumer's telemetry
+        // does not depend on which adapter they mounted.
+        expect(reported).toEqual([{ key: "", operation: "context" }]);
     });
 });

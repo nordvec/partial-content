@@ -62,11 +62,12 @@ partial-content/hono         Hono middleware
 partial-content/http         Any range-capable HTTP origin (Supabase, presigned URLs, CDNs)
 partial-content/memory       In-memory store (tests, demos, embedded assets)
 partial-content/mime         Curated zero-dep MIME lookup
+partial-content/conformance  Contract harness for a custom read or write store
 ```
 
 Every storage backend ships both sides of the protocol from the same subpath: an `ObjectStore` for serving and a `ResumableWriteStore` for uploads. `s3Store` + `s3UploadStore` (multipart), `r2Store` + `r2UploadStore` (native multipart), `gcsStore` + `gcsUploadStore` (compose), `azureStore` + `azureUploadStore` (uncommitted blocks), `fsStore` + `fsUploadStore` (fsync + atomic rename), `memoryStore` + `memoryUploadStore`. `/http` is read-side only: a generic HTTP origin cannot accept resumable writes.
 
-Cloud SDKs are **optional peer dependencies**: `@aws-sdk/client-s3` for `/s3` (plus `@aws-sdk/s3-request-presigner` only if you use `createSignedUrl()`), `@google-cloud/storage` for `/gcs`, `@azure/storage-blob` for `/azure`, `hono` for `/hono`. The kernel, `/web`, `/node`, `/fs`, `/http`, `/r2`, `/memory`, `/mime`, `/tus`, and `/upload` need nothing beyond the platform, and `/redis-locker` takes whatever Redis client you already run behind a four-command interface instead of depending on one.
+Cloud SDKs are **optional peer dependencies**: `@aws-sdk/client-s3` for `/s3` (plus `@aws-sdk/s3-request-presigner` only if you use `createSignedUrl()`), `@google-cloud/storage` for `/gcs`, `@azure/storage-blob` for `/azure`, `hono` for `/hono`. The kernel, `/web`, `/node`, `/fs`, `/http`, `/r2`, `/memory`, `/mime`, `/tus`, `/upload`, and `/conformance` need nothing beyond the platform, and `/redis-locker` takes whatever Redis client you already run behind a four-command interface instead of depending on one.
 
 ## Features
 
@@ -75,8 +76,9 @@ Cloud SDKs are **optional peer dependencies**: `@aws-sdk/client-s3` for `/s3` (p
 - **RFC 9530 Repr-Digest**: End-to-end integrity verification via `sha-256=:<base64>:` header, with `Want-Repr-Digest` negotiation -- first-class support that `send`, `sirv`, and the framework static middlewares lack
 - **Built-in storage adapters**: S3-compatible (AWS, R2 S3-mode, Hetzner, MinIO, Backblaze, Wasabi), R2 native, GCS, Azure, local filesystem, any range-capable HTTP origin, in-memory
 - **Built-in framework adapters**: Fetch API (Next.js, SvelteKit, Remix, Nuxt, Astro, Workers, Bun.serve, Deno.serve), Node.js (Express/Fastify/Koa/raw http), Hono
-- **Resumable uploads, one engine, two dialects**: `createTusHandler` (`/tus`: tus 1.0 core plus the creation, creation-with-upload, creation-defer-length, termination, expiration, and opt-in checksum extensions) and `createUploadHandler` (`/upload`: IETF resumable-uploads draft, interop versions 3, 5, and 6) translate the wire; one shared, wire-agnostic state machine makes every protocol decision
+- **Resumable uploads, one engine, two dialects**: `createTusHandler` (`/tus`: tus 1.0 core plus the creation, creation-with-upload, creation-defer-length, termination, expiration, and opt-in checksum extensions) and `createUploadHandler` (`/upload`: IETF resumable-uploads draft, interop versions 3, 5, 6, and 9) translate the wire; one shared, wire-agnostic state machine makes every protocol decision
 - **Upload write stores for every backend**: in-memory, filesystem (fsynced appends, atomic-rename publish), S3 multipart, Azure uncommitted blocks, GCS compose, R2 native multipart -- each declaring honest capability flags the engine adapts to
+- **A conformance harness for custom stores** (`/conformance`): 15 checks that a write store DOES what its capability flags CLAIM, since nothing at construction can tell a store that performs the at-write offset check from one that declares `enforcesOffsetCheck: true` and writes anyway, plus 6 read-side checks that an `ObjectStore` serves the window it was asked for, an honest total on a partial read, and a not-found the serving path can tell from a failure. No test framework and no dependencies, so it runs in CI, under any runner, or as a startup self-test; the read side is side-effect free, so it can run against a staging bucket
 - **Crash-safe upload offsets**: the offset a probe reports is always derived from storage's own bookkeeping (part listings, block lists, an fsynced file size), never from a stored counter that can drift from the bytes after a crash
 - **Upload policy enforced before bytes land**: max/min total size, per-append bounds, and max age are evaluated against fresh state before any byte reaches storage, and streaming appends are hard-capped mid-flight
 - **Cooperative-preemption upload locking** plus a post-abort grace window: a dropped connection resumes in milliseconds instead of stalling behind a zombie request, and bytes received before the drop still become durable; `/redis-locker` ships the same semantics for multi-instance deployments over any Redis-protocol server (client injected, still zero dependencies)
@@ -121,6 +123,7 @@ export const HEAD = GET;
 import express from "express";
 import { serveObject } from "partial-content/node";
 import { fsStore } from "partial-content/fs";
+import { lookupMime } from "partial-content/mime";
 
 const store = fsStore({ root: "/var/data/uploads" });
 // Hot small files? Opt into the bounded TTL cache (see Benchmarks):
@@ -131,6 +134,9 @@ const app = express();
 // extractors; plain JS callers just omit it.
 app.get("/files/:key", serveObject<express.Request>(store, {
   key: (req) => req.params.key,
+  // Without a mime the response is application/octet-stream, which no browser
+  // renders inline: a PDF or video downloads instead of playing.
+  mime: (req) => lookupMime(req.params.key),
   disposition: "inline",
 }));
 ```
@@ -138,28 +144,35 @@ app.get("/files/:key", serveObject<express.Request>(store, {
 ### Kernel only (bring your own I/O)
 
 ```typescript
-import { evaluateConditionalRequest } from "partial-content";
+import { evaluateConditionalRequest, type ObjectStore } from "partial-content";
 
-const { status, headers, range } = evaluateConditionalRequest(
-  request.headers,
-  {
-    totalSize: fileSize,
-    contentType: "video/mp4",
-    etag: '"abc123"',
-    lastModified: "2025-06-28T12:00:00.000Z",  // ISO 8601 normalized automatically
-  },
-);
+// Your storage and the metadata you already hold for this object.
+declare const store: ObjectStore;
+declare const key: string;
+declare const fileSize: number;
 
-if (status === 304 || status === 412 || status === 416) {
-  return new Response(null, { status, headers });
+export async function GET(request: Request): Promise<Response> {
+  const { status, headers, range } = evaluateConditionalRequest(
+    request.headers,
+    {
+      totalSize: fileSize,
+      contentType: "video/mp4",
+      etag: '"abc123"',
+      lastModified: "2025-06-28T12:00:00.000Z",  // ISO 8601 normalized automatically
+    },
+  );
+
+  if (status === 304 || status === 412 || status === 416) {
+    return new Response(null, { status, headers });
+  }
+
+  // `range` is a kernel-validated ParsedRange -- pass it straight to your store.
+  const { body } = range
+    ? await store.getObject(key, { range })  // 206: only the requested slice
+    : await store.getObject(key);            // 200: the whole object
+
+  return new Response(body, { status, headers });
 }
-
-// `range` is a kernel-validated ParsedRange -- pass it straight to your store.
-const { body } = range
-  ? await store.getObject(key, { range })  // 206: only the requested slice
-  : await store.getObject(key);            // 200: the whole object
-
-return new Response(body, { status, headers });
 ```
 
 More recipes in **[docs/EXAMPLES.md](docs/EXAMPLES.md)**: Hono, Cloudflare Workers (R2 native), kernel-only Express, Content-Disposition, Repr-Digest, resumable uploads, and the manual step-by-step primitives. Coming from `send` or `sirv`? **[docs/MIGRATION.md](docs/MIGRATION.md)** maps every option and event, and is honest about what has no equivalent.
@@ -190,8 +203,10 @@ const handler = createTusHandler(store, {
   location: (token) => `/api/files/${token}`,
   // How resource requests recover the token from the URL.
   resolveToken: (req) => new URL(req.url).pathname.split("/").pop() || undefined,
-  maxSize: 5 * 1024 * 1024 * 1024,  // advertised as Tus-Max-Size
-  maxAgeSeconds: 24 * 60 * 60,      // drives Upload-Expires
+  policy: {
+    maxSize: 5 * 1024 * 1024 * 1024,  // advertised as Tus-Max-Size
+    maxAgeSeconds: 24 * 60 * 60,      // drives Upload-Expires
+  },
 });
 
 const route = (req: Request) => handler(req);
@@ -204,11 +219,11 @@ export { route as OPTIONS }; // capability discovery
 
 Point any tus 1.0 client at the creation URL and resumable uploads work end to end: pause, disconnect, resume from the durable offset. On frameworks that route the token as a path parameter, pass it explicitly instead of using `resolveToken`: `handler(req, { uploadToken: params.token })`.
 
-On any surface reachable by untrusted clients, set at least one of `maxSize` and `maxAgeSeconds`: with neither, an upload accepts unbounded bytes and abandoned resources never expire. `maxAgeSeconds` marks a resource eligible for expiry, but storage is reclaimed only when you run the store's `sweepExpired()` on a schedule (e.g. a cron), so pair the two.
+On any surface reachable by untrusted clients, set at least one of `policy.maxSize` and `policy.maxAgeSeconds`: with neither, an upload accepts unbounded bytes and abandoned resources never expire. `maxAgeSeconds` marks a resource eligible for expiry, but storage is reclaimed only when you run the store's `sweepExpired()` on a schedule (e.g. a cron), so pair the two.
 
 ### IETF resumable-uploads draft
 
-The same store works under the IETF dialect (`draft-ietf-httpbis-resumable-upload`), which speaks the draft revisions actual clients implement, identified by interop versions 3, 5, and 6, including the `Upload-Complete`/`Upload-Incomplete` header flip between them. A request may assert a whole-representation SHA-256 via `Repr-Digest`; it is verified before publication on stores that can hash the assembled bytes.
+The same store works under the IETF dialect (`draft-ietf-httpbis-resumable-upload`), which speaks the draft revisions clients implement, identified by interop versions 3 (draft-01), 5 (draft-03), 6 (draft-04/-05), and 9 (draft-12). Each request is answered entirely in its own version's terms, including the `Upload-Complete`/`Upload-Incomplete` header flip between 3 and the rest, so a client upgrades on its own schedule. Interop 9 additionally advertises the server's bounds as an RFC 8941 `Upload-Limit` dictionary on offset retrievals and on any rejection a limit caused, admits `GET` as an offset probe beside `HEAD`, and replays the completion answer when an append arrives for an upload that is already finished. A request may assert a whole-representation SHA-256 via `Repr-Digest` (RFC 9530) on every version; it is verified before publication on stores that can hash the assembled bytes.
 
 ```typescript
 import { createUploadHandler } from "partial-content/upload";
@@ -217,6 +232,14 @@ import { fsUploadStore } from "partial-content/fs";
 const handler = createUploadHandler(fsUploadStore({ root: "/var/data/files" }), {
   key: () => `uploads/${crypto.randomUUID()}`,
   location: (token) => `/api/uploads/${token}`,
+  // How resource requests recover the token from the URL. This dialect
+  // consults resolveToken on EVERY request and treats "no token" as a
+  // CREATION, so both directions matter: omit it and every probe, append and
+  // cancel creates a fresh upload instead, orphaning the bytes already stored;
+  // return a token for the creation URL itself and the create is answered 405.
+  // Match only the resource path, so `/api/uploads` stays a creation.
+  resolveToken: (req) =>
+    /^\/api\/uploads\/(.+)$/.exec(new URL(req.url).pathname)?.[1],
   policy: { maxSize: 5 * 1024 * 1024 * 1024, maxAgeSeconds: 24 * 60 * 60 },
 });
 // Requests without an upload token are creations; requests with one target
@@ -242,7 +265,15 @@ Use this library when your application **must** proxy file requests (authorizati
 
 ```typescript
 import { serveObject } from "partial-content/web";
-import { s3Store } from "partial-content/s3";
+import { s3Store, type S3StoreOptions } from "partial-content/s3";
+
+// Yours to supply: a configured S3 client (`new S3Client({ region: "eu-central-1" })`),
+// wherever you log and meter, and the authorization check that owns access.
+declare const client: S3StoreOptions["client"];
+declare const logger: { info(fields: object, msg: string): void; error(fields: object, msg: string): void };
+declare const meter: { recordEgress(key: string, bytes: number): void };
+declare const authorize: (request: Request, key: string) =>
+  Promise<{ id: string; path: string; mimeType: string; filename: string } | null>;
 
 const store = s3Store({ client, bucket: "private-documents" });
 
@@ -285,11 +316,12 @@ This is the path behind `<video>`/`<audio>` seeking and PDF.js progressive loadi
 
 The full reference lives in **[docs/API.md](docs/API.md)**. The shape of the surface:
 
-- **Kernel** (`partial-content`): `evaluateConditionalRequest` / `evaluateConditionalWrite` (the one-call orchestrators), the step-by-step primitives (`parseRangeHeader`, `parseRanges`, `isConditionalFresh`, `isPreconditionFailure`, `isRangeFresh`, the `build*Headers` family), `generateETag`, `buildContentDisposition`, `clientWantsDigest`, `clientWantsContentDigest`, `fromNodeHeaders`, `sanitizeHeaderValue`
+- **Kernel** (`partial-content`): `evaluateConditionalRequest` / `evaluateConditionalWrite` (the one-call orchestrators), the step-by-step primitives (`parseRangeHeader`, `parseRanges`, `isConditionalFresh`, `isPreconditionFailure`, `isRangeFresh`, the `build*Headers` family), `generateETag`, `buildContentDisposition`, `clientWantsDigest`, `clientWantsContentDigest`, `fromNodeHeaders`, `sanitizeHeaderValue`, `isSha256Base64`
 - **Serving** (`/web`, `/node`, `/hono`): `serveObject` handlers with `disposition`, `cacheControl` (verbatim passthrough), security headers, `onServe` / `onTransfer` / `onError` / `onTiming` observability hooks, `auditKey` (PII-free audit events), `maxRanges`, and a slow-read stall bound on the Node pump
 - **Stores** (`/s3`, `/r2`, `/gcs`, `/azure`, `/fs`, `/http`, `/memory`): ready-made `ObjectStore` implementations with pinned reads and truthful error mapping (404 / retryable 503 + `Retry-After` / 502)
-- **Custom adapters**: the published `ObjectStore` contract plus the primitives the built-ins are made of (`classifyStoreRead`, `nodeStreamToWeb`, `guardStreamLength`, `resolveServedRange`)
-- **Resumable uploads** (`/tus`, `/upload`, plus an `*UploadStore` factory on every storage subpath): `createTusHandler` / `createUploadHandler` wire dialects, the `ResumableWriteStore` write contract with honest per-backend capability flags, `UploadPolicy` bounds, cooperative-preemption locking, `onUploadEvent` content-free audit events, and `sweepExpired` housekeeping
+- **Custom adapters**: the published `ObjectStore` contract plus the primitives the built-ins are made of (`classifyStoreRead`, `nodeStreamToWeb`, `guardStreamLength`, `resolveServedRange`, `reservedKeyGuard`) and the name-based store-error matchers (`isObjectNotFoundError`, `isObjectChangedError`, `isStoreUnavailableError`)
+- **Resumable uploads** (`/tus`, `/upload`, plus an `*UploadStore` factory on every storage subpath): `createTusHandler` / `createUploadHandler` wire dialects, the `ResumableWriteStore` write contract with honest per-backend capability flags, `UploadPolicy` bounds, cooperative-preemption locking, `onUploadEvent` content-free audit events, the `onUploadComplete` publication hook that pairs an upload token with the storage key it published to, and `sweepExpired` housekeeping
+- **Store conformance** (`/conformance`): `checkResumableWriteStore(makeStore, opts?)`, `checkObjectStore(store, opts)` and `formatConformanceReport(report)`, for proving a custom write store meets the contract it declares and a custom read store meets the one the serving path assumes
 
 ## Design Decisions
 
@@ -348,8 +380,8 @@ The library surface maps directly to audit requirements for SOC 2 Type II, ISO 2
 | Performance observability | W3C Server-Timing | `Server-Timing` metrics with `onTiming` callback |
 | Cache control | RFC 9111 / RFC 5861 | Verbatim `Cache-Control` passthrough (`s-maxage`, `must-revalidate`, `stale-while-revalidate`, `stale-if-error`); auto-`immutable` for content-addressed keys |
 | Upload audit trail | SOC 2 CC7.2, ISO 27001 A.8.15 | `onUploadEvent` structured, content-free events (created, append accepted/rejected with reason, completed, cancelled, expired); `auditKey` substitutes an opaque id for the upload token and the filename-bearing storage key in every event |
-| Upload size bounds | OWASP (resource exhaustion) | `UploadPolicy` `maxSize`/`minSize`/`maxAppendSize`/`minAppendSize` enforced by the engine before any byte reaches storage; appends of unknown length are hard-capped mid-stream and an over-bound append terminally invalidates the resource |
-| Abandoned-upload expiry | GDPR Art. 5(1)(e) (storage limitation) | `maxAgeSeconds` policy (expired resources refuse every interaction and answer 410/404) plus the `sweepExpired` store hook to reap idle upload state on a schedule |
+| Upload size bounds | OWASP (resource exhaustion) | `UploadPolicy` `maxSize`/`minSize`/`maxAppendSize`/`minAppendSize` enforced by the engine before any byte reaches storage; appends of unknown length are hard-capped mid-stream, and what crossing a cap means depends on which cap: past a known length or the total `maxSize` the resource is terminally invalidated, while past the per-request `maxAppendSize` the append stops, answers 413, and leaves the upload resumable |
+| Abandoned-upload expiry | GDPR Art. 5(1)(e) (storage limitation) | `maxAgeSeconds` policy (expired resources refuse probes and appends with 410/404, while a `DELETE` still frees their bytes) plus the `sweepExpired` store hook to reap idle upload state on a schedule |
 | Upload integrity at completion | RFC 9530, GDPR Art. 32 (integrity of processing) | Client-asserted `Repr-Digest` SHA-256 verified against the assembled bytes BEFORE publication, on stores that can hash them (`fs`, `memory`); S3 multipart checksums are composite-only, so the S3 store honestly declines whole-object verification (`digestOnComplete: false`) and a digest asserted against it is rejected rather than silently ignored |
 
 Not claimed, deliberately: malware scanning, content-type allowlists, authentication/authorization, and per-tenant quotas are the caller's responsibility -- the upload handlers assume the request was already authorized, exactly like the serving handlers.

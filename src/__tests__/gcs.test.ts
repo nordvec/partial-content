@@ -1,5 +1,13 @@
 import { describe, test, expect } from "bun:test";
-import { gcsStore, ObjectNotFoundError, ObjectChangedError, StoreUnavailableError } from "../gcs";
+import {
+    gcsStore,
+    ObjectNotFoundError,
+    ObjectChangedError,
+    StoreUnavailableError,
+    type GcsStoreOptions,
+} from "../gcs";
+import { asStream } from "./helpers";
+import type { ObjectStream } from "../index";
 
 // ─── Mock GCS Storage ───────────────────────────────────────────────────────
 
@@ -10,6 +18,24 @@ const GENERATION = "1719576000000000";
 const DIGEST = Buffer.alloc(32, 7).toString("base64");
 const SIGNED_URL = "https://storage.example/doc?X-Goog-Signature=abc";
 
+/**
+ * The storage surface the adapter consumes and the signing config it builds,
+ * both read off the adapter's own option type. Deriving them binds the double
+ * to the contract: a change to either shape fails this file at compile time
+ * instead of leaving the mock satisfying a contract nobody has.
+ */
+type GcsStorage = GcsStoreOptions["storage"];
+type GcsSignedUrlConfig = Parameters<
+    ReturnType<ReturnType<GcsStorage["bucket"]>["file"]>["getSignedUrl"]
+>[0];
+
+/** One recorded createReadStream call, with the generation it was pinned to. */
+interface GcsReadCall {
+    generation?: string | number;
+    start?: number;
+    end?: number;
+}
+
 interface MockGcsOpts {
     missing?: boolean;
     /** getMetadata throws a NON-404 error (auth failure, 500). */
@@ -17,13 +43,13 @@ interface MockGcsOpts {
     /** Record stream destroy() calls. */
     destroyed?: { count: number };
     /** Record which generation each read stream was pinned to. */
-    reads?: Array<{ generation?: string | number; start?: number; end?: number }>;
+    reads?: GcsReadCall[];
     /** Count of getMetadata round trips. */
     metadataCalls?: { count: number };
     /** Custom metadata returned by getMetadata (the x-goog-meta-* namespace). */
     customMetadata?: Record<string, string>;
     /** Record getSignedUrl configs. */
-    signCalls?: Array<Record<string, unknown>>;
+    signCalls?: GcsSignedUrlConfig[];
     /** getSignedUrl rejects (missing signing credentials, IAM denial). */
     signError?: Error;
 }
@@ -32,7 +58,7 @@ async function* iterate(buf: Buffer): AsyncGenerator<Buffer> {
     yield buf;
 }
 
-function mockStorage(opts: MockGcsOpts = {}) {
+function mockStorage(opts: MockGcsOpts = {}): GcsStorage {
     return {
         bucket(_name: string) {
             return {
@@ -55,7 +81,7 @@ function mockStorage(opts: MockGcsOpts = {}) {
                                 updated: string; metadata?: Record<string, string>;
                             }];
                         },
-                        async getSignedUrl(config: Record<string, unknown>) {
+                        async getSignedUrl(config: GcsSignedUrlConfig) {
                             opts.signCalls?.push(config);
                             if (opts.signError) throw opts.signError;
                             return [SIGNED_URL] as [string];
@@ -82,6 +108,11 @@ function mockStorage(opts: MockGcsOpts = {}) {
     };
 }
 
+/**
+ * The streaming half of an {@link ObjectStream} body. This adapter opens a
+ * read stream for every object, so a byte body means the adapter stopped
+ * streaming and the surrounding assertion is measuring the wrong thing.
+ */
 async function drain(body: ReadableStream<Uint8Array> | Uint8Array): Promise<string> {
     if (body instanceof Uint8Array) return Buffer.from(body).toString("utf8");
     const chunks: Uint8Array[] = [];
@@ -137,7 +168,7 @@ describe("gcsStore: getObject", () => {
     });
 
     test("ifMatch mismatch throws ObjectChangedError before any streaming", async () => {
-        const reads: unknown[] = [];
+        const reads: GcsReadCall[] = [];
         const store = gcsStore({ storage: mockStorage({ reads }), bucket: "b" });
 
         await expect(
@@ -292,7 +323,7 @@ describe("gcsStore: failure propagation and cleanup", () => {
         const store = gcsStore({ storage: mockStorage({ destroyed }), bucket: "b" });
         const result = await store.getObject("doc.pdf");
 
-        await result.body.cancel();
+        await asStream(result.body).cancel();
         expect(destroyed.count).toBe(1);
     });
 });
@@ -312,7 +343,7 @@ describe("gcsStore: digestMetadataKey", () => {
         // Custom-metadata digests name the WHOLE representation, so a ranged
         // read keeps it (Repr-Digest is valid on 206 responses).
         expect(result.digest).toBe(DIGEST);
-        await result.body.cancel();
+        await asStream(result.body).cancel();
     });
 
     test("the pin round-trip carries the digest without a second metadata read", async () => {
@@ -327,7 +358,7 @@ describe("gcsStore: digestMetadataKey", () => {
         const result = await store.getObject("doc.pdf", { ifMatch: meta.etag, pin: meta.pin });
         expect(result.digest).toBe(DIGEST);
         expect(metadataCalls.count).toBe(1); // HEAD only; the pin skipped the re-fetch
-        await result.body.cancel();
+        await asStream(result.body).cancel();
     });
 
     test("invalid digest values yield undefined, never an error", async () => {
@@ -371,7 +402,7 @@ describe("gcsStore: digestMetadataKey", () => {
 
 describe("gcsStore: createSignedUrl", () => {
     test("returns ok with a V4 read URL and forwards the sanitized disposition", async () => {
-        const signCalls: Array<Record<string, unknown>> = [];
+        const signCalls: GcsSignedUrlConfig[] = [];
         const store = gcsStore({ storage: mockStorage({ signCalls }), bucket: "b" });
 
         const result = await store.createSignedUrl!("doc.pdf", {
@@ -389,7 +420,7 @@ describe("gcsStore: createSignedUrl", () => {
     });
 
     test("forces attachment + inert content type even without a downloadFilename", async () => {
-        const signCalls: Array<Record<string, unknown>> = [];
+        const signCalls: GcsSignedUrlConfig[] = [];
         const store = gcsStore({ storage: mockStorage({ signCalls }), bucket: "b" });
 
         const result = await store.createSignedUrl!("doc.pdf", { expiresInSeconds: 60 });
@@ -402,7 +433,7 @@ describe("gcsStore: createSignedUrl", () => {
     });
 
     test("a hostile filename never reaches the signed disposition unsanitized", async () => {
-        const signCalls: Array<Record<string, unknown>> = [];
+        const signCalls: GcsSignedUrlConfig[] = [];
         const store = gcsStore({ storage: mockStorage({ signCalls }), bucket: "b" });
 
         await store.createSignedUrl!("doc.pdf", {
@@ -416,7 +447,7 @@ describe("gcsStore: createSignedUrl", () => {
     });
 
     test("expiry is expiresInSeconds from now", async () => {
-        const signCalls: Array<Record<string, unknown>> = [];
+        const signCalls: GcsSignedUrlConfig[] = [];
         const store = gcsStore({ storage: mockStorage({ signCalls }), bucket: "b" });
 
         const before = Date.now();
@@ -430,7 +461,7 @@ describe("gcsStore: createSignedUrl", () => {
     });
 
     test("cacheControl is never forwarded (GCS has no response-cache-control override)", async () => {
-        const signCalls: Array<Record<string, unknown>> = [];
+        const signCalls: GcsSignedUrlConfig[] = [];
         const store = gcsStore({ storage: mockStorage({ signCalls }), bucket: "b" });
 
         await store.createSignedUrl!("doc.pdf", {

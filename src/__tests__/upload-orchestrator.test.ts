@@ -1,13 +1,19 @@
 import { describe, test, expect } from "bun:test";
-import { createUploadOrchestrator, type UploadResourceEvent } from "../upload-orchestrator";
 import {
+    createUploadOrchestrator,
+    type UploadOrchestratorOptions,
+    type UploadResourceEvent,
+} from "../upload-orchestrator";
+import {
+    UploadAppendBoundError,
     UploadDigestMismatchError,
     UploadNotFoundError,
     UploadOffsetConflictError,
+    UploadOverrunError,
     type ResumableWriteStore,
     type StoredUploadState,
 } from "../upload-store";
-import { UploadLockTimeoutError, type UploadLocker } from "../upload-locker";
+import { UploadLockTimeoutError, memoryUploadLocker, type UploadLocker } from "../upload-locker";
 
 const NOW = 1_800_000_000_000;
 
@@ -28,6 +34,7 @@ function fakeStore(over: Partial<ResumableWriteStore> = {}) {
     const base: ResumableWriteStore = {
         exactOffsetRecovery: true,
         atomicCompletion: true,
+        enforcesOffsetCheck: true,
         digestOnComplete: "sha256",
         async createUpload(opts) {
             const uploadToken = `u${++seq}`;
@@ -41,6 +48,7 @@ function fakeStore(over: Partial<ResumableWriteStore> = {}) {
             const u = uploads.get(token);
             if (!u) throw new UploadNotFoundError(token);
             return {
+                key: u.key,
                 offset: u.bytes.byteLength, length: u.length, isComplete: u.isComplete,
                 isInvalidated: u.isInvalidated, createdAt: u.createdAt, lastAppendAt: u.lastAppendAt,
             };
@@ -49,10 +57,25 @@ function fakeStore(over: Partial<ResumableWriteStore> = {}) {
             const u = uploads.get(token);
             if (!u) throw new UploadNotFoundError(token);
             let written = 0;
+            let crossedBound = false;
             const chunks: Uint8Array[] = [];
+            /** Take as much as the bound allows; false = the body crossed it. */
+            const accept = (chunk: Uint8Array): boolean => {
+                const room = opts.maxBytes === undefined
+                    ? chunk.byteLength
+                    : Math.min(chunk.byteLength, opts.maxBytes - written);
+                if (room > 0) {
+                    chunks.push(chunk.subarray(0, room));
+                    written += room;
+                }
+                if (room < chunk.byteLength) {
+                    crossedBound = true;
+                    return false;
+                }
+                return true;
+            };
             if (body instanceof Uint8Array) {
-                chunks.push(body);
-                written = body.byteLength;
+                accept(body);
             } else {
                 const reader = body.getReader();
                 try {
@@ -60,8 +83,7 @@ function fakeStore(over: Partial<ResumableWriteStore> = {}) {
                         if (opts.signal?.aborted) break;
                         const { done, value } = await reader.read();
                         if (done) break;
-                        chunks.push(value);
-                        written += value.byteLength;
+                        if (!accept(value)) break;
                     }
                 } catch {
                     // torn body: keep the flushed prefix
@@ -76,6 +98,16 @@ function fakeStore(over: Partial<ResumableWriteStore> = {}) {
             // Persist a length first declared on this append (deferred-length).
             if (opts.length !== undefined && u.length === undefined) u.length = opts.length;
             if (opts.signal?.aborted) throw new Error("aborted mid-append");
+            // Contract: a REPRESENTATION bound is the terminal fault; this
+            // request's ceiling only stops the append and leaves the resource
+            // healthy. A fake that ignored the distinction would let the
+            // orchestrator's handling of it go untested.
+            if (crossedBound && opts.maxBytesFatal) {
+                u.isInvalidated = true;
+                throw new UploadOverrunError(token, opts.maxBytes!);
+            } else if (crossedBound) {
+                throw new UploadAppendBoundError(token, u.bytes.byteLength);
+            }
             return { bytesWritten: written };
         },
         async completeUpload(token, opts) {
@@ -313,6 +345,119 @@ describe("concurrency and hooks", () => {
         expect(probed).toMatchObject({ kind: "probed", offset: 3 });
     });
 
+    test("a rejected creation-with-upload announces WHY it was rejected", async () => {
+        // Each rejection on this path emits its own audit event, and the reason
+        // is the whole point of emitting one: a consumer reading its records
+        // has to be able to tell a client that overran its request ceiling from
+        // one that contradicted its own declared length. The offset is 0
+        // because creation streams from the start.
+        const cases = [
+            {
+                label: "a body past this request's ceiling",
+                build: () => new UploadAppendBoundError("t", 4),
+                reason: "append-too-large",
+            },
+            {
+                label: "a body past a representation bound",
+                build: () => new UploadOverrunError("t", 4),
+                reason: "size-exceeded",
+            },
+            {
+                label: "a client that won the lock first",
+                build: () => new UploadOffsetConflictError("t", 4),
+                reason: "offset-mismatch",
+            },
+        ] as const;
+
+        for (const { label, build, reason } of cases) {
+            const events: UploadResourceEvent[] = [];
+            const { store } = fakeStore({
+                appendChunk: async () => { throw build(); },
+            });
+            const o = createUploadOrchestrator(store, {
+                now: () => NOW, graceMs: 0,
+                policy: { maxSize: 4 },
+                onUploadEvent: (e) => events.push(e),
+            });
+
+            const out = await o.create({ key: "k", complete: false, body: bodyOf("abcdefgh") });
+
+            const rejected = events.map((e) => e.event).filter((e) => e.kind === "append-rejected");
+            expect(rejected, label).toEqual([
+                { kind: "append-rejected", reason, atOffset: 0 },
+            ]);
+            expect(out.kind, label).not.toBe("created");
+        }
+    });
+
+    test("an append rejected at its ceiling announces the offset it stopped at", async () => {
+        // The same rejection on the append path, where the offset is a real
+        // resume point rather than 0. It is what the consumer's records need to
+        // show where the client should continue from, so it has to be the
+        // durable offset the append started at and not a placeholder.
+        const events: UploadResourceEvent[] = [];
+        let failNext = false;
+        const { store } = fakeStore({});
+        const wrapped: ResumableWriteStore = {
+            ...store,
+            appendChunk: async (token, offset, body, opts) => {
+                if (failNext) throw new UploadAppendBoundError(token, offset);
+                return store.appendChunk(token, offset, body, opts);
+            },
+        };
+        const o = createUploadOrchestrator(wrapped, {
+            now: () => NOW, graceMs: 0,
+            onUploadEvent: (e) => events.push(e),
+        });
+
+        const created = await o.create({ key: "k", complete: false });
+        if (created.kind !== "created") throw new Error("setup");
+        await o.append(created.uploadToken, {
+            offset: 0, contentLength: 3, complete: false, body: bodyOf("abc"),
+        });
+
+        events.length = 0;
+        failNext = true;
+        const out = await o.append(created.uploadToken, {
+            offset: 3, contentLength: 5, complete: false, body: bodyOf("defgh"),
+        });
+
+        expect(out).toMatchObject({ kind: "limit-violation", reason: "append-too-large" });
+        // The engine accepts the intent before the store refuses the bytes, so
+        // the accepted event precedes the rejection; the rejection is the one
+        // carrying the resume point.
+        expect(events.map((e) => e.event).filter((e) => e.kind === "append-rejected")).toEqual([
+            { kind: "append-rejected", reason: "append-too-large", atOffset: 3 },
+        ]);
+    });
+
+    test("a creation failure reaches onError verbatim: there is no token to redact yet", async () => {
+        // `create` is the one reporting path with no token, since the token is
+        // what creation produces. Redaction searches for the token it is given,
+        // so a missing one must short-circuit rather than search for the word
+        // it stringifies to: backend messages carry "undefined" constantly, and
+        // substituting the audit key into one rewrites an unrelated diagnostic.
+        const boom = new Error("S3: Cannot read properties of undefined (reading 'UploadId')");
+        const seen: { err: unknown; ctx: { uploadToken?: string; auditKey?: string } }[] = [];
+        const { store } = fakeStore({
+            createUpload: async () => { throw boom; },
+        });
+        const o = createUploadOrchestrator(store, {
+            now: () => NOW, graceMs: 0,
+            onError: (err, ctx) => seen.push({ err, ctx }),
+        });
+
+        const out = await o.create({ key: "k", complete: false, auditKey: "doc-7" });
+
+        expect(out.kind).toBe("store-error");
+        expect(seen).toHaveLength(1);
+        // The same object, not a scrubbed clone of it.
+        expect(seen[0]!.err).toBe(boom);
+        expect((seen[0]!.err as Error).message).toContain("undefined");
+        expect(seen[0]!.ctx.auditKey).toBe("doc-7");
+        expect(seen[0]!.ctx.uploadToken).toBeUndefined();
+    });
+
     test("upload events are emitted with the auditKey and a throwing hook routes to onError", async () => {
         const events: UploadResourceEvent[] = [];
         const errors: string[] = [];
@@ -330,8 +475,31 @@ describe("concurrency and hooks", () => {
         await o.append(created.uploadToken, { offset: 0, contentLength: 2, complete: false, body: bodyOf("ab"), auditKey: "doc-7" });
 
         expect(events[0]).toMatchObject({ auditKey: "doc-7", event: { kind: "created" } });
+        // The audit key SUBSTITUTES for the token rather than accompanying it.
+        // The token is the capability: possession of it authorizes appending,
+        // probing and cancelling, and this hook is the most log-adjacent
+        // surface in the package, so a caller that supplied a safe identifier
+        // must not get the credential written beside it.
+        expect(events.every((e) => e.uploadToken === undefined)).toBe(true);
         expect(events.some((e) => e.event.kind === "append-accepted")).toBe(true);
         expect(errors).toContain("audit");
+    });
+
+    test("without an auditKey the token IS reported, so events stay correlatable", async () => {
+        // The substitution is opt-in: a caller that supplied no safe id still
+        // needs something to join events on, and it has the token already.
+        const events: UploadResourceEvent[] = [];
+        const { store } = fakeStore();
+        const o = createUploadOrchestrator(store, {
+            now: () => NOW, graceMs: 0, onUploadEvent: (e) => events.push(e),
+        });
+        const created = await o.create({ key: "k", complete: false });
+        if (created.kind !== "created") throw new Error("setup");
+        await o.append(created.uploadToken, { offset: 0, contentLength: 2, complete: false, body: bodyOf("ab") });
+
+        const appended = events.find((e) => e.event.kind === "append-accepted");
+        expect(appended?.uploadToken).toBe(created.uploadToken);
+        expect(appended?.auditKey).toBeUndefined();
     });
 
     test("store maxAppendSize tightens the effective policy", async () => {
@@ -347,6 +515,49 @@ describe("concurrency and hooks", () => {
         expect(out).toMatchObject({ kind: "limit-violation", reason: "append-too-large" });
     });
 
+    test("an unknown-length body past maxAppendSize is a 413, not a destroyed upload", async () => {
+        // The known-size case above never reaches storage: the engine refuses
+        // it up front. This is the case that cannot be checked in advance, a
+        // chunked body with no Content-Length, and it used to invalidate the
+        // whole resource over a per-REQUEST ceiling. The representation is
+        // untouched by running long, so the upload survives and resumes.
+        const { store, uploads } = fakeStore();
+        const o = orch(store, { policy: { maxAppendSize: 4 } });
+        const created = await o.create({ key: "k", complete: false });
+        if (created.kind !== "created") throw new Error("setup");
+
+        const out = await o.append(created.uploadToken, {
+            offset: 0, complete: false, body: bodyOf("0123456789"),
+        });
+        expect(out).toMatchObject({ kind: "limit-violation", reason: "append-too-large" });
+        // Alive, not invalidated, with the accepted prefix durable.
+        const record = uploads.get(created.uploadToken)!;
+        expect(record.isInvalidated).toBe(false);
+
+        const probed = await o.probe(created.uploadToken);
+        expect(probed.kind).toBe("probed");
+        if (probed.kind !== "probed") return;
+        const resumed = await o.append(created.uploadToken, {
+            offset: probed.offset, complete: false, body: bodyOf("ab"),
+        });
+        expect(resumed.kind).toBe("appended");
+    });
+
+    test("an unknown-length body past a REPRESENTATION bound still invalidates", async () => {
+        // The other half of the same split: maxSize bounds the representation,
+        // so bytes past it are the terminal fault and the resource dies. The
+        // per-request ceiling must not have softened this.
+        const { store, uploads } = fakeStore();
+        const o = orch(store, { policy: { maxSize: 4 } });
+        const created = await o.create({ key: "k", complete: false });
+        if (created.kind !== "created") throw new Error("setup");
+
+        await o.append(created.uploadToken, {
+            offset: 0, complete: false, body: bodyOf("0123456789"),
+        });
+        expect(uploads.get(created.uploadToken)!.isInvalidated).toBe(true);
+    });
+
     test("canVerifyDigest reflects the store capability", async () => {
         const { store } = fakeStore();
         expect(orch(store).canVerifyDigest).toBe(true);
@@ -358,8 +569,26 @@ describe("concurrency and hooks", () => {
 describe("construction guards", () => {
     test("a store reporting atomicCompletion: false is refused", () => {
         const { store } = fakeStore();
-        const nonAtomic = { ...store, atomicCompletion: false } as ResumableWriteStore;
+        // `atomicCompletion` is typed `true`, so no TypeScript caller can build
+        // this store: the guard defends against an untyped consumer and a backend
+        // that reports a capability it does not have, which is what this cast
+        // reconstructs.
+        const nonAtomic = { ...store, atomicCompletion: false } as unknown as ResumableWriteStore;
         expect(() => createUploadOrchestrator(nonAtomic, { now: () => NOW })).toThrow(TypeError);
+    });
+
+    test("a store reporting enforcesOffsetCheck: false is refused", () => {
+        // The lock serializes writers but cannot prove the writer still holds
+        // it: an expiry-based distributed lock is stealable from a holder that
+        // stalls past its TTL and resumes. The store's at-write offset check is
+        // the only thing that makes that holder's late write loud instead of
+        // silently interleaved, so a store admitting it cannot do the check has
+        // no defense left and is refused rather than deployed and hoped about.
+        const { store } = fakeStore();
+        // Typed `true` like `atomicCompletion`, and reached the same way.
+        const unchecked = { ...store, enforcesOffsetCheck: false } as unknown as ResumableWriteStore;
+        expect(() => createUploadOrchestrator(unchecked, { now: () => NOW }))
+            .toThrow(/enforcesOffsetCheck/);
     });
 
     test("a NaN / negative / fractional / inverted policy is refused", () => {
@@ -686,8 +915,8 @@ describe("clock injection", () => {
         expect(out.remainingLifetimeSeconds).toBe(100);
     });
 
-    test("an expired resource answers gone to append and cancel", async () => {
-        const { store } = fakeStore();
+    test("an expired resource answers gone to append but cancel still frees the bytes", async () => {
+        const { store, uploads } = fakeStore();
         let t = NOW;
         const o = createUploadOrchestrator(store, {
             now: () => t, graceMs: 0, policy: { maxAgeSeconds: 100 },
@@ -699,8 +928,129 @@ describe("clock injection", () => {
             offset: 0, contentLength: 1, complete: false, body: bodyOf("x"),
         });
         expect(appended).toMatchObject({ kind: "gone", reason: "expired" });
+        // DELETE is the one verb that must succeed on a dead resource: cancel
+        // frees the partial bytes instead of refusing, so an expired upload
+        // does not wait for a sweep (which may never run without a max age).
         const cancelled = await o.cancel(created.uploadToken);
-        expect(cancelled).toMatchObject({ kind: "gone", reason: "expired" });
+        expect(cancelled).toMatchObject({ kind: "cancelled" });
+        expect(uploads.has(created.uploadToken)).toBe(false);
+    });
+});
+
+describe("terminal audit events are emitted only after the store action succeeds", () => {
+    test("a complete-now append whose completeUpload throws does NOT emit a completed event", async () => {
+        const events: UploadResourceEvent[] = [];
+        const { store } = fakeStore({
+            completeUpload: async () => { throw new Error("publish failed"); },
+        });
+        const o = createUploadOrchestrator(store, {
+            now: () => NOW, graceMs: 0, onUploadEvent: (e) => events.push(e),
+        });
+        const created = await o.create({ key: "k", declaredLength: 3, complete: false });
+        if (created.kind !== "created") throw new Error("setup");
+        await o.append(created.uploadToken, { offset: 0, contentLength: 3, complete: false, body: bodyOf("abc") });
+        // Zero-content completing tail at offset == length: a complete-now verdict.
+        const out = await o.append(created.uploadToken, { offset: 3, contentLength: 0, complete: true });
+        expect(out.kind).toBe("store-error");
+        // The audit trail must not record a completion that never happened.
+        expect(events.some((e) => e.event.kind === "completed")).toBe(false);
+    });
+
+    test("a complete-now append emits completed exactly once, after completeUpload returns", async () => {
+        const seq: string[] = [];
+        const { store } = fakeStore();
+        const spy: ResumableWriteStore = {
+            ...store,
+            completeUpload: async (t, o2) => { seq.push("store.complete"); return store.completeUpload(t, o2); },
+        };
+        const completed: UploadResourceEvent[] = [];
+        const o = createUploadOrchestrator(spy, {
+            now: () => NOW, graceMs: 0,
+            onUploadEvent: (e) => { if (e.event.kind === "completed") { seq.push("event.completed"); completed.push(e); } },
+        });
+        const created = await o.create({ key: "k", declaredLength: 3, complete: false });
+        if (created.kind !== "created") throw new Error("setup");
+        await o.append(created.uploadToken, { offset: 0, contentLength: 3, complete: false, body: bodyOf("abc") });
+        const out = await o.append(created.uploadToken, { offset: 3, contentLength: 0, complete: true });
+        expect(out).toMatchObject({ kind: "appended", complete: true });
+        expect(completed).toHaveLength(1);
+        expect(completed[0]!.event).toEqual({ kind: "completed", length: 3 });
+        // Emission strictly follows the store action it describes.
+        expect(seq).toEqual(["store.complete", "event.completed"]);
+    });
+
+    test("a cancel whose abortUpload throws does NOT emit a cancelled event", async () => {
+        const events: UploadResourceEvent[] = [];
+        const { store } = fakeStore({
+            abortUpload: async () => { throw new Error("discard failed"); },
+        });
+        const o = createUploadOrchestrator(store, {
+            now: () => NOW, graceMs: 0, onUploadEvent: (e) => events.push(e),
+        });
+        const created = await o.create({ key: "k", complete: false });
+        if (created.kind !== "created") throw new Error("setup");
+        const out = await o.cancel(created.uploadToken);
+        expect(out.kind).toBe("store-error");
+        expect(events.some((e) => e.event.kind === "cancelled")).toBe(false);
+    });
+
+    test("a successful cancel emits cancelled exactly once, after abortUpload returns", async () => {
+        const seq: string[] = [];
+        const { store } = fakeStore();
+        const spy: ResumableWriteStore = {
+            ...store,
+            abortUpload: async (t, o2) => { seq.push("store.abort"); return store.abortUpload(t, o2); },
+        };
+        const cancelled: UploadResourceEvent[] = [];
+        const o = createUploadOrchestrator(spy, {
+            now: () => NOW, graceMs: 0,
+            onUploadEvent: (e) => { if (e.event.kind === "cancelled") { seq.push("event.cancelled"); cancelled.push(e); } },
+        });
+        const created = await o.create({ key: "k", complete: false });
+        if (created.kind !== "created") throw new Error("setup");
+        const out = await o.cancel(created.uploadToken);
+        expect(out.kind).toBe("cancelled");
+        expect(cancelled).toHaveLength(1);
+        expect(seq).toEqual(["store.abort", "event.cancelled"]);
+    });
+});
+
+describe("created outcome anchors expiry at creation start", () => {
+    test("a created outcome carries expiresAt anchored at the creation instant", async () => {
+        const { store } = fakeStore();
+        const o = orch(store, { policy: { maxAgeSeconds: 100 } });
+        const out = await o.create({ key: "k", declaredLength: 10, complete: false });
+        expect(out).toMatchObject({ kind: "created", expiresAt: NOW + 100_000 });
+    });
+
+    test("expiresAt anchors at creation start, not after a slow streaming create", async () => {
+        // A streaming create whose body drains over time advertises a deadline
+        // pinned to when creation STARTED, not now()+maxAge measured after the
+        // stream completes (which would inflate the deadline past real expiry).
+        let t = NOW;
+        const { store } = fakeStore();
+        const o = createUploadOrchestrator(store, {
+            now: () => t, graceMs: 0, policy: { maxAgeSeconds: 100 },
+        });
+        const body = controlledStream();
+        const creating = o.create({ key: "k", complete: false, body: body.stream });
+        await new Promise((r) => setTimeout(r, 5));
+        t = NOW + 30_000; // clock advances DURING the slow stream
+        body.push("abc");
+        body.close();
+        const out = await creating;
+        expect(out.kind).toBe("created");
+        if (out.kind !== "created") return;
+        expect(out.expiresAt).toBe(NOW + 100_000);
+    });
+
+    test("no max age means no expiresAt on the created outcome", async () => {
+        const { store } = fakeStore();
+        const o = orch(store);
+        const out = await o.create({ key: "k", declaredLength: 5, complete: false });
+        expect(out.kind).toBe("created");
+        if (out.kind !== "created") return;
+        expect(out.expiresAt).toBeUndefined();
     });
 });
 
@@ -886,7 +1236,7 @@ describe("probe edge paths", () => {
     test("probe on an invalidated resource answers gone", async () => {
         const { store } = fakeStore({
             getUploadState: async (): Promise<StoredUploadState> => ({
-                offset: 0, isComplete: false, isInvalidated: true, createdAt: NOW,
+                key: "k", offset: 0, isComplete: false, isInvalidated: true, createdAt: NOW,
             }),
         });
         const o = orch(store);
@@ -1036,6 +1386,25 @@ describe("append edge paths", () => {
         });
     });
 
+    test("a CREATION whose stream hits durable bytes answers offset-mismatch, not a backend error", async () => {
+        // A client that took the early location and won the lock with an append
+        // before this creation acquired it leaves durable bytes at some offset.
+        // Creation always streams at 0, so the store's preflight refuses. That
+        // is a recoverable race with a truthful answer; reporting a store error
+        // would tell the client the backend failed for a state it can resume
+        // from.
+        const { store } = fakeStore();
+        const conflicted: ResumableWriteStore = {
+            ...store,
+            appendChunk: async (token) => { throw new UploadOffsetConflictError(token, 3); },
+        };
+        const o = orch(conflicted);
+        const out = await o.create({ key: "k", complete: false, contentLength: 5, body: bodyOf("hello") });
+        expect(out).toMatchObject({
+            kind: "offset-mismatch", claimedOffset: 0, correctOffset: 3, complete: false,
+        });
+    });
+
     test("a short store flush (no abort) does NOT complete a completing append", async () => {
         const { store, uploads } = fakeStore();
         const partial: ResumableWriteStore = {
@@ -1100,15 +1469,21 @@ describe("cancel edge paths", () => {
         expect(out.kind).toBe("store-error");
     });
 
-    test("cancel on an invalidated resource answers gone, not cancelled", async () => {
+    test("cancel on an invalidated resource frees the bytes instead of refusing", async () => {
+        // DELETE must succeed on a dead resource: a client told its upload is
+        // invalidated needs to reclaim the partial bytes, and abortUpload is
+        // idempotent, so cancel is answered ahead of the terminal refusals.
+        let aborted = false;
         const { store } = fakeStore({
             getUploadState: async (): Promise<StoredUploadState> => ({
-                offset: 0, isComplete: false, isInvalidated: true, createdAt: NOW,
+                key: "k", offset: 0, isComplete: false, isInvalidated: true, createdAt: NOW,
             }),
+            abortUpload: async () => { aborted = true; },
         });
         const o = orch(store);
         const out = await o.cancel("dead");
-        expect(out).toMatchObject({ kind: "gone", reason: "invalidated" });
+        expect(out).toMatchObject({ kind: "cancelled" });
+        expect(aborted).toBe(true);
     });
 
     test("a failing abortUpload maps to store-error and reports operation abort", async () => {
@@ -1308,7 +1683,10 @@ describe("minSize gate at completion emits and returns cleanly", () => {
             now: () => NOW, graceMs: 0, policy: { minSize: 10 }, onUploadEvent: (e) => events.push(e),
         });
         const out = await o.create({ key: "k", complete: true, body: bodyOf("abc") });
-        expect(out).toEqual({ kind: "limit-violation", reason: "below-min-size", events: [] });
+        // The token travels with a rejection that lands AFTER the resource was
+        // allocated: without it the bytes already durable are unreachable, so
+        // the client can neither resume them nor delete them.
+        expect(out).toEqual({ kind: "limit-violation", reason: "below-min-size", uploadToken: "u1", events: [] });
         expect([...uploads.values()][0]!.isComplete).toBe(false);
         expect(events.some((e) => e.event.kind === "append-rejected" && e.event.reason === "below-min-size")).toBe(true);
     });
@@ -1409,5 +1787,541 @@ describe("policy validation field coverage", () => {
         // A correctly ordered append window with BOTH bounds present constructs
         // (min below max, both defined).
         expect(mk({ minAppendSize: 3, maxAppendSize: 5 })).not.toThrow();
+    });
+});
+
+// ─── Fatal append bound: the client's fault, answered as one ────────────────
+
+describe("a body past a REPRESENTATION bound", () => {
+    test("a creation whose content exceeds the length it declares is refused before anything is allocated", async () => {
+        const { store, uploads } = fakeStore();
+        const o = createUploadOrchestrator(store, { now: () => NOW, graceMs: 0 });
+
+        const out = await o.create({
+            key: "k", declaredLength: 10, contentLength: 50, complete: false, body: bodyOf("x".repeat(50)),
+        });
+
+        expect(out.kind).toBe("length-inconsistent");
+        // Refusing up front is the whole point: reaching the store would
+        // truncate at the bound and destroy an upload the client was just told
+        // it had created.
+        expect(uploads.size).toBe(0);
+    });
+
+    test("a chunked body past the declared length answers 400, names the resource, and records the rejection", async () => {
+        const events: UploadResourceEvent[] = [];
+        const { store, uploads } = fakeStore();
+        const o = createUploadOrchestrator(store, {
+            now: () => NOW, graceMs: 0, onUploadEvent: (e) => events.push(e),
+        });
+        const created = await o.create({ key: "k", declaredLength: 4, complete: false });
+        if (created.kind !== "created") throw new Error("setup");
+        events.length = 0;
+
+        // No content length: the overrun is only discoverable while streaming.
+        const out = await o.append(created.uploadToken, {
+            offset: 0, complete: false, body: bodyOf("0123456789"),
+        });
+
+        expect(out).toEqual({
+            kind: "length-inconsistent",
+            uploadToken: created.uploadToken,
+            events: [],
+        });
+        expect(uploads.get(created.uploadToken)!.isInvalidated).toBe(true);
+        // An upload destroyed with no audit record is the failure this pins.
+        expect(events.map((e) => e.event)).toEqual([
+            { kind: "append-accepted", atOffset: 0, completes: false },
+            { kind: "append-rejected", reason: "length-inconsistent", atOffset: 0 },
+        ]);
+    });
+
+    test("a chunked body past the policy maximum is a size violation, not a length one", async () => {
+        const { store } = fakeStore();
+        const o = createUploadOrchestrator(store, {
+            now: () => NOW, graceMs: 0, policy: { maxSize: 4 },
+        });
+        const created = await o.create({ key: "k", complete: false });
+        if (created.kind !== "created") throw new Error("setup");
+
+        const out = await o.append(created.uploadToken, {
+            offset: 0, complete: false, body: bodyOf("0123456789"),
+        });
+
+        // Both bounds invalidate; only the answer differs, and the client never
+        // declared a length to be inconsistent with.
+        expect(out).toEqual({
+            kind: "limit-violation",
+            reason: "size-exceeded",
+            uploadToken: created.uploadToken,
+            events: [],
+        });
+    });
+
+    test("a NON-fatal ceiling leaves the resource healthy and hands back its token", async () => {
+        const { store, uploads } = fakeStore();
+        const o = createUploadOrchestrator(store, {
+            now: () => NOW, graceMs: 0, policy: { maxAppendSize: 4 },
+        });
+
+        const out = await o.create({ key: "k", complete: false, body: bodyOf("0123456789") });
+
+        // Without the token the four durable bytes are unreachable: not
+        // resumable, not deletable, reclaimed only by a sweep that may never run.
+        expect(out.kind).toBe("limit-violation");
+        if (out.kind !== "limit-violation") throw new Error("kind");
+        expect(out.uploadToken).toBeDefined();
+        const live = uploads.get(out.uploadToken!)!;
+        expect(live.isInvalidated).toBe(false);
+        expect(live.bytes.byteLength).toBe(4);
+    });
+});
+
+// ─── The offset check the whole capability flag exists for ──────────────────
+
+describe("a store-detected offset conflict", () => {
+    test("records the rejection instead of leaving an accepted append in the trail", async () => {
+        const events: UploadResourceEvent[] = [];
+        const { store } = fakeStore({
+            async appendChunk(token) {
+                // The stolen-lock case: durable state disagrees with the claim.
+                throw new UploadOffsetConflictError(token, 7);
+            },
+        });
+        const o = createUploadOrchestrator(store, {
+            now: () => NOW, graceMs: 0, onUploadEvent: (e) => events.push(e),
+        });
+        const created = await o.create({ key: "k", complete: false });
+        if (created.kind !== "created") throw new Error("setup");
+        events.length = 0;
+
+        const out = await o.append(created.uploadToken, {
+            offset: 0, complete: false, body: bodyOf("abc"),
+        });
+
+        expect(out).toMatchObject({ kind: "offset-mismatch", claimedOffset: 0, correctOffset: 7 });
+        expect(events.map((e) => e.event)).toEqual([
+            { kind: "append-accepted", atOffset: 0, completes: false },
+            { kind: "append-rejected", reason: "offset-mismatch", atOffset: 0 },
+        ]);
+    });
+});
+
+// ─── The audit key substitutes on every reporting surface ───────────────────
+
+describe("auditKey and the token", () => {
+    test("a store failure reports the audit key, never the capability", async () => {
+        const seen: Array<{ uploadToken?: string; auditKey?: string; operation: string }> = [];
+        const { store } = fakeStore({
+            async appendChunk() { throw new Error("backend down"); },
+        });
+        const o = createUploadOrchestrator(store, {
+            now: () => NOW, graceMs: 0,
+            onError: (_err, ctx) => seen.push(ctx),
+        });
+        const created = await o.create({ key: "k", complete: false });
+        if (created.kind !== "created") throw new Error("setup");
+
+        await o.append(created.uploadToken, {
+            offset: 0, complete: false, body: bodyOf("abc"), auditKey: "safe-id",
+        });
+
+        expect(seen).toEqual([{ uploadToken: undefined, auditKey: "safe-id", operation: "append" }]);
+    });
+
+    test("without an audit key the token is what identifies the resource", async () => {
+        const seen: Array<{ uploadToken?: string; auditKey?: string; operation: string }> = [];
+        const { store } = fakeStore({
+            async appendChunk() { throw new Error("backend down"); },
+        });
+        const o = createUploadOrchestrator(store, {
+            now: () => NOW, graceMs: 0,
+            onError: (_err, ctx) => seen.push(ctx),
+        });
+        const created = await o.create({ key: "k", complete: false });
+        if (created.kind !== "created") throw new Error("setup");
+
+        await o.append(created.uploadToken, { offset: 0, complete: false, body: bodyOf("abc") });
+
+        expect(seen).toEqual([
+            { uploadToken: created.uploadToken, auditKey: undefined, operation: "append" },
+        ]);
+    });
+
+    test("a resource-existence check reports a backend failure rather than absorbing it", async () => {
+        const seen: string[] = [];
+        const { store } = fakeStore({
+            async getUploadState() { throw new Error("backend down"); },
+        });
+        const o = createUploadOrchestrator(store, {
+            now: () => NOW, graceMs: 0,
+            onError: (_err, ctx) => seen.push(ctx.operation),
+        });
+
+        // Fail-open is the right answer, silence is not: a persistent failure
+        // on this gate is otherwise completely invisible.
+        expect(await o.resourceExists("whatever")).toBe(true);
+        expect(seen).toEqual(["head"]);
+    });
+
+    test("a backend failure with NO onError configured still answers true", async () => {
+        // The hook is optional, so the reporting path has to tolerate its
+        // absence: calling an absent sink would turn a backend outage into a
+        // TypeError thrown out of the gate a caller uses to avoid one.
+        const { store } = fakeStore({
+            async getUploadState() { throw new Error("backend down"); },
+        });
+        const o = orch(store);
+
+        expect(await o.resourceExists("whatever")).toBe(true);
+    });
+});
+
+// ─── A length declared on the completing append is a fact to record ─────────
+
+describe("deferred length declared at completion", () => {
+    test("the length the request declares is persisted, not just acted on", async () => {
+        const { store, uploads } = fakeStore();
+        const o = createUploadOrchestrator(store, { now: () => NOW, graceMs: 0 });
+        const created = await o.create({ key: "k", complete: false });
+        if (created.kind !== "created") throw new Error("setup");
+        await o.append(created.uploadToken, { offset: 0, complete: false, body: bodyOf("0123456789") });
+
+        // Bodyless completing PATCH that declares the total for the first time.
+        const out = await o.append(created.uploadToken, {
+            offset: 10, contentLength: 0, complete: true, declaredLength: 10,
+        });
+
+        expect(out).toMatchObject({ kind: "appended", complete: true, length: 10 });
+        // Publishing an upload whose length the store never learned leaves a
+        // completed resource that denies knowing its own size.
+        expect(uploads.get(created.uploadToken)!.length).toBe(10);
+        const probed = await o.probe(created.uploadToken);
+        expect(probed).toMatchObject({ kind: "probed", complete: true, length: 10 });
+    });
+});
+
+// ─── A cancel must survive whatever state the resource is in ────────────────
+
+describe("cancel on malformed bookkeeping", () => {
+    test("a resource whose state is nonsense can still be discarded", async () => {
+        const { store, uploads } = fakeStore({
+            async getUploadState() {
+                // Offset past the length, and a non-finite creation time: the
+                // shape most likely to have been corrupted is the one most in
+                // need of being deletable.
+                return {
+                    key: "k", offset: 99, length: 10, isComplete: false, isInvalidated: false,
+                    createdAt: Number.NaN,
+                } satisfies StoredUploadState;
+            },
+        });
+        const o = createUploadOrchestrator(store, { now: () => NOW, graceMs: 0 });
+        const created = await o.create({ key: "k", complete: false });
+        if (created.kind !== "created") throw new Error("setup");
+
+        expect(await o.cancel(created.uploadToken)).toEqual({ kind: "cancelled" });
+        expect(uploads.has(created.uploadToken)).toBe(false);
+    });
+});
+
+// ─── Which representation bound binds decides the answer ────────────────────
+
+describe("two representation bounds at once", () => {
+    test("the policy maximum below the declared length answers as a size violation", async () => {
+        const { store } = fakeStore();
+        const o = createUploadOrchestrator(store, {
+            now: () => NOW, graceMs: 0, policy: { maxSize: 4 },
+        });
+        // A length accepted under the old policy outlives a redeploy that
+        // tightens the maximum, so the server ceiling is what the body crosses.
+        const lenient = createUploadOrchestrator(store, {
+            now: () => NOW, graceMs: 0, policy: { maxSize: 100 },
+        });
+        const created = await lenient.create({ key: "k", declaredLength: 100, complete: false });
+        if (created.kind !== "created") throw new Error("setup");
+
+        const out = await o.append(created.uploadToken, {
+            offset: 0, complete: false, body: bodyOf("0123456789"),
+        });
+
+        expect(out).toEqual({
+            kind: "limit-violation",
+            reason: "size-exceeded",
+            uploadToken: created.uploadToken,
+            events: [],
+        });
+    });
+
+    test("the declared length below the policy maximum answers as a length inconsistency", async () => {
+        const { store } = fakeStore();
+        const o = createUploadOrchestrator(store, {
+            now: () => NOW, graceMs: 0, policy: { maxSize: 100 },
+        });
+        const created = await o.create({ key: "k", declaredLength: 4, complete: false });
+        if (created.kind !== "created") throw new Error("setup");
+
+        const out = await o.append(created.uploadToken, {
+            offset: 0, complete: false, body: bodyOf("0123456789"),
+        });
+
+        expect(out).toEqual({
+            kind: "length-inconsistent",
+            uploadToken: created.uploadToken,
+            events: [],
+        });
+    });
+
+    test("equal bounds answer as the client's own broken declaration", async () => {
+        const { store } = fakeStore();
+        const o = createUploadOrchestrator(store, {
+            now: () => NOW, graceMs: 0, policy: { maxSize: 4 },
+        });
+        // Declaring exactly the maximum is allowed; sending past it breaks the
+        // declaration the client made, which is the more specific statement.
+        const created = await o.create({ key: "k", declaredLength: 4, complete: false });
+        if (created.kind !== "created") throw new Error("setup");
+
+        const out = await o.append(created.uploadToken, {
+            offset: 0, complete: false, body: bodyOf("0123456789"),
+        });
+
+        expect(out).toMatchObject({ kind: "length-inconsistent" });
+    });
+
+    test("a per-request ceiling below both stays non-fatal and resumable", async () => {
+        const { store, uploads } = fakeStore();
+        const o = createUploadOrchestrator(store, {
+            now: () => NOW, graceMs: 0, policy: { maxSize: 100, maxAppendSize: 4 },
+        });
+        const created = await o.create({ key: "k", declaredLength: 50, complete: false });
+        if (created.kind !== "created") throw new Error("setup");
+
+        const out = await o.append(created.uploadToken, {
+            offset: 0, complete: false, body: bodyOf("0123456789"),
+        });
+
+        // The representation is untouched: destroying the upload over a
+        // per-request cap turns a resumable situation into a lost one.
+        expect(out).toMatchObject({ kind: "limit-violation", reason: "append-too-large" });
+        expect(uploads.get(created.uploadToken)!.isInvalidated).toBe(false);
+        expect(uploads.get(created.uploadToken)!.bytes.byteLength).toBe(4);
+    });
+});
+
+// ─── Learning which object an upload became ─────────────────────────────────
+
+describe("onUploadComplete", () => {
+    /**
+     * What the completion hook reports, read off the orchestrator's own option
+     * type so a field added there fails these assertions instead of being
+     * silently dropped from the recorded shape.
+     */
+    type Landed = Parameters<NonNullable<UploadOrchestratorOptions["onUploadComplete"]>>[0];
+
+    test("a creation that also completes reports its key", async () => {
+        const landed: Landed[] = [];
+        const { store } = fakeStore();
+        const o = createUploadOrchestrator(store, {
+            now: () => NOW, graceMs: 0,
+            onUploadComplete: (info) => { landed.push(info); },
+        });
+
+        const out = await o.create({ key: "docs/q4.pdf", complete: true, body: bodyOf("payload") });
+
+        expect(out).toMatchObject({ kind: "created", complete: true });
+        // The key is chosen before a token exists, so without this the two
+        // cannot be paired afterwards except by racing the creation call.
+        expect(landed).toEqual([{
+            uploadToken: "u1",
+            auditKey: undefined,
+            key: "docs/q4.pdf",
+            length: 7,
+            metadata: undefined,
+            etag: '"done"',
+            digest: undefined,
+        }]);
+    });
+
+    test("a streaming upload finished by a later append reports it too", async () => {
+        const landed: Landed[] = [];
+        const { store } = fakeStore();
+        const o = createUploadOrchestrator(store, {
+            now: () => NOW, graceMs: 0,
+            onUploadComplete: (info) => { landed.push(info); },
+        });
+        const created = await o.create({ key: "docs/big.bin", declaredLength: 10, complete: false });
+        if (created.kind !== "created") throw new Error("setup");
+
+        await o.append(created.uploadToken, {
+            offset: 0, contentLength: 10, complete: true, body: bodyOf("0123456789"),
+            auditKey: "safe-id",
+        });
+
+        expect(landed).toHaveLength(1);
+        expect(landed[0]).toMatchObject({ key: "docs/big.bin", length: 10, auditKey: "safe-id" });
+    });
+
+    test("it fires once, and never for an upload that did not publish", async () => {
+        const landed: Landed[] = [];
+        const { store } = fakeStore();
+        const o = createUploadOrchestrator(store, {
+            now: () => NOW, graceMs: 0,
+            onUploadComplete: (info) => { landed.push(info); },
+        });
+        const created = await o.create({ key: "k", declaredLength: 10, complete: false });
+        if (created.kind !== "created") throw new Error("setup");
+
+        // A partial append publishes nothing, so there is nothing to record.
+        await o.append(created.uploadToken, { offset: 0, complete: false, body: bodyOf("01234") });
+        expect(landed).toEqual([]);
+
+        await o.append(created.uploadToken, { offset: 5, complete: true, body: bodyOf("56789") });
+        expect(landed).toHaveLength(1);
+    });
+
+    test("a throwing hook fails the request rather than acknowledging an unrecorded object", async () => {
+        const { store } = fakeStore();
+        const o = createUploadOrchestrator(store, {
+            now: () => NOW, graceMs: 0,
+            onUploadComplete: () => { throw new Error("database is down"); },
+            onError: () => {},
+        });
+
+        const out = await o.create({ key: "k", complete: true, body: bodyOf("payload") });
+
+        // Telling the client it landed while the consumer's own records never
+        // saw it leaves an object nothing points at.
+        expect(out.kind).toBe("store-error");
+    });
+
+    test("the client's retry after a failed delivery re-delivers, so the hook is at-least-once", async () => {
+        // Without this the hook is at-most-once and its own promise cannot be
+        // kept: the publish succeeded, the throw told the client the backend
+        // failed, and the client's retry is answered already-complete. The
+        // client then believes the upload landed, the consumer's records never
+        // saw it, and no protocol path invokes the hook again.
+        const { store } = fakeStore();
+        const landed: string[] = [];
+        let failNext = true;
+        const o = createUploadOrchestrator(store, {
+            now: () => NOW, graceMs: 0,
+            onUploadComplete: (info) => {
+                if (failNext) {
+                    failNext = false;
+                    throw new Error("database is down");
+                }
+                landed.push(info.key);
+            },
+            onError: () => {},
+        });
+
+        const created = await o.create({ key: "k", complete: false, contentLength: 7, body: bodyOf("payload") });
+        if (created.kind !== "created") throw new Error("setup");
+
+        const first = await o.append(created.uploadToken, { offset: 7, complete: true });
+        expect(first.kind).toBe("store-error");
+        expect(landed).toEqual([]);
+
+        // The same completing request again: the object is already published,
+        // so the answer is the idempotent one and the record is finally made.
+        const retry = await o.append(created.uploadToken, { offset: 7, complete: true });
+        expect(retry.kind).toBe("already-complete");
+        expect(landed).toEqual(["k"]);
+    });
+});
+
+// ─── A policy that contradicts itself is refused where it is written ────────
+
+describe("policy coherence at construction", () => {
+    const build = (policy: Record<string, number>) => () =>
+        createUploadOrchestrator(fakeStore().store, { now: () => NOW, graceMs: 0, policy });
+
+    test("a floor above its ceiling is refused, on both pairs", () => {
+        // Accepting it would mean every upload is rejected at runtime for a
+        // reason nothing points back at the configuration that caused it.
+        expect(build({ minSize: 10, maxSize: 4 })).toThrow(TypeError);
+        expect(build({ minAppendSize: 10, maxAppendSize: 4 })).toThrow(TypeError);
+    });
+
+    test("the message names both bounds and their values", () => {
+        expect(build({ minSize: 10, maxSize: 4 })).toThrow(/minSize \(10\) exceeds maxSize \(4\)/);
+        expect(build({ minAppendSize: 9, maxAppendSize: 2 }))
+            .toThrow(/minAppendSize \(9\) exceeds maxAppendSize \(2\)/);
+    });
+
+    test("equal bounds are coherent, and one bound alone is never contradictory", () => {
+        expect(build({ minSize: 4, maxSize: 4 })).not.toThrow();
+        expect(build({ minAppendSize: 4, maxAppendSize: 4 })).not.toThrow();
+        expect(build({ minSize: 10 })).not.toThrow();
+        expect(build({ maxSize: 4 })).not.toThrow();
+        expect(build({ minAppendSize: 10 })).not.toThrow();
+        expect(build({ maxAppendSize: 4 })).not.toThrow();
+    });
+});
+
+// ─── The lock deadline reaches the locker that was installed ────────────────
+
+describe("lockTimeoutMs", () => {
+    test("a request that cannot get the lock in time answers contended", async () => {
+        const { store } = fakeStore();
+        const locker = memoryUploadLocker({ acquireTimeoutMs: 30_000 });
+        const o = createUploadOrchestrator(store, {
+            now: () => NOW, graceMs: 0, locker, lockTimeoutMs: 40,
+        });
+        const created = await o.create({ key: "k", declaredLength: 10, complete: false });
+        if (created.kind !== "created") throw new Error("setup");
+
+        // Hold the lock outside the orchestrator so the next call has to wait.
+        const held = await locker.acquire(created.uploadToken);
+        const out = await o.probe(created.uploadToken);
+        held.release();
+
+        // The orchestrator's deadline wins over the locker's own default, so
+        // the knob is reachable whichever locker is installed.
+        expect(out).toEqual({ kind: "contended", events: [] });
+    });
+
+    test("with no deadline configured the locker's own default applies", async () => {
+        const { store } = fakeStore();
+        const locker = memoryUploadLocker({ acquireTimeoutMs: 40 });
+        const o = createUploadOrchestrator(store, { now: () => NOW, graceMs: 0, locker });
+        const created = await o.create({ key: "k", declaredLength: 10, complete: false });
+        if (created.kind !== "created") throw new Error("setup");
+
+        const held = await locker.acquire(created.uploadToken);
+        const out = await o.probe(created.uploadToken);
+        held.release();
+
+        expect(out).toEqual({ kind: "contended", events: [] });
+    });
+});
+
+// ─── A fatal bound on the creation body answers by which bound it was ───────
+
+describe("a creation body past a representation bound", () => {
+    test("past the declared length is a length inconsistency, and names the resource", async () => {
+        const { store, uploads } = fakeStore();
+        const o = createUploadOrchestrator(store, { now: () => NOW, graceMs: 0 });
+
+        // Declared length with no content length: the overrun is only
+        // discoverable while the body streams.
+        const out = await o.create({ key: "k", declaredLength: 4, complete: false, body: bodyOf("0123456789") });
+
+        expect(out).toMatchObject({ kind: "length-inconsistent" });
+        if (out.kind !== "length-inconsistent") throw new Error("kind");
+        expect(out.uploadToken).toBe("u1");
+        expect(uploads.get("u1")!.isInvalidated).toBe(true);
+    });
+
+    test("past the policy maximum is a size violation", async () => {
+        const { store } = fakeStore();
+        const o = createUploadOrchestrator(store, {
+            now: () => NOW, graceMs: 0, policy: { maxSize: 4 },
+        });
+
+        const out = await o.create({ key: "k", complete: false, body: bodyOf("0123456789") });
+
+        expect(out).toMatchObject({ kind: "limit-violation", reason: "size-exceeded", uploadToken: "u1" });
     });
 });

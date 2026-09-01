@@ -1,5 +1,11 @@
 import { describe, test, expect } from "bun:test";
-import { azureStore, ObjectNotFoundError, ObjectChangedError, StoreUnavailableError } from "../azure";
+import {
+    azureStore,
+    ObjectNotFoundError,
+    ObjectChangedError,
+    StoreUnavailableError,
+    type AzureStoreOptions,
+} from "../azure";
 import { OPEN_ENDED } from "../index";
 
 // ─── Mock Azure Container Client ────────────────────────────────────────────
@@ -7,6 +13,17 @@ import { OPEN_ENDED } from "../index";
 const CONTENT = Buffer.from("0123456789abcdefghij"); // 20 bytes
 const LAST_MODIFIED = new Date("2025-06-28T12:00:00Z");
 const ETAG = '"0x8DAZURE"';
+
+/**
+ * The container-client surface the adapter consumes, and the SAS option bag it
+ * signs with, both read off the adapter's own option type. Deriving them binds
+ * the double to the contract: a change to either shape fails this file at
+ * compile time instead of leaving the mock satisfying a contract nobody has.
+ */
+type AzureContainerClient = AzureStoreOptions["containerClient"];
+type AzureSasOptions = Parameters<
+    ReturnType<AzureContainerClient["getBlobClient"]>["generateSasUrl"]
+>[0];
 
 interface MockAzureOpts {
     missing?: boolean;
@@ -37,7 +54,7 @@ interface MockAzureOpts {
     /** Invoked when the download's readableStreamBody is destroyed. */
     onDestroy?: () => void;
     /** Record generateSasUrl option objects. */
-    sasCalls?: Array<Record<string, unknown>>;
+    sasCalls?: AzureSasOptions[];
     /** generateSasUrl throws (client not constructed with a shared-key credential). */
     sasError?: Error;
 }
@@ -82,7 +99,7 @@ async function* iterate(buf: Buffer): AsyncGenerator<Buffer> {
     yield buf;
 }
 
-function mockContainer(opts: MockAzureOpts = {}) {
+function mockContainer(opts: MockAzureOpts = {}): AzureContainerClient {
     return {
         getBlobClient(_name: string) {
             return {
@@ -138,7 +155,7 @@ function mockContainer(opts: MockAzureOpts = {}) {
                         lastModified: LAST_MODIFIED,
                     };
                 },
-                async generateSasUrl(options: Record<string, unknown>) {
+                async generateSasUrl(options: AzureSasOptions) {
                     opts.sasCalls?.push(options);
                     if (opts.sasError) throw opts.sasError;
                     return "https://account.blob.example/documents/doc.pdf?sv=2025&sig=abc";
@@ -317,7 +334,7 @@ describe("azureStore: degenerate SDK responses", () => {
 
 describe("azureStore: createSignedUrl", () => {
     test("returns ok with a SAS URL: read-only permissions and a sanitized disposition", async () => {
-        const sasCalls: Array<Record<string, unknown>> = [];
+        const sasCalls: AzureSasOptions[] = [];
         const store = azureStore({ containerClient: mockContainer({ sasCalls }) });
 
         const result = await store.createSignedUrl!("doc.pdf", {
@@ -339,7 +356,7 @@ describe("azureStore: createSignedUrl", () => {
     });
 
     test("forces attachment + inert content type even without a downloadFilename", async () => {
-        const sasCalls: Array<Record<string, unknown>> = [];
+        const sasCalls: AzureSasOptions[] = [];
         const store = azureStore({ containerClient: mockContainer({ sasCalls }) });
 
         const result = await store.createSignedUrl!("doc.pdf", { expiresInSeconds: 60 });
@@ -350,7 +367,7 @@ describe("azureStore: createSignedUrl", () => {
     });
 
     test("a hostile filename never reaches the SAS disposition unsanitized", async () => {
-        const sasCalls: Array<Record<string, unknown>> = [];
+        const sasCalls: AzureSasOptions[] = [];
         const store = azureStore({ containerClient: mockContainer({ sasCalls }) });
 
         await store.createSignedUrl!("doc.pdf", {
@@ -364,7 +381,7 @@ describe("azureStore: createSignedUrl", () => {
     });
 
     test("expiresOn is expiresInSeconds from now", async () => {
-        const sasCalls: Array<Record<string, unknown>> = [];
+        const sasCalls: AzureSasOptions[] = [];
         const store = azureStore({ containerClient: mockContainer({ sasCalls }) });
 
         const before = Date.now();
@@ -378,7 +395,7 @@ describe("azureStore: createSignedUrl", () => {
     });
 
     test("cacheControl override rides the SAS, absent when unset", async () => {
-        const sasCalls: Array<Record<string, unknown>> = [];
+        const sasCalls: AzureSasOptions[] = [];
         const store = azureStore({ containerClient: mockContainer({ sasCalls }) });
 
         await store.createSignedUrl!("doc.pdf", {
@@ -412,7 +429,7 @@ describe("azureStore: createSignedUrl", () => {
 describe("azureStore: OPEN_ENDED wire translation", () => {
     test("an open-ended range downloads with offset and NO count", async () => {
         const calls: Array<{ offset?: number; count?: number; ifMatch?: string }> = [];
-        const store = azureStore({ containerClient: mockContainer({ calls }) as never });
+        const store = azureStore({ containerClient: mockContainer({ calls }) });
 
         const result = await store.getObject("test.bin", { range: { start: 5, end: OPEN_ENDED } });
 

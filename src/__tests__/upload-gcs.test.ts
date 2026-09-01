@@ -337,8 +337,8 @@ describe("gcsUploadStore: guards", () => {
         const { uploadToken } = await store.createUpload({ key: "f.bin", now: NOW });
 
         await expect(
-            store.appendChunk(uploadToken, 0, streamOf(bytes(1, 2, 3), bytes(4, 5, 6)), { now: NOW, maxBytes: 4 }),
-        ).rejects.toThrow(/byte bound/);
+            store.appendChunk(uploadToken, 0, streamOf(bytes(1, 2, 3), bytes(4, 5, 6)), { now: NOW, maxBytes: 4, maxBytesFatal: true }),
+        ).rejects.toThrow(/representation bound/);
 
         // The destroyed single-shot write left nothing durable.
         expect([...objects.keys()].filter((name) => /\/\d{6}$/.test(name))).toEqual([]);
@@ -430,15 +430,17 @@ describe("gcsUploadStore: not-found and token integrity", () => {
         await expect(store.getUploadState(uploadToken)).rejects.toBeInstanceOf(UploadNotFoundError);
     });
 
-    test("a token whose key was tampered answers UploadNotFoundError", async () => {
+    test("a token that is not a minted id answers UploadNotFoundError", async () => {
         const { store } = makeStore();
-        const { uploadToken } = await store.createUpload({ key: "victim.bin", now: NOW });
-        const decoded = JSON.parse(new TextDecoder().decode(
-            Uint8Array.from(atob(uploadToken.replace(/-/g, "+").replace(/_/g, "/")), (c) => c.charCodeAt(0)),
-        )) as { key: string; id: string };
-        const forged = btoa(JSON.stringify({ key: "attacker.bin", id: decoded.id }))
-            .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-        await expect(store.getUploadState(forged)).rejects.toBeInstanceOf(UploadNotFoundError);
+        await store.createUpload({ key: "victim.bin", now: NOW });
+        for (const forged of [
+            "00000000-0000-4000-8000-000000000000", // well-formed, names nothing
+            "eyJrZXkiOiJhdHRhY2tlci5iaW4ifQ", // the old key-bearing shape
+            "../../etc/passwd",
+            "",
+        ]) {
+            await expect(store.getUploadState(forged)).rejects.toBeInstanceOf(UploadNotFoundError);
+        }
     });
 
     test("corrupt info content answers UploadNotFoundError", async () => {
@@ -504,26 +506,33 @@ describe("gcsUploadStore: abort and sweep", () => {
 // ─── Token Integrity Hardening ───────────────────────────────────────────────
 
 describe("gcsUploadStore: token integrity hardening", () => {
-    test("abort with a forged (valid-id, wrong-key) token discards nothing", async () => {
+    test("the token discloses nothing about the destination key", async () => {
+        const { store } = makeStore();
+        const { uploadToken } = await store.createUpload({ key: "tenants/acme/payroll.csv", now: NOW });
+        // The key routinely embeds a filename or a tenant id, and the token is
+        // held by the client. Carrying the key would publish both to whoever
+        // holds it, and would let a request name a key the server never
+        // recorded; the token is the resource id and nothing else.
+        expect(uploadToken).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+        expect(uploadToken).not.toContain("acme");
+        expect(uploadToken).not.toContain("payroll");
+    });
+
+    test("abort with an id that names no resource discards nothing", async () => {
         const { store, objects } = makeStore();
         const { uploadToken } = await store.createUpload({ key: "victim.bin", now: NOW });
         await store.appendChunk(uploadToken, 0, bytes(1, 2), { now: NOW });
-        const decoded = JSON.parse(new TextDecoder().decode(
-            Uint8Array.from(atob(uploadToken.replace(/-/g, "+").replace(/_/g, "/")), (c) => c.charCodeAt(0)),
-        )) as { key: string; id: string };
-        const forged = btoa(JSON.stringify({ key: "attacker.bin", id: decoded.id }))
-            .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 
-        await store.abortUpload(forged);
+        await store.abortUpload("00000000-0000-4000-8000-000000000000");
+        await store.abortUpload("not-a-token");
+
         // The victim's upload (info + chunks) is fully intact.
         expect((await store.getUploadState(uploadToken)).offset).toBe(2);
         expect([...objects.keys()].filter((name) => /\/\d{6}$/.test(name)).length).toBe(1);
     });
 
-    test("tokens are URL-safe even when the key's base64 needs + and /", async () => {
+    test("tokens are URL-safe whatever the key contains", async () => {
         const { store } = makeStore();
-        // ">>>" base64-encodes with "+" and "???" with "/": both must be
-        // translated to the URL-safe alphabet and pad-stripped.
         const { uploadToken } = await store.createUpload({ key: ">>>???", now: NOW });
         expect(uploadToken).toMatch(/^[A-Za-z0-9_-]+$/);
         expect((await store.getUploadState(uploadToken)).offset).toBe(0); // and still round-trips

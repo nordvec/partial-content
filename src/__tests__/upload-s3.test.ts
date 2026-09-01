@@ -70,8 +70,20 @@ function routeGetObject(routes: {
     };
 }
 
+/**
+ * A sidecar body. `key` and `uploadId` are what the store addresses the backend
+ * with -- the token carries neither -- so they default to what
+ * `createStoreWithUpload` creates; a test wanting another destination overrides
+ * them explicitly.
+ */
 function infoResponse(record: Record<string, unknown>) {
-    return { Body: new TextEncoder().encode(JSON.stringify(record)) };
+    return {
+        Body: new TextEncoder().encode(JSON.stringify({
+            key: "docs/file.bin",
+            uploadId: "mp-1",
+            ...record,
+        })),
+    };
 }
 
 const bytesOf = (text: string) => new TextEncoder().encode(text);
@@ -123,7 +135,11 @@ describe("s3UploadStore: creation and token round trip", () => {
             now: NOW,
         });
 
-        expect(uploadToken.length).toBeGreaterThan(0);
+        // The token is the resource id and nothing else: the destination key
+        // and the multipart id live in the sidecar, so a client never learns
+        // the key it publishes under and can never name one.
+        expect(uploadToken).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+        expect(uploadToken).not.toContain("q4");
         expect(sent[0].name).toBe("CreateMultipartUploadCommand");
         expect(sent[0].input).toMatchObject({ Bucket: "docs", Key: "reports/q4.pdf" });
         // checksums are opt-in; the default sends no checksum parameters
@@ -133,7 +149,13 @@ describe("s3UploadStore: creation and token round trip", () => {
         expect(sent[1].name).toBe("PutObjectCommand");
         expect(String(sent[1].input.Key)).toBe(`.uploads/${uploadToken}.info`);
         const record = JSON.parse(String(sent[1].input.Body)) as Record<string, unknown>;
-        expect(record).toEqual({ length: 10, metadata: { filename: "q4.pdf" }, createdAt: NOW });
+        expect(record).toEqual({
+            key: "reports/q4.pdf",
+            uploadId: "mp-123",
+            length: 10,
+            metadata: { filename: "q4.pdf" },
+            createdAt: NOW,
+        });
     });
 
     test("the returned token decodes back to the key and UploadId on later calls", async () => {
@@ -402,7 +424,7 @@ describe("s3UploadStore: appendChunk", () => {
         });
 
         await expect(
-            store.appendChunk(uploadToken, 0, body, { maxBytes: 4, now: NOW }),
+            store.appendChunk(uploadToken, 0, body, { maxBytes: 4, maxBytesFatal: true, now: NOW }),
         ).rejects.toThrow(/invalidated/);
 
         expect(sent.filter((c) => c.name === "UploadPartCommand")).toHaveLength(0);
@@ -410,6 +432,61 @@ describe("s3UploadStore: appendChunk", () => {
 
         const state = await store.getUploadState(uploadToken);
         expect(state.isInvalidated).toBe(true);
+    });
+
+    test("a stale holder's sidecar write cannot un-invalidate the resource", async () => {
+        // Sidecar writes are read-modify-writes with no precondition, and the
+        // snapshot an append holds is read before the body streams. A holder
+        // whose lock was stolen would otherwise write back a record from
+        // before the invalidation, and `invalidated` lives only here: nothing
+        // recomputes it, so the resurrection is permanent and silent.
+        let storedInfo = JSON.stringify({
+            key: "docs/file.bin",
+            uploadId: "mp-1",
+            createdAt: NOW,
+        });
+        const { store, uploadToken } = await createStoreWithUpload(
+            {
+                GetObjectCommand: routeGetObject({
+                    info: () => ({ Body: new TextEncoder().encode(storedInfo) }),
+                }),
+                PutObjectCommand: (input) => {
+                    if (String(input.Key).endsWith(".info")) storedInfo = String(input.Body);
+                    return {};
+                },
+                ListPartsCommand: () => ({ Parts: [], IsTruncated: false }),
+                HeadObjectCommand: () => { throw notFound("NotFound"); },
+                UploadPartCommand: () => ({ ETag: '"e"' }),
+            },
+            { storeOpts: { minPartSize: 8 } },
+        );
+
+        // Enqueued lazily, so the flip lands AFTER appendChunk's pre-stream
+        // read has taken its snapshot: that snapshot is the stale one, and it
+        // is what the sidecar write at the end would otherwise be built from.
+        let pulls = 0;
+        const stalebody = new ReadableStream<Uint8Array>({
+            pull(controller) {
+                if (pulls++ === 0) {
+                    controller.enqueue(new Uint8Array(4));
+                    // A newer holder invalidates the resource while this body
+                    // is still streaming: the window the lock cannot cover.
+                    storedInfo = JSON.stringify({
+                        key: "docs/file.bin",
+                        uploadId: "mp-1",
+                        createdAt: NOW,
+                        invalidated: true,
+                    });
+                    return;
+                }
+                controller.close();
+            },
+        });
+
+        await store.appendChunk(uploadToken, 0, stalebody, { now: NOW });
+
+        expect(JSON.parse(storedInfo).invalidated).toBe(true);
+        expect((await store.getUploadState(uploadToken)).isInvalidated).toBe(true);
     });
 
     test("crossing S3's 10,000-part limit fails loudly, naming the minPartSize knob, before completion", async () => {
@@ -449,7 +526,7 @@ describe("s3UploadStore: appendChunk", () => {
             { storeOpts: { minPartSize: 8 } },
         );
 
-        const result = await store.appendChunk(uploadToken, 0, new Uint8Array(4), { maxBytes: 4, now: NOW });
+        const result = await store.appendChunk(uploadToken, 0, new Uint8Array(4), { maxBytes: 4, maxBytesFatal: true, now: NOW });
         expect(result.bytesWritten).toBe(4);
     });
 
@@ -484,6 +561,91 @@ describe("s3UploadStore: appendChunk", () => {
         );
         expect(new TextDecoder().decode(tailPut?.input.Body as Uint8Array)).toBe("hello");
         expect(cancelled.called).toBe(true);
+    });
+
+    test("a signal that trips mid-chunk still lands the whole accepted chunk, and the tail stays sub-minimum", async () => {
+        // The stolen-lock ceiling is a bound on BYTES, not on backend calls:
+        // the store stops pulling from the body at the chunk boundary, and
+        // whatever it had already accepted becomes durable. Stopping part-way
+        // through the shaping would make exactly the same bytes durable in a
+        // worse arrangement, since the remainder is parked in the tail sidecar
+        // whose own contract is that it holds LESS than one part.
+        const controller = new AbortController();
+        const { store, sent, uploadToken } = await createStoreWithUpload(
+            {
+                GetObjectCommand: routeGetObject({ info: () => infoResponse({ createdAt: NOW }) }),
+                ListPartsCommand: () => ({ Parts: [], IsTruncated: false }),
+                PutObjectCommand: () => ({}),
+                UploadPartCommand: () => {
+                    // The watchdog fires while the first part is in flight.
+                    controller.abort();
+                    return { ETag: '"e"' };
+                },
+            },
+            { storeOpts: { minPartSize: 8 } },
+        );
+
+        // One chunk of four parts plus a remainder.
+        const result = await store.appendChunk(uploadToken, 0, new Uint8Array(35), {
+            now: NOW,
+            signal: controller.signal,
+        });
+
+        expect(result.bytesWritten).toBe(35);
+        expect(sent.filter((c) => c.name === "UploadPartCommand")).toHaveLength(4);
+        const tailPut = sent.find(
+            (c) => c.name === "PutObjectCommand" && String(c.input.Key).endsWith(".part"),
+        );
+        expect((tailPut?.input.Body as Uint8Array).length).toBe(3);
+    });
+
+    test("a torn body keeps the received prefix instead of surfacing as a storage fault", async () => {
+        // The client vanished mid-request. Storage never failed, so reporting
+        // this as a backend error hands the caller a 502 for something the
+        // backend never saw, and throws away a truthful durable offset the
+        // client could have resumed from.
+        const { store, sent, uploadToken } = await createStoreWithUpload(
+            {
+                GetObjectCommand: routeGetObject({ info: () => infoResponse({ createdAt: NOW }) }),
+                ListPartsCommand: () => ({ Parts: [], IsTruncated: false }),
+            },
+            { storeOpts: { minPartSize: 8 } },
+        );
+        const body = new ReadableStream<Uint8Array>({
+            start(controller) {
+                controller.enqueue(bytesOf("hello"));
+            },
+            pull(controller) {
+                controller.error(new Error("connection reset"));
+            },
+        });
+
+        const result = await store.appendChunk(uploadToken, 0, body, {
+            now: NOW, maxBytesFatal: true,
+        });
+
+        expect(result.bytesWritten).toBe(5);
+        const tailPut = sent.find(
+            (c) => c.name === "PutObjectCommand" && String(c.input.Key).endsWith(".part"),
+        );
+        expect(new TextDecoder().decode(tailPut?.input.Body as Uint8Array)).toBe("hello");
+    });
+
+    test("a backend failure during a flush still propagates", async () => {
+        // The other half of the split: separating body reads from flushes must
+        // not swallow a real storage failure into a truncated-but-fine answer.
+        const { store, uploadToken } = await createStoreWithUpload(
+            {
+                GetObjectCommand: routeGetObject({ info: () => infoResponse({ createdAt: NOW }) }),
+                ListPartsCommand: () => ({ Parts: [], IsTruncated: false }),
+                UploadPartCommand: () => { throw s3Error("InternalError", 500); },
+            },
+            { storeOpts: { minPartSize: 4 } },
+        );
+
+        await expect(store.appendChunk(uploadToken, 0, new Uint8Array(16), {
+            now: NOW, maxBytesFatal: true,
+        })).rejects.toThrow("InternalError");
     });
 
     test("appending to an invalidated resource is refused without touching the multipart upload", async () => {
@@ -574,7 +736,7 @@ describe("s3UploadStore: deferred-length declaration on append", () => {
 // ─── Completion ─────────────────────────────────────────────────────────────
 
 describe("s3UploadStore: completeUpload", () => {
-    test("lifts the tail sidecar as the size-exempt final part and reaps the sidecars", async () => {
+    test("lifts the tail sidecar as the size-exempt final part, reaps it, and marks the metadata sidecar", async () => {
         const { store, sent, uploadToken } = await createStoreWithUpload({
             GetObjectCommand: routeGetObject({
                 info: () => infoResponse({ createdAt: NOW }),
@@ -598,14 +760,23 @@ describe("s3UploadStore: completeUpload", () => {
         expect(uploadPart?.input.PartNumber).toBe(2);
         expect(new TextDecoder().decode(uploadPart?.input.Body as Uint8Array)).toBe("xyz");
 
-        // the tail sidecar is deleted BEFORE the completion commits, so a
-        // failed completion cannot double-count the lifted bytes
+        // The tail sidecar is deleted BEFORE its bytes are rewritten into a
+        // part, the same ordering appendChunk uses. Asserting only that the
+        // delete precedes the COMPLETION is too weak to catch the inversion:
+        // committing the part first leaves a window where the tail is both a
+        // committed part and a live sidecar, and the derived offset counts it
+        // twice - a permanent RangeError under a declared length, and under a
+        // deferred one a client that resumes above its real progress while the
+        // published object carries those bytes twice. Losing the tail in the
+        // reverse window only costs a re-send.
         const deletePartIndex = sent.findIndex(
             (c) => c.name === "DeleteObjectCommand" && String(c.input.Key).endsWith(".part"),
         );
+        const uploadPartIndex = sent.findIndex((c) => c.name === "UploadPartCommand");
         const completeIndex = sent.findIndex((c) => c.name === "CompleteMultipartUploadCommand");
         expect(deletePartIndex).toBeGreaterThan(-1);
-        expect(deletePartIndex).toBeLessThan(completeIndex);
+        expect(deletePartIndex).toBeLessThan(uploadPartIndex);
+        expect(uploadPartIndex).toBeLessThan(completeIndex);
 
         const complete = sent[completeIndex];
         expect((complete.input.MultipartUpload as { Parts: unknown[] }).Parts).toEqual([
@@ -613,11 +784,16 @@ describe("s3UploadStore: completeUpload", () => {
             { PartNumber: 2, ETag: '"tail-etag"' },
         ]);
 
-        // the metadata sidecar is reaped after publication
-        const deleteInfoIndex = sent.findIndex(
-            (c) => c.name === "DeleteObjectCommand" && String(c.input.Key).endsWith(".info"),
+        // The metadata sidecar is MARKED after publication, not reaped: it is
+        // the only record that this token named this key, and a retried
+        // completion or a late probe needs it to answer from the published
+        // object rather than from a key the caller supplied.
+        const markInfoIndex = sent.findIndex(
+            (c) => c.name === "PutObjectCommand" && String(c.input.Key).endsWith(".info"),
         );
-        expect(deleteInfoIndex).toBeGreaterThan(completeIndex);
+        expect(markInfoIndex).toBeGreaterThan(completeIndex);
+        expect(JSON.parse(String(sent[markInfoIndex].input.Body)) as { completed?: boolean })
+            .toMatchObject({ completed: true });
     });
 
     test("a zero-byte upload commits one empty part before completing", async () => {
@@ -652,9 +828,11 @@ describe("s3UploadStore: completeUpload", () => {
         await expect(store.completeUpload(uploadToken, { now: NOW })).rejects.toThrow(/invalidated/);
     });
 
-    test("a completion retried after full cleanup answers from the published object alone", async () => {
+    test("a completion retried against the completed marker answers from the published object alone", async () => {
         const { store, sent, uploadToken } = await createStoreWithUpload({
-            GetObjectCommand: routeGetObject({}),
+            GetObjectCommand: routeGetObject({
+                info: () => infoResponse({ createdAt: NOW, completed: true }),
+            }),
             HeadObjectCommand: (input) => {
                 if (String(input.Key) === "docs/file.bin") return { ContentLength: 42, ETag: '"pub"' };
                 throw notFound("NotFound");
@@ -665,6 +843,22 @@ describe("s3UploadStore: completeUpload", () => {
 
         expect(result.etag).toBe('"pub"');
         expect(sent.some((c) => c.name === "CompleteMultipartUploadCommand")).toBe(false);
+    });
+
+    test("a completion with no sidecar answers 404 rather than reporting a backend object", async () => {
+        // The key is carried in the client-supplied token and the sidecar is
+        // named after the whole token, so the sidecar's existence is the only
+        // proof the server minted this key. Answering from the backend without
+        // it would report an arbitrary object's ETag as this upload's, and
+        // would make the probe an existence oracle over the bucket.
+        const { store, sent, uploadToken } = await createStoreWithUpload({
+            GetObjectCommand: routeGetObject({}),
+            HeadObjectCommand: () => ({ ContentLength: 42, ETag: '"someone-elses"' }),
+        });
+
+        await expect(store.completeUpload(uploadToken, { now: NOW }))
+            .rejects.toBeInstanceOf(UploadNotFoundError);
+        expect(sent.some((c) => c.name === "HeadObjectCommand")).toBe(false);
     });
 
     test("completing a resource that never existed throws UploadNotFoundError", async () => {
@@ -721,10 +915,61 @@ describe("s3UploadStore: abortUpload", () => {
 
     test("a real backend failure still propagates", async () => {
         const { store, uploadToken } = await createStoreWithUpload({
+            GetObjectCommand: routeGetObject({ info: () => infoResponse({ createdAt: NOW }) }),
             AbortMultipartUploadCommand: () => { throw s3Error("InternalError", 500); },
         });
 
         await expect(store.abortUpload(uploadToken)).rejects.toThrow("InternalError");
+    });
+
+    test("a token this store never minted deletes nothing", async () => {
+        // The token is a suffix of the object key, so an abort that skipped the
+        // shape check could address `<prefix><anything>.info` and `.part` and
+        // reap the foreign objects the sweep deliberately leaves alone. It is a
+        // no-op instead, because abort is idempotent for an unknown token and a
+        // token that cannot be one is a stronger case of unknown.
+        const { store, sent } = await createStoreWithUpload({
+            DeleteObjectCommand: () => ({}),
+            AbortMultipartUploadCommand: () => ({}),
+        });
+
+        await store.abortUpload("../../etc/passwd");
+        await store.abortUpload("someone-elses-object");
+
+        expect(sent).toHaveLength(0);
+    });
+
+    test("aborting a COMPLETED upload deletes only bookkeeping, never the published object", async () => {
+        // Store contract: the object at the key is live data once completion
+        // returns, and abort is idempotent, so an abort that reached the key
+        // would destroy production data on a replayed or retried DELETE.
+        const { store, sent, uploadToken } = await createStoreWithUpload({
+            GetObjectCommand: routeGetObject({
+                info: () => infoResponse({ createdAt: NOW }),
+                part: () => ({ Body: bytesOf("xyz") }),
+            }),
+            ListPartsCommand: () => ({
+                Parts: [{ PartNumber: 1, Size: 5 * MiB, ETag: '"e1"' }],
+                IsTruncated: false,
+            }),
+            UploadPartCommand: () => ({ ETag: '"tail-etag"' }),
+            DeleteObjectCommand: () => ({}),
+            CompleteMultipartUploadCommand: () => ({ ETag: '"final"' }),
+            AbortMultipartUploadCommand: () => { throw notFound("NoSuchUpload"); },
+        });
+        await store.completeUpload(uploadToken, { now: NOW });
+        const deletesBefore = sent.filter((c) => c.name === "DeleteObjectCommand").length;
+
+        await store.abortUpload(uploadToken);
+        await store.abortUpload(uploadToken);
+
+        const abortDeletes = sent
+            .filter((c) => c.name === "DeleteObjectCommand")
+            .slice(deletesBefore)
+            .map((c) => String(c.input.Key));
+        expect(abortDeletes.length).toBeGreaterThan(0);
+        expect(abortDeletes.every((k) => k.startsWith(".uploads/"))).toBe(true);
+        expect(abortDeletes).not.toContain("docs/file.bin");
     });
 });
 
@@ -747,6 +992,18 @@ describe("s3UploadStore: sweepExpired", () => {
                 ],
                 IsTruncated: false,
             }),
+            // The multipart an abort discards is named by the sidecar, never by
+            // the token, so the sweep has to read one per resource it reaps.
+            GetObjectCommand: (input) => {
+                const key = String(input.Key);
+                if (key === `.uploads/${oldToken}.info`) {
+                    return infoResponse({ key: "old.bin", uploadId: "mp-old", createdAt: NOW - 100_000 });
+                }
+                if (key === `.uploads/${newToken}.info`) {
+                    return infoResponse({ key: "new.bin", uploadId: "mp-new", createdAt: NOW });
+                }
+                throw notFound();
+            },
             AbortMultipartUploadCommand: () => ({}),
             DeleteObjectCommand: () => ({}),
         });
@@ -842,9 +1099,11 @@ describe("s3UploadStore: gone-multipart disambiguation", () => {
         });
     }
 
-    test("a reaped .info with a published final object still answers completed state", async () => {
+    test("a completed marker with a published final object answers completed state", async () => {
         const { store, uploadToken } = await createStoreWithUpload({
-            GetObjectCommand: routeGetObject({}),
+            GetObjectCommand: routeGetObject({
+                info: () => infoResponse({ createdAt: NOW, completed: true }),
+            }),
             HeadObjectCommand: (input) => {
                 if (String(input.Key) === "docs/file.bin") {
                     return { ContentLength: 7, ETag: '"pub"', LastModified: new Date(NOW + 1) };
@@ -857,8 +1116,21 @@ describe("s3UploadStore: gone-multipart disambiguation", () => {
 
         expect(state.isComplete).toBe(true);
         expect(state.offset).toBe(7);
-        // the published object's LastModified stands in for the reaped createdAt
-        expect(state.createdAt).toBe(NOW + 1);
+    });
+
+    test("a reaped .info answers 404 and never probes the token's key", async () => {
+        // Once the bookkeeping is gone nothing proves this token named this
+        // key, so the published object is not this upload's to report. A probe
+        // here would answer for any key a caller named: existence, exact size
+        // and last-modified across the whole bucket, read with the
+        // application's own credentials.
+        const { store, sent, uploadToken } = await createStoreWithUpload({
+            GetObjectCommand: routeGetObject({}),
+            HeadObjectCommand: () => ({ ContentLength: 7, ETag: '"someone-elses"' }),
+        });
+
+        await expect(store.getUploadState(uploadToken)).rejects.toBeInstanceOf(UploadNotFoundError);
+        expect(sent.some((c) => c.name === "HeadObjectCommand")).toBe(false);
     });
 
     test("no .info and no published object means the upload never existed", async () => {
@@ -918,6 +1190,51 @@ describe("s3UploadStore: gone-multipart disambiguation", () => {
 
         await expect(store.getUploadState(uploadToken)).rejects.toThrow(/numeric createdAt/);
     });
+
+    // The sidecar is the ONLY source of the destination now that the token
+    // carries none, so a record that cannot address the backend has to be
+    // refused rather than half-used with a guessed or absent key.
+    const unaddressable: Array<[string, string]> = [
+        ["no key", JSON.stringify({ uploadId: "mp-1", createdAt: NOW })],
+        ["an empty key", JSON.stringify({ key: "", uploadId: "mp-1", createdAt: NOW })],
+        ["a non-string key", JSON.stringify({ key: 7, uploadId: "mp-1", createdAt: NOW })],
+        ["no uploadId", JSON.stringify({ key: "docs/file.bin", createdAt: NOW })],
+        ["an empty uploadId", JSON.stringify({ key: "docs/file.bin", uploadId: "", createdAt: NOW })],
+        ["a non-string uploadId", JSON.stringify({ key: "docs/file.bin", uploadId: 7, createdAt: NOW })],
+    ];
+    for (const [label, body] of unaddressable) {
+        test(`a metadata sidecar with ${label} fails loudly`, async () => {
+            const { store, sent, uploadToken } = await createStoreWithUpload({
+                GetObjectCommand: routeGetObject({ info: () => ({ Body: bytesOf(body) }) }),
+                ListPartsCommand: () => ({ Parts: [], IsTruncated: false }),
+                HeadObjectCommand: () => ({ ContentLength: 1, ETag: '"x"' }),
+            });
+
+            await expect(store.getUploadState(uploadToken)).rejects.toThrow(/key\/uploadId/);
+            // Refused before the record is used to name anything.
+            expect(sent.some((c) => c.name === "ListPartsCommand")).toBe(false);
+            expect(sent.some((c) => c.name === "HeadObjectCommand")).toBe(false);
+        });
+    }
+
+    test("a sidecar that is valid JSON but not an object fails loudly", async () => {
+        const { store, uploadToken } = await createStoreWithUpload({
+            GetObjectCommand: routeGetObject({ info: () => ({ Body: bytesOf("null") }) }),
+        });
+
+        await expect(store.getUploadState(uploadToken)).rejects.toThrow(/numeric createdAt/);
+    });
+
+    test("a sidecar whose createdAt is non-finite fails loudly", async () => {
+        const { store, uploadToken } = await createStoreWithUpload({
+            // Infinity has no JSON literal, so it arrives as the string 1e999.
+            GetObjectCommand: routeGetObject({
+                info: () => ({ Body: bytesOf('{"key":"docs/file.bin","uploadId":"mp-1","createdAt":1e999}') }),
+            }),
+        });
+
+        await expect(store.getUploadState(uploadToken)).rejects.toThrow(/numeric createdAt/);
+    });
 });
 
 // ─── SDK body shapes ────────────────────────────────────────────────────────
@@ -928,8 +1245,9 @@ describe("s3UploadStore: sidecar body shapes", () => {
             GetObjectCommand: routeGetObject({
                 info: () => ({
                     Body: {
-                        transformToByteArray: async () =>
-                            new TextEncoder().encode(JSON.stringify({ createdAt: NOW, length: 3 })),
+                        transformToByteArray: async () => new TextEncoder().encode(
+                            JSON.stringify({ key: "docs/file.bin", uploadId: "mp-1", createdAt: NOW, length: 3 }),
+                        ),
                     },
                 }),
             }),
@@ -942,7 +1260,7 @@ describe("s3UploadStore: sidecar body shapes", () => {
     });
 
     test("an async-iterable (Node Readable) body is collected across chunks", async () => {
-        const json = JSON.stringify({ createdAt: NOW, length: 8 });
+        const json = JSON.stringify({ key: "docs/file.bin", uploadId: "mp-1", createdAt: NOW, length: 8 });
         async function* iterate(): AsyncGenerator<Uint8Array> {
             yield bytesOf(json.slice(0, 5));
             yield bytesOf(json.slice(5));
@@ -1112,5 +1430,134 @@ describe("s3UploadStore: capability flags", () => {
         const { client } = createMockClient({});
         expect(() => s3UploadStore({ client, bucket: "b", minPartSize: 0 })).toThrow(RangeError);
         expect(() => s3UploadStore({ client, bucket: "b", minPartSize: 1.5 })).toThrow(RangeError);
+    });
+});
+
+describe("the sidecar merge is monotonic in its terminal flags", () => {
+    /**
+     * A sidecar write is a read-modify-write with no precondition, and the
+     * snapshot an append holds was read before the body streamed, which can be
+     * minutes. The lock makes that safe for a live holder and not for one whose
+     * lock was stolen: such a holder writes back a record from before the new
+     * holder's changes. `invalidated` lives only in the sidecar and nothing
+     * recomputes it, so re-writing it away resurrects a terminally dead upload.
+     *
+     * The merge therefore re-reads and treats both terminal flags as one-way.
+     * These drive that through appendChunk with a sidecar that CHANGES between
+     * the caller's snapshot and the merge's own read.
+     */
+
+    /** A `.info` GET that answers with a different record after the first call. */
+    function shiftingInfo(first: Record<string, unknown>, thereafter: Record<string, unknown>) {
+        let calls = 0;
+        return () => {
+            calls += 1;
+            return infoResponse(calls === 1 ? first : thereafter);
+        };
+    }
+
+    /** The record the store wrote back to the `.info` sidecar. */
+    function writtenInfo(sent: { name: string; input: Record<string, unknown> }[]) {
+        const put = sent.filter(
+            (c) => c.name === "PutObjectCommand" && String(c.input.Key).endsWith(".info"),
+        ).at(-1);
+        if (!put) throw new Error("no .info write");
+        return JSON.parse(String(put.input.Body)) as Record<string, unknown>;
+    }
+
+    test("an invalidation landing mid-append is not cleared by the append's write-back", async () => {
+        const { store, sent, uploadToken } = await createStoreWithUpload({
+            GetObjectCommand: routeGetObject({
+                info: shiftingInfo({ createdAt: NOW }, { createdAt: NOW, invalidated: true }),
+            }),
+            ListPartsCommand: () => ({ Parts: [] }),
+            UploadPartCommand: () => ({ ETag: '"p1"' }),
+            HeadObjectCommand: () => { throw notFound(); },
+            DeleteObjectCommand: () => ({}),
+        });
+
+        await store.appendChunk(uploadToken, 0, bytesOf("hello"), { now: NOW + 5 });
+
+        // Written from the FRESH read, not from the snapshot the append opened with.
+        expect(writtenInfo(sent).invalidated).toBe(true);
+    });
+
+    test("a completion landing mid-append is not cleared either", async () => {
+        const { store, sent, uploadToken } = await createStoreWithUpload({
+            GetObjectCommand: routeGetObject({
+                info: shiftingInfo({ createdAt: NOW }, { createdAt: NOW, completed: true }),
+            }),
+            ListPartsCommand: () => ({ Parts: [] }),
+            UploadPartCommand: () => ({ ETag: '"p1"' }),
+            HeadObjectCommand: () => { throw notFound(); },
+            DeleteObjectCommand: () => ({}),
+        });
+
+        await store.appendChunk(uploadToken, 0, bytesOf("hello"), { now: NOW + 5 });
+
+        expect(writtenInfo(sent).completed).toBe(true);
+    });
+
+    test("a length already recorded by the winner survives the loser's write-back", async () => {
+        // Creation facts and a recorded length are write-once by contract, so
+        // the fresh copy either equals the caller's or is the one that won.
+        const { store, sent, uploadToken } = await createStoreWithUpload({
+            GetObjectCommand: routeGetObject({
+                info: shiftingInfo({ createdAt: NOW }, { createdAt: NOW, length: 99 }),
+            }),
+            ListPartsCommand: () => ({ Parts: [] }),
+            UploadPartCommand: () => ({ ETag: '"p1"' }),
+            HeadObjectCommand: () => { throw notFound(); },
+            DeleteObjectCommand: () => ({}),
+        });
+
+        // This append declares 50; the sidecar already records 99, so the
+        // recorded one stands and the late declaration does not overwrite it.
+        await store.appendChunk(uploadToken, 0, bytesOf("hello"), { now: NOW + 5, length: 50 });
+
+        expect(writtenInfo(sent).length).toBe(99);
+    });
+
+    test("an unchanged sidecar still records the append, so the merge is not inert", async () => {
+        // The positive half: without it, a merge mutated to write nothing at all
+        // passes every case above.
+        const { store, sent, uploadToken } = await createStoreWithUpload({
+            GetObjectCommand: routeGetObject({ info: () => infoResponse({ createdAt: NOW }) }),
+            ListPartsCommand: () => ({ Parts: [] }),
+            UploadPartCommand: () => ({ ETag: '"p1"' }),
+            HeadObjectCommand: () => { throw notFound(); },
+            DeleteObjectCommand: () => ({}),
+        });
+
+        await store.appendChunk(uploadToken, 0, bytesOf("hello"), { now: NOW + 5 });
+
+        const written = writtenInfo(sent);
+        expect(written.lastAppendAt).toBe(NOW + 5);
+        expect(written.invalidated).toBeUndefined();
+        expect(written.completed).toBeUndefined();
+    });
+
+    test("a sidecar read that fails leaves the caller's snapshot as the base", async () => {
+        // The fallback is no worse than writing from the snapshot unconditionally,
+        // which is the floor the merge replaced; the monotonic rules still apply
+        // to whatever it holds.
+        let calls = 0;
+        const { store, sent, uploadToken } = await createStoreWithUpload({
+            GetObjectCommand: routeGetObject({
+                info: () => {
+                    calls += 1;
+                    if (calls > 1) throw new Error("sidecar read failed");
+                    return infoResponse({ createdAt: NOW });
+                },
+            }),
+            ListPartsCommand: () => ({ Parts: [] }),
+            UploadPartCommand: () => ({ ETag: '"p1"' }),
+            HeadObjectCommand: () => { throw notFound(); },
+            DeleteObjectCommand: () => ({}),
+        });
+
+        await store.appendChunk(uploadToken, 0, bytesOf("hello"), { now: NOW + 5 });
+
+        expect(writtenInfo(sent).createdAt).toBe(NOW);
     });
 });

@@ -2,14 +2,18 @@
  * Resumable-upload wire dialect for the IETF draft protocol
  * (draft-ietf-httpbis-resumable-upload) over the Fetch API.
  *
- * The handler speaks the draft revisions that deployed clients actually
- * implement, identified by their interop versions: 3 (draft-01), 5
- * (draft-03), and 6 (draft-04/-05). Later revisions have no deployed
- * speakers, so their surface (version negotiation, `Upload-Limit`, GET as an
- * offset probe) is deliberately absent until a stabilized revision ships
- * real clients. Versions are a compiled allowlist; the draft itself forbids
- * cross-version interop, so an unlisted version is answered 400 with the
- * supported set named in the body.
+ * The handler speaks four draft revisions, identified by their interop
+ * versions: 3 (draft-01), 5 (draft-03), 6 (draft-04 and -05) and 9
+ * (draft-12, the current revision). The older three are what deployed clients
+ * implement; the newest is what the specification says today, and a client
+ * asks for whichever it speaks. Versions are a compiled allowlist, and the
+ * draft forbids cross-version interop, so an unlisted version is answered 400
+ * with the supported set named in the body.
+ *
+ * Serving several versions from one endpoint is what lets a client upgrade on
+ * its own schedule rather than the server's, and the wire differences are
+ * data rather than branches: one row per version in a table the handlers
+ * read.
  *
  * The wire differences between the supported versions are encoded in one
  * explicit mapping table ({@link INTEROP_WIRE_FORMATS}), the most important
@@ -36,13 +40,15 @@
 import {
   createUploadOrchestrator,
   type UploadOutcome,
+  type UploadOrchestratorOptions,
   type UploadResourceEvent,
 } from "./upload-orchestrator.ts";
 import type { UploadPolicy } from "./upload-engine.ts";
 import type { ResumableWriteStore } from "./upload-store.ts";
 import type { UploadLocker } from "./upload-locker.ts";
 import { UPLOAD_ERROR_HEADERS } from "./upload-shared.ts";
-import { sanitizeHeaderValue } from "./kernel.ts";
+import { redactUploadToken } from "./upload-internals.ts";
+import { sanitizeHeaderValue, isSha256Base64 } from "./kernel.ts";
 
 // ─── Per-version wire mapping ───────────────────────────────────────────────
 
@@ -70,6 +76,13 @@ interface InteropWireFormat {
    */
   mismatchProblemDetails: boolean;
   /**
+   * Length-inconsistency answers carry the registered problem type
+   * (`inconsistent-upload-length`) as `application/problem+json`. It is
+   * registered later than the offset one, so the versions that predate it get
+   * a plain-text body naming the same fault.
+   */
+  lengthProblemDetails: boolean;
+  /**
    * Offset probes announce `Upload-Length` when the total is known
    * (a MUST from draft-05 onward; earlier revisions lack the field).
    */
@@ -83,12 +96,48 @@ interface InteropWireFormat {
    * an absent header as INCOMPLETE (never complete).
    */
   completenessRequiredOnAppend: boolean;
+  /**
+   * An append to an upload that is ALREADY complete may replay the completion
+   * answer instead of refusing.
+   *
+   * Interop 3, 5 and 6 require the refusal: the server "MUST NOT modify the
+   * upload resource and MUST respond with a 400 (Bad Request) status code",
+   * so a client written against those versions can use the 400 to learn that
+   * its upload finished. Interop 9 replaces that with the case it was getting
+   * wrong, a completion whose response the client never received, and permits
+   * the server to "replay the final response ... if the request to append to
+   * the completed upload is valid".
+   *
+   * The behaviours are incompatible, so the version decides. A client that
+   * wants the retry to succeed asks for interop 9.
+   */
+  completedAppendIsReplayable: boolean;
+  /**
+   * Offset-retrieval answers carry `Upload-Limit`, and a rejection caused by a
+   * limit carries it too. Interop 9 requires the first and recommends the
+   * second; earlier versions define the field but ask for it only on creation
+   * and OPTIONS.
+   */
+  probeAnnouncesLimits: boolean;
+  /**
+   * `GET` probes the offset alongside `HEAD`. Interop 9 admits it, noting
+   * `HEAD` is preferred "since response content is not required for
+   * resumption"; earlier versions define `HEAD` alone, so a `GET` there is a
+   * method the resource does not implement.
+   */
+  getProbesOffset: boolean;
 }
 
 /**
- * The compiled interop allowlist. 3 = draft-01, 5 = draft-03, 6 =
- * draft-04/-05: every version with deployed clients. The current draft
- * revision has none; it joins this table when it stabilizes.
+ * The compiled interop allowlist. 3 = draft-01, 5 = draft-03, 6 = draft-04
+ * and -05, 9 = draft-12, the current revision.
+ *
+ * Several versions are served from one endpoint because the draft's
+ * negotiation is deliberately all-or-nothing: a request declares its version
+ * and is answered entirely in that version's terms, and a server that does not
+ * recognize the declared one is told not to announce support at all. Keeping
+ * the older rows is therefore what lets a client upgrade on its own schedule
+ * rather than on ours.
  */
 const INTEROP_WIRE_FORMATS: ReadonlyMap<number, InteropWireFormat> = new Map([
   [3, {
@@ -98,6 +147,10 @@ const INTEROP_WIRE_FORMATS: ReadonlyMap<number, InteropWireFormat> = new Map([
     mismatchProblemDetails: false,
     probeAnnouncesLength: false,
     completenessRequiredOnAppend: false,
+    completedAppendIsReplayable: false,
+    probeAnnouncesLimits: false,
+    getProbesOffset: false,
+    lengthProblemDetails: false,
   }],
   [5, {
     completenessHeader: "Upload-Complete" as const,
@@ -106,6 +159,10 @@ const INTEROP_WIRE_FORMATS: ReadonlyMap<number, InteropWireFormat> = new Map([
     mismatchProblemDetails: false,
     probeAnnouncesLength: false,
     completenessRequiredOnAppend: true,
+    completedAppendIsReplayable: false,
+    probeAnnouncesLimits: false,
+    getProbesOffset: false,
+    lengthProblemDetails: false,
   }],
   [6, {
     completenessHeader: "Upload-Complete" as const,
@@ -114,14 +171,51 @@ const INTEROP_WIRE_FORMATS: ReadonlyMap<number, InteropWireFormat> = new Map([
     mismatchProblemDetails: true,
     probeAnnouncesLength: true,
     completenessRequiredOnAppend: true,
+    completedAppendIsReplayable: false,
+    probeAnnouncesLimits: false,
+    getProbesOffset: false,
+    lengthProblemDetails: false,
+  }],
+  [9, {
+    completenessHeader: "Upload-Complete" as const,
+    headerAssertsComplete: true,
+    requiresPartialUploadMediaType: true,
+    mismatchProblemDetails: true,
+    probeAnnouncesLength: true,
+    completenessRequiredOnAppend: true,
+    completedAppendIsReplayable: true,
+    lengthProblemDetails: true,
+    probeAnnouncesLimits: true,
+    getProbesOffset: true,
   }],
 ]);
 
-const DEFAULT_INTEROP_VERSIONS: readonly number[] = [3, 5, 6];
+const DEFAULT_INTEROP_VERSIONS: readonly number[] = [3, 5, 6, 9];
+
+/**
+ * Serialize the effective policy as the `Upload-Limit` dictionary.
+ *
+ * An absent member means the server states no limit of that kind. A server
+ * applying none at all still has to say so rather than send an empty field,
+ * which is why `min-size` falls back to zero: an empty structured-field value
+ * is not a valid dictionary, and silence about limits is what makes a client
+ * guess a chunk size and get a 413.
+ */
+function encodeUploadLimit(policy: UploadPolicy): string {
+  const members: string[] = [];
+  if (policy.maxSize !== undefined) members.push(`max-size=${policy.maxSize}`);
+  members.push(`min-size=${policy.minSize ?? 0}`);
+  if (policy.maxAppendSize !== undefined) members.push(`max-append-size=${policy.maxAppendSize}`);
+  if (policy.minAppendSize !== undefined) members.push(`min-append-size=${policy.minAppendSize}`);
+  if (policy.maxAgeSeconds !== undefined) members.push(`max-age=${policy.maxAgeSeconds}`);
+  return members.join(", ");
+}
 
 const INTEROP_VERSION_HEADER = "Upload-Draft-Interop-Version";
 const MISMATCHING_OFFSET_PROBLEM_TYPE =
   "https://iana.org/assignments/http-problem-types#mismatching-upload-offset";
+const INCONSISTENT_LENGTH_PROBLEM_TYPE =
+  "https://iana.org/assignments/http-problem-types#inconsistent-upload-length";
 
 /** Serialize a completeness fact into the version's header value. */
 function encodeCompleteness(wire: InteropWireFormat, complete: boolean): string {
@@ -175,6 +269,18 @@ function parseContentLength(value: string | null): number | undefined {
  * algorithms and malformed members are ignored per RFC 9530; only a
  * well-formed `sha-256` byte sequence is returned.
  */
+/**
+ * A client's asserted whole-representation SHA-256, from RFC 9530
+ * `Repr-Digest`, verified at completion by a store that can.
+ *
+ * Offered on every interop version this endpoint serves, including the ones
+ * whose draft revision carries no upload-digest text of its own. RFC 9530
+ * defines the field independently of any upload protocol, and honoring an
+ * assertion the client volunteered cannot break a client that sends none:
+ * absent means unverified, exactly as before. Dropping it on the newer
+ * versions would remove an integrity guarantee from the consumers most likely
+ * to want one, in exchange for nothing a client can observe.
+ */
 function parseReprDigestSha256(value: string | null): string | undefined {
   if (value === null) return undefined;
   for (const member of value.split(",")) {
@@ -184,7 +290,7 @@ function parseReprDigestSha256(value: string | null): string | undefined {
     const raw = member.slice(eq + 1).trim();
     if (!raw.startsWith(":") || !raw.endsWith(":")) continue;
     const b64 = raw.slice(1, -1);
-    if (!/^[A-Za-z0-9+/]{43}=$/.test(b64)) continue;
+    if (!isSha256Base64(b64)) continue;
     return b64;
   }
   return undefined;
@@ -235,14 +341,35 @@ export interface UploadHandlerOptions {
   /** Structured, content-free audit events. */
   onUploadEvent?: (event: UploadResourceEvent) => void;
   /** Must not throw (there is no sink for a failing error sink). */
-  onError?: (error: unknown, context: { uploadToken?: string; operation: string }) => void;
+  /**
+   * The upload published. The one hook carrying the storage key, so a caller
+   * can record which object an upload became; the key is chosen before a
+   * token exists, and pairing them by position across the creation call is a
+   * race. Awaited before the response goes out, so a throw answers a backend
+   * error rather than acknowledging an object the caller's records never saw.
+   *
+   * Deliberately not the audit stream, which is content-free by design: a
+   * storage key commonly embeds a filename.
+   */
+  onUploadComplete?: UploadOrchestratorOptions["onUploadComplete"];
+  /** How long a request waits for the upload lock before answering busy. */
+  lockTimeoutMs?: number;
+  /**
+   * Must not throw (there is no sink for a failing error sink). `auditKey`
+   * arrives in place of `uploadToken` whenever one was supplied.
+   */
+  onError?: (error: unknown, context: {
+    uploadToken?: string;
+    auditKey?: string;
+    operation: string;
+  }) => void;
   /** Post-abort flush window in milliseconds. @default 10000 */
   graceMs?: number;
   /** Clock injection (tests). @default Date.now */
   now?: () => number;
   /**
    * Interop versions to serve, each of which must be one this module has a
-   * wire mapping for. @default [3, 5, 6]
+   * wire mapping for. @default [3, 5, 6, 9]
    */
   interopVersions?: readonly number[];
   /**
@@ -326,6 +453,7 @@ export function createUploadHandler(
   const supportedSet = versions.join(", ");
   const latestVersion = versions[versions.length - 1]!;
   const onError = options.onError;
+  const uploadLimit = encodeUploadLimit(options.policy ?? {});
 
   const orchestrator = createUploadOrchestrator(store, {
     policy: options.policy,
@@ -333,6 +461,8 @@ export function createUploadHandler(
     onUploadEvent: options.onUploadEvent,
     onError,
     graceMs: options.graceMs,
+    onUploadComplete: options.onUploadComplete,
+    lockTimeoutMs: options.lockTimeoutMs,
     now: options.now,
   });
 
@@ -388,21 +518,48 @@ export function createUploadHandler(
    * mismatches and idempotent completion replays are append-specific and
    * handled by the caller before this runs.
    */
-  function rejectResponse(outcome: UploadOutcome, version: number): Response {
-    const echo = { [INTEROP_VERSION_HEADER]: String(version) };
+  function rejectResponse(
+    outcome: UploadOutcome,
+    version: number,
+    extra?: Record<string, string>,
+  ): Response {
+    const echo = { [INTEROP_VERSION_HEADER]: String(version), ...extra };
     switch (outcome.kind) {
-      case "limit-violation":
+      case "limit-violation": {
+        // A rejection caused by a limit carries the limits, so the client's
+        // retry aims at a number instead of guessing a smaller chunk.
+        const limited = INTEROP_WIRE_FORMATS.get(version)?.probeAnnouncesLimits
+          ? { ...echo, "Upload-Limit": uploadLimit }
+          : echo;
         // Size violations are payload problems (413); the floor violations
         // are malformed requests against advertised bounds (400).
         if (outcome.reason === "size-exceeded" || outcome.reason === "append-too-large") {
-          return textResponse(413, `upload rejected: ${outcome.reason}`, echo);
+          return textResponse(413, `upload rejected: ${outcome.reason}`, limited);
         }
-        return textResponse(400, `upload rejected: ${outcome.reason}`, echo);
-      case "length-inconsistent":
-        // The registered inconsistent-length problem type postdates every
-        // supported version (it arrives at interop 7), so the body stays
-        // plain text at interops 3, 5, and 6.
-        return textResponse(400, "inconsistent upload length indicators", echo);
+        return textResponse(400, `upload rejected: ${outcome.reason}`, limited);
+      }
+      case "length-inconsistent": {
+        // A registered problem type is machine-readable where the version
+        // defines one; the versions that predate the registration get the
+        // same fault as plain text rather than a type they cannot resolve.
+        const wireFormat = INTEROP_WIRE_FORMATS.get(version);
+        if (wireFormat?.lengthProblemDetails !== true) {
+          return textResponse(400, "inconsistent upload length indicators", echo);
+        }
+        const body = UTF8_ENCODER.encode(JSON.stringify({
+          type: INCONSISTENT_LENGTH_PROBLEM_TYPE,
+          title: "inconsistent length values for upload",
+        }));
+        return new Response(body, {
+          status: 400,
+          headers: {
+            ...echo,
+            ...UPLOAD_ERROR_HEADERS,
+            "Content-Type": "application/problem+json",
+            "Content-Length": String(body.byteLength),
+          },
+        });
+      }
       case "gone":
       case "not-found":
         // The draft folds every dead resource (unknown, cancelled, expired,
@@ -488,7 +645,16 @@ export function createUploadHandler(
       auditKey,
       signal: req.signal,
     });
-    if (outcome.kind !== "created") return rejectResponse(outcome, version);
+    if (outcome.kind !== "created") {
+      // A rejection that names a resource landed AFTER creation allocated it,
+      // so bytes may already be durable. The Location is how the client
+      // resumes them or deletes them; without it they are unreachable and
+      // only a sweep (optional, and meaningless with no max age) reclaims them.
+      const stranded = "uploadToken" in outcome ? outcome.uploadToken : undefined;
+      return rejectResponse(outcome, version, stranded === undefined
+        ? undefined
+        : { Location: sanitizeHeaderValue(options.location(stranded)) });
+    }
 
     // A caller's location() output is header-sanitized like every other
     // caller-derived header value (the tus dialect does the same): a stray
@@ -535,6 +701,9 @@ export function createUploadHandler(
     };
     if (wire.probeAnnouncesLength && outcome.length !== undefined) {
       headers["Upload-Length"] = String(outcome.length);
+    }
+    if (wire.probeAnnouncesLimits) {
+      headers["Upload-Limit"] = uploadLimit;
     }
     return emptyResponse(204, headers);
   }
@@ -601,9 +770,14 @@ export function createUploadHandler(
           "Upload-Offset": String(outcome.offset),
         });
       case "already-complete":
-        // Idempotent replay of a completion the client never saw acknowledged.
-        // The engine only answers this when the claimed offset IS the durable
-        // offset, so echoing it back is truthful.
+        // The engine answers this only when the claimed offset IS the durable
+        // offset, so the request is a retry of a completion whose response the
+        // client never received. Whether that may be replayed is the version's
+        // decision, not ours: replaying where the version requires a refusal
+        // would deny a client the signal it uses to learn the upload finished.
+        if (!wire.completedAppendIsReplayable) {
+          return textResponse(400, "upload is already complete", echo);
+        }
         return emptyResponse(200, {
           ...echo,
           [wire.completenessHeader]: encodeCompleteness(wire, true),
@@ -641,11 +815,17 @@ export function createUploadHandler(
   async function dispatch(req: Request, ctx?: UploadHandlerContext): Promise<Response> {
     const method = req.method.toUpperCase();
     if (method === "OPTIONS") {
-      // Standard method discovery (RFC 9110 Section 8.6); version-agnostic.
-      // Limits advertisement via Upload-Limit is a later-revision surface no
-      // supported client consumes, so it is deliberately absent here.
+      // Standard method discovery (RFC 9110 Section 8.6); version-agnostic,
+      // because a client discovering the endpoint has not yet negotiated one.
+      //
+      // The limits ride along: this target creates upload resources, and a
+      // client asks precisely so it can size its first request instead of
+      // discovering a ceiling by being refused at one. A version that does not
+      // define the field ignores it, which is what makes it safe to answer
+      // before the version is known.
       return emptyResponse(204, {
         Allow: "POST, HEAD, PATCH, DELETE, OPTIONS",
+        "Upload-Limit": uploadLimit,
         "Cache-Control": "no-store",
       });
     }
@@ -665,7 +845,20 @@ export function createUploadHandler(
       // completeness-header requirement inside does the real gating.
       return handleCreation(req, version, wire, auditKey);
     }
+    const methodNotAllowed = () => textResponse(405, "method not allowed on an upload resource", {
+      [INTEROP_VERSION_HEADER]: String(version),
+      Allow: wire.getProbesOffset
+        ? "GET, HEAD, PATCH, DELETE, OPTIONS"
+        : "HEAD, PATCH, DELETE, OPTIONS",
+    });
     switch (method) {
+      case "GET":
+        // A GET that reaches an upload resource is an offset probe on the
+        // versions that define one, and a method the resource does not
+        // implement on the versions that do not.
+        return wire.getProbesOffset
+          ? handleProbe(req, uploadToken, version, wire, auditKey)
+          : methodNotAllowed();
       case "HEAD":
         return handleProbe(req, uploadToken, version, wire, auditKey);
       case "PATCH":
@@ -673,10 +866,7 @@ export function createUploadHandler(
       case "DELETE":
         return handleCancel(req, uploadToken, version, wire, auditKey);
       default:
-        return textResponse(405, "method not allowed on an upload resource", {
-          [INTEROP_VERSION_HEADER]: String(version),
-          Allow: "HEAD, PATCH, DELETE, OPTIONS",
-        });
+        return methodNotAllowed();
     }
   }
 
@@ -687,7 +877,23 @@ export function createUploadHandler(
       // Nothing protocol-level throws (outcomes carry every failure); this
       // is the last-resort seam for hostile inputs and caller-supplied
       // callbacks, honoring the never-throw contract of the handler.
-      onError?.(err, { uploadToken: ctx?.uploadToken, operation: "handle" });
+      //
+      // The audit key substitutes for the token here as on every other
+      // reporting surface. Deriving it is guarded because a throwing caller
+      // callback is one of the things that reaches this seam.
+      let auditKey: string | undefined;
+      try {
+        auditKey = options.auditKey?.(req);
+      } catch {
+        auditKey = undefined;
+      }
+      const token = ctx?.uploadToken;
+      onError?.(
+        auditKey === undefined ? err : redactUploadToken(err, token, auditKey),
+        auditKey === undefined
+          ? { uploadToken: token, operation: "handle" }
+          : { auditKey, operation: "handle" },
+      );
       return textResponse(500, "upload handler failure");
     }
   };

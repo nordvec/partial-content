@@ -146,7 +146,7 @@ describe("node adapter failure paths", () => {
             async headObject() { return { contentLength: 5 }; },
             async getObject() {
                 return {
-                    body: new ReadableStream<Uint8Array>({
+                    body: new ReadableStream<Uint8Array<ArrayBuffer>>({
                         pull(controller) {
                             controller.enqueue(new TextEncoder().encode("01234"));
                         },
@@ -202,7 +202,7 @@ describe("node adapter failure paths", () => {
             async headObject() { return { contentLength: 5 }; },
             async getObject() {
                 return {
-                    body: new ReadableStream<Uint8Array>({
+                    body: new ReadableStream<Uint8Array<ArrayBuffer>>({
                         pull(controller) { controller.enqueue(new TextEncoder().encode("01234")); },
                         cancel() { readerCancelled = true; },
                     }),
@@ -244,7 +244,7 @@ describe("node adapter failure paths", () => {
             async getObject(key) {
                 if (key === "ok") {
                     return {
-                        body: new ReadableStream<Uint8Array>({
+                        body: new ReadableStream<Uint8Array<ArrayBuffer>>({
                             start(controller) {
                                 controller.enqueue(new TextEncoder().encode("0123456789"));
                                 controller.close();
@@ -255,7 +255,7 @@ describe("node adapter failure paths", () => {
                     };
                 }
                 return {
-                    body: new ReadableStream<Uint8Array>({
+                    body: new ReadableStream<Uint8Array<ArrayBuffer>>({
                         pull(controller) {
                             controller.enqueue(new TextEncoder().encode("01234"));
                             // Second pull: the backend dies mid-transfer.

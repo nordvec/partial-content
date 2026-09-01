@@ -30,6 +30,7 @@ function fakeStore(over: Partial<ResumableWriteStore> = {}) {
     const base: ResumableWriteStore = {
         exactOffsetRecovery: true,
         atomicCompletion: true,
+        enforcesOffsetCheck: true,
         digestOnComplete: "sha256",
         async createUpload(opts) {
             const uploadToken = `u${++seq}`;
@@ -44,6 +45,7 @@ function fakeStore(over: Partial<ResumableWriteStore> = {}) {
             const u = uploads.get(token);
             if (!u) throw new UploadNotFoundError(token);
             return {
+                key: u.key,
                 offset: u.bytes.byteLength, length: u.length, isComplete: u.isComplete,
                 isInvalidated: u.isInvalidated, createdAt: u.createdAt,
                 lastAppendAt: u.lastAppendAt, metadata: u.metadata,
@@ -96,7 +98,7 @@ function fakeStore(over: Partial<ResumableWriteStore> = {}) {
 
 // ─── Request helpers ─────────────────────────────────────────────────────────
 
-function bodyOf(text: string): Uint8Array {
+function bodyOf(text: string): Uint8Array<ArrayBuffer> {
     return new TextEncoder().encode(text);
 }
 
@@ -228,7 +230,7 @@ describe("CORS exposed headers", () => {
     test("every header actually emitted by a full upload flow is in the exposed list", async () => {
         // Drive create -> HEAD -> PATCH-complete with expiration on and collect
         // every response header; each must be exposable or a CORS client breaks.
-        const { handler } = makeHandler({ maxAgeSeconds: 3600 });
+        const { handler } = makeHandler({ policy: { maxAgeSeconds: 3600 }});
         const seen = new Set<string>();
         const collect = (res: Response) => res.headers.forEach((_v, k) => seen.add(k.toLowerCase()));
 
@@ -268,7 +270,7 @@ describe("OPTIONS", () => {
     });
 
     test("advertises `expiration` only when a max age is configured", async () => {
-        const { handler: withAge } = makeHandler({ maxAgeSeconds: 3600 });
+        const { handler: withAge } = makeHandler({ policy: { maxAgeSeconds: 3600 }});
         const withRes = await withAge(tusRequest("OPTIONS", { noVersion: true }));
         expect(withRes.headers.get("tus-extension")).toContain("expiration");
 
@@ -278,19 +280,15 @@ describe("OPTIONS", () => {
     });
 
     test("advertises Tus-Max-Size when a maximum size is configured", async () => {
-        const { handler } = makeHandler({ maxSize: 1024 });
+        const { handler } = makeHandler({ policy: { maxSize: 1024 }});
         const res = await handler(tusRequest("OPTIONS", { noVersion: true }));
         expect(res.headers.get("tus-max-size")).toBe("1024");
     });
 
-    test("a policy object works like flat fields, and flat fields win", async () => {
+    test("the configured maximum is what OPTIONS advertises", async () => {
         const { handler } = makeHandler({ policy: { maxSize: 512 } });
         const res = await handler(tusRequest("OPTIONS", { noVersion: true }));
         expect(res.headers.get("tus-max-size")).toBe("512");
-
-        const { handler: overridden } = makeHandler({ policy: { maxSize: 512 }, maxSize: 2048 });
-        const res2 = await overridden(tusRequest("OPTIONS", { noVersion: true }));
-        expect(res2.headers.get("tus-max-size")).toBe("2048");
     });
 });
 
@@ -354,7 +352,7 @@ describe("creation", () => {
     });
 
     test("Upload-Length above the maximum answers 413 with Tus-Max-Size", async () => {
-        const { handler } = makeHandler({ maxSize: 4 });
+        const { handler } = makeHandler({ policy: { maxSize: 4 }});
         const res = await handler(tusRequest("POST", { headers: { "Upload-Length": "100" } }));
         expect(res.status).toBe(413);
         expect(res.headers.get("tus-max-size")).toBe("4");
@@ -376,6 +374,49 @@ describe("creation", () => {
         expect(res.status).toBe(201);
         expect(seen[0]).toEqual({ filename: "plan.pdf", empty: "" });
         expect(uploads.get("u1")!.metadata).toEqual({ filename: "plan.pdf", empty: "" });
+    });
+
+    test("HEAD echoes the stored metadata, round-tripping through the creation grammar", async () => {
+        // Creation extension: a HEAD on an upload that carries metadata MUST
+        // report it, so a client resuming from a cold start recovers the
+        // filename and type it no longer holds.
+        const { handler } = makeHandler();
+        await handler(tusRequest("POST", {
+            headers: {
+                "Upload-Length": "5",
+                "Upload-Metadata": `filename ${b64("pl an,å.pdf")},empty`,
+            },
+        }));
+        const res = await handler(tusRequest("HEAD"), { uploadToken: "u1" });
+        expect(res.status).toBe(200);
+        // Values are base64 (so a comma, a space, or a non-ASCII byte inside
+        // one cannot rewrite the header); an empty value is the bare key.
+        expect(res.headers.get("upload-metadata")).toBe(`filename ${b64("pl an,å.pdf")},empty`);
+        // The echo is exactly what the parser accepts back.
+        expect(parseUploadMetadata(res.headers.get("upload-metadata"))).toEqual({
+            filename: "pl an,å.pdf", empty: "",
+        });
+    });
+
+    test("HEAD omits Upload-Metadata entirely when the upload carries none", async () => {
+        const { handler } = makeHandler();
+        await handler(tusRequest("POST", { headers: { "Upload-Length": "5" } }));
+        const res = await handler(tusRequest("HEAD"), { uploadToken: "u1" });
+        expect(res.headers.has("upload-metadata")).toBe(false);
+    });
+
+    test("HEAD skips a metadata key the header grammar cannot express", async () => {
+        // Another dialect or a direct orchestrator caller can store any key.
+        // The tus grammar has no escaping, so a key holding a comma, a space
+        // or a control byte is dropped rather than allowed to rewrite the
+        // header around it.
+        const { handler, uploads } = makeHandler();
+        await handler(tusRequest("POST", { headers: { "Upload-Length": "5" } }));
+        uploads.get("u1")!.metadata = {
+            "we ird": "x", "com,ma": "y", "line\r\nbreak": "z", ok: "fine",
+        };
+        const res = await handler(tusRequest("HEAD"), { uploadToken: "u1" });
+        expect(res.headers.get("upload-metadata")).toBe(`ok ${b64("fine")}`);
     });
 
     test("malformed Upload-Metadata answers 400 before any store call", async () => {
@@ -607,12 +648,13 @@ describe("PATCH", () => {
 
     test("a missing or malformed Upload-Offset answers 400", async () => {
         const { handler, token } = await withUpload();
-        for (const headers of [
+        const headerCases: Record<string, string>[] = [
             { "Content-Type": OFFSET_TYPE },
             { "Content-Type": OFFSET_TYPE, "Upload-Offset": "abc" },
             { "Content-Type": OFFSET_TYPE, "Upload-Offset": "-1" },
             { "Content-Type": OFFSET_TYPE, "Upload-Offset": "0x2" },
-        ]) {
+        ];
+        for (const headers of headerCases) {
             const res = await handler(tusRequest("PATCH", { headers }), { uploadToken: token });
             expect(res.status).toBe(400);
             expect(await res.text()).toBe("missing or invalid Upload-Offset header");
@@ -664,7 +706,7 @@ describe("PATCH", () => {
     });
 
     test("an append crossing the maximum size answers 413", async () => {
-        const { handler } = makeHandler({ maxSize: 4 });
+        const { handler } = makeHandler({ policy: { maxSize: 4 }});
         const token = await createUpload(handler, { "Upload-Defer-Length": "1" });
         const res = await handler(tusRequest("PATCH", {
             headers: { "Content-Type": OFFSET_TYPE, "Upload-Offset": "0", "Content-Length": "10" },
@@ -844,8 +886,39 @@ describe("checksum extension", () => {
     }
 
     function checksumHandler(opts: Partial<TusHandlerOptions> = {}) {
-        return makeHandler({ checksum: webCryptoChecksum(), maxAppendSize: 1024, ...opts });
+        return makeHandler({ checksum: webCryptoChecksum(), policy: { maxAppendSize: 1024 }, ...opts });
     }
+
+    test("an unknown token answers 404 without buffering or hashing the body", async () => {
+        // Verification buffers and hashes the whole request up to the cap.
+        // A token that names nothing must not buy that work: without the gate
+        // a bogus token costs memory times concurrency and a digest per
+        // attempt, before the append fails 404 anyway.
+        let digests = 0;
+        const { handler } = checksumHandler({
+            checksum: {
+                algorithms: ["sha1"],
+                digest: async (algorithm, content) => {
+                    digests += 1;
+                    return webCryptoChecksum().digest(algorithm, content);
+                },
+            },
+        });
+        const res = await handler(tusRequest("PATCH", {
+            headers: {
+                "Content-Type": OFFSET_TYPE,
+                "Upload-Offset": "0",
+                "Upload-Checksum": `sha1 ${await sha1b64("abcd")}`,
+            },
+            body: bodyOf("abcd"),
+        }), { uploadToken: "no-such-token" });
+
+        expect(res.status).toBe(404);
+        // The digest is the expensive half and unambiguously ours; a byte
+        // counter on the body would also catch the Request's own buffering,
+        // which is not what this pins.
+        expect(digests).toBe(0);
+    });
 
     test("OPTIONS advertises the extension and its algorithms", async () => {
         const { handler } = checksumHandler();
@@ -1011,7 +1084,7 @@ describe("checksum extension", () => {
             key: () => "k", location: (t) => `/f/${t}`, checksum: webCryptoChecksum(),
         })).toThrow(TypeError);
         expect(() => createTusHandler(store, {
-            key: () => "k", location: (t) => `/f/${t}`, maxAppendSize: 1024,
+            key: () => "k", location: (t) => `/f/${t}`, policy: { maxAppendSize: 1024 },
             checksum: { algorithms: [], digest: (_a, b) => b },
         })).toThrow(TypeError);
     });
@@ -1066,7 +1139,7 @@ describe("expiration", () => {
     const IMF_RE = /^[A-Z][a-z]{2}, \d{2} [A-Z][a-z]{2} \d{4} \d{2}:\d{2}:\d{2} GMT$/;
 
     test("creation, HEAD, and PATCH carry Upload-Expires in IMF-fixdate format", async () => {
-        const { handler } = makeHandler({ maxAgeSeconds: MAX_AGE });
+        const { handler } = makeHandler({ policy: { maxAgeSeconds: MAX_AGE }});
         const createRes = await handler(tusRequest("POST", { headers: { "Upload-Length": "10" } }));
         expect(createRes.headers.get("upload-expires")).toBe(EXPECTED);
         expect(createRes.headers.get("upload-expires")).toMatch(IMF_RE);
@@ -1084,7 +1157,7 @@ describe("expiration", () => {
     });
 
     test("a completed upload carries no Upload-Expires", async () => {
-        const { handler } = makeHandler({ maxAgeSeconds: MAX_AGE });
+        const { handler } = makeHandler({ policy: { maxAgeSeconds: MAX_AGE }});
         const token = await createUpload(handler, { "Upload-Length": "4" });
         const res = await handler(tusRequest("PATCH", {
             headers: { "Content-Type": OFFSET_TYPE, "Upload-Offset": "0", "Content-Length": "4" },
@@ -1109,22 +1182,39 @@ describe("expiration", () => {
     });
 
     test("a completed upload's HEAD carries no Upload-Expires", async () => {
-        const { handler } = makeHandler({ maxAgeSeconds: MAX_AGE });
+        const { handler } = makeHandler({ policy: { maxAgeSeconds: MAX_AGE }});
         const token = await createUpload(handler, { "Upload-Length": "0" });
         const head = await handler(tusRequest("HEAD"), { uploadToken: token });
         expect(head.status).toBe(200);
         expect(head.headers.get("upload-expires")).toBeNull();
     });
 
-    test("the object policy form drives Upload-Expires too", async () => {
-        const { handler } = makeHandler({ policy: { maxAgeSeconds: MAX_AGE } });
-        const res = await handler(tusRequest("POST", { headers: { "Upload-Length": "10" } }));
+
+    test("a slow streaming creation anchors Upload-Expires at creation start, not stream end", async () => {
+        // The creation response's deadline is pinned to when creation STARTED,
+        // via the created outcome's expiresAt. A body that streams for minutes
+        // must not advertise now()+maxAge measured after it drains, or a client
+        // honoring the header resumes past the real expiry into a 404.
+        let clock = NOW;
+        const { handler } = makeHandler({ policy: { maxAgeSeconds: MAX_AGE }, now: () => clock });
+        const body = controlledStream();
+        const pending = handler(tusRequest("POST", {
+            headers: { "Upload-Defer-Length": "1", "Content-Type": OFFSET_TYPE },
+            body: body.stream,
+        }));
+        await new Promise((r) => setTimeout(r, 5));
+        clock = NOW + 1800 * 1000; // 30 minutes elapse while the body streams
+        body.push("abc");
+        body.close();
+        const res = await pending;
+        expect(res.status).toBe(201);
+        // Anchored at NOW (creation start), NOT NOW + 1800s + MAX_AGE.
         expect(res.headers.get("upload-expires")).toBe(EXPECTED);
     });
 
     test("an expired upload answers 410", async () => {
         let clock = NOW;
-        const { handler } = makeHandler({ maxAgeSeconds: MAX_AGE, now: () => clock });
+        const { handler } = makeHandler({ policy: { maxAgeSeconds: MAX_AGE }, now: () => clock });
         const token = await createUpload(handler, { "Upload-Length": "10" });
         clock = NOW + (MAX_AGE + 1) * 1000;
         const head = await handler(tusRequest("HEAD"), { uploadToken: token });
@@ -1233,21 +1323,15 @@ describe("routing and hardening", () => {
 // ─── Policy bounds (flat fields and the policy object form) ─────────────────
 
 describe("policy bounds", () => {
-    test("flat minSize rejects a too-small declared upload with 400", async () => {
-        const { handler } = makeHandler({ minSize: 5 });
+    test("minSize rejects a too-small declared upload with 400", async () => {
+        const { handler } = makeHandler({ policy: { minSize: 5 }});
         const res = await handler(tusRequest("POST", { headers: { "Upload-Length": "1" } }));
         expect(res.status).toBe(400);
         expect(await res.text()).toBe("upload violates a size policy");
     });
 
-    test("object-form minSize is enforced identically", async () => {
-        const { handler } = makeHandler({ policy: { minSize: 5 } });
-        const res = await handler(tusRequest("POST", { headers: { "Upload-Length": "1" } }));
-        expect(res.status).toBe(400);
-    });
-
-    test("flat maxAppendSize rejects an oversized append with 413 and no Tus-Max-Size", async () => {
-        const { handler } = makeHandler({ maxAppendSize: 2 });
+    test("maxAppendSize rejects an oversized append with 413 and no Tus-Max-Size", async () => {
+        const { handler } = makeHandler({ policy: { maxAppendSize: 2 }});
         const token = await createUpload(handler, { "Upload-Length": "10" });
         const res = await handler(tusRequest("PATCH", {
             headers: { "Content-Type": OFFSET_TYPE, "Upload-Offset": "0", "Content-Length": "3" },
@@ -1258,18 +1342,9 @@ describe("policy bounds", () => {
         expect(res.headers.get("tus-max-size")).toBeNull();
     });
 
-    test("object-form maxAppendSize is enforced identically", async () => {
-        const { handler } = makeHandler({ policy: { maxAppendSize: 2 } });
-        const token = await createUpload(handler, { "Upload-Length": "10" });
-        const res = await handler(tusRequest("PATCH", {
-            headers: { "Content-Type": OFFSET_TYPE, "Upload-Offset": "0", "Content-Length": "3" },
-            body: bodyOf("abc"),
-        }), { uploadToken: token });
-        expect(res.status).toBe(413);
-    });
 
     test("minAppendSize rejects a small non-final append but exempts the completing one", async () => {
-        const { handler, uploads } = makeHandler({ minAppendSize: 6 });
+        const { handler, uploads } = makeHandler({ policy: { minAppendSize: 6 }});
         const token = await createUpload(handler, { "Upload-Length": "10" });
         const small = await handler(tusRequest("PATCH", {
             headers: { "Content-Type": OFFSET_TYPE, "Upload-Offset": "0", "Content-Length": "2" },
@@ -1289,18 +1364,9 @@ describe("policy bounds", () => {
         expect(uploads.get(tokenSmallFile)!.isComplete).toBe(true);
     });
 
-    test("object-form minAppendSize is enforced identically", async () => {
-        const { handler } = makeHandler({ policy: { minAppendSize: 6 } });
-        const token = await createUpload(handler, { "Upload-Length": "10" });
-        const res = await handler(tusRequest("PATCH", {
-            headers: { "Content-Type": OFFSET_TYPE, "Upload-Offset": "0", "Content-Length": "2" },
-            body: bodyOf("ab"),
-        }), { uploadToken: token });
-        expect(res.status).toBe(400);
-    });
 
     test("a small completing creation-with-upload is exempt from minAppendSize", async () => {
-        const { handler, uploads } = makeHandler({ minAppendSize: 6 });
+        const { handler, uploads } = makeHandler({ policy: { minAppendSize: 6 }});
         const res = await handler(tusRequest("POST", {
             headers: { "Upload-Length": "4", "Content-Type": OFFSET_TYPE, "Content-Length": "4" },
             body: bodyOf("abcd"),
@@ -1373,7 +1439,7 @@ describe("implicit-completion healing", () => {
     });
 
     test("a healed creation with a max age carries no Upload-Expires (it is complete)", async () => {
-        const { handler } = makeHandler({ maxAgeSeconds: 3600 });
+        const { handler } = makeHandler({ policy: { maxAgeSeconds: 3600 }});
         const ctl = new AbortController();
         const body = controlledStream();
         const pending = handler(tusRequest("POST", {
@@ -1391,7 +1457,7 @@ describe("implicit-completion healing", () => {
     });
 
     test("a healed PATCH with a max age carries no Upload-Expires (it is complete)", async () => {
-        const { handler } = makeHandler({ maxAgeSeconds: 3600 });
+        const { handler } = makeHandler({ policy: { maxAgeSeconds: 3600 }});
         const token = await createUpload(handler, { "Upload-Length": "3" });
         const ctl = new AbortController();
         const body = controlledStream();
@@ -1458,7 +1524,7 @@ describe("audit hooks", () => {
         let clock = NOW;
         const events: UploadResourceEvent[] = [];
         const { handler } = makeHandler({
-            maxAgeSeconds: 60,
+            policy: { maxAgeSeconds: 60 },
             now: () => clock,
             auditKey: (token) => `audit-${token}`,
             onUploadEvent: (e) => events.push(e),
@@ -1555,7 +1621,7 @@ describe("HEAD implicit-completion healing", () => {
     });
 
     test("a healed HEAD with a max age drops Upload-Expires (the upload is now complete)", async () => {
-        const { handler, uploads } = makeHandler({ maxAgeSeconds: 3600 });
+        const { handler, uploads } = makeHandler({ policy: { maxAgeSeconds: 3600 }});
         const token = await createUpload(handler, { "Upload-Length": "3" });
         crashWindow(uploads, token, 3);
         const res = await handler(tusRequest("HEAD"), { uploadToken: token });
@@ -1568,7 +1634,7 @@ describe("HEAD implicit-completion healing", () => {
     test("HEAD does NOT heal an upload still short of its length", async () => {
         // offset < length: genuinely incomplete. The heal must not fire, and with
         // a max age Upload-Expires still rides the HEAD.
-        const { handler, uploads } = makeHandler({ maxAgeSeconds: 3600 });
+        const { handler, uploads } = makeHandler({ policy: { maxAgeSeconds: 3600 }});
         const token = await createUpload(handler, { "Upload-Length": "10" });
         const rec = uploads.get(token)!;
         rec.bytes = new Uint8Array(4);

@@ -119,13 +119,31 @@ export function serveObject(
   const handler = serveObjectWeb(store, serveOpts);
 
   return async function honoHandler(c: HonoContext): Promise<Response> {
-    const key = await keyFn(c);
-    const ctx: ServeContext = {
-      key,
-      mime: mimeFn?.(c),
-      filename: filenameFn?.(c),
-      auditKey: auditKeyFn?.(c),
-    };
+    let ctx: ServeContext;
+    try {
+      ctx = {
+        key: await keyFn(c),
+        mime: mimeFn?.(c),
+        filename: filenameFn?.(c),
+        auditKey: auditKeyFn?.(c),
+      };
+    } catch (err) {
+      // A throwing extractor is consumer code failing: surface it to the
+      // consumer's telemetry (the response body stays generic), with the
+      // same error-hygiene headers every other error response carries.
+      // `onError` reports the `context` operation on every adapter, so a
+      // consumer's telemetry does not depend on which one they mounted.
+      serveOpts.onError?.(err, { key: "", operation: "context" });
+      return new Response("Internal Server Error", {
+        status: 500,
+        headers: {
+          "Content-Type": "text/plain; charset=utf-8",
+          "X-Content-Type-Options": "nosniff",
+          "Cache-Control": "no-store",
+          "Content-Security-Policy": "default-src 'none'",
+        },
+      });
+    }
 
     return handler(c.req.raw, ctx);
   };

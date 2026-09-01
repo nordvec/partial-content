@@ -4,7 +4,14 @@ import { httpStore, ObjectNotFoundError, ObjectChangedError, StoreUnavailableErr
 import { memoryStore } from "../memory";
 import { serveObject } from "../web";
 import { serveObject as serveObjectNode } from "../node";
+import { asStream } from "./helpers";
+import type { ObjectStream } from "../index";
 
+/**
+ * The streaming half of an {@link ObjectStream} body. This store proxies an
+ * origin response, which is always a stream, so a byte body means the adapter
+ * stopped proxying and the assertion is measuring the wrong path.
+ */
 // ─── Stub-fetch unit tests ──────────────────────────────────────────────────
 
 function stubFetch(
@@ -201,7 +208,7 @@ describe("httpStore: unit (stub fetch)", () => {
         });
         const result = await store.getObject("empty.bin");
         expect(result.contentLength).toBe(0);
-        const reader = result.body.getReader();
+        const reader = asStream(result.body).getReader();
         expect((await reader.read()).done).toBe(true);
     });
 
@@ -722,7 +729,7 @@ describe("httpStore: degenerate origin responses", () => {
         });
         const result = await store.getObject("empty.bin");
         const chunks: Uint8Array[] = [];
-        for await (const chunk of result.body) chunks.push(chunk);
+        for await (const chunk of asStream(result.body)) chunks.push(chunk);
 
         expect(chunks).toHaveLength(0);
         expect(result.contentLength).toBe(0);

@@ -15,7 +15,7 @@ function createMockStore(overrides?: Partial<ObjectStore>): ObjectStore {
             lastModified: "Sat, 28 Jun 2025 12:00:00 GMT",
         })),
         getObject: mock(async (_key: string, _opts?: { range?: ParsedRange; signal?: AbortSignal; ifMatch?: string }): Promise<ObjectStream> => ({
-            body: new ReadableStream<Uint8Array>({
+            body: new ReadableStream<Uint8Array<ArrayBuffer>>({
                 start(controller) {
                     controller.enqueue(new Uint8Array([72, 101, 108, 108, 111])); // "Hello"
                     controller.close();
@@ -93,7 +93,7 @@ describe("serveObject", () => {
     test("returns 206 on valid Range with conditional headers", async () => {
         const rangeStore = createMockStore({
             getObject: mock(async (_key: string, _opts?: { range?: ParsedRange }): Promise<ObjectStream> => ({
-                body: new ReadableStream<Uint8Array>({
+                body: new ReadableStream<Uint8Array<ArrayBuffer>>({
                     start(controller) {
                         controller.enqueue(new Uint8Array([1, 2, 3]));
                         controller.close();
@@ -128,7 +128,7 @@ describe("serveObject", () => {
         // parse the range, then GET with the resolved range.
         const rangeStore = createMockStore({
             getObject: mock(async (_key: string, _opts?: { range?: ParsedRange }): Promise<ObjectStream> => ({
-                body: new ReadableStream<Uint8Array>({
+                body: new ReadableStream<Uint8Array<ArrayBuffer>>({
                     start(controller) {
                         controller.enqueue(new Uint8Array([1, 2, 3]));
                         controller.close();
@@ -244,7 +244,7 @@ describe("serveObject", () => {
         // Simulate: a range was requested via conditionals, but S3 returned full content
         const noRangeStore = createMockStore({
             getObject: mock(async (_key: string, _opts?: { range?: ParsedRange }): Promise<ObjectStream> => ({
-                body: new ReadableStream<Uint8Array>({
+                body: new ReadableStream<Uint8Array<ArrayBuffer>>({
                     start(c) { c.close(); },
                 }),
                 contentLength: 10000,
@@ -411,7 +411,7 @@ describe("serveObject", () => {
             lastModified: "Sat, 28 Jun 2025 12:00:00 GMT",
         }));
         const getSpy = mock(async (_key: string, _opts?: { range?: ParsedRange; signal?: AbortSignal; ifMatch?: string }): Promise<ObjectStream> => ({
-            body: new ReadableStream<Uint8Array>({
+            body: new ReadableStream<Uint8Array<ArrayBuffer>>({
                 start(controller) {
                     controller.enqueue(new Uint8Array([72, 101, 108, 108, 111]));
                     controller.close();
@@ -1014,7 +1014,7 @@ describe("serveObject", () => {
     test("emits Repr-Digest on Path C when GET response carries digest", async () => {
         const store = createMockStore({
             getObject: mock(async (_key: string, _opts?: { range?: ParsedRange; signal?: AbortSignal; ifMatch?: string }): Promise<ObjectStream> => ({
-                body: new ReadableStream<Uint8Array>({
+                body: new ReadableStream<Uint8Array<ArrayBuffer>>({
                     start(controller) {
                         controller.enqueue(new Uint8Array([1, 2, 3]));
                         controller.close();

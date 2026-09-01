@@ -1,5 +1,5 @@
 import { describe, test, expect } from "bun:test";
-import { r2Store, ObjectNotFoundError, ObjectChangedError } from "../r2";
+import { r2Store, ObjectNotFoundError, ObjectChangedError, type R2StoreOptions } from "../r2";
 import { OPEN_ENDED } from "../index";
 
 // ─── Mock R2 Bucket ─────────────────────────────────────────────────────────
@@ -12,6 +12,14 @@ function sha256Buf(): ArrayBuffer {
     return new Uint8Array(32).fill(7).buffer;
 }
 
+/**
+ * The bucket surface the adapter consumes, read off the adapter's own option
+ * type. Deriving it binds the double to the contract, and keeps the union the
+ * binding really returns: a failed `onlyIf` precondition resolves to a
+ * body-less object, which a body-only mock shape could not express.
+ */
+type R2Bucket = R2StoreOptions["bucket"];
+
 interface MockR2Opts {
     /** Override the range the mock reports as actually returned. */
     reportedRange?: { offset: number; length: number };
@@ -21,7 +29,7 @@ interface MockR2Opts {
     withChecksum?: boolean;
 }
 
-function mockBucket(opts: MockR2Opts = {}) {
+function mockBucket(opts: MockR2Opts = {}): R2Bucket {
     const base = {
         key: "test.bin",
         size: CONTENT.length,

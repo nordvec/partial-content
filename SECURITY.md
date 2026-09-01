@@ -45,9 +45,11 @@ storage-backend metadata. Defenses under test:
   first, and a request whose coalesced parts exceed `maxRanges` (default 50)
   or already cover the whole representation degrades to a single full 200.
   A client cannot force a large or redundant multipart response by sending
-  many tiny or overlapping ranges (the mitigation in Go `net/http.ServeContent`
-  and nginx `max_ranges`). The multipart `Content-Length` is computed exactly,
-  never chunked, so the response size is known and bounded up front.
+  many tiny or overlapping ranges. RFC 9110 Section 14.2 lets a server ignore
+  a `Range` field and answer `200`, which is what makes the cap conformant, and
+  Section 15.3.7.2 sanctions coalescing the parts it does serve. The
+  multipart `Content-Length` is computed exactly, never chunked, so the
+  response size is known and bounded up front.
 - **MIME sniffing / encoding-sniffing XSS:** `X-Content-Type-Options: nosniff`
   on every success + error response (the `200`/`206`/`404`/`502`/`503` bodies
   and the bodyless `412`/`416` denials; `304`/`302` carry none), `charset=utf-8`
@@ -57,6 +59,18 @@ storage-backend metadata. Defenses under test:
   own origin it can run same-origin script. For untrusted uploads, serve SVG
   as `attachment` (per-MIME `disposition` hook) or add a sandboxing CSP via
   `securityHeaders`.
+- **Unpublished uploads reachable through the read path:** a read store and an
+  upload store are routinely pointed at one root or bucket, which is what makes
+  a completed upload servable without copying it. That also places the upload
+  store's bookkeeping inside the read store's namespace: the in-flight bytes of
+  an upload nobody has published, and the sidecar naming the key it is destined
+  for, which commonly embeds a filename. An upload token is the only handle
+  meant to reach that namespace and a read handler holds none, so `fsStore`,
+  `s3Store`, `r2Store`, `gcsStore` and `azureStore` refuse keys at or under a
+  `reservedPrefix` with `ObjectNotFoundError` on `headObject`, `getObject`, and
+  `createSignedUrl`. It defaults to the sibling upload store's prefix, so the
+  refusal is what a consumer gets without asking; `reservedPrefix: ""` opts out
+  for a location no upload store shares.
 - **Parser robustness:** the range/Content-Range/disposition parsers are
   covered by seeded randomized invariant tests (never throw; bounds always
   valid; output always header-safe).

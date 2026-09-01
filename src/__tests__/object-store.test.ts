@@ -21,6 +21,10 @@ import {
     guardStreamLength,
     resolveServedRange,
     parseRetryAfterSeconds,
+    reservedKeyGuard,
+    isObjectNotFoundError,
+    isObjectChangedError,
+    isStoreUnavailableError,
     type StoreErrorClassifiers,
 } from "../object-store";
 
@@ -169,9 +173,9 @@ describe("resolveServedRange", () => {
 // ─── guardStreamLength: committed-length enforcement on web streams ──────────
 
 describe("guardStreamLength", () => {
-    function webStreamOf(chunks: Uint8Array[]): ReadableStream<Uint8Array> {
+    function webStreamOf(chunks: Uint8Array<ArrayBuffer>[]): ReadableStream<Uint8Array<ArrayBuffer>> {
         let i = 0;
-        return new ReadableStream<Uint8Array>({
+        return new ReadableStream<Uint8Array<ArrayBuffer>>({
             pull(controller) {
                 if (i < chunks.length) controller.enqueue(chunks[i++]);
                 else controller.close();
@@ -410,5 +414,84 @@ describe("nodeStreamToWeb teardown without a destroy capability", () => {
         };
         await nodeStreamToWeb(iterable).cancel("client gone");
         expect(returned).toEqual(["client gone"]);
+    });
+});
+
+// ─── reservedKeyGuard ───────────────────────────────────────────────────────
+
+describe("reservedKeyGuard", () => {
+    test("refuses the prefix itself and everything under it", () => {
+        const guard = reservedKeyGuard(".uploads/");
+        // The bare form matters on its own: a store fronting a flat namespace
+        // can hold an object at exactly that name.
+        expect(() => guard(".uploads")).toThrow(ObjectNotFoundError);
+        expect(() => guard(".uploads/token")).toThrow(ObjectNotFoundError);
+        expect(() => guard(".uploads/token.json")).toThrow(ObjectNotFoundError);
+    });
+
+    test("a key that merely shares the leading characters is served", () => {
+        const guard = reservedKeyGuard(".uploads/");
+        expect(() => guard(".uploadsomething")).not.toThrow();
+        expect(() => guard(".uploads-archive/file.bin")).not.toThrow();
+        expect(() => guard("uploads/file.bin")).not.toThrow();
+    });
+
+    test("a prefix given without a trailing slash guards the same keys", () => {
+        const guard = reservedKeyGuard(".uploads");
+        expect(() => guard(".uploads")).toThrow(ObjectNotFoundError);
+        expect(() => guard(".uploads/token")).toThrow(ObjectNotFoundError);
+        expect(() => guard(".uploadsomething")).not.toThrow();
+    });
+
+    test("an empty prefix guards nothing at all", () => {
+        const guard = reservedKeyGuard("");
+        // The opt-out for a location no upload store shares. It must not
+        // silently become a guard on "/" instead.
+        for (const key of ["", "/", "/anything", ".uploads", ".uploads/token", "any/key"]) {
+            expect(() => guard(key)).not.toThrow();
+        }
+    });
+
+    test("the refusal names the key, so a log says which read was refused", () => {
+        try {
+            reservedKeyGuard(".uploads/")(".uploads/secret");
+            throw new Error("expected a throw");
+        } catch (err) {
+            expect(isObjectNotFoundError(err)).toBe(true);
+            expect((err as Error).message).toContain(".uploads/secret");
+        }
+    });
+});
+
+// ─── Read-side error matchers ───────────────────────────────────────────────
+
+describe("read-side error matchers", () => {
+    test("each matches its own class and nothing else", () => {
+        const notFound = new ObjectNotFoundError("k");
+        const changed = new ObjectChangedError("k");
+        const unavailable = new StoreUnavailableError("k");
+
+        expect(isObjectNotFoundError(notFound)).toBe(true);
+        expect(isObjectNotFoundError(changed)).toBe(false);
+        expect(isObjectChangedError(changed)).toBe(true);
+        expect(isObjectChangedError(unavailable)).toBe(false);
+        expect(isStoreUnavailableError(unavailable)).toBe(true);
+        expect(isStoreUnavailableError(notFound)).toBe(false);
+    });
+
+    test("an equivalently named error from another copy of the package matches", () => {
+        // The reason these exist: `instanceof` fails across package boundaries,
+        // so the name is the identity a third-party store can reproduce.
+        const foreign = new Error("not found");
+        foreign.name = "ObjectNotFoundError";
+        expect(isObjectNotFoundError(foreign)).toBe(true);
+    });
+
+    test("a non-error is never a match", () => {
+        for (const value of [undefined, null, "ObjectNotFoundError", { name: "ObjectNotFoundError" }]) {
+            expect(isObjectNotFoundError(value)).toBe(false);
+            expect(isObjectChangedError(value)).toBe(false);
+            expect(isStoreUnavailableError(value)).toBe(false);
+        }
     });
 });

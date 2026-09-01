@@ -32,21 +32,45 @@ import {
   type ObjectMetadata,
   type ObjectStream,
   type ParsedRange,
+  reservedKeyGuard,
 } from "./index.ts";
 import {
   UploadNotFoundError,
   UploadOffsetConflictError,
+  UploadAppendBoundError,
+  UploadOverrunError,
   type ResumableWriteStore,
+  type SweepingWriteStore,
   type StoredUploadState,
   type CreateUploadOptions,
   type AppendChunkOptions,
   type CompleteUploadOptions,
   type CompletedUpload,
 } from "./upload-store.ts";
+import {
+  bytesToBase64,
+  decodeUploadId,
+  isCount,
+  newUploadId,
+  openUploadBody,
+  publishKeyGuard,
+  toStoredState,
+} from "./upload-internals.ts";
 
 // Re-export for convenience
 export { ObjectNotFoundError, ObjectChangedError };
 export { UploadNotFoundError, UploadOffsetConflictError };
+export { UploadAppendBoundError, UploadOverrunError };
+export type {
+  ResumableWriteStore,
+  SweepingWriteStore,
+  StoredUploadState,
+  CreateUploadOptions,
+  AppendChunkOptions,
+  CompleteUploadOptions,
+  CompletedUpload,
+} from "./upload-store.ts";
+
 
 // ─── R2 Types ───────────────────────────────────────────────────────────────
 
@@ -57,7 +81,7 @@ export { UploadNotFoundError, UploadOffsetConflictError };
  * The shapes match the runtime behavior; type-checking is the caller's
  * responsibility (their Worker project imports the full types).
  */
-interface R2Bucket {
+export interface R2Bucket {
   head(key: string): Promise<R2Object | null>;
   /**
    * With `onlyIf`, a failed precondition resolves to a body-less `R2Object`
@@ -66,7 +90,7 @@ interface R2Bucket {
   get(key: string, options?: R2GetOptions): Promise<R2Object | R2ObjectBody | null>;
 }
 
-interface R2Object {
+export interface R2Object {
   key: string;
   size: number;
   etag: string;
@@ -75,34 +99,42 @@ interface R2Object {
   httpMetadata?: R2HttpMetadata;
 }
 
-interface R2ObjectBody extends R2Object {
+export interface R2ObjectBody extends R2Object {
   body: ReadableStream<Uint8Array>;
   range: R2Range;
 }
 
-interface R2Range {
+export interface R2Range {
   offset: number;
   length: number;
 }
 
-interface R2GetOptions {
+export interface R2GetOptions {
   // `length` is optional in the real R2 binding: offset alone reads to the
   // end of the object (the open-ended fast-path form).
   range?: { offset: number; length?: number };
   onlyIf?: { etagMatches?: string };
 }
 
-interface R2Checksums {
+export interface R2Checksums {
   sha256?: ArrayBuffer;
 }
 
-interface R2HttpMetadata {
+export interface R2HttpMetadata {
   contentType?: string;
 }
 
 // ─── Options ────────────────────────────────────────────────────────────────
 
 export interface R2StoreOptions {
+  /**
+   * Key prefix this store refuses to serve, because it is where an upload
+   * store sharing this location keeps its in-flight bytes and the sidecars
+   * naming their destination keys. Keys at or under it answer
+   * {@link ObjectNotFoundError}. Set to `""` when no upload store shares it.
+   * @default ".partial-content-uploads/"
+   */
+  reservedPrefix?: string;
   /** The R2 bucket binding from the Worker environment. */
   bucket: R2Bucket;
 }
@@ -119,12 +151,7 @@ export interface R2StoreOptions {
  * same whole-object guard S3 applies.
  */
 function arrayBufferToBase64(buffer: ArrayBuffer): string {
-  const bytes = new Uint8Array(buffer);
-  let binary = "";
-  for (let i = 0; i < bytes.length; i++) {
-    binary += String.fromCharCode(bytes[i]);
-  }
-  return btoa(binary);
+  return bytesToBase64(new Uint8Array(buffer));
 }
 
 // ─── Factory ────────────────────────────────────────────────────────────────
@@ -147,6 +174,7 @@ function arrayBufferToBase64(buffer: ArrayBuffer): string {
  */
 export function r2Store(opts: R2StoreOptions): ObjectStore {
   const { bucket } = opts;
+  const assertReadable = reservedKeyGuard(opts.reservedPrefix ?? ".partial-content-uploads/");
 
   // No `classifyStoreRead` here (unlike s3/gcs/azure): the R2 Workers binding
   // signals its recoverable outcomes structurally, not as classifiable errors.
@@ -165,6 +193,7 @@ export function r2Store(opts: R2StoreOptions): ObjectStore {
     authoritativeRange: true,
 
     async headObject(key: string, opts?: { signal?: AbortSignal }): Promise<ObjectMetadata> {
+      assertReadable(key);
       opts?.signal?.throwIfAborted();
       const obj = await bucket.head(key);
       if (!obj) throw new ObjectNotFoundError(key);
@@ -180,6 +209,7 @@ export function r2Store(opts: R2StoreOptions): ObjectStore {
     },
 
     async getObject(key: string, opts?: { range?: ParsedRange; signal?: AbortSignal; ifMatch?: string }): Promise<ObjectStream> {
+      assertReadable(key);
       const { range, ifMatch } = opts ?? {};
       opts?.signal?.throwIfAborted();
       // An open-ended fast-path range (OPEN_ENDED sentinel end) reads to the
@@ -296,58 +326,6 @@ const R2_DEFAULT_PART_SIZE = 5 * 1024 * 1024;
 /** R2 (like S3) caps a multipart upload at 10,000 parts. */
 const R2_MAX_PART_NUMBER = 10_000;
 
-/** The UUID shape `createUpload` mints; nothing else may name a manifest. */
-const R2_UPLOAD_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
-
-function r2BytesToBase64Url(bytes: Uint8Array): string {
-  let binary = "";
-  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]!);
-  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-}
-
-function r2Base64UrlToBytes(value: string): Uint8Array {
-  const binary = atob(value.replace(/-/g, "+").replace(/_/g, "/"));
-  const out = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
-  return out;
-}
-
-/** What the opaque upload token folds in (base64url JSON). */
-interface R2UploadToken {
-  key: string;
-  id: string;
-}
-
-function encodeR2UploadToken(token: R2UploadToken): string {
-  return r2BytesToBase64Url(new TextEncoder().encode(JSON.stringify(token)));
-}
-
-/**
- * Decode + validate a token. The `id` is interpolated into object keys, so
- * only the exact UUID shape minted at creation is accepted: a forged token
- * cannot traverse into foreign keys. Garbage decodes to
- * {@link UploadNotFoundError} (dialects answer 404, never a parse crash).
- */
-function decodeR2UploadToken(uploadToken: string): R2UploadToken {
-  try {
-    const parsed: unknown = JSON.parse(
-      new TextDecoder().decode(r2Base64UrlToBytes(uploadToken)),
-    );
-    if (typeof parsed === "object" && parsed !== null) {
-      const candidate = parsed as Record<string, unknown>;
-      if (
-        typeof candidate.key === "string" && candidate.key.length > 0 &&
-        typeof candidate.id === "string" && R2_UPLOAD_ID_RE.test(candidate.id)
-      ) {
-        return { key: candidate.key, id: candidate.id };
-      }
-    }
-  } catch (err) {
-    throw new UploadNotFoundError(uploadToken, err);
-  }
-  throw new UploadNotFoundError(uploadToken);
-}
-
 /** One accepted part, exactly as recorded after its upload. */
 interface R2ManifestPart {
   partNumber: number;
@@ -388,8 +366,6 @@ function decodeR2Manifest(raw: string): R2PersistedManifest | null {
   }
   if (typeof parsed !== "object" || parsed === null) return null;
   const c = parsed as Record<string, unknown>;
-  const isCount = (v: unknown): v is number =>
-    typeof v === "number" && Number.isSafeInteger(v) && v >= 0;
   const isPart = (v: unknown): v is R2ManifestPart =>
     typeof v === "object" && v !== null &&
     isCount((v as Record<string, unknown>).partNumber) &&
@@ -417,26 +393,6 @@ function decodeR2Manifest(raw: string): R2PersistedManifest | null {
   return null;
 }
 
-/** Normalize an append body to an async chunk sequence. */
-async function* r2UploadBodyChunks(
-  body: ReadableStream<Uint8Array> | Uint8Array,
-): AsyncGenerator<Uint8Array> {
-  if (body instanceof Uint8Array) {
-    if (body.length > 0) yield body;
-    return;
-  }
-  const reader = body.getReader();
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) return;
-      if (value && value.length > 0) yield value;
-    }
-  } finally {
-    reader.releaseLock();
-  }
-}
-
 /** The binding's "multipart upload no longer exists" failure, by message. */
 function isR2MultipartGone(err: unknown): boolean {
   return err instanceof Error && /does not exist|no such upload/i.test(err.message);
@@ -457,8 +413,9 @@ function isR2MultipartGone(err: unknown): boolean {
  * resume; same-number uploads replace). That honesty has a hard limit, and it
  * is why `exactOffsetRecovery` is FALSE: the manifest is the adapter's own
  * bookkeeping, not backend-derived truth, and with no ListParts the binding
- * offers nothing to cross-check it against. The orchestrator therefore never
- * advertises exact resume on this store and re-anchors on its own accounting.
+ * offers nothing to cross-check it against. The flag declares that, so a
+ * consumer weighing backends knows a resume here may re-send the tail of one
+ * chunk; no engine behavior keys off it.
  *
  * Part sizing: R2 requires every non-final part of an upload to be the SAME
  * size (`uniformPartSize: true`), minimum 5 MiB. Appends buffer to exactly
@@ -504,9 +461,10 @@ function isR2MultipartGone(err: unknown): boolean {
  * };
  * ```
  */
-export function r2UploadStore(opts: R2UploadStoreOptions): ResumableWriteStore {
+export function r2UploadStore(opts: R2UploadStoreOptions): SweepingWriteStore {
   const { bucket } = opts;
   const prefix = (opts.uploadPrefix ?? R2_DEFAULT_UPLOAD_PREFIX).replace(/\/+$/, "");
+  const assertPublishable = publishKeyGuard(`${prefix}/`);
   const partSize = opts.partSize ?? R2_DEFAULT_PART_SIZE;
   if (!Number.isSafeInteger(partSize) || partSize <= 0) {
     throw new RangeError(`r2UploadStore: partSize must be a positive integer, got ${partSize}`);
@@ -520,33 +478,18 @@ export function r2UploadStore(opts: R2UploadStoreOptions): ResumableWriteStore {
 
   /** Read + validate the manifest behind a token. Throws 404-shaped. */
   async function readUpload(uploadToken: string): Promise<{ manifest: R2PersistedManifest; id: string }> {
-    const token = decodeR2UploadToken(uploadToken);
-    const obj = await bucket.get(manifestName(token.id));
+    const id = decodeUploadId(uploadToken);
+    const obj = await bucket.get(manifestName(id));
     if (!obj) throw new UploadNotFoundError(uploadToken);
     const manifest = decodeR2Manifest(await obj.text());
-    // Corrupt bookkeeping, or a token whose key was tampered to point at a
-    // different key than the one recorded at creation: both answer 404. The
-    // PERSISTED key/uploadId are authoritative for every backend operation.
-    if (!manifest || manifest.key !== token.key) {
-      throw new UploadNotFoundError(uploadToken);
-    }
-    return { manifest, id: token.id };
+    // Corrupt bookkeeping answers 404. There is no key to reconcile here: the
+    // token carries none, so the persisted key is the only one that exists.
+    if (!manifest) throw new UploadNotFoundError(uploadToken);
+    return { manifest, id };
   }
 
   function durableOffsetOf(manifest: R2PersistedManifest): number {
     return manifest.parts.reduce((sum, part) => sum + part.size, 0);
-  }
-
-  function toStoredState(manifest: R2PersistedManifest, offset: number): StoredUploadState {
-    return {
-      offset,
-      length: manifest.length,
-      isComplete: manifest.isComplete,
-      isInvalidated: manifest.isInvalidated,
-      createdAt: manifest.createdAt,
-      lastAppendAt: manifest.lastAppendAt,
-      metadata: manifest.metadata,
-    };
   }
 
   return {
@@ -554,11 +497,14 @@ export function r2UploadStore(opts: R2UploadStoreOptions): ResumableWriteStore {
     uniformPartSize: true,
     exactOffsetRecovery: false,
     atomicCompletion: true,
+    /** Every append verifies the claimed offset against durable state before writing. */
+    enforcesOffsetCheck: true,
     digestOnComplete: false,
 
     async createUpload(createOpts: CreateUploadOptions): Promise<{ uploadToken: string }> {
       createOpts.signal?.throwIfAborted();
-      const id = crypto.randomUUID();
+      assertPublishable(createOpts.key);
+      const id = newUploadId();
       // Multipart upload FIRST, manifest second: if the manifest write
       // crashes, the caller retries creation and R2's default lifecycle
       // aborts the orphaned multipart upload after 7 days; the reverse order
@@ -576,7 +522,7 @@ export function r2UploadStore(opts: R2UploadStoreOptions): ResumableWriteStore {
         parts: [],
       };
       await putManifest(id, manifest);
-      return { uploadToken: encodeR2UploadToken({ key: createOpts.key, id }) };
+      return { uploadToken: id };
     },
 
     async getUploadState(uploadToken: string, stateOpts?: { signal?: AbortSignal }): Promise<StoredUploadState> {
@@ -593,14 +539,16 @@ export function r2UploadStore(opts: R2UploadStoreOptions): ResumableWriteStore {
     ): Promise<{ bytesWritten: number }> {
       const { manifest, id } = await readUpload(uploadToken);
       if (manifest.isInvalidated) {
-        throw new Error(`Upload ${uploadToken} is invalidated; nothing may be appended`);
+        throw new Error(`Upload is invalidated; nothing may be appended`);
       }
       if (manifest.isComplete) {
-        throw new Error(`Upload ${uploadToken} is already complete; nothing may be appended`);
+        throw new Error(`Upload is already complete; nothing may be appended`);
       }
       const durableOffset = durableOffsetOf(manifest);
-      // Defense-in-depth under the orchestrator's lock: the manifest was
-      // needed anyway, so the claimed offset is verified for free.
+      // Required by the store contract: the lock serializes writers but cannot
+      // prove the writer still holds it, so verifying the claim here is what
+      // makes a stolen-lock write loud instead of silently interleaved. The
+      // manifest was needed anyway, so the check costs nothing.
       if (offset !== durableOffset) {
         throw new UploadOffsetConflictError(uploadToken, durableOffset);
       }
@@ -619,6 +567,7 @@ export function r2UploadStore(opts: R2UploadStoreOptions): ResumableWriteStore {
 
       let written = 0;
       let consumed = 0;
+      let ceilingHit = false;
       let manifestTouched = false;
       // Exact-size part assembly: R2's uniform-part rule needs precise
       // splitting, not a flush threshold.
@@ -628,7 +577,7 @@ export function r2UploadStore(opts: R2UploadStoreOptions): ResumableWriteStore {
       const flushPart = async (bytes: Uint8Array): Promise<void> => {
         if (nextPartNumber > R2_MAX_PART_NUMBER) {
           throw new Error(
-            `Upload ${uploadToken}: exceeds R2's 10,000-part limit; raise partSize`,
+            `Upload exceeds R2's 10,000-part limit; raise partSize`,
           );
         }
         // Part FIRST, manifest second (the load-bearing ordering): a crash
@@ -643,7 +592,7 @@ export function r2UploadStore(opts: R2UploadStoreOptions): ResumableWriteStore {
         written += bytes.length;
       };
 
-      const iterator = r2UploadBodyChunks(body)[Symbol.asyncIterator]();
+      const { iterator, finalize } = openUploadBody(body, { cancelBody: true });
       let bodyEndedCleanly = false;
       while (true) {
         if (appendOpts.signal?.aborted) break;
@@ -660,13 +609,19 @@ export function r2UploadStore(opts: R2UploadStoreOptions): ResumableWriteStore {
         const chunk = next.value;
         consumed += chunk.length;
         if (appendOpts.maxBytes !== undefined && consumed > appendOpts.maxBytes) {
-          // Bytes past the engine's hard bound are the terminal fault: record
+          if (!appendOpts.maxBytesFatal) {
+            // This request's ceiling, not the representation's. Stop reading
+            // and fall through to the normal durable-flush tail so the
+            // accepted prefix lands and the resource stays healthy.
+            ceilingHit = true;
+            break;
+          }
+          // Bytes past a REPRESENTATION bound are the terminal fault: record
           // the invalidation marker durably in the manifest, then fail loudly.
           manifest.isInvalidated = true;
           await putManifest(id, manifest);
-          throw new Error(
-            `Upload ${uploadToken}: body crossed the ${appendOpts.maxBytes}-byte bound; resource invalidated`,
-          );
+          await finalize();
+          throw new UploadOverrunError(uploadToken, appendOpts.maxBytes);
         }
         let chunkOffset = 0;
         while (chunkOffset < chunk.length) {
@@ -694,6 +649,10 @@ export function r2UploadStore(opts: R2UploadStoreOptions): ResumableWriteStore {
         manifest.lastAppendAt = appendOpts.now;
         await putManifest(id, manifest);
       }
+      // Reported only after the accepted prefix is durable: the resource is
+      // untouched, so the client resumes from here in smaller chunks.
+      await finalize();
+      if (ceilingHit) throw new UploadAppendBoundError(uploadToken, durableOffset + written);
       return { bytesWritten: written };
     },
 
@@ -701,7 +660,7 @@ export function r2UploadStore(opts: R2UploadStoreOptions): ResumableWriteStore {
       completeOpts.signal?.throwIfAborted();
       const { manifest, id } = await readUpload(uploadToken);
       if (manifest.isInvalidated) {
-        throw new Error(`Upload ${uploadToken} is invalidated; it cannot be completed`);
+        throw new Error(`Upload is invalidated; it cannot be completed`);
       }
       if (manifest.isComplete) {
         return { etag: manifest.etag };
@@ -758,20 +717,15 @@ export function r2UploadStore(opts: R2UploadStoreOptions): ResumableWriteStore {
 
     async abortUpload(uploadToken: string, abortOpts?: { signal?: AbortSignal }): Promise<void> {
       abortOpts?.signal?.throwIfAborted();
-      let token: R2UploadToken;
+      let id: string;
       try {
-        token = decodeR2UploadToken(uploadToken);
+        id = decodeUploadId(uploadToken);
       } catch {
         return; // idempotent: a token that never named a resource has nothing to discard
       }
-      const obj = await bucket.get(manifestName(token.id));
+      const obj = await bucket.get(manifestName(id));
       if (!obj) return; // already aborted/swept
       const manifest = decodeR2Manifest(await obj.text());
-      // A token whose key disagrees with the recorded one is forged: it is
-      // not this resource's handle, so it may discard NOTHING (state reads
-      // answer 404 for it; deleting here would let a tampered token destroy
-      // a live upload's bookkeeping).
-      if (manifest && manifest.key !== token.key) return;
       if (manifest && !manifest.isComplete) {
         try {
           await bucket.resumeMultipartUpload(manifest.key, manifest.uploadId).abort();
@@ -779,7 +733,7 @@ export function r2UploadStore(opts: R2UploadStoreOptions): ResumableWriteStore {
       }
       // A completed upload's published object is live data: only the
       // bookkeeping goes. A corrupt manifest has nothing else to discard.
-      await bucket.delete(manifestName(token.id));
+      await bucket.delete(manifestName(id));
     },
 
     async sweepExpired(olderThanMs: number, sweepOpts?: { signal?: AbortSignal }): Promise<{ removed: number }> {

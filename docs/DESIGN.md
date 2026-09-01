@@ -626,21 +626,60 @@ the store inside the lock immediately before evaluation (nothing from an
 earlier request is ever reused), and the orchestrator executes exactly the
 verdict's action and nothing else.
 
-### The interop-version allowlist {3, 5, 6}
+### The interop-version allowlist {3, 5, 6, 9}
 
-The IETF handler speaks the draft revisions actual clients implement,
-identified by their interop versions: 3 (draft-01), 5 (draft-03), and 6
-(draft-04/-05). The draft itself forbids cross-version interop, so versions
-are a compiled allowlist and an unlisted version is answered 400 with the
-supported set named. Later revisions have no deployed speakers, so their
-surface (version negotiation, `Upload-Limit`, GET as an offset probe) is
-deliberately absent until a stabilized revision ships real clients. The wire
-differences between the supported versions are encoded in one explicit
-mapping table, the most important being the completeness header flip:
-interop 3 sends `Upload-Incomplete` (`?1` asserts NOT complete), interop 5
-and 6 send `Upload-Complete` (`?1` asserts complete). Both names ride
-requests and responses, so the polarity is a per-version fact, never a
-renamed boolean.
+The IETF handler speaks the draft revisions clients implement, identified by
+their interop versions: 3 (draft-01), 5 (draft-03), 6 (draft-04/-05), and 9
+(draft-12). The draft itself forbids cross-version interop, so versions are a
+compiled allowlist and an unlisted version is answered 400 with the supported
+set named.
+
+Several versions are served from one endpoint because the draft's negotiation
+is deliberately all-or-nothing: a request declares its version and is answered
+entirely in that version's terms, and a server that does not recognize the
+declared one is told not to announce support at all. Keeping the older rows is
+therefore what lets a client upgrade on its own schedule rather than on ours.
+The wire differences are encoded in one explicit mapping table, one row per
+version and every difference a named field, so no behavior is reachable by
+guessing at a version number. The most important is the completeness header
+flip: interop 3 sends `Upload-Incomplete` (`?1` asserts NOT complete), interop
+5, 6 and 9 send `Upload-Complete` (`?1` asserts complete). Both names ride
+requests and responses, so the polarity is a per-version fact, never a renamed
+boolean.
+
+Interop 9 turns on three behaviors the older rows leave off. `Upload-Limit`
+(an RFC 8941 dictionary of `max-size`, `min-size`, `max-append-size`,
+`min-append-size`, `max-age`) rides a successful offset retrieval and any
+rejection a limit caused, which is the difference between a client that
+retries at a stated number and one that halves its chunk size until something
+sticks; `min-size` is always emitted, defaulting to 0, because an empty
+structured-field value is not a valid dictionary and a server enforcing no
+limits still has to say so rather than send nothing. `GET` becomes an offset
+probe beside `HEAD`, and the `Allow` on a 405 names it only where the version
+admits it, so the refusal never advertises a method that version does not
+define. And an append to an already-complete upload becomes replayable.
+
+That last one is the one place two supported versions answer the same request
+differently, and it is a conformance obligation rather than a preference.
+draft-05 Section 4.4.2 has the server "MUST NOT modify the upload resource and
+MUST respond with a 400 (Bad Request) status code", which a client written
+against interop 3, 5 or 6 uses to learn that its upload finished; replaying a
+success there would deny it that signal. draft-12 Section 4.4.2 revises the
+rule for the case the older one was getting wrong, a completion whose response
+the client never received, and says the server "can choose to replay the final
+response to the client if the request to append to the completed upload is
+valid". The behaviors are incompatible, so the version decides and the table
+carries it as a field. A client that wants the retry to succeed asks for
+interop 9.
+
+`Repr-Digest` verification (RFC 9530) is the mirror-image decision, and goes
+the other way. It is offered on every version this endpoint serves, interop 9
+included, whose draft revision carries no upload-digest text of its own.
+RFC 9530 defines the field independently of any upload protocol; honoring an
+assertion the client volunteered cannot break a client that sends none, since
+absent means unverified exactly as before. Withdrawing it from the newest
+version would remove an integrity guarantee from the consumers most likely to
+want one, in exchange for nothing a client can observe.
 
 ### Offsets are backend-derived, never stored counters
 
@@ -657,6 +696,55 @@ survived IS the offset. The engine treats adapter-reported state as
 authoritative truth, and a malformed state (offset past a known length
 without invalidation) throws loudly as an adapter bug rather than laundering
 corruption into protocol answers.
+
+### Three bounds on one append, two consequences
+
+Three constraints can bind a single append, and collapsing them into one
+number is the mistake this design exists to avoid. Room toward a known length
+and room under the policy's `maxSize` bound the REPRESENTATION: they describe
+the object being assembled. `maxAppendSize` bounds THIS REQUEST only, whether
+it comes from server policy or from a backend's own per-call ceiling. The
+engine derives all three in one place, hands the store the tightest of them
+as `maxBytes`, and states which kind it is through `maxBytesFatal`, because
+only the store sees the stream and nothing upstream can enforce a bound on
+bytes it never reads.
+
+Crossing a representation bound is terminal. The surplus bytes have nowhere
+to go and the upload can never be completed coherently, so the store
+invalidates the resource durably and throws `UploadOverrunError`, after which
+every probe and every append refuses. Returning normally instead would answer
+a destroyed upload with a success and an offset the client cannot build on.
+
+Crossing the per-request ceiling is not terminal, and treating it as though
+it were is how a resumable situation becomes a lost one. A body that runs
+past `maxAppendSize` has done nothing to the representation, so the store
+stops at the bound, keeps the accepted prefix durable, and throws
+`UploadAppendBoundError` carrying the truthful offset. Both dialects answer
+413 and the client resumes from that offset in smaller chunks, so an upload
+survives a chunk that was merely too big. That is the whole reason the two
+bounds carry different consequences rather than one.
+
+Ties go to the representation bound: at equal values, crossing the per-append
+cap crosses the total as well, and the terminal reading is the correct one.
+
+Which representation bound binds decides the ANSWER, not the consequence.
+Both invalidate, but they are different faults and the protocols answer them
+differently. A body past the length the client itself declared is a length
+inconsistency, answered 400 on both dialects. A body past the server's
+`maxSize` is a size violation, answered 413 (RFC 9110's Content Too Large),
+carrying `Tus-Max-Size` on the tus dialect, which has a vocabulary for the
+limit. A tie means the client declared exactly the maximum, so its own
+declaration is the one it broke. The engine carries the distinction as
+`fatalReason` and the orchestrator maps it, so neither dialect decides it and
+the two wires cannot answer the same fault differently.
+
+The streaming bound only ever fires on a body whose size was not knowable in
+advance. A known content size is checked against all three constraints before
+a byte is written, and an oversized append is refused up front with the
+resource untouched, invalidation being reserved for bytes that actually
+landed past a bound. The fatal path therefore exists for the one case that
+cannot be checked ahead of time: an unknown-length (chunked) body, whose size
+the server learns only by counting it.
 
 ### Cooperative-preemption locking
 
@@ -680,8 +768,20 @@ retryable 423 after the acquire timeout, never an indefinite hang. The
 default locker is in-process; multi-instance deployments supply their own
 through the same tiny interface (`partial-content/redis-locker` is one).
 Cooperative cancellation has an observation-latency ceiling: a holder stalled
-past the point it should have yielded can still land one write, which the
-stores make non-corrupting by re-checking the claimed offset at write time.
+past the point it should have yielded can still land one write. What makes
+that non-corrupting is the store's own preflight, so it is a required
+capability rather than a courtesy: `appendChunk` re-derives durable state at
+the start of every call and answers `UploadOffsetConflictError` instead of
+writing when the claimed offset disagrees, and a store declares it through
+`enforcesOffsetCheck`, which `createUploadOrchestrator` refuses to construct
+without. The lock cannot carry the guarantee itself, because it serializes
+writers without proving the writer still holds it, and no single-process
+deployment can opt out: the store is where the deployment shape stops being
+knowable, since the same store runs behind the in-process locker today and a
+distributed one tomorrow with nothing in the code to notice. The flag claims a
+preflight per call and not one atomic step with the bytes, so the residual is
+the one write above, bounded by the lock signal every adapter tests at each
+chunk boundary; closing it entirely needs a backend-enforced fencing token.
 
 ### The post-abort grace window
 
@@ -698,7 +798,13 @@ could be, costing the client a re-upload of bytes the server already had.
 ### Per-backend mapping honesty
 
 Each write store maps the contract onto what its backend can actually do, and
-declares capability flags the orchestrator reads instead of assuming:
+declares capability flags that say so instead of leaving a caller to assume.
+Every adapter accepts an append of ANY size and buffers to its backend's real
+granularity internally, so the orchestrator never re-chunks: `appendGranularity`
+and `uniformPartSize` are efficiency hints for whoever sizes the chunks, and
+`exactOffsetRecovery` is a disclosure to weigh when choosing a backend. Only
+`atomicCompletion` and `enforcesOffsetCheck` gate construction, and both are
+required:
 
 - **Filesystem**: appends are fsynced before they are acknowledged, because
   `exactOffsetRecovery` is only honest if a post-crash `stat` can never see
@@ -744,6 +850,50 @@ declares capability flags the orchestrator reads instead of assuming:
   non-final part of an upload to be the same size, so appends buffer to a
   fixed part size recorded at creation.
 
+### A declared capability is not a demonstrated one
+
+Two capability flags gate construction, and both are claims a store makes
+about its own behavior. `createUploadOrchestrator` can check that a store
+DECLARES `atomicCompletion` and `enforcesOffsetCheck`, and nothing at
+construction can tell a store that performs the at-write offset check from one
+that reports `true` and writes anyway. Documenting the obligation harder does
+not close that, because the failure mode is not a store author who disagrees;
+it is one who believes the flag is true and never had a way to find out.
+
+The second store presents as working. Appends land, uploads complete, and the
+guarantee is absent exactly when a distributed lock is stolen from a holder
+that stalled past its TTL and came back, which is the case nobody exercises by
+hand. So the checks ship as code (`partial-content/conformance`), not as
+prose: a plain async function per obligation, over the store's own public
+surface, with no test framework and no dependencies, so a store author can run
+it under any runner, in CI, or as a startup self-test against a staging
+bucket. The factory-not-instance signature is the same reasoning applied to
+durability: an offset held in process memory and one derived from the backend
+are indistinguishable until a second instance reads the same upload, so the
+harness makes one.
+
+What it must not do is launder an unverified guarantee into a green report.
+A store that is in-process by construction cannot demonstrate cross-instance
+durability at all, so `restartable: false` SKIPS those checks and reports them
+as skipped, rather than passing them or quietly omitting them: a report that
+counted them as passes would be a worse artifact than no report, since it
+would answer a question it never asked.
+
+The read side has the same gap for a different reason. No `ObjectStore`
+capability is gated at construction the way the write side's two are, and the
+obligations a custom read store most often misses are invisible while it
+serves bytes correctly: the total size reported on a partial read, which becomes the
+`Content-Range` total a client sizes its remaining requests against, and
+whether an absent key fails distinguishably from an outage, which decides
+between a 404 and a 502 a caching layer will retry. So `checkObjectStore`
+runs the read contract as assertions too, against an object the store already
+serves. It never creates and never deletes, because the contract has no
+vocabulary for either and a read store may front something immutable, which
+is what lets the check run where the real objects are instead of somewhere a
+fixture can be written. A store declaring `supportsRange: false` gets the same
+treatment as `restartable: false` on the write side: the range obligations are
+reported skipped, never passed.
+
 ### Deliberate omissions
 
 - **No concatenation extension** (tus): a parallel-upload pattern with
@@ -768,9 +918,13 @@ declares capability flags the orchestrator reads instead of assuming:
   only asks servers to send 104 when they can. The
   `onResumptionSupported` hook carries the same facts, so a transport that
   can write interim responses may emit the 104 itself.
-- **Final-response replay is descoped**: a completed upload answers
-  idempotent retries with its offset and completeness (the durable facts),
-  not a stored copy of the original completion response.
+- **No stored final response**: where a revision permits replaying the answer
+  to an append against an already-complete upload (interop 9), the reply is
+  synthesized from the durable facts, the offset and the completeness, not
+  served from a copy of the original completion response kept somewhere. The
+  durable facts are what a resumable protocol is defined in terms of, and
+  keeping response bodies alive past the request that produced them would add
+  a retention surface for no answer a client can distinguish.
 
 ## Runtime Notes
 

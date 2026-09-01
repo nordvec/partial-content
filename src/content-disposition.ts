@@ -235,6 +235,7 @@ function sanitizeFilename(raw: string): string {
     //    Soft hyphen (U+00AD): invisible except at line breaks, same spoofing
     //    class. NBSP (U+00A0): often mistaken for a regular space.
     const noControls = raw.replace(
+        // eslint-disable-next-line no-control-regex -- matching control characters IS the sanitizer
         /[\r\n\x00-\x1F\x7F\x80-\x9F\u00A0\u00AD\u061C\u180E\u200B-\u200F\u2028\u2029\u202A-\u202E\u2060-\u2064\u2066-\u2069\uFEFF\uFFF9-\uFFFB]/g,
         "",
     );

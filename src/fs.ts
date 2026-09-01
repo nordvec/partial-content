@@ -43,12 +43,16 @@ import {
   type ObjectMetadata,
   type ObjectStream,
   type ParsedRange,
+  reservedKeyGuard,
 } from "./index.ts";
 import {
   UploadNotFoundError,
   UploadOffsetConflictError,
+  UploadAppendBoundError,
+  UploadOverrunError,
   UploadDigestMismatchError,
   type ResumableWriteStore,
+  type SweepingWriteStore,
   type StoredUploadState,
   type CreateUploadOptions,
   type AppendChunkOptions,
@@ -58,11 +62,29 @@ import {
 
 // Re-export for convenience (consumers can catch without importing the kernel)
 export { ObjectNotFoundError };
-export { UploadNotFoundError, UploadOffsetConflictError, UploadDigestMismatchError };
+export { UploadNotFoundError, UploadOffsetConflictError, UploadAppendBoundError, UploadOverrunError, UploadDigestMismatchError };
+export type {
+  ResumableWriteStore,
+  SweepingWriteStore,
+  StoredUploadState,
+  CreateUploadOptions,
+  AppendChunkOptions,
+  CompleteUploadOptions,
+  CompletedUpload,
+} from "./upload-store.ts";
+
 
 // ─── Options ────────────────────────────────────────────────────────────────
 
 export interface FsStoreOptions {
+  /**
+   * Key prefix this store refuses to serve, because it is where an upload
+   * store sharing this location keeps its in-flight bytes and the sidecars
+   * naming their destination keys. Keys at or under it answer
+   * {@link ObjectNotFoundError}. Set to `""` when no upload store shares it.
+   * @default ".uploads/"
+   */
+  reservedPrefix?: string;
   /**
    * Root directory. All keys are resolved relative to this path.
    * Must be an absolute path.
@@ -128,8 +150,28 @@ interface CacheEntry {
  * const meta = await store.headObject("reports/q4.pdf");
  * ```
  */
+/**
+ * A relative root resolves against `process.cwd()`, which is the shell's
+ * directory in development and the service manager's in production, so the
+ * same configuration points at two different places. Refuse it where the
+ * mistake is made rather than serving an empty directory later.
+ */
+function assertAbsoluteRoot(factory: string, root: unknown): void {
+  if (typeof root !== "string" || root === "") {
+    throw new TypeError(`${factory}: options.root is required (the directory objects live under)`);
+  }
+  if (!isAbsolute(root)) {
+    throw new TypeError(
+      `${factory}: options.root must be an absolute path, got ${JSON.stringify(root)} `
+      + "(a relative root resolves against process.cwd(), which differs between your shell and your service manager)",
+    );
+  }
+}
+
 export function fsStore(opts: FsStoreOptions): ObjectStore {
+  assertAbsoluteRoot("fsStore", opts?.root);
   const root = resolve(opts.root);
+  const assertReadable = reservedKeyGuard(opts.reservedPrefix ?? ".uploads/");
   const cacheTtl = opts.cache?.ttlMs ?? 0;
   const cacheMax = opts.cache?.maxEntries ?? 1024;
   const cacheMaxBytes = opts.cache?.maxBytes ?? DEFAULT_CACHE_MAX_BYTES;
@@ -232,6 +274,7 @@ export function fsStore(opts: FsStoreOptions): ObjectStore {
     authoritativeRange: true,
 
     async headObject(key: string, opts?: { signal?: AbortSignal }): Promise<ObjectMetadata> {
+      assertReadable(key);
       opts?.signal?.throwIfAborted();
       const cached = cacheGet(key);
       if (cached) {
@@ -272,6 +315,7 @@ export function fsStore(opts: FsStoreOptions): ObjectStore {
     },
 
     async getObject(key: string, opts?: { range?: ParsedRange; signal?: AbortSignal }): Promise<ObjectStream> {
+      assertReadable(key);
       const { range, signal } = opts ?? {};
       signal?.throwIfAborted();
 
@@ -500,7 +544,8 @@ interface UploadSidecar {
  * const reads = fsStore({ root: "/var/data/files" }); // serves completions
  * ```
  */
-export function fsUploadStore(opts: FsUploadStoreOptions): ResumableWriteStore {
+export function fsUploadStore(opts: FsUploadStoreOptions): SweepingWriteStore {
+  assertAbsoluteRoot("fsUploadStore", opts?.root);
   const root = resolve(opts.root);
   const uploadsDir = join(root, UPLOADS_DIR);
 
@@ -526,6 +571,8 @@ export function fsUploadStore(opts: FsUploadStoreOptions): ResumableWriteStore {
   return {
     exactOffsetRecovery: true,
     atomicCompletion: true,
+    /** Every append verifies the claimed offset against durable state before writing. */
+    enforcesOffsetCheck: true,
     digestOnComplete: "sha256",
 
     async createUpload(createOpts: CreateUploadOptions): Promise<{ uploadToken: string }> {
@@ -563,6 +610,7 @@ export function fsUploadStore(opts: FsUploadStoreOptions): ResumableWriteStore {
       const paths = requireTokenPaths(uploadToken);
       const sidecar = await readSidecar(paths.sidecar, uploadToken);
       const facts = {
+        key: sidecar.key,
         length: sidecar.length,
         createdAt: sidecar.createdAt,
         lastAppendAt: sidecar.lastAppendAt,
@@ -610,8 +658,10 @@ export function fsUploadStore(opts: FsUploadStoreOptions): ResumableWriteStore {
       }
       try {
         const durableOffset = (await handle.stat()).size;
-        // Verify the claim against DURABLE truth (defense in depth under the
-        // orchestrator's lock), and refuse invalidated resources outright.
+        // Verify the claim against DURABLE truth, and refuse invalidated
+        // resources outright. Required by the store contract: the lock
+        // serializes writers but cannot prove the writer still holds it, so
+        // this is what makes a stolen-lock write loud, not silent.
         if (sidecar.isInvalidated || offset !== durableOffset) {
           throw new UploadOffsetConflictError(uploadToken, durableOffset);
         }
@@ -628,7 +678,7 @@ export function fsUploadStore(opts: FsUploadStoreOptions): ResumableWriteStore {
         }
 
         let flushed = 0;
-        let crossedBound = false;
+        let crossedBound: number | undefined;
         /** Write as much of `chunk` as the byte bound allows; false = crossed. */
         const acceptChunk = async (chunk: Uint8Array): Promise<boolean> => {
           const room = appendOpts.maxBytes === undefined
@@ -639,7 +689,7 @@ export function fsUploadStore(opts: FsUploadStoreOptions): ResumableWriteStore {
             flushed += room;
           }
           if (room < chunk.length) {
-            crossedBound = true;
+            crossedBound = appendOpts.maxBytes;
             return false;
           }
           return true;
@@ -677,11 +727,19 @@ export function fsUploadStore(opts: FsUploadStoreOptions): ResumableWriteStore {
         await handle.sync();
 
         sidecar.lastAppendAt = appendOpts.now;
-        if (crossedBound) {
-          // Bytes tried to land past the engine's bound: terminal fault,
-          // recorded durably so every later interaction refuses.
+        if (crossedBound !== undefined && appendOpts.maxBytesFatal) {
+          // Bytes tried to land past a REPRESENTATION bound (a known length,
+          // the total maxSize): terminal fault, recorded durably so every
+          // later interaction refuses.
           sidecar.isInvalidated = true;
           await writeSidecar(paths.sidecar, sidecar, true);
+          throw new UploadOverrunError(uploadToken, crossedBound);
+        } else if (crossedBound !== undefined) {
+          // This request's ceiling, not the representation's. Persist the
+          // prefix that landed and leave the resource healthy: the client
+          // resumes from the truthful offset in smaller chunks.
+          await writeSidecar(paths.sidecar, sidecar, lengthDeclared);
+          throw new UploadAppendBoundError(uploadToken, durableOffset + flushed);
         } else {
           // A newly declared length is a creation fact: fsync it so a crash
           // after the ack cannot lose it (an un-synced length would strand the
@@ -707,7 +765,7 @@ export function fsUploadStore(opts: FsUploadStoreOptions): ResumableWriteStore {
       if (sidecar.isComplete) return { etag: sidecar.etag, digest: sidecar.digest };
       if (sidecar.isInvalidated) {
         throw new Error(
-          `fsUploadStore ${uploadToken}: cannot complete an invalidated upload`,
+          `fsUploadStore cannot complete an invalidated upload`,
         );
       }
       // Re-validate the key at publish time: the sidecar sat on disk between

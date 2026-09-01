@@ -9,22 +9,6 @@
  */
 import { parseContentRange, type ParsedRange } from "./kernel.ts";
 
-// ─── Cancel Signal ──────────────────────────────────────────────────────────
-
-/**
- * Structural type matching the standard `AbortSignal` interface.
- *
- * Using a structural type instead of the global `AbortSignal` keeps the kernel
- * free of DOM/lib dependencies. At call sites, `req.signal` (which is a real
- * `AbortSignal`) satisfies this interface automatically.
- */
-export interface CancelSignal {
-  readonly aborted: boolean;
-  throwIfAborted(): void;
-  addEventListener(type: "abort", listener: () => void): void;
-  removeEventListener(type: "abort", listener: () => void): void;
-}
-
 // ─── Error Types ────────────────────────────────────────────────────────────
 
 /**
@@ -48,6 +32,32 @@ export class ObjectNotFoundError extends Error {
     this.key = key;
     if (cause !== undefined) this.cause = cause;
   }
+}
+
+/**
+ * Refuse keys that name an upload store's bookkeeping rather than a published
+ * object.
+ *
+ * A read store and an upload store are routinely pointed at the same root or
+ * bucket, which is what lets a completed upload be served without copying it.
+ * In that arrangement the upload store's own namespace is reachable through
+ * the read path: the in-flight bytes of an upload nobody has published yet,
+ * and the sidecar naming the key it is destined for, which commonly embeds a
+ * filename. Upload tokens are the only handles meant to reach that namespace,
+ * and a read handler holds no token.
+ *
+ * Refusal is the default rather than an opt-in, because the shared arrangement
+ * is the documented one and the safe posture has to be what a consumer gets
+ * without knowing to ask for it. Pass `reservedPrefix: ""` to serve the whole
+ * namespace when no upload store shares it.
+ */
+export function reservedKeyGuard(reservedPrefix: string): (key: string) => void {
+  if (reservedPrefix === "") return () => {};
+  const prefix = reservedPrefix.endsWith("/") ? reservedPrefix : `${reservedPrefix}/`;
+  const bare = prefix.slice(0, -1);
+  return (key: string): void => {
+    if (key === bare || key.startsWith(prefix)) throw new ObjectNotFoundError(key);
+  };
 }
 
 /**
@@ -114,6 +124,23 @@ export class StoreUnavailableError extends Error {
     if (hint !== undefined) this.retryAfterSeconds = hint;
     if (opts?.cause !== undefined) this.cause = opts.cause;
   }
+}
+
+/**
+ * Name-based matchers for the read-side store errors, mirroring the write
+ * side's. `instanceof` is unreliable across package boundaries: a consumer
+ * with two copies of this package in its tree, or a store built against a
+ * different install, throws an error that is structurally right and fails the
+ * check. The name is the stable identity.
+ */
+export function isObjectNotFoundError(err: unknown): err is ObjectNotFoundError {
+  return err instanceof Error && err.name === "ObjectNotFoundError";
+}
+export function isObjectChangedError(err: unknown): err is ObjectChangedError {
+  return err instanceof Error && err.name === "ObjectChangedError";
+}
+export function isStoreUnavailableError(err: unknown): err is StoreUnavailableError {
+  return err instanceof Error && err.name === "StoreUnavailableError";
 }
 
 /**
@@ -229,7 +256,7 @@ export interface HeadObjectOptions {
    * Cancel signal. Pass `req.signal` to cancel the backend request when the
    * client disconnects.
    */
-  signal?: CancelSignal;
+  signal?: AbortSignal;
 }
 
 /**
@@ -251,7 +278,7 @@ export interface GetObjectOptions {
    * Cancel signal. Cancels the backend stream when the client disconnects,
    * preventing orphaned TCP connections.
    */
-  signal?: CancelSignal;
+  signal?: AbortSignal;
   /** Raw backend ETag the object must still match (strong validators only). */
   ifMatch?: string;
   /**
@@ -695,6 +722,16 @@ export interface ObjectStore {
    *   re-encode the apostrophes to `%27`, which no longer matches a
    *   canned-policy signature (AccessDenied). CloudFront signers must use a
    *   custom policy with a wildcard query (`...?*`).
+   */
+  /**
+   * Returns an outcome rather than throwing, unlike every other method on this
+   * interface, because DECLINING and FAILING are different answers here and
+   * the caller acts on them differently. `{ ok: false }` says this store
+   * cannot sign (no credential configured, a backend without the capability),
+   * and the serving path falls back to streaming the bytes itself, which is a
+   * correct response. A thrown error says signing was supposed to work and did
+   * not, which is reported and answered as a backend failure. Collapsing the
+   * two would turn "no signing configured" into a 502 on every request.
    */
   createSignedUrl?(
     key: string,

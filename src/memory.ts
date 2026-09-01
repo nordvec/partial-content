@@ -43,18 +43,32 @@ import {
 import {
   UploadNotFoundError,
   UploadOffsetConflictError,
+  UploadAppendBoundError,
+  UploadOverrunError,
   UploadDigestMismatchError,
   type ResumableWriteStore,
+  type SweepingWriteStore,
   type StoredUploadState,
   type CreateUploadOptions,
   type AppendChunkOptions,
   type CompleteUploadOptions,
   type CompletedUpload,
 } from "./upload-store.ts";
+import { bytesToBase64, newUploadId } from "./upload-internals.ts";
 
 // Re-export for convenience
 export { ObjectNotFoundError, ObjectChangedError };
-export { UploadNotFoundError, UploadOffsetConflictError, UploadDigestMismatchError };
+export { UploadNotFoundError, UploadOffsetConflictError, UploadAppendBoundError, UploadOverrunError, UploadDigestMismatchError };
+export type {
+  ResumableWriteStore,
+  SweepingWriteStore,
+  StoredUploadState,
+  CreateUploadOptions,
+  AppendChunkOptions,
+  CompleteUploadOptions,
+  CompletedUpload,
+} from "./upload-store.ts";
+
 
 // ─── Options ────────────────────────────────────────────────────────────────
 
@@ -85,6 +99,9 @@ export interface MemoryStoreOptions {
  * Create an {@link ObjectStore} over an in-memory object map.
  */
 export function memoryStore(opts: MemoryStoreOptions): ObjectStore {
+  if (opts?.objects === null || typeof opts?.objects !== "object") {
+    throw new TypeError("memoryStore: options.objects is required (the map objects are served from)");
+  }
   const encoder = new TextEncoder();
   // Cache the UTF-8 encoding of string bodies so a hot-served asset is not
   // re-encoded on every head + get. The map is keyed by the entry and holds
@@ -202,11 +219,16 @@ interface MemoryUploadRecord {
  * counterpart of {@link memoryStore}, for consumer test suites and demos.
  *
  * Faithful to the write contract: offsets derive from the bytes actually
- * held (never a separately persisted counter), a byte bound that the body
- * tries to cross truncates the append and invalidates the resource
- * terminally, completion verifies an asserted SHA-256 (Web Crypto, so any
- * runtime) BEFORE publishing, and publication is atomic: a failed
- * completion leaves the objects map untouched.
+ * held (never a separately persisted counter), every append opens with the
+ * offset preflight {@link ResumableWriteStore.enforcesOffsetCheck} declares,
+ * a byte bound the body tries to cross truncates the append and then answers
+ * per {@link AppendChunkOptions.maxBytesFatal} (a representation bound
+ * invalidates the resource terminally and raises {@link UploadOverrunError};
+ * a request ceiling keeps the truncated prefix durable, leaves the resource
+ * resumable, and raises {@link UploadAppendBoundError}), completion verifies
+ * an asserted SHA-256 (Web Crypto, so any runtime) BEFORE publishing, and
+ * publication is atomic: a failed completion leaves the objects map
+ * untouched.
  *
  * @example
  * ```typescript
@@ -217,7 +239,14 @@ interface MemoryUploadRecord {
  * const reads = memoryStore({ objects });        // serves completed uploads
  * ```
  */
-export function memoryUploadStore(opts: MemoryUploadStoreOptions): ResumableWriteStore {
+export function memoryUploadStore(opts: MemoryUploadStoreOptions): SweepingWriteStore {
+  if (opts?.objects === null || typeof opts?.objects !== "object") {
+    throw new TypeError(
+      "memoryUploadStore: options.objects is required (the map completed uploads publish into). "
+      + "Pass the SAME object to memoryStore so the published bytes can be served: "
+      + "const objects = {}; memoryUploadStore({ objects }); memoryStore({ objects });",
+    );
+  }
   const uploads = new Map<string, MemoryUploadRecord>();
 
   function lookupUpload(uploadToken: string): MemoryUploadRecord {
@@ -229,11 +258,13 @@ export function memoryUploadStore(opts: MemoryUploadStoreOptions): ResumableWrit
   return {
     exactOffsetRecovery: true,
     atomicCompletion: true,
+    /** Every append verifies the claimed offset against durable state before writing. */
+    enforcesOffsetCheck: true,
     digestOnComplete: "sha256",
 
     async createUpload(createOpts: CreateUploadOptions): Promise<{ uploadToken: string }> {
       createOpts.signal?.throwIfAborted();
-      const uploadToken = newUploadToken();
+      const uploadToken = newUploadId();
       uploads.set(uploadToken, {
         key: createOpts.key,
         chunks: [],
@@ -254,6 +285,7 @@ export function memoryUploadStore(opts: MemoryUploadStoreOptions): ResumableWrit
       stateOpts?.signal?.throwIfAborted();
       const record = lookupUpload(uploadToken);
       return {
+        key: record.key,
         offset: record.size,
         length: record.length,
         isComplete: record.isComplete,
@@ -273,9 +305,10 @@ export function memoryUploadStore(opts: MemoryUploadStoreOptions): ResumableWrit
       appendOpts.signal?.throwIfAborted();
       const record = lookupUpload(uploadToken);
       // Dead or already-published resources refuse every append, and a
-      // mismatched claim loses to durable truth. The conflict error is the
-      // loud answer (a correct orchestrator re-derives fresh state under its
-      // lock and never reaches this branch).
+      // mismatched claim loses to durable truth. Required by the store
+      // contract, not a nicety: the orchestrator's lock serializes writers but
+      // cannot prove the writer still holds it, so this is what turns a
+      // stolen-lock holder's late write into a loud conflict.
       if (record.isComplete || record.isInvalidated || offset !== record.size) {
         throw new UploadOffsetConflictError(uploadToken, record.size);
       }
@@ -290,7 +323,7 @@ export function memoryUploadStore(opts: MemoryUploadStoreOptions): ResumableWrit
 
       const accepted: Uint8Array[] = [];
       let flushed = 0;
-      let crossedBound = false;
+      let crossedBound: number | undefined;
       /** Take as much of `chunk` as the byte bound allows; false = crossed. */
       const accept = (chunk: Uint8Array): boolean => {
         const room = appendOpts.maxBytes === undefined
@@ -303,7 +336,7 @@ export function memoryUploadStore(opts: MemoryUploadStoreOptions): ResumableWrit
           flushed += room;
         }
         if (room < chunk.length) {
-          crossedBound = true;
+          crossedBound = appendOpts.maxBytes;
           return false;
         }
         return true;
@@ -338,9 +371,17 @@ export function memoryUploadStore(opts: MemoryUploadStoreOptions): ResumableWrit
       for (const chunk of accepted) record.chunks.push(chunk);
       record.size += flushed;
       record.lastAppendAt = appendOpts.now;
-      // Bytes tried to land past the engine's bound: the terminal fault the
-      // contract reserves invalidation for.
-      if (crossedBound) record.isInvalidated = true;
+      // Bytes tried to land past the engine's bound. Only a REPRESENTATION
+      // bound (a known length, the total maxSize) is the terminal fault that
+      // invalidation is reserved for.
+      if (crossedBound !== undefined && appendOpts.maxBytesFatal) {
+        record.isInvalidated = true;
+        throw new UploadOverrunError(uploadToken, crossedBound);
+      } else if (crossedBound !== undefined) {
+        // This request's ceiling. The prefix above is durable and the resource
+        // is healthy, so the client resumes from here in smaller chunks.
+        throw new UploadAppendBoundError(uploadToken, record.size);
+      }
       return { bytesWritten: flushed };
     },
 
@@ -354,7 +395,7 @@ export function memoryUploadStore(opts: MemoryUploadStoreOptions): ResumableWrit
       if (record.isComplete) return { etag: record.etag, digest: record.digest };
       if (record.isInvalidated) {
         throw new Error(
-          `memoryUploadStore ${uploadToken}: cannot complete an invalidated upload`,
+          `memoryUploadStore cannot complete an invalidated upload`,
         );
       }
 
@@ -415,18 +456,6 @@ export function memoryUploadStore(opts: MemoryUploadStoreOptions): ResumableWrit
 
 // ─── Resumable Uploads: Internal Helpers ────────────────────────────────────
 
-/** Opaque, collision-resistant upload token (UUID where available). */
-function newUploadToken(): string {
-  const uuid = globalThis.crypto?.randomUUID?.();
-  if (uuid) return uuid;
-  // Fallback for runtimes without randomUUID: 16 random bytes as hex.
-  const bytes = new Uint8Array(16);
-  globalThis.crypto.getRandomValues(bytes);
-  let hex = "";
-  for (const b of bytes) hex += b.toString(16).padStart(2, "0");
-  return hex;
-}
-
 /** Assemble accepted chunks into one contiguous, ArrayBuffer-backed body. */
 function concatChunks(chunks: Uint8Array[], size: number): Uint8Array<ArrayBuffer> {
   const out = new Uint8Array(size);
@@ -441,10 +470,5 @@ function concatChunks(chunks: Uint8Array[], size: number): Uint8Array<ArrayBuffe
 /** RFC 9530 raw base64 SHA-256 via Web Crypto (runtime-agnostic). */
 async function sha256Base64(bytes: Uint8Array<ArrayBuffer>): Promise<string> {
   const digest = await globalThis.crypto.subtle.digest("SHA-256", bytes);
-  const view = new Uint8Array(digest);
-  let binary = "";
-  for (let i = 0; i < view.length; i++) {
-    binary += String.fromCharCode(view[i]);
-  }
-  return btoa(binary);
+  return bytesToBase64(new Uint8Array(digest));
 }

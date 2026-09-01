@@ -37,11 +37,16 @@ export interface UploadLock {
   release(): void;
 }
 
-/** Thrown when the holder did not yield within the acquire timeout. */
+/**
+ * Thrown when `acquire` did not obtain the lock within its timeout: the holder
+ * did not yield, or (for a locker that talks to a server) the server did not
+ * answer in time. Both are the same answer to the caller, retryable
+ * contention, so they share one error.
+ */
 export class UploadLockTimeoutError extends Error {
   readonly uploadToken: string;
   constructor(uploadToken: string) {
-    super("Upload lock holder did not yield in time");
+    super("Upload lock was not acquired in time");
     this.name = "UploadLockTimeoutError";
     this.uploadToken = uploadToken;
   }
@@ -59,6 +64,14 @@ export interface AcquireOptions {
    * @default 15000
    */
   timeoutMs?: number;
+  /**
+   * A safe identifier that SUBSTITUTES for the upload token wherever this
+   * acquire is reported. The token is the capability: possession of it is the
+   * authorization, so a locker that names it in an error context hands it to
+   * a log sink. A locker cannot invent the substitute, and its own errors are
+   * the only place it would appear, so the caller supplies it here.
+   */
+  auditKey?: string;
 }
 
 export interface UploadLocker {
@@ -92,7 +105,20 @@ interface Holder {
 }
 
 /** Single-process in-memory locker (the default). */
-export function memoryUploadLocker(): UploadLocker {
+export function memoryUploadLocker(opts?: {
+  /**
+   * How long `acquire` waits for a hand-over before giving up, when the
+   * caller names no deadline of its own.
+   * @default 15000
+   */
+  acquireTimeoutMs?: number;
+}): UploadLocker {
+  const defaultAcquireTimeoutMs = opts?.acquireTimeoutMs ?? DEFAULT_ACQUIRE_TIMEOUT_MS;
+  if (!Number.isSafeInteger(defaultAcquireTimeoutMs) || defaultAcquireTimeoutMs <= 0) {
+    throw new TypeError(
+      `memoryUploadLocker: acquireTimeoutMs must be a positive safe integer, got ${opts?.acquireTimeoutMs}`,
+    );
+  }
   const holders = new Map<string, Holder>();
 
   function makeLock(token: string, controller: AbortController): UploadLock {
@@ -124,7 +150,7 @@ export function memoryUploadLocker(): UploadLocker {
 
   return {
     acquire(token, opts): Promise<UploadLock> {
-      const timeoutMs = opts?.timeoutMs ?? DEFAULT_ACQUIRE_TIMEOUT_MS;
+      const timeoutMs = opts?.timeoutMs ?? defaultAcquireTimeoutMs;
       const holder = holders.get(token);
       if (!holder) {
         const controller = new AbortController();

@@ -9,9 +9,12 @@
  * client is a few lines each (see the docs' locking section).
  *
  * How it locks:
- * - **Hold**: `SET key <fencing-id> NX PX <ttl>`. The value is a per-acquire
+ * - **Hold**: `SET key <hold-id> NX PX <ttl>`. The value is a per-acquire
  *   random id so release and renewal only ever act on the holder's own lock
- *   (compare-and-delete / compare-and-expire via Lua).
+ *   (compare-and-delete / compare-and-expire via Lua). It is deliberately NOT
+ *   called a fencing token: it fences this locker's own release and renewal
+ *   against a stale holder, and never reaches a store write, so it cannot
+ *   fence the thing a fencing token exists to fence.
  * - **Preempt**: a waiter publishes a preempt request on the resource's
  *   channel and RE-publishes it every poll round. The holder's subscription
  *   fires `onPreemptRequested`, the holder aborts at its next safe boundary
@@ -21,19 +24,37 @@
  *   interval instead of lost.
  * - **Crash recovery**: the TTL reaps a dead holder's lock. A LIVE holder
  *   renews at ttl/3 via a watchdog; a renewal that fails (connection loss,
- *   TTL already expired, lock taken by someone else) fires
- *   `onPreemptRequested` so the holder stops writing, because it can no
- *   longer prove it holds the lock.
+ *   TTL already expired, lock taken by someone else) or that has not answered
+ *   by the time the next one is due fires `onPreemptRequested` so the holder
+ *   stops writing, because it can no longer prove it holds the lock.
+ * - **Bounded by the clock, not by the server's cooperation**: every round
+ *   trip an acquire makes is bounded by that acquire's remaining timeout, and
+ *   every renewal by the renew interval. A server that accepts a command and
+ *   never answers therefore costs a caller its timeout and no more, and the
+ *   one command with a lasting effect (the SET) is followed by a
+ *   compare-and-delete whenever it is abandoned, so a late arrival cannot
+ *   hold the resource.
  *
  * Honesty about fencing: expiry-based locks can be STOLEN from a holder that
  * stalls longer than its TTL and then resumes. The write store takes no
- * fencing token, so the engine's protection against such a zombie's late
- * append is the same one it has in-process: every append is validated
- * against fresh durable state under the new holder's lock, and the built-in
- * stores re-check the claimed offset at write time (a stale write answers
- * `UploadOffsetConflictError`, loudly, instead of corrupting). The watchdog
- * and preemption keep the stolen-lock window small; the state validation is
- * what makes it non-corrupting.
+ * fencing token, so the protection against such a zombie is the same one the
+ * engine has in-process: every append is validated against fresh durable state
+ * under the new holder's lock, and every conformant store re-derives durable
+ * state and refuses a disagreeing claim before it writes (a stale append
+ * answers `UploadOffsetConflictError`, loudly, instead of corrupting). That
+ * check is a MUST in the store contract precisely because this locker exists,
+ * and the orchestrator refuses a store that reports it cannot do it.
+ *
+ * What that does NOT cover, stated plainly rather than left to be discovered:
+ * the check runs once per append call, so it catches a zombie's NEXT append,
+ * not the one it was already mid-way through when it stalled. The backends
+ * accept their writes unconditionally, so the last defense there is
+ * cooperative: the watchdog fires `onPreemptRequested`, the lock's signal
+ * aborts, and the store's per-chunk signal test stops it pulling more body.
+ * The ceiling is therefore the bytes of one already-accepted chunk, not one
+ * backend call, as the orchestrator's sequencing invariants describe. The
+ * watchdog and preemption keep the stolen-lock window small; the state
+ * validation is what keeps a returning zombie from silently continuing.
  *
  * @packageDocumentation
  */
@@ -46,6 +67,16 @@ import { UploadLockTimeoutError, UPLOAD_PREEMPTED, type UploadLock, type UploadL
  * messages for ONE channel to the given listener and resolve to an
  * unsubscribe function (dedicated subscriber connections, as real clients
  * require, are the adapter's concern).
+ *
+ * Commands issued through this client MUST reach the server in issue order.
+ * A single connection gives that for free, which is what node-redis and
+ * ioredis provide; an adapter over a round-robin POOL, or one that replays
+ * buffered commands after a reconnect, does not and must not be used here.
+ * The safety argument for an abandoned acquire rests on it: a SET whose reply
+ * never arrived is followed by a compare-and-delete, so the lock cannot
+ * outlive the attempt. Execute those two out of order and the delete finds
+ * nothing, the SET then lands, and the resource is held by nobody for a full
+ * TTL while every waiter times out into contention.
  */
 export interface RedisLockerClient {
   /** `SET key value NX PX ttl`: resolves "OK" when taken, null when held. */
@@ -54,8 +85,13 @@ export interface RedisLockerClient {
    * The Redis `EVAL` command (server-side Lua), NOT JavaScript `eval`: the
    * locker only ever passes the two static compare-and-delete /
    * compare-and-expire scripts defined in this module, never caller input.
+   *
+   * Both scripts return a Lua number, so an adapter must resolve to the
+   * NUMBER the server sent: `1` when the hold was ours, `0` when it was not.
+   * A client that stringifies integer replies has to convert here, or every
+   * renewal reads as a lost hold and preempts its own holder.
    */
-  eval(script: string, keys: readonly string[], args: readonly string[]): Promise<unknown>;
+  eval(script: string, keys: readonly string[], args: readonly string[]): Promise<number>;
   /** `PUBLISH channel message`. */
   publish(channel: string, message: string): Promise<unknown>;
   /** Subscribe one channel; resolves to the unsubscribe function. */
@@ -69,7 +105,13 @@ export interface RedisUploadLockerOptions {
    * @default 30000
    */
   ttlMs?: number;
-  /** Default acquire timeout (per-call `AcquireOptions.timeoutMs` wins). @default 15000 */
+  /**
+   * Default acquire timeout (per-call `AcquireOptions.timeoutMs` wins). It
+   * bounds the whole acquire, every round trip to the server included, so a
+   * server that stops answering surfaces as retryable contention within this
+   * budget rather than as an indefinite hang.
+   * @default 15000
+   */
   acquireTimeoutMs?: number;
   /** Base poll interval while waiting, jittered per round. @default 50 */
   pollIntervalMs?: number;
@@ -78,9 +120,27 @@ export interface RedisUploadLockerOptions {
   /**
    * Observability for failures the locker absorbs (failed renewal, failed
    * release DEL, failed unsubscribe). Must not throw.
+   *
+   * Exactly one of `uploadToken` and `auditKey` is present. When the acquire
+   * supplied an {@link AcquireOptions.auditKey} the key SUBSTITUTES for the
+   * token here rather than accompanying it: the token is the capability, and
+   * a caller that went to the trouble of naming a safe identifier for its log
+   * records gains nothing from receiving the credential beside a stack trace.
    */
-  onError?: (error: unknown, context: { uploadToken: string; operation: string }) => void;
+  onError?: (
+    error: unknown,
+    context: { uploadToken?: string; auditKey?: string; operation: string },
+  ) => void;
 }
+
+/**
+ * The largest delay a timer accepts. A larger one overflows and fires at once,
+ * so an unclamped delay would turn the most generous acquire budget a caller
+ * can express into an instant timeout. 24.8 days is indistinguishable from
+ * unbounded for a lock acquire, which makes clamping the honest reading of a
+ * caller asking to wait effectively forever.
+ */
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
 /** Delete the lock only when it is still ours. */
 const RELEASE_SCRIPT
@@ -102,19 +162,89 @@ export function redisUploadLocker(
   const pollIntervalMs = opts.pollIntervalMs ?? 50;
   const keyPrefix = opts.keyPrefix ?? "partial-content:lock:";
   const onError = opts.onError;
-  if (!Number.isSafeInteger(ttlMs) || ttlMs <= 0
-    || !Number.isSafeInteger(defaultAcquireTimeoutMs) || defaultAcquireTimeoutMs <= 0
-    || !Number.isSafeInteger(pollIntervalMs) || pollIntervalMs <= 0) {
-    throw new TypeError("redisUploadLocker: ttlMs, acquireTimeoutMs, and pollIntervalMs must be positive integers");
+
+  /** How one acquire names its resource on every sink this locker writes to. */
+  interface LockIdent {
+    uploadToken: string;
+    auditKey?: string;
+  }
+
+  /** Report an absorbed failure, naming the resource the safe way. */
+  const report = (err: unknown, ident: LockIdent, operation: string): void => {
+    onError?.(err, ident.auditKey === undefined
+      ? { uploadToken: ident.uploadToken, operation }
+      : { auditKey: ident.auditKey, operation });
+  };
+
+  for (const [name, value] of [
+    ["ttlMs", ttlMs],
+    ["acquireTimeoutMs", defaultAcquireTimeoutMs],
+    ["pollIntervalMs", pollIntervalMs],
+  ] as const) {
+    if (!Number.isSafeInteger(value) || value <= 0) {
+      throw new TypeError(
+        `redisUploadLocker: ${name} must be a positive safe integer, got ${value}`,
+      );
+    }
   }
 
   const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
+  /**
+   * Bound one client round trip. A server that accepts a command and never
+   * answers (a partitioned socket, a client queueing through a reconnect) must
+   * not park the caller past the budget it was given: `acquireTimeoutMs` is a
+   * promise to the caller, not merely a cap on how long this locker polls.
+   *
+   * The protocol has no client-side cancellation, so an abandoned command may
+   * still execute. Only the SET has a lasting effect, and its caller pairs
+   * abandonment with the compare-and-delete that makes a late arrival
+   * harmless; a preempt PUBLISH that lands late is re-published by the next
+   * round anyway, and a SUBSCRIBE that lands late is unsubscribed by the
+   * caller that abandoned it.
+   */
+  async function withinTimeout<T>(
+    op: () => Promise<T>,
+    timeoutMs: number,
+    timeoutError: () => Error,
+  ): Promise<T> {
+    if (timeoutMs <= 0) throw timeoutError();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      // race() attaches a handler to `op()`, so a rejection arriving after the
+      // timer won is absorbed rather than surfacing as an unhandled rejection.
+      return await Promise.race([
+        op(),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(timeoutError()), Math.min(timeoutMs, MAX_TIMER_DELAY_MS));
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /**
+   * Let go of the key an acquire took, without waiting for the answer. The
+   * compare-and-delete only ever removes OUR hold id, so this is safe on
+   * every path that abandons a hold, including one that cannot know whether
+   * the SET landed at all. A failed or undeliverable DEL is absorbed: the TTL
+   * reaps the key, costing waiters at most the remaining TTL, never a stuck
+   * resource. Fire-and-forget by design, so no cleanup can itself hang.
+   */
+  function releaseKey(ident: LockIdent, key: string, holdId: string): void {
+    void Promise.resolve()
+      .then(() => client.eval(RELEASE_SCRIPT, [key], [holdId]))
+      .catch((err) => report(err, ident, "release"));
+  }
+
   async function takeLock(
-    uploadToken: string,
+    ident: LockIdent,
     key: string,
-    fencingId: string,
+    holdId: string,
+    deadline: number,
   ): Promise<UploadLock> {
+    const { uploadToken } = ident;
     const channel = `${keyPrefix}preempt:${uploadToken}`;
     let released = false;
     // The lock's preemption signal: aborted when a waiter asks the holder to
@@ -128,25 +258,59 @@ export function redisUploadLocker(
     // Subscribed AFTER the SET: a preempt published into that gap is
     // re-published by the waiter every poll round, so it is delayed by at
     // most one interval, never lost.
-    const unsubscribe = await client.subscribe(channel, preempt);
+    //
+    // If subscribe fails or does not answer within what is left of the acquire
+    // budget (the subscriber connection is down, typically during a failover,
+    // exactly when the system is fragile) the key is already held with no
+    // release closure and no watchdog yet, so it would dead-lock the resource
+    // for the full TTL and every waiter would time out into contention.
+    // Release the key we just took, then surface the failure.
+    let unsubscribe: () => void | Promise<void>;
+    // Held so a subscription that lands after the deadline can be undone: an
+    // abandoned SUBSCRIBE still executes, and its listener would otherwise
+    // outlive every reference to it.
+    const pending = client.subscribe(channel, preempt);
+    try {
+      unsubscribe = await withinTimeout(
+        () => pending,
+        deadline - Date.now(),
+        () => new UploadLockTimeoutError(uploadToken),
+      );
+    } catch (err) {
+      void pending.then(
+        (late) => { void Promise.resolve(late()).catch(() => undefined); },
+        () => undefined,
+      );
+      releaseKey(ident, key, holdId);
+      throw err;
+    }
 
-    // Watchdog: renew at ttl/3. A renewal that does not positively confirm
-    // the hold means the lock may belong to someone else; the only safe
-    // move is to stop writing, which is exactly what preemption means.
+    // Watchdog: renew at ttl/3. A renewal that does not positively confirm the
+    // hold means the lock may belong to someone else; the only safe move is to
+    // stop writing, which is exactly what preemption means. Silence is not
+    // confirmation, so a renewal that has not answered by the time the next one
+    // is due counts as a failure to confirm: without that bound a server that
+    // accepts renewals and never answers lets a holder write straight through
+    // its own TTL believing the hold is good.
+    const renewIntervalMs = Math.max(1, Math.floor(ttlMs / 3));
     const watchdog = setInterval(() => {
-      client.eval(RENEW_SCRIPT, [key], [fencingId, String(ttlMs)])
+      withinTimeout(
+        () => client.eval(RENEW_SCRIPT, [key], [holdId, String(ttlMs)]),
+        renewIntervalMs,
+        () => new Error("Upload lock renewal did not answer within the renew interval"),
+      )
         .then((renewed) => {
           if (renewed !== 1 && !released) {
             preempt();
-            onError?.(new Error("Upload lock renewal found the lock no longer held"),
-              { uploadToken, operation: "renew" });
+            report(new Error("Upload lock renewal found the lock no longer held"), ident, "renew");
           }
         })
         .catch((err) => {
+          if (released) return;
           preempt();
-          onError?.(err, { uploadToken, operation: "renew" });
+          report(err, ident, "renew");
         });
-    }, Math.max(1, Math.floor(ttlMs / 3)));
+    }, renewIntervalMs);
 
     return {
       signal: controller.signal,
@@ -156,11 +320,8 @@ export function redisUploadLocker(
         clearInterval(watchdog);
         void Promise.resolve()
           .then(() => unsubscribe())
-          .catch((err) => onError?.(err, { uploadToken, operation: "unsubscribe" }));
-        // A failed DEL is absorbed: the TTL reaps the lock, costing waiters
-        // at most the remaining TTL, never a stuck resource.
-        client.eval(RELEASE_SCRIPT, [key], [fencingId])
-          .catch((err) => onError?.(err, { uploadToken, operation: "release" }));
+          .catch((err) => report(err, ident, "unsubscribe"));
+        releaseKey(ident, key, holdId);
       },
     };
   }
@@ -168,21 +329,47 @@ export function redisUploadLocker(
   return {
     async acquire(uploadToken, acquireOpts): Promise<UploadLock> {
       const timeoutMs = acquireOpts?.timeoutMs ?? defaultAcquireTimeoutMs;
+      const ident: LockIdent = {
+        uploadToken,
+        ...(acquireOpts?.auditKey === undefined ? {} : { auditKey: acquireOpts.auditKey }),
+      };
       const key = keyPrefix + uploadToken;
       const channel = `${keyPrefix}preempt:${uploadToken}`;
-      const fencingId = crypto.randomUUID();
+      const holdId = crypto.randomUUID();
       const deadline = Date.now() + timeoutMs;
 
       for (;;) {
-        const taken = await client.set(key, fencingId, { NX: true, PX: ttlMs });
+        // Checked before the SET as well as after it: a round trip issued with
+        // no time left to answer can only be abandoned, and abandoning a SET
+        // costs a speculative release.
+        if (Date.now() >= deadline) throw new UploadLockTimeoutError(uploadToken);
+        let taken: string | null;
+        try {
+          taken = await withinTimeout(
+            () => client.set(key, holdId, { NX: true, PX: ttlMs }),
+            deadline - Date.now(),
+            () => new UploadLockTimeoutError(uploadToken),
+          );
+        } catch (err) {
+          // A SET that was issued may have taken the key even though its answer
+          // never arrived, and nothing else knows this hold id, so the only
+          // moment it can be freed is here. The compare-and-delete is a no-op
+          // when the SET never landed.
+          releaseKey(ident, key, holdId);
+          throw err;
+        }
         if (taken !== null) {
-          return takeLock(uploadToken, key, fencingId);
+          return takeLock(ident, key, holdId, deadline);
         }
         if (Date.now() >= deadline) throw new UploadLockTimeoutError(uploadToken);
         // Ask the holder to yield, EVERY round: repetition is what makes the
         // preempt level-triggered across subscribe gaps and dropped messages.
-        await client.publish(channel, "preempt").catch((err) => {
-          onError?.(err, { uploadToken, operation: "preempt-publish" });
+        await withinTimeout(
+          () => client.publish(channel, "preempt"),
+          deadline - Date.now(),
+          () => new UploadLockTimeoutError(uploadToken),
+        ).catch((err) => {
+          report(err, ident, "preempt-publish");
         });
         // Jitter breaks convoy effects when several waiters poll one resource.
         const wait = Math.min(pollIntervalMs + Math.floor(Math.random() * pollIntervalMs), deadline - Date.now());

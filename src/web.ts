@@ -31,6 +31,9 @@
  */
 
 import {
+  isObjectNotFoundError,
+  isObjectChangedError,
+  isStoreUnavailableError,
   evaluateConditionalRequest,
   buildRangeResponseHeaders,
   buildContentDisposition,
@@ -58,7 +61,6 @@ import {
 
 // Re-export kernel types so consumers only need one import
 export type {
-  CancelSignal,
   ObjectStore,
   ObjectMetadata,
   ObjectStream,
@@ -77,7 +79,7 @@ export type {
 const UTF8_ENCODER = new TextEncoder();
 
 /** Reason phrases for HTTP statuses used by this adapter. */
-const STATUS_TEXT: Record<number, string> = {
+const STATUS_TEXT = {
   200: "OK",
   206: "Partial Content",
   304: "Not Modified",
@@ -85,7 +87,7 @@ const STATUS_TEXT: Record<number, string> = {
   416: "Range Not Satisfiable",
   499: "Client Closed Request",
   502: "Bad Gateway",
-};
+} as const satisfies Record<number, string>;
 
 /**
  * Content codings the `precompressed` option can negotiate, mapped to the
@@ -2040,16 +2042,6 @@ function isAbortError(err: unknown): boolean {
 }
 
 /**
- * Check if an error is a pinned-read ObjectChangedError.
- *
- * Matched by name rather than instanceof so third-party stores can throw
- * their own equivalently-named error without importing the kernel class.
- */
-function isObjectChangedError(err: unknown): boolean {
-  return err instanceof Error && err.name === "ObjectChangedError";
-}
-
-/**
  * Build a plain-text error response with a computed Content-Length.
  *
  * The body is encoded once and Content-Length comes from the encoded byte
@@ -2116,7 +2108,7 @@ function isNotFoundStoreError(err: unknown): boolean {
     return (err as { status: unknown }).status === 404;
   }
   if (err instanceof Error) {
-    return err.name === "ObjectNotFoundError" || err.name === "NotFound";
+    return isObjectNotFoundError(err) || err.name === "NotFound";
   }
   return false;
 }
@@ -2131,7 +2123,7 @@ function isUnavailableStoreError(err: unknown): boolean {
   if (typeof err === "object" && err !== null && "status" in err) {
     if ((err as { status: unknown }).status === 503) return true;
   }
-  return err instanceof Error && err.name === "StoreUnavailableError";
+  return isStoreUnavailableError(err);
 }
 
 /**

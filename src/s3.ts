@@ -57,23 +57,46 @@ import {
   type ObjectStream,
   type ParsedRange,
   type StoreErrorClassifiers,
+  isSha256Base64,
+  reservedKeyGuard,
 } from "./index.ts";
 import {
   UploadNotFoundError,
   UploadOffsetConflictError,
+  UploadAppendBoundError,
+  UploadOverrunError,
   UploadDigestMismatchError,
   isUploadNotFoundError,
   type ResumableWriteStore,
+  type SweepingWriteStore,
   type StoredUploadState,
   type CreateUploadOptions,
   type AppendChunkOptions,
   type CompleteUploadOptions,
   type CompletedUpload,
 } from "./upload-store.ts";
+import {
+  UPLOAD_ID_RE,
+  cancelUploadBody,
+  newUploadId,
+  openUploadBody,
+  publishKeyGuard,
+} from "./upload-internals.ts";
 
 // Re-export for convenience
 export { ObjectNotFoundError, ObjectChangedError, StoreUnavailableError };
 export { UploadNotFoundError, UploadOffsetConflictError, UploadDigestMismatchError };
+export { UploadAppendBoundError, UploadOverrunError };
+export type {
+  ResumableWriteStore,
+  SweepingWriteStore,
+  StoredUploadState,
+  CreateUploadOptions,
+  AppendChunkOptions,
+  CompleteUploadOptions,
+  CompletedUpload,
+} from "./upload-store.ts";
+
 
 // ─── S3 Body -> Web ReadableStream ──────────────────────────────────────────
 
@@ -107,6 +130,14 @@ function toWebStream(body: unknown, signal?: AbortSignal, expectedBytes?: number
 // ─── S3 ObjectStore Options ─────────────────────────────────────────────────
 
 export interface S3StoreOptions {
+  /**
+   * Key prefix this store refuses to serve, because it is where an upload
+   * store sharing this location keeps its in-flight bytes and the sidecars
+   * naming their destination keys. Keys at or under it answer
+   * {@link ObjectNotFoundError}. Set to `""` when no upload store shares it.
+   * @default ".uploads/"
+   */
+  reservedPrefix?: string;
   /** Pre-configured S3Client instance (BYOC, no config coupling). */
   client: S3Client;
   /** The S3 bucket name. */
@@ -130,8 +161,22 @@ export interface S3StoreOptions {
  * const meta = await store.headObject("reports/q4.pdf");
  * ```
  */
+/** Both S3 factories need a client and a bucket; neither fails usefully without one. */
+function assertS3Target(factory: string, opts: { client?: unknown; bucket?: unknown } | undefined): void {
+  if (opts?.client === null || typeof opts?.client !== "object") {
+    throw new TypeError(`${factory}: options.client is required (an @aws-sdk/client-s3 S3Client)`);
+  }
+  if (typeof opts?.bucket !== "string" || opts.bucket === "") {
+    throw new TypeError(
+      `${factory}: options.bucket is required and must be a non-empty string, got ${JSON.stringify(opts?.bucket)}`,
+    );
+  }
+}
+
 export function s3Store(opts: S3StoreOptions): ObjectStore {
+  assertS3Target("s3Store", opts);
   const { client, bucket } = opts;
+  const assertReadable = reservedKeyGuard(opts.reservedPrefix ?? ".uploads/");
 
   return {
     supportsRange: true,
@@ -140,6 +185,7 @@ export function s3Store(opts: S3StoreOptions): ObjectStore {
     authoritativeRange: true,
 
     async headObject(key: string, opts?: { signal?: AbortSignal }): Promise<ObjectMetadata> {
+      assertReadable(key);
       const response = await classifyStoreRead(key, () => client.send(
         // ChecksumMode is required for S3 to return ChecksumSHA256 at all;
         // without it the digest would silently never be emitted.
@@ -160,6 +206,7 @@ export function s3Store(opts: S3StoreOptions): ObjectStore {
     },
 
     async getObject(key: string, opts?: { range?: ParsedRange; signal?: AbortSignal; ifMatch?: string }): Promise<ObjectStream> {
+      assertReadable(key);
       const { range, signal, ifMatch } = opts ?? {};
       // Open-ended fast-path ranges (`bytes=a-`) carry the OPEN_ENDED
       // sentinel end; emit the bare open form so no 16-digit last-byte-pos
@@ -232,6 +279,7 @@ export function s3Store(opts: S3StoreOptions): ObjectStore {
     },
 
     async createSignedUrl(key, signOpts) {
+      assertReadable(key);
       try {
         // A signed URL is a 302 redirect target: the client fetches bytes
         // DIRECTLY from S3, bypassing the serve route's security headers
@@ -278,7 +326,6 @@ export function s3Store(opts: S3StoreOptions): ObjectStore {
 // ─── Internal Helpers ───────────────────────────────────────────────────────
 
 /** A raw base64-encoded SHA-256 hash: exactly 43 base64 chars plus padding. */
-const SHA256_BASE64_RE = /^[A-Za-z0-9+/]{43}=$/;
 
 /**
  * Validate an S3 checksum for use as an RFC 9530 representation digest.
@@ -289,7 +336,7 @@ const SHA256_BASE64_RE = /^[A-Za-z0-9+/]{43}=$/;
  * base64 SHA-256 of the full object passes through.
  */
 function toReprDigest(checksum: string | undefined): string | undefined {
-  return checksum && SHA256_BASE64_RE.test(checksum) ? checksum : undefined;
+  return isSha256Base64(checksum) ? checksum : undefined;
 }
 
 /**
@@ -450,7 +497,8 @@ export interface S3UploadStoreOptions {
  * });
  * ```
  */
-export function s3UploadStore(opts: S3UploadStoreOptions): ResumableWriteStore {
+export function s3UploadStore(opts: S3UploadStoreOptions): SweepingWriteStore {
+  assertS3Target("s3UploadStore", opts);
   const { client, bucket, checksums = false } = opts;
   const minPartSize = opts.minPartSize ?? S3_MIN_PART_SIZE;
   if (!Number.isSafeInteger(minPartSize) || minPartSize <= 0) {
@@ -458,14 +506,30 @@ export function s3UploadStore(opts: S3UploadStoreOptions): ResumableWriteStore {
   }
   const rawPrefix = opts.uploadPrefix ?? ".uploads/";
   const prefix = rawPrefix.endsWith("/") ? rawPrefix : `${rawPrefix}/`;
-  const infoKey = (token: string): string => `${prefix}${token}.info`;
-  const partKey = (token: string): string => `${prefix}${token}.part`;
+  const assertPublishable = publishKeyGuard(prefix);
+  // The token is interpolated into object names, so the shape check lives in
+  // the builders rather than at each call site: a caller that skipped it could
+  // otherwise address `<prefix><anything>.info` and delete or read an object
+  // this store never minted, including the foreign objects the sweep
+  // deliberately leaves alone. Callers that must tolerate an unknown token
+  // (readInfo, abortUpload) test it themselves and never reach here.
+  const assertToken = (token: string): string => {
+    if (!UPLOAD_ID_RE.test(token)) {
+      throw new TypeError("s3UploadStore: refusing to build an object key from a token this store did not mint");
+    }
+    return token;
+  };
+  const infoKey = (token: string): string => `${prefix}${assertToken(token)}.info`;
+  const partKey = (token: string): string => `${prefix}${assertToken(token)}.part`;
 
   const classified = <T>(key: string, op: () => Promise<T>): Promise<T> =>
     classifyStoreRead(key, op, uploadOpClassifiers);
 
   /** Read + parse the metadata sidecar; `undefined` when it does not exist. */
   async function readInfo(token: string, signal?: AbortSignal): Promise<UploadInfoRecord | undefined> {
+    // The id is interpolated into object names, so a token that is not one the
+    // store minted is refused here rather than sent to the backend as a key.
+    if (!UPLOAD_ID_RE.test(token)) return undefined;
     let response;
     try {
       response = await classified(infoKey(token), () => client.send(
@@ -477,7 +541,52 @@ export function s3UploadStore(opts: S3UploadStoreOptions): ResumableWriteStore {
       throw err;
     }
     const bytes = await bodyToBytes(response.Body, `upload metadata ${infoKey(token)}`);
-    return parseInfoRecord(new TextDecoder().decode(bytes), token);
+    return parseInfoRecord(new TextDecoder().decode(bytes));
+  }
+
+  /**
+   * Apply a patch to the sidecar, based on a FRESH read rather than on the
+   * snapshot the caller has been holding.
+   *
+   * A sidecar write is a read-modify-write with no precondition behind it, and
+   * the snapshot an append is holding was read before the body streamed, which
+   * can be minutes. The lock makes that safe for a live holder and does not
+   * make it safe for one whose lock was stolen: such a holder would write back
+   * a record from before the new holder's changes, and `invalidated` lives
+   * ONLY here, so re-writing it away silently resurrects a terminally dead
+   * upload. Unlike `completed`, which the multipart-gone fallback re-derives
+   * from the published object, nothing recomputes that flag.
+   *
+   * Two rules make the merge safe for what a stale writer can still do:
+   *
+   * - Both terminal flags are MONOTONIC. Once set, no later write clears them,
+   *   whichever record it was computed from.
+   * - The creation facts and a recorded length come from the fresh copy. They
+   *   are write-once by contract, so the fresh copy either equals the caller's
+   *   or is the one that won.
+   *
+   * That shrinks the window from stream-duration to one round trip. It does not
+   * close it, and cannot: closing it needs a conditional write (If-Match on the
+   * sidecar's ETag), which S3 now supports and the store does not yet use.
+   */
+  async function mergeInfo(
+    token: string,
+    fallback: UploadInfoRecord,
+    patch: Partial<Pick<UploadInfoRecord, "length" | "lastAppendAt" | "invalidated" | "completed">>,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    // A read that fails leaves the caller's snapshot as the only base there
+    // is; writing from it is what the code did unconditionally before, so the
+    // fallback is no worse than the old floor and the monotonic rules below
+    // still apply to whatever it holds.
+    const fresh = await readInfo(token, signal).catch(() => undefined) ?? fallback;
+    await writeInfo(token, {
+      ...fresh,
+      ...patch,
+      ...(fresh.length !== undefined ? { length: fresh.length } : {}),
+      ...(fresh.invalidated === true || patch.invalidated === true ? { invalidated: true } : {}),
+      ...(fresh.completed === true || patch.completed === true ? { completed: true } : {}),
+    }, signal);
   }
 
   async function writeInfo(token: string, record: UploadInfoRecord, signal?: AbortSignal): Promise<void> {
@@ -589,17 +698,28 @@ export function s3UploadStore(opts: S3UploadStoreOptions): ResumableWriteStore {
   }
 
   async function abortUpload(uploadToken: string, abortOpts?: { signal?: AbortSignal }): Promise<void> {
-    const { key, uploadId } = decodeUploadToken(uploadToken);
     const signal = abortOpts?.signal;
-    try {
-      await classified(key, () => client.send(new AbortMultipartUploadCommand({
-        Bucket: bucket,
-        Key: key,
-        UploadId: uploadId,
-      }), { abortSignal: signal }));
-    } catch (err) {
-      // Already aborted, or completed and reaped: idempotent by contract.
-      if (!isMultipartGoneError(err)) throw err;
+    // A token this store never minted names no resource here, so aborting it
+    // is a no-op rather than an error: the call is idempotent by contract for
+    // an unknown token, and a token that cannot be one is a stronger case of
+    // unknown. Tested here rather than relied on downstream, because the two
+    // deletes below run even when the sidecar read finds nothing.
+    if (!UPLOAD_ID_RE.test(uploadToken)) return;
+    // The multipart is named by the sidecar, so a token that names none
+    // discards nothing. An unreadable or corrupt sidecar still gets its
+    // bookkeeping removed below, the one cleanup left possible.
+    const info = await readInfo(uploadToken, signal).catch(() => undefined);
+    if (info !== undefined) {
+      try {
+        await classified(info.key, () => client.send(new AbortMultipartUploadCommand({
+          Bucket: bucket,
+          Key: info.key,
+          UploadId: info.uploadId,
+        }), { abortSignal: signal }));
+      } catch (err) {
+        // Already aborted, or completed and reaped: idempotent by contract.
+        if (!isMultipartGoneError(err)) throw err;
+      }
     }
     await deleteObjectIdempotent(partKey(uploadToken), signal);
     await deleteObjectIdempotent(infoKey(uploadToken), signal);
@@ -610,10 +730,17 @@ export function s3UploadStore(opts: S3UploadStoreOptions): ResumableWriteStore {
     /** Byte-exact appends are impossible under the part-size floor; the engine buffers to it. */
     appendGranularity: minPartSize,
     uniformPartSize: false,
-    /** Offset derives from ListParts + the tail sidecar's HEAD on every read. */
+    /**
+     * Offset derives from ListParts + the tail sidecar's HEAD on every read,
+     * both backend facts. The tail-lift's delete-before-rewrite window is the
+     * bounded regression the flag's own doc describes: a crash there loses at
+     * most the sub-minimum remainder and the client resumes lower.
+     */
     exactOffsetRecovery: true,
     /** CompleteMultipartUpload publishes all-or-nothing. */
     atomicCompletion: true,
+    /** Every append verifies the claimed offset against durable state before writing. */
+    enforcesOffsetCheck: true,
     // Never "sha256": multipart SHA-256 checksums are composite (hash of
     // per-part hashes), so a whole-representation digest is unverifiable
     // server-side regardless of the checksums option.
@@ -623,6 +750,7 @@ export function s3UploadStore(opts: S3UploadStoreOptions): ResumableWriteStore {
 
     async createUpload(createOpts: CreateUploadOptions): Promise<{ uploadToken: string }> {
       const { key, length, metadata, now, signal } = createOpts;
+      assertPublishable(key);
       const created = await classified(key, () => client.send(new CreateMultipartUploadCommand({
         Bucket: bucket,
         Key: key,
@@ -631,9 +759,11 @@ export function s3UploadStore(opts: S3UploadStoreOptions): ResumableWriteStore {
       if (created.UploadId === undefined) {
         throw new Error(`CreateMultipartUpload returned no UploadId for ${key}`);
       }
-      const uploadToken = encodeUploadToken(key, created.UploadId);
+      const uploadToken = newUploadId();
       try {
         await writeInfo(uploadToken, {
+          key,
+          uploadId: created.UploadId,
           ...(length !== undefined ? { length } : {}),
           ...(metadata !== undefined ? { metadata } : {}),
           createdAt: now,
@@ -652,17 +782,14 @@ export function s3UploadStore(opts: S3UploadStoreOptions): ResumableWriteStore {
     },
 
     async getUploadState(uploadToken: string, stateOpts?: { signal?: AbortSignal }): Promise<StoredUploadState> {
-      const { key, uploadId } = decodeUploadToken(uploadToken);
       const signal = stateOpts?.signal;
 
       const info = await readInfo(uploadToken, signal);
-      if (info === undefined) {
-        // The metadata sidecar is deleted on successful completion, so a
-        // published object under the final key answers a late probe with
-        // completed state; no object either means the resource never
-        // existed or was aborted/swept.
+      if (info === undefined) throw new UploadNotFoundError(uploadToken);
+      const { key, uploadId } = info;
+      if (info.completed === true) {
         const published = await finalObjectState(key, signal);
-        if (published !== undefined) return publishedState(published, undefined);
+        if (published !== undefined) return publishedState(key, published, info);
         throw new UploadNotFoundError(uploadToken);
       }
 
@@ -675,7 +802,7 @@ export function s3UploadStore(opts: S3UploadStoreOptions): ResumableWriteStore {
           // object and crashed before sidecar cleanup, or an external actor
           // (lifecycle rule) aborted the upload. The final key disambiguates.
           const published = await finalObjectState(key, signal);
-          if (published !== undefined) return publishedState(published, info);
+          if (published !== undefined) return publishedState(key, published, info);
           throw new UploadNotFoundError(uploadToken, err);
         }
         throw err;
@@ -684,6 +811,7 @@ export function s3UploadStore(opts: S3UploadStoreOptions): ResumableWriteStore {
       const committed = parts.reduce((sum, part) => sum + part.size, 0);
       const tailSize = await headTailSize(uploadToken, signal);
       return {
+        key,
         offset: committed + tailSize,
         ...(info.length !== undefined ? { length: info.length } : {}),
         isComplete: false,
@@ -700,14 +828,14 @@ export function s3UploadStore(opts: S3UploadStoreOptions): ResumableWriteStore {
       body: ReadableStream<Uint8Array> | Uint8Array,
       appendOpts: AppendChunkOptions,
     ): Promise<{ bytesWritten: number }> {
-      const { key, uploadId } = decodeUploadToken(uploadToken);
-      const { maxBytes, length: declaredLength, now, signal } = appendOpts;
+      const { maxBytes, maxBytesFatal, length: declaredLength, now, signal } = appendOpts;
 
       const info = await readInfo(uploadToken, signal);
       if (info === undefined) throw new UploadNotFoundError(uploadToken);
+      const { key, uploadId } = info;
       if (info.invalidated === true) {
         // Defense in depth: the orchestrator's fresh state read already refused.
-        throw new Error(`Upload ${uploadToken}: resource is invalidated and accepts no bytes`);
+        throw new Error(`Upload resource is invalidated and accepts no bytes`);
       }
 
       let parts: S3CommittedPart[];
@@ -743,6 +871,7 @@ export function s3UploadStore(opts: S3UploadStoreOptions): ResumableWriteStore {
       let nextPartNumber = parts.reduce((max, part) => Math.max(max, part.partNumber), 0) + 1;
       let flushed = 0;
       let received = 0;
+      let ceilingHit = false;
 
       // Writes deliberately do not carry the abort signal: an in-progress
       // flush is allowed to finish so already-received bytes become durable
@@ -753,7 +882,7 @@ export function s3UploadStore(opts: S3UploadStoreOptions): ResumableWriteStore {
         // and the lever (a larger minPartSize) while the token still resolves.
         if (nextPartNumber > S3_MAX_MULTIPART_PARTS) {
           throw new Error(
-            `Upload ${uploadToken}: exceeds S3's ${S3_MAX_MULTIPART_PARTS}-part limit `
+            `Upload exceeds S3's ${S3_MAX_MULTIPART_PARTS}-part limit `
             + `(max object ~= ${S3_MAX_MULTIPART_PARTS} x minPartSize); raise minPartSize`,
           );
         }
@@ -769,30 +898,63 @@ export function s3UploadStore(opts: S3UploadStoreOptions): ResumableWriteStore {
         flushed += bytes.length;
       };
 
+      // Reading the body and flushing to the backend get SEPARATE failure
+      // handling, because they are separate failures wearing one shape. A body
+      // that dies mid-request is the client vanishing: the accepted prefix is
+      // the truthful answer and the next probe agrees with it, exactly as the
+      // other adapters already treat it. A flush that dies is the backend, and
+      // that must surface. One try around both reported a client disconnect as
+      // a storage fault, which is a 502 for something the storage never saw.
+      const { iterator, finalize } = openUploadBody(body, { cancelBody: false });
       try {
-        for await (const chunk of iterateBody(body)) {
+        for (;;) {
+          let next: IteratorResult<Uint8Array>;
+          try {
+            next = await iterator.next();
+          } catch {
+            // Torn body: keep the prefix and account it truthfully.
+            break;
+          }
+          if (next.done) break;
+          const chunk = next.value;
           received += chunk.length;
           if (maxBytes !== undefined && received > maxBytes) {
+            if (!maxBytesFatal) {
+              // This request's ceiling, not the representation's. Stop reading
+              // and fall through to the normal durable-flush tail below, so
+              // the accepted prefix lands and the resource stays healthy; the
+              // ceiling is reported after those bytes are safe.
+              ceilingHit = true;
+              break;
+            }
             // Durably mark the terminal fault before surfacing it, so every
             // later state read refuses, even from a process that never saw
             // this request. No over-bound byte lands: the crossing chunk is
             // dropped, never written.
-            await writeInfo(uploadToken, { ...info, invalidated: true });
-            throw new Error(
-              `Upload ${uploadToken}: body crossed the ${maxBytes}-byte append bound; resource invalidated`,
-            );
+            await mergeInfo(uploadToken, info, { invalidated: true });
+            await finalize();
+            throw new UploadOverrunError(uploadToken, maxBytes);
           }
           queue.push(chunk);
+          // Drained fully before the signal is consulted, deliberately. One
+          // chunk can be several parts, and stopping mid-drain would not make
+          // fewer bytes durable: the remainder is parked in the tail sidecar
+          // below, which advances the derived offset by exactly as much. What
+          // bounds a stalled holder is the chunk boundary, where it stops
+          // pulling from the body; the shape those already-accepted bytes take
+          // on the backend is not what the bound is about.
           while (queue.size >= minPartSize) {
             await flushPart(queue.take(minPartSize));
           }
           if (signal?.aborted) break;
         }
       } catch (err) {
-        await cancelBody(body);
+        await finalize();
+        await cancelUploadBody(body);
         throw err;
       }
-      if (signal?.aborted) await cancelBody(body);
+      await finalize();
+      if (signal?.aborted || ceilingHit) await cancelUploadBody(body);
 
       // Park the sub-minimum remainder (append tail OR abort leftover) in
       // the sidecar so every received byte is durable and counted by the
@@ -813,8 +975,7 @@ export function s3UploadStore(opts: S3UploadStoreOptions): ResumableWriteStore {
       // the guard makes it safe): a length already recorded is never overwritten.
       // The PutObject below is awaited, so the length is durable before the ack.
       const declaresLength = declaredLength !== undefined && info.length === undefined;
-      await writeInfo(uploadToken, {
-        ...info,
+      await mergeInfo(uploadToken, info, {
         ...(declaresLength ? { length: declaredLength } : {}),
         lastAppendAt: now,
       });
@@ -823,11 +984,14 @@ export function s3UploadStore(opts: S3UploadStoreOptions): ResumableWriteStore {
       // prefix that actually flushed counts. (A flush failure right after
       // the tail delete can leave the derived offset lower than claimed;
       // the engine re-derives fresh state on the next interaction.)
-      return { bytesWritten: Math.max(0, flushed - tailSize) };
+      const bytesWritten = Math.max(0, flushed - tailSize);
+      // Reported only now: the accepted prefix is durable and the resource is
+      // untouched, so the client resumes from here in smaller chunks.
+      if (ceilingHit) throw new UploadAppendBoundError(uploadToken, durableOffset + bytesWritten);
+      return { bytesWritten };
     },
 
     async completeUpload(uploadToken: string, completeOpts: CompleteUploadOptions): Promise<CompletedUpload> {
-      const { key, uploadId } = decodeUploadToken(uploadToken);
       const { expectedDigest, signal } = completeOpts;
 
       if (expectedDigest !== undefined) {
@@ -842,7 +1006,11 @@ export function s3UploadStore(opts: S3UploadStoreOptions): ResumableWriteStore {
       }
 
       const info = await readInfo(uploadToken, signal);
-      if (info === undefined) {
+      if (info === undefined) throw new UploadNotFoundError(uploadToken);
+      const { key, uploadId } = info;
+      if (info.completed === true) {
+        // Idempotent retry: the object published on an earlier call, and the
+        // marker is the record that says which object was ours.
         const published = await finalObjectState(key, signal);
         if (published !== undefined) {
           return published.etag !== undefined ? { etag: published.etag } : {};
@@ -850,7 +1018,7 @@ export function s3UploadStore(opts: S3UploadStoreOptions): ResumableWriteStore {
         throw new UploadNotFoundError(uploadToken);
       }
       if (info.invalidated === true) {
-        throw new Error(`Upload ${uploadToken}: resource is invalidated and cannot complete`);
+        throw new Error(`Upload resource is invalidated and cannot complete`);
       }
 
       let parts: S3CommittedPart[];
@@ -883,6 +1051,29 @@ export function s3UploadStore(opts: S3UploadStoreOptions): ResumableWriteStore {
         // S3 exempts only the LAST part from the part-size floor, which is
         // exactly what the parked tail becomes here.
         const partNumber = parts.reduce((max, part) => Math.max(max, part.partNumber), 0) + 1;
+        // The same ceiling flushPart enforces. Without it here, an upload of
+        // exactly the limit plus a sub-minimum tail flushes its last legal part,
+        // parks the remainder, and then fails the completion with S3's opaque
+        // part-range error on every retry: uncompletable at 100%, with cancel
+        // and a full re-upload as the only exit.
+        if (partNumber > S3_MAX_MULTIPART_PARTS) {
+          throw new Error(
+            `Upload exceeds S3's ${S3_MAX_MULTIPART_PARTS}-part limit `
+            + `(max object ~= ${S3_MAX_MULTIPART_PARTS} x minPartSize); raise minPartSize`,
+          );
+        }
+        // Delete the sidecar BEFORE rewriting its bytes into a part, the same
+        // ordering appendChunk uses and for the same reason. Committing first
+        // leaves a window (a crash, or a throwing delete) where the tail exists
+        // BOTH as a committed part and as a live sidecar, and the derived offset
+        // then counts it twice: past a declared length that is a permanent
+        // RangeError on every later call, and under a deferred length the client
+        // resumes above its real progress and the published object silently
+        // carries the tail twice while the source bytes at that range are never
+        // sent. Losing the tail in the reverse window is the safe direction: the
+        // offset shrinks by at most one tail and the client re-sends bytes it
+        // still holds.
+        await deleteObjectIdempotent(partKey(uploadToken));
         const uploaded = await classified(key, () => client.send(new UploadPartCommand({
           Bucket: bucket,
           Key: key,
@@ -896,10 +1087,6 @@ export function s3UploadStore(opts: S3UploadStoreOptions): ResumableWriteStore {
           ...(uploaded.ETag !== undefined ? { ETag: uploaded.ETag } : {}),
           ...(checksums && uploaded.ChecksumSHA256 !== undefined ? { ChecksumSHA256: uploaded.ChecksumSHA256 } : {}),
         });
-        // Delete the sidecar before completing: its bytes now live in a
-        // committed part, and keeping both would double-count the tail in
-        // the offset derivation if the completion itself fails.
-        await deleteObjectIdempotent(partKey(uploadToken));
       }
 
       if (completedParts.length === 0) {
@@ -930,11 +1117,11 @@ export function s3UploadStore(opts: S3UploadStoreOptions): ResumableWriteStore {
         MultipartUpload: { Parts: completedParts },
       }), { abortSignal: signal }));
 
-      // Completion has published the object: failing to reap the metadata
-      // sidecar must not be reported as a failed completion (the object is
-      // fully visible). A lingering .info is harmless -- the next state read
-      // disambiguates via the published object, and the sweep reaps orphans.
-      await client.send(new DeleteObjectCommand({ Bucket: bucket, Key: infoKey(uploadToken) }))
+      // Marked, not deleted: the sidecar is the only record of where this
+      // upload published, and a retried completion or a late probe needs it to
+      // answer. The sweep reaps it once idle. Failing to mark is not a failed
+      // completion, since the object is already visible.
+      await mergeInfo(uploadToken, info, { completed: true }, signal)
         .catch(() => undefined);
 
       return completion.ETag !== undefined ? { etag: completion.ETag } : {};
@@ -971,6 +1158,7 @@ export function s3UploadStore(opts: S3UploadStoreOptions): ResumableWriteStore {
           const lastActivityMs = object.LastModified?.getTime();
           if (lastActivityMs === undefined || lastActivityMs >= olderThanMs) continue;
           const token = objectKey.slice(prefix.length, -".info".length);
+          if (!UPLOAD_ID_RE.test(token)) continue; // foreign object: not ours to reap
           try {
             await abortUpload(token, sweepOpts);
             removed += 1;
@@ -995,11 +1183,20 @@ export function s3UploadStore(opts: S3UploadStoreOptions): ResumableWriteStore {
 
 /** Creation-time facts persisted in the `.info` metadata sidecar. */
 interface UploadInfoRecord {
+  /** Held here rather than in the token: a request carries only the id. */
+  key: string;
+  uploadId: string;
   length?: number;
   metadata?: Record<string, string>;
   createdAt: number;
   lastAppendAt?: number;
   invalidated?: boolean;
+  /**
+   * Set once the object has published. The sidecar outlives completion so a
+   * retried completion or a late probe still has a record proving this token
+   * named this key; the sweep reaps it like any other idle bookkeeping.
+   */
+  completed?: boolean;
 }
 
 /** One committed part from a ListParts page. */
@@ -1035,61 +1232,39 @@ function isMultipartGoneError(err: unknown): boolean {
 }
 
 /**
- * Fold everything resumption needs into the opaque upload token:
- * base64url-encoded JSON of the final key and the multipart UploadId.
- * The engine and orchestrator never parse it; only this adapter does.
- */
-function encodeUploadToken(key: string, uploadId: string): string {
-  const bytes = new TextEncoder().encode(JSON.stringify({ key, uploadId }));
-  let binary = "";
-  for (const byte of bytes) binary += String.fromCharCode(byte);
-  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
-}
-
-/** Any malformed token is simply an upload that does not exist (404-class). */
-function decodeUploadToken(token: string): { key: string; uploadId: string } {
-  try {
-    const base64 = token.replaceAll("-", "+").replaceAll("_", "/");
-    const padded = base64 + "=".repeat((4 - (base64.length % 4)) % 4);
-    const binary = atob(padded);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-    const parsed = JSON.parse(new TextDecoder().decode(bytes)) as { key?: unknown; uploadId?: unknown };
-    if (typeof parsed.key !== "string" || parsed.key.length === 0
-      || typeof parsed.uploadId !== "string" || parsed.uploadId.length === 0) {
-      throw new Error("upload token is missing key/uploadId");
-    }
-    return { key: parsed.key, uploadId: parsed.uploadId };
-  } catch (err) {
-    throw new UploadNotFoundError(token, err);
-  }
-}
-
-/**
  * Parse + sanity-gate the metadata sidecar. Malformed contents are adapter
  * state corruption: fail loudly rather than fabricate protocol answers.
  */
-function parseInfoRecord(text: string, token: string): UploadInfoRecord {
+function parseInfoRecord(text: string): UploadInfoRecord {
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
   } catch (err) {
-    throw new Error(`Upload ${token}: metadata sidecar holds unparseable JSON`, { cause: err });
+    throw new Error(`Upload metadata sidecar holds unparseable JSON`, { cause: err });
   }
   const record = parsed as Partial<UploadInfoRecord> | null;
   if (record === null || typeof record !== "object"
     || typeof record.createdAt !== "number" || !Number.isFinite(record.createdAt)) {
-    throw new Error(`Upload ${token}: metadata sidecar is missing a numeric createdAt`);
+    throw new Error(`Upload metadata sidecar is missing a numeric createdAt`);
+  }
+  // The sidecar is the only source of the destination: a record without them
+  // cannot address the backend, and guessing would defeat the point of keeping
+  // them off the token.
+  if (typeof record.key !== "string" || record.key === ""
+    || typeof record.uploadId !== "string" || record.uploadId === "") {
+    throw new Error(`Upload metadata sidecar is missing its key/uploadId`);
   }
   return record as UploadInfoRecord;
 }
 
 /** Completed-state answer derived from the published object under the final key. */
 function publishedState(
+  key: string,
   published: { size: number; lastModifiedMs?: number },
   info: UploadInfoRecord | undefined,
 ): StoredUploadState {
   return {
+    key,
     offset: published.size,
     length: info?.length ?? published.size,
     isComplete: true,
@@ -1142,34 +1317,6 @@ class ByteQueue {
   takeAll(): Uint8Array {
     return this.take(this.size);
   }
-}
-
-/** Iterate an append body uniformly, whether buffered or streaming. */
-async function* iterateBody(
-  body: ReadableStream<Uint8Array> | Uint8Array,
-): AsyncGenerator<Uint8Array, void, undefined> {
-  if (body instanceof Uint8Array) {
-    if (body.length > 0) yield body;
-    return;
-  }
-  const reader = body.getReader();
-  try {
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) return;
-      if (value !== undefined && value.length > 0) yield value;
-    }
-  } finally {
-    reader.releaseLock();
-  }
-}
-
-/** Cancel a streaming body after an early stop; a buffered body has nothing to cancel. */
-async function cancelBody(body: ReadableStream<Uint8Array> | Uint8Array): Promise<void> {
-  if (body instanceof Uint8Array) return;
-  // Cancelling an already-errored/closed stream rejects; the stop already
-  // happened, so that rejection carries no additional information.
-  await body.cancel().catch(() => undefined);
 }
 
 /** Collect an SDK response body (mixin, web stream, or Node Readable) into bytes. */

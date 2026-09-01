@@ -1,5 +1,25 @@
 {
+  // SELF-CONTAINED on purpose: no `extends`. This directory is synced verbatim
+  // to the standalone public repo, which is the ONLY place the package can
+  // publish from (docs/plans/npm-partial-content-launch.md: release.yml on a
+  // v* tag, npm tokens revoked everywhere else). There the package root IS the
+  // repo root, so a relative extends points outside the repository and tsc
+  // fails with TS5083; an earlier revision made exactly that mistake.
+  //
+  // The strictness block below must MIRROR packages/typescript-config/base.json
+  // (minus its noEmit, since this package really builds dist/). The mirror is
+  // enforced, not remembered: scripts/ci/__tests__/partial-content-tsconfig-mirror.test.ts
+  // fails the monorepo suite when base.json gains or changes a flag this file
+  // does not carry.
   "compilerOptions": {
+    "strict": true,
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true,
+    "noImplicitOverride": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+
     "target": "ES2025",
     "module": "NodeNext",
     "moduleResolution": "nodenext",
@@ -8,9 +28,6 @@
     "sourceMap": true,
     "outDir": "dist",
     "rootDir": "src",
-    "strict": true,
-    "esModuleInterop": true,
-    "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
     "isolatedModules": true,
     "verbatimModuleSyntax": true,

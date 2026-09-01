@@ -2,19 +2,37 @@
 
 Two suites: kernel micro-benchmarks (library overhead only) and end-to-end HTTP serving against `send` and `sirv`. Reproduce with `bun bench.ts` and `npm run bench`.
 
+Every table states the exact runtime and package build it was measured on. The
+kernel table is current. The two HTTP tables were measured on partial-content
+1.4.0 and have not been re-measured since; treat them as the shape of the cost,
+not as figures for the version you are installing, and re-run them yourself
+with the commands given if the absolute numbers matter to you.
+
 ## Kernel micro-benchmarks
 
-Representative throughput measured on Bun 1.3 (single core, 2M iterations). These measure library overhead only -- they do not include network or storage latency.
+Throughput of the pure header functions, measured on Bun 1.4.0 against the
+current source: single thread, 2M iterations after a 50k warmup, per-row median
+of three consecutive runs on a shared development machine. Read a row as the
+cost class it belongs to rather than as a certified peak. These measure library
+overhead only -- they do not include network or storage latency. Reproduce with
+`bun bench.ts`.
 
 | Function | Throughput |
 |----------|-----------|
-| `parseRangeHeader` | 10.1M ops/sec |
+| `parseRangeHeader` | 10.4M ops/sec |
 | `isPreconditionFailure` | 10.2M ops/sec |
-| `isRangeFresh` | 13.9M ops/sec |
-| `isConditionalFresh` | 4.7M ops/sec |
-| `buildRangeResponseHeaders` | 4.2M ops/sec |
-| `evaluateConditionalRequest` | 1.7M ops/sec |
-| `buildContentDisposition` | 1.7M ops/sec |
+| `isRangeFresh` | 20.6M ops/sec |
+| `isConditionalFresh` | 6.5M ops/sec |
+| `buildRangeResponseHeaders` | 8.9M ops/sec |
+| `evaluateConditionalRequest` (304 path) | 3.1M ops/sec |
+| `evaluateConditionalRequest` (206 path) | 1.8M ops/sec |
+| `evaluateConditionalRequest` (200, unconditional) | 2.1M ops/sec |
+| `buildContentDisposition` (ASCII) | 5.3M ops/sec |
+| `buildContentDisposition` (non-ASCII) | 0.9M ops/sec |
+
+`bench.ts` also times `build416Headers`, which is left out of this table: its
+argument is loop-invariant and its result unused, so the engine elides the call
+and the figure that comes back measures the optimizer rather than the function.
 
 ## End-to-end vs `send` and `sirv`
 
@@ -32,8 +50,9 @@ through the node adapter + fsStore. Reproduce with `npm run bench`.
 | Revalidation (304) | 20,014 req/s | **22,838 req/s** | 19,931 req/s | 33,165 req/s* |
 
 Each cell is the per-cell MEDIAN of three consecutive runs on an otherwise
-idle machine (Node 24.11, 1.4.0 build): single-run cells on a shared dev box
-swing 10-20% with background load, and medians keep one contaminated cell
+idle machine (Node 24.11, partial-content 1.4.0): single-run cells on a
+shared dev box swing 10-20% with background load, and medians keep one
+contaminated cell
 from flattering either side. The full conditional chain, digest negotiation,
 disposition hardening, and the disabled-by-default 1.2.0 additions (encoding
 negotiation gate, inline-CSP check, offload hooks) are all in the measured
@@ -66,8 +85,8 @@ a second ago; at 1 MB, all four columns converge on I/O parity.
 
 ## Bun runtime
 
-Same code on Bun 1.3 (`Bun.serve`, same machine, same out-of-process
-client -- the web adapter's Request/Response ARE the runtime's native
+Same code on Bun 1.3 (partial-content 1.4.0, `Bun.serve`, same machine, same
+out-of-process client -- the web adapter's Request/Response ARE the runtime's native
 primitives there, no node bridge): GET 4 KB 9,418 req/s plain and
 22,898 req/s with the cache; revalidation 12,538 plain and **38,090 req/s**
 with the cache -- a TTL-revalidating cache serving runtime uploads,

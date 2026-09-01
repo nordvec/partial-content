@@ -28,11 +28,16 @@ import {
   type ObjectStream,
   type ParsedRange,
   type StoreErrorClassifiers,
+  isSha256Base64,
+  reservedKeyGuard,
 } from "./index.ts";
 import {
   UploadNotFoundError,
   UploadOffsetConflictError,
+  UploadAppendBoundError,
+  UploadOverrunError,
   type ResumableWriteStore,
+  type SweepingWriteStore,
   type StoredUploadState,
   type CreateUploadOptions,
   type AppendChunkOptions,
@@ -43,6 +48,27 @@ import {
 // Re-export for convenience
 export { ObjectNotFoundError, ObjectChangedError, StoreUnavailableError };
 export { UploadNotFoundError, UploadOffsetConflictError };
+export { UploadAppendBoundError, UploadOverrunError };
+export type {
+  ResumableWriteStore,
+  SweepingWriteStore,
+  StoredUploadState,
+  CreateUploadOptions,
+  AppendChunkOptions,
+  CompleteUploadOptions,
+  CompletedUpload,
+} from "./upload-store.ts";
+import {
+  UPLOAD_ID_RE,
+  decodeUploadId,
+  newUploadId,
+  openUploadBody,
+  publishKeyGuard,
+  toStoredState,
+  validatePersistedUploadShape,
+  type PersistedUpload,
+} from "./upload-internals.ts";
+
 
 // ─── GCS Types ──────────────────────────────────────────────────────────────
 
@@ -53,22 +79,22 @@ export { UploadNotFoundError, UploadOffsetConflictError };
  * Users who import `partial-content/gcs` will have it installed as an
  * optional peer dependency.
  */
-interface GcsStorage {
+export interface GcsStorage {
   bucket(name: string): GcsBucket;
 }
 
-interface GcsBucket {
+export interface GcsBucket {
   file(name: string, opts?: { generation?: string | number }): GcsFile;
 }
 
-interface GcsFile {
+export interface GcsFile {
   getMetadata(): Promise<[GcsFileMetadata]>;
   createReadStream(opts?: { start?: number; end?: number }): NodeJS.ReadableStream & AsyncIterable<Buffer>;
   getSignedUrl(config: GcsSignedUrlConfig): Promise<[string]>;
 }
 
 /** The V4 read-signing subset of the SDK's `GetSignedUrlConfig`. */
-interface GcsSignedUrlConfig {
+export interface GcsSignedUrlConfig {
   version: "v4";
   action: "read";
   expires: Date;
@@ -78,7 +104,7 @@ interface GcsSignedUrlConfig {
   responseType: string;
 }
 
-interface GcsFileMetadata {
+export interface GcsFileMetadata {
   size: string; // GCS returns size as a string
   etag?: string;
   /** Object generation: changes on every overwrite. Used to pin reads. */
@@ -91,6 +117,14 @@ interface GcsFileMetadata {
 // ─── Options ────────────────────────────────────────────────────────────────
 
 export interface GcsStoreOptions {
+  /**
+   * Key prefix this store refuses to serve, because it is where an upload
+   * store sharing this location keeps its in-flight bytes and the sidecars
+   * naming their destination keys. Keys at or under it answer
+   * {@link ObjectNotFoundError}. Set to `""` when no upload store shares it.
+   * @default ".partial-content-uploads/"
+   */
+  reservedPrefix?: string;
   /** Pre-configured @google-cloud/storage instance. */
   storage: GcsStorage;
   /** GCS bucket name. */
@@ -130,12 +164,14 @@ export interface GcsStoreOptions {
  */
 export function gcsStore(opts: GcsStoreOptions): ObjectStore {
   const bucket = opts.storage.bucket(opts.bucket);
+  const assertReadable = reservedKeyGuard(opts.reservedPrefix ?? ".partial-content-uploads/");
   const { digestMetadataKey } = opts;
 
   return {
     supportsRange: true,
 
     async headObject(key: string, opts?: { signal?: AbortSignal }): Promise<ObjectMetadata> {
+      assertReadable(key);
       opts?.signal?.throwIfAborted();
       const [metadata] = await classifyStoreRead(key, () => bucket.file(key).getMetadata(), gcsClassifiers);
 
@@ -158,6 +194,7 @@ export function gcsStore(opts: GcsStoreOptions): ObjectStore {
     },
 
     async getObject(key: string, opts?: { range?: ParsedRange; signal?: AbortSignal; ifMatch?: string; pin?: string }): Promise<ObjectStream> {
+      assertReadable(key);
       const { range, signal, ifMatch, pin } = opts ?? {};
       signal?.throwIfAborted();
 
@@ -257,6 +294,7 @@ export function gcsStore(opts: GcsStoreOptions): ObjectStore {
     },
 
     async createSignedUrl(key, signOpts) {
+      assertReadable(key);
       try {
         // A signed URL is a 302 redirect target: the client fetches bytes
         // DIRECTLY from GCS, bypassing the serve route's security headers
@@ -302,7 +340,6 @@ export function gcsStore(opts: GcsStoreOptions): ObjectStore {
  * The only shape trusted as an RFC 9530 representation digest; anything else
  * (hex, truncated base64, a composite checksum) is discarded, never emitted.
  */
-const SHA256_BASE64_RE = /^[A-Za-z0-9+/]{43}=$/;
 
 /**
  * Extract a consumer-stored whole-object SHA-256 from GCS custom metadata
@@ -317,7 +354,7 @@ function digestFromCustomMetadata(
 ): string | undefined {
   if (!digestMetadataKey) return undefined;
   const value = metadata.metadata?.[digestMetadataKey];
-  return typeof value === "string" && SHA256_BASE64_RE.test(value)
+  return isSha256Base64(value)
     ? value
     : undefined;
 }
@@ -372,7 +409,7 @@ function decodeGcsPin(pin: string): GcsPin | null {
       // The digest is emitted inside `Repr-Digest: sha-256=:...:`; only the
       // exact raw-base64 SHA-256 shape validated at encode time is trusted.
       (candidate.digest === undefined ||
-        (typeof candidate.digest === "string" && SHA256_BASE64_RE.test(candidate.digest)))
+        isSha256Base64(candidate.digest))
     ) {
       return candidate as unknown as GcsPin;
     }
@@ -481,70 +518,8 @@ const GCS_MAX_COMPOSE_SOURCES = 32;
 /** Chunk-object names are zero-padded so listings read in append order. */
 const GCS_CHUNK_NAME_WIDTH = 6;
 
-/** The UUID shape `createUpload` mints; nothing else may name upload objects. */
-const GCS_UPLOAD_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
-
-function gcsBytesToBase64Url(bytes: Uint8Array): string {
-  let binary = "";
-  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]!);
-  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-}
-
-function gcsBase64UrlToBytes(value: string): Uint8Array {
-  const binary = atob(value.replace(/-/g, "+").replace(/_/g, "/"));
-  const out = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
-  return out;
-}
-
-/** What the opaque upload token folds in (base64url JSON). */
-interface GcsUploadToken {
-  key: string;
-  id: string;
-}
-
-function encodeGcsUploadToken(token: GcsUploadToken): string {
-  return gcsBytesToBase64Url(new TextEncoder().encode(JSON.stringify(token)));
-}
-
-/**
- * Decode + validate a token. The `id` is interpolated into object names, so
- * only the exact UUID shape minted at creation is accepted: a forged token
- * cannot traverse into foreign objects. Garbage decodes to
- * {@link UploadNotFoundError} (dialects answer 404, never a parse crash).
- */
-function decodeGcsUploadToken(uploadToken: string): GcsUploadToken {
-  try {
-    const parsed: unknown = JSON.parse(
-      new TextDecoder().decode(gcsBase64UrlToBytes(uploadToken)),
-    );
-    if (typeof parsed === "object" && parsed !== null) {
-      const candidate = parsed as Record<string, unknown>;
-      if (
-        typeof candidate.key === "string" && candidate.key.length > 0 &&
-        typeof candidate.id === "string" && GCS_UPLOAD_ID_RE.test(candidate.id)
-      ) {
-        return { key: candidate.key, id: candidate.id };
-      }
-    }
-  } catch (err) {
-    throw new UploadNotFoundError(uploadToken, err);
-  }
-  throw new UploadNotFoundError(uploadToken);
-}
-
 /** Durable upload bookkeeping, persisted as the `.info` object's JSON body. */
-interface GcsPersistedUpload {
-  key: string;
-  length?: number;
-  metadata?: Record<string, string>;
-  createdAt: number;
-  lastAppendAt?: number;
-  isComplete: boolean;
-  isInvalidated: boolean;
-  /** Recorded at completion for idempotent-retry answers. */
-  etag?: string;
-}
+type GcsPersistedUpload = PersistedUpload;
 
 /** Decode + shape-validate persisted state; null for corrupt values. */
 function decodeGcsPersistedUpload(raw: Uint8Array): GcsPersistedUpload | null {
@@ -554,45 +529,7 @@ function decodeGcsPersistedUpload(raw: Uint8Array): GcsPersistedUpload | null {
   } catch {
     return null;
   }
-  if (typeof parsed !== "object" || parsed === null) return null;
-  const c = parsed as Record<string, unknown>;
-  const isCount = (v: unknown): v is number =>
-    typeof v === "number" && Number.isSafeInteger(v) && v >= 0;
-  if (
-    typeof c.key === "string" && c.key.length > 0 &&
-    (c.length === undefined || isCount(c.length)) &&
-    isCount(c.createdAt) &&
-    (c.lastAppendAt === undefined || isCount(c.lastAppendAt)) &&
-    typeof c.isComplete === "boolean" &&
-    typeof c.isInvalidated === "boolean" &&
-    (c.etag === undefined || typeof c.etag === "string") &&
-    (c.metadata === undefined ||
-      (typeof c.metadata === "object" && c.metadata !== null &&
-        Object.values(c.metadata).every((v) => typeof v === "string")))
-  ) {
-    return c as unknown as GcsPersistedUpload;
-  }
-  return null;
-}
-
-/** Normalize an append body to an async chunk sequence. */
-async function* gcsUploadBodyChunks(
-  body: ReadableStream<Uint8Array> | Uint8Array,
-): AsyncGenerator<Uint8Array> {
-  if (body instanceof Uint8Array) {
-    if (body.length > 0) yield body;
-    return;
-  }
-  const reader = body.getReader();
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) return;
-      if (value && value.length > 0) yield value;
-    }
-  } finally {
-    reader.releaseLock();
-  }
+  return validatePersistedUploadShape(parsed);
 }
 
 /**
@@ -672,9 +609,10 @@ function gcsSizeToNumber(size: string | number | undefined): number {
  * const store = gcsUploadStore({ storage, bucket: "my-bucket" });
  * ```
  */
-export function gcsUploadStore(opts: GcsUploadStoreOptions): ResumableWriteStore {
+export function gcsUploadStore(opts: GcsUploadStoreOptions): SweepingWriteStore {
   const bucket = opts.storage.bucket(opts.bucket);
   const prefix = (opts.uploadPrefix ?? GCS_DEFAULT_UPLOAD_PREFIX).replace(/\/+$/, "");
+  const assertPublishable = publishKeyGuard(`${prefix}/`);
 
   const infoName = (id: string): string => `${prefix}/${id}.info`;
   const chunkPrefix = (id: string): string => `${prefix}/${id}/`;
@@ -688,22 +626,19 @@ export function gcsUploadStore(opts: GcsUploadStoreOptions): ResumableWriteStore
 
   /** Read + validate the persisted state behind a token. Throws 404-shaped. */
   async function readUpload(uploadToken: string): Promise<{ state: GcsPersistedUpload; id: string }> {
-    const token = decodeGcsUploadToken(uploadToken);
+    const id = decodeUploadId(uploadToken);
     let raw: Uint8Array;
     try {
-      [raw] = await bucket.file(infoName(token.id)).download();
+      [raw] = await bucket.file(infoName(id)).download();
     } catch (err) {
       if (isGcsNotFound(err)) throw new UploadNotFoundError(uploadToken, err);
       throw err;
     }
     const state = decodeGcsPersistedUpload(raw);
-    // Corrupt bookkeeping, or a token whose key was tampered to point at a
-    // different object than the one recorded at creation: both answer 404.
-    // The PERSISTED key is authoritative for every backend operation.
-    if (!state || state.key !== token.key) {
-      throw new UploadNotFoundError(uploadToken);
-    }
-    return { state, id: token.id };
+    // Corrupt bookkeeping answers 404. There is no key to reconcile here: the
+    // token carries none, so the persisted key is the only one that exists.
+    if (!state) throw new UploadNotFoundError(uploadToken);
+    return { state, id };
   }
 
   /** List this upload's chunk objects, ascending by append sequence. */
@@ -733,26 +668,17 @@ export function gcsUploadStore(opts: GcsUploadStoreOptions): ResumableWriteStore
     await bucket.file(infoName(id)).delete({ ignoreNotFound: true });
   }
 
-  function toStoredState(state: GcsPersistedUpload, offset: number): StoredUploadState {
-    return {
-      offset,
-      length: state.length,
-      isComplete: state.isComplete,
-      isInvalidated: state.isInvalidated,
-      createdAt: state.createdAt,
-      lastAppendAt: state.lastAppendAt,
-      metadata: state.metadata,
-    };
-  }
-
   return {
     exactOffsetRecovery: true,
     atomicCompletion: true,
+    /** Every append verifies the claimed offset against durable state before writing. */
+    enforcesOffsetCheck: true,
     digestOnComplete: false,
 
     async createUpload(createOpts: CreateUploadOptions): Promise<{ uploadToken: string }> {
       createOpts.signal?.throwIfAborted();
-      const id = crypto.randomUUID();
+      assertPublishable(createOpts.key);
+      const id = newUploadId();
       const state: GcsPersistedUpload = {
         key: createOpts.key,
         length: createOpts.length,
@@ -762,14 +688,15 @@ export function gcsUploadStore(opts: GcsUploadStoreOptions): ResumableWriteStore
         isInvalidated: false,
       };
       await saveState(state, id);
-      return { uploadToken: encodeGcsUploadToken({ key: createOpts.key, id }) };
+      return { uploadToken: id };
     },
 
     async getUploadState(uploadToken: string, stateOpts?: { signal?: AbortSignal }): Promise<StoredUploadState> {
       stateOpts?.signal?.throwIfAborted();
       const { state, id } = await readUpload(uploadToken);
       if (state.isInvalidated) {
-        // Terminal: the offset is moot (the engine refuses everything anyway).
+        // Terminal: the offset is moot (the engine refuses every probe and
+        // append, and the one verb still allowed, cancel, does not read it).
         return toStoredState(state, 0);
       }
       if (state.isComplete) {
@@ -797,16 +724,18 @@ export function gcsUploadStore(opts: GcsUploadStoreOptions): ResumableWriteStore
     ): Promise<{ bytesWritten: number }> {
       const { state, id } = await readUpload(uploadToken);
       if (state.isInvalidated) {
-        throw new Error(`Upload ${uploadToken} is invalidated; nothing may be appended`);
+        throw new Error(`Upload is invalidated; nothing may be appended`);
       }
       if (state.isComplete) {
-        throw new Error(`Upload ${uploadToken} is already complete; nothing may be appended`);
+        throw new Error(`Upload is already complete; nothing may be appended`);
       }
       const chunks = await listChunks(id);
       const durableOffset = chunks.reduce((sum, chunk) => sum + chunk.size, 0);
-      // Cheap defense-in-depth under the orchestrator's lock: the chunk
-      // listing was needed anyway (next sequence number), so the claimed
-      // offset is verified against the durable sum for free.
+      // Required by the store contract: the lock serializes writers but cannot
+      // prove the writer still holds it, so verifying the claim here is what
+      // makes a stolen-lock write loud instead of silently interleaved. The
+      // chunk listing was needed anyway (next sequence number), so the check
+      // against the durable sum costs nothing.
       if (offset !== durableOffset) {
         throw new UploadOffsetConflictError(uploadToken, durableOffset);
       }
@@ -824,8 +753,9 @@ export function gcsUploadStore(opts: GcsUploadStoreOptions): ResumableWriteStore
       };
       let written = 0;
       let consumed = 0;
+      let ceilingHit = false;
 
-      const iterator = gcsUploadBodyChunks(body)[Symbol.asyncIterator]();
+      const { iterator, finalize } = openUploadBody(body, { cancelBody: true });
       while (true) {
         if (appendOpts.signal?.aborted) break;
         let next: IteratorResult<Uint8Array>;
@@ -839,14 +769,20 @@ export function gcsUploadStore(opts: GcsUploadStoreOptions): ResumableWriteStore
         if (next.done) break;
         consumed += next.value.length;
         if (appendOpts.maxBytes !== undefined && consumed > appendOpts.maxBytes) {
-          // Bytes past the engine's hard bound are the terminal fault. The
+          if (!appendOpts.maxBytesFatal) {
+            // This request's ceiling, not the representation's. Stop reading
+            // and fall through to the normal end-the-object tail so the
+            // accepted prefix lands and the resource stays healthy.
+            ceilingHit = true;
+            break;
+          }
+          // Bytes past a REPRESENTATION bound are the terminal fault. The
           // destroyed single-shot write leaves NO object behind, then the
           // invalidation is recorded durably so every later interaction refuses.
           stream?.destroy(new Error("append crossed the engine's byte bound"));
           await saveState({ ...state, isInvalidated: true }, id);
-          throw new Error(
-            `Upload ${uploadToken}: body crossed the ${appendOpts.maxBytes}-byte bound; resource invalidated`,
-          );
+          await finalize();
+          throw new UploadOverrunError(uploadToken, appendOpts.maxBytes);
         }
         if (streamFailure) break;
         if (!stream) {
@@ -886,6 +822,10 @@ export function gcsUploadStore(opts: GcsUploadStoreOptions): ResumableWriteStore
         ...(declaresLength ? { length: appendOpts.length } : {}),
         lastAppendAt: appendOpts.now,
       }, id);
+      // Reported only after the accepted prefix is durable: the resource is
+      // untouched, so the client resumes from here in smaller chunks.
+      await finalize();
+      if (ceilingHit) throw new UploadAppendBoundError(uploadToken, durableOffset + (stream ? written : 0));
       return { bytesWritten: stream ? written : 0 };
     },
 
@@ -893,7 +833,7 @@ export function gcsUploadStore(opts: GcsUploadStoreOptions): ResumableWriteStore
       completeOpts.signal?.throwIfAborted();
       const { state, id } = await readUpload(uploadToken);
       if (state.isInvalidated) {
-        throw new Error(`Upload ${uploadToken} is invalidated; it cannot be completed`);
+        throw new Error(`Upload is invalidated; it cannot be completed`);
       }
       if (state.isComplete) {
         return { etag: state.etag };
@@ -948,31 +888,26 @@ export function gcsUploadStore(opts: GcsUploadStoreOptions): ResumableWriteStore
 
     async abortUpload(uploadToken: string, abortOpts?: { signal?: AbortSignal }): Promise<void> {
       abortOpts?.signal?.throwIfAborted();
-      let token: GcsUploadToken;
+      let id: string;
       try {
-        token = decodeGcsUploadToken(uploadToken);
+        id = decodeUploadId(uploadToken);
       } catch {
         return; // idempotent: a token that never named a resource has nothing to discard
       }
       let raw: Uint8Array;
       try {
-        [raw] = await bucket.file(infoName(token.id)).download();
+        [raw] = await bucket.file(infoName(id)).download();
       } catch (err) {
         if (isGcsNotFound(err)) return; // already aborted/swept
         throw err;
       }
       const state = decodeGcsPersistedUpload(raw);
-      // A token whose key disagrees with the recorded one is forged: it is
-      // not this resource's handle, so it may discard NOTHING (state reads
-      // answer 404 for it; deleting here would let a tampered token destroy
-      // a live upload's bookkeeping).
-      if (state && state.key !== token.key) return;
       if (state?.isComplete) {
         // The published object is live data now; only the bookkeeping goes.
-        await bucket.file(infoName(token.id)).delete({ ignoreNotFound: true });
+        await bucket.file(infoName(id)).delete({ ignoreNotFound: true });
         return;
       }
-      await deleteUploadArtifacts(token.id);
+      await deleteUploadArtifacts(id);
     },
 
     async sweepExpired(olderThanMs: number, sweepOpts?: { signal?: AbortSignal }): Promise<{ removed: number }> {
@@ -982,7 +917,7 @@ export function gcsUploadStore(opts: GcsUploadStoreOptions): ResumableWriteStore
         sweepOpts?.signal?.throwIfAborted();
         if (!entry.name.endsWith(".info")) continue;
         const id = entry.name.slice(`${prefix}/`.length, -".info".length);
-        if (!GCS_UPLOAD_ID_RE.test(id)) continue; // foreign object: not ours to reap
+        if (!UPLOAD_ID_RE.test(id)) continue; // foreign object: not ours to reap
         let state: GcsPersistedUpload | null = null;
         try {
           const [raw] = await bucket.file(entry.name).download();

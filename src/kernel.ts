@@ -1431,8 +1431,18 @@ export function sanitizeHeaderValue(s: string): string {
 /**
  * The raw base64 of a 32-byte SHA-256: exactly 43 base64 chars plus optional
  * `=` padding. Gate for digest emission -- see {@link emitDigestFields}.
+ *
+ * Padding is optional on the way IN because an unpadded 43-char encoding
+ * decodes to the same 32 bytes and rejecting it would discard a valid digest
+ * over a formatting difference. What the package EMITS is always the padded
+ * form RFC 9530 carries, since the field is a Structured Fields Byte Sequence.
  */
 const SHA256_BASE64_RE = /^[A-Za-z0-9+/]{43}=?$/;
+
+/** Is this the raw base64 of a 32-byte SHA-256? One definition, package-wide. */
+export function isSha256Base64(value: unknown): value is string {
+  return typeof value === "string" && SHA256_BASE64_RE.test(value);
+}
 
 /**
  * Emit RFC 9530 `Repr-Digest` (and `Content-Digest` unless `reprOnly`) for

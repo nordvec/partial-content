@@ -7,6 +7,8 @@ import {
     ObjectNotFoundError,
     UploadNotFoundError,
     UploadOffsetConflictError,
+    UploadAppendBoundError,
+    UploadOverrunError,
     UploadDigestMismatchError,
 } from "../memory";
 import {
@@ -185,7 +187,9 @@ describe("memoryUploadStore: create / state / append / complete round trip", () 
         try {
             const store = memoryUploadStore({ objects: {} });
             const { uploadToken } = await store.createUpload({ key: "a", now: 0 });
-            expect(uploadToken).toMatch(/^[0-9a-f]{32}$/);
+            // UUID-shaped on this path too: the object stores accept only that
+            // shape, so a fallback-minted token has to be one they can resolve.
+            expect(uploadToken).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
             expect((await store.getUploadState(uploadToken)).offset).toBe(0);
         } finally {
             Object.defineProperty(globalThis.crypto, "randomUUID", { value: original, configurable: true });
@@ -318,16 +322,42 @@ describe("memoryUploadStore: partial-write accounting", () => {
 });
 
 describe("memoryUploadStore: maxBytes bound", () => {
+    test("a NON-fatal bound keeps the prefix, keeps the resource, and reports the ceiling", async () => {
+        // maxAppendSize bounds THIS REQUEST, not the representation. A body
+        // that runs past it has done nothing to the upload, so destroying the
+        // upload over it would turn a resumable situation into a lost one.
+        const store = memoryUploadStore({ objects: {} });
+        const { uploadToken } = await store.createUpload({ key: "k", now: 0 });
+
+        await expect(store.appendChunk(
+            uploadToken, 0, enc.encode("0123456789"), { maxBytes: 4, maxBytesFatal: false, now: 1 },
+        )).rejects.toBeInstanceOf(UploadAppendBoundError);
+
+        const state = await store.getUploadState(uploadToken);
+        // The accepted prefix is durable and the resource is alive.
+        expect(state.offset).toBe(4);
+        expect(state.isInvalidated).toBe(false);
+
+        // ...so the client simply resumes from there in smaller chunks.
+        const resumed = await store.appendChunk(
+            uploadToken, 4, enc.encode("45"), { maxBytes: 4, maxBytesFatal: false, now: 2 },
+        );
+        expect(resumed.bytesWritten).toBe(2);
+        expect((await store.getUploadState(uploadToken)).offset).toBe(6);
+    });
+
     test("a body crossing the bound is truncated at it and the resource is invalidated", async () => {
         const store = memoryUploadStore({ objects: {} });
         const { uploadToken } = await store.createUpload({ key: "k", now: 0 });
 
-        const result = await store.appendChunk(
-            uploadToken, 0, enc.encode("0123456789"), { maxBytes: 4, now: 1 },
-        );
-        expect(result.bytesWritten).toBe(4);
+        // A fatal bound throws: returning an offset would tell the caller to
+        // carry on from bytes nothing can ever be built on.
+        await expect(store.appendChunk(
+            uploadToken, 0, enc.encode("0123456789"), { maxBytes: 4, maxBytesFatal: true, now: 1 },
+        )).rejects.toBeInstanceOf(UploadOverrunError);
 
         const state = await store.getUploadState(uploadToken);
+        // The accepted prefix is still durable and still truthful.
         expect(state.offset).toBe(4);
         expect(state.isInvalidated).toBe(true);
 
@@ -340,10 +370,9 @@ describe("memoryUploadStore: maxBytes bound", () => {
     test("a stream crossing the bound mid-chunk keeps the exact prefix", async () => {
         const store = memoryUploadStore({ objects: {} });
         const { uploadToken } = await store.createUpload({ key: "k", now: 0 });
-        const result = await store.appendChunk(
-            uploadToken, 0, streamOf("abc", "defg"), { maxBytes: 5, now: 1 },
-        );
-        expect(result.bytesWritten).toBe(5);
+        await expect(store.appendChunk(
+            uploadToken, 0, streamOf("abc", "defg"), { maxBytes: 5, maxBytesFatal: true, now: 1 },
+        )).rejects.toBeInstanceOf(UploadOverrunError);
         const state = await store.getUploadState(uploadToken);
         expect(state.offset).toBe(5);
         expect(state.isInvalidated).toBe(true);
@@ -354,7 +383,7 @@ describe("memoryUploadStore: maxBytes bound", () => {
         const store = memoryUploadStore({ objects });
         const { uploadToken } = await store.createUpload({ key: "k", now: 0 });
         const result = await store.appendChunk(
-            uploadToken, 0, enc.encode("abcd"), { maxBytes: 4, now: 1 },
+            uploadToken, 0, enc.encode("abcd"), { maxBytes: 4, maxBytesFatal: true, now: 1 },
         );
         expect(result.bytesWritten).toBe(4);
         const state = await store.getUploadState(uploadToken);
@@ -376,7 +405,8 @@ describe("memoryUploadStore: maxBytes bound", () => {
                 cancelled = true;
             },
         });
-        await store.appendChunk(uploadToken, 0, body, { maxBytes: 4, now: 1 });
+        await expect(store.appendChunk(uploadToken, 0, body, { maxBytes: 4, maxBytesFatal: true, now: 1 }))
+            .rejects.toBeInstanceOf(UploadOverrunError);
         // The producer is told to stop; without the cancel it would sit on
         // an abandoned locked reader forever.
         expect(cancelled).toBe(true);
@@ -385,10 +415,9 @@ describe("memoryUploadStore: maxBytes bound", () => {
     test("maxBytes 0 with a non-empty body invalidates without accepting a byte", async () => {
         const store = memoryUploadStore({ objects: {} });
         const { uploadToken } = await store.createUpload({ key: "k", now: 0 });
-        const result = await store.appendChunk(
-            uploadToken, 0, enc.encode("abc"), { maxBytes: 0, now: 1 },
-        );
-        expect(result.bytesWritten).toBe(0);
+        await expect(store.appendChunk(
+            uploadToken, 0, enc.encode("abc"), { maxBytes: 0, maxBytesFatal: true, now: 1 },
+        )).rejects.toBeInstanceOf(UploadOverrunError);
         const state = await store.getUploadState(uploadToken);
         expect(state.offset).toBe(0);
         expect(state.isInvalidated).toBe(true);
@@ -511,5 +540,33 @@ describe("memoryUploadStore: abort and sweep", () => {
         expect((await store.sweepExpired!(9_000)).removed).toBe(0);
         expect((await store.sweepExpired!(9_001)).removed).toBe(1);
         await expect(store.getUploadState(active.uploadToken)).rejects.toBeInstanceOf(UploadNotFoundError);
+    });
+});
+
+// ─── A missing required option fails where the mistake was made ─────────────
+
+describe("memoryUploadStore: construction", () => {
+    test("a missing objects map is refused before anything can be uploaded", () => {
+        // Without this the store accepts creation and every append, then dies
+        // at publication, after the whole body has already transferred.
+        expect(() => memoryUploadStore(undefined as never)).toThrow(TypeError);
+        expect(() => memoryUploadStore({} as never)).toThrow(/options\.objects is required/);
+    });
+
+    test("the message names the map and how to pair it with the read store", () => {
+        try {
+            memoryUploadStore({} as never);
+            throw new Error("expected a throw");
+        } catch (err) {
+            // An error that says what to change beats one that says what broke.
+            expect((err as Error).message).toContain("memoryStore");
+        }
+    });
+
+    test("the factory promises the sweep, so a retention pass needs no optional call", async () => {
+        const store = memoryUploadStore({ objects: {} });
+        // `store.sweepExpired?.()` would silently become a no-op if the method
+        // ever went missing, which is how a retention obligation goes unmet.
+        expect(await store.sweepExpired(Date.now() - 1_000)).toBeDefined();
     });
 });

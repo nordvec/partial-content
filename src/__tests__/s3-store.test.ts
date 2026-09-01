@@ -1,9 +1,15 @@
 import { describe, test, expect, mock, beforeEach } from "bun:test";
-import { s3Store, ObjectChangedError, StoreUnavailableError } from "../s3";
+import { s3Store, s3UploadStore, ObjectChangedError, StoreUnavailableError } from "../s3";
 import { nodeStreamToWeb } from "../object-store";
 import { OPEN_ENDED } from "../index";
-import type { ObjectStore } from "../index";
+import { asStream } from "./helpers";
+import type { ObjectStore, ObjectStream } from "../index";
 
+/**
+ * The streaming half of an {@link ObjectStream} body. This store hands back the
+ * SDK's own body, which is always a stream, so a byte body means the adapter
+ * stopped streaming and the assertion is measuring the wrong path.
+ */
 // ─── Mock S3Client ──────────────────────────────────────────────────────────
 
 /**
@@ -382,7 +388,7 @@ describe("s3Store: committed-length guard", () => {
         const result = await store.getObject("doc");
         const chunks: Uint8Array[] = [];
         await expect((async () => {
-            for await (const c of result.body) chunks.push(c);
+            for await (const c of asStream(result.body)) chunks.push(c);
         })()).rejects.toThrow(/expected 10/);
     });
 });
@@ -409,7 +415,7 @@ describe("s3Store: SDK body shapes", () => {
         const result = await store.getObject("doc");
 
         const chunks: Uint8Array[] = [];
-        for await (const c of result.body) chunks.push(c);
+        for await (const c of asStream(result.body)) chunks.push(c);
         expect(new TextDecoder().decode(Buffer.concat(chunks))).toBe("sdk-body");
     });
 
@@ -429,7 +435,7 @@ describe("s3Store: SDK body shapes", () => {
         });
         const store = s3Store({ client: client.client, bucket: "b" });
         const result = await store.getObject("doc");
-        await result.body.cancel();
+        await asStream(result.body).cancel();
 
         expect(destroyed).toBe(1);
     });
@@ -519,4 +525,134 @@ describe("s3Store: createSignedUrl", () => {
 
         expect(result).toEqual({ ok: false, error: "credentials expired" });
     });
+});
+
+describe("throttle classification by name, with no HTTP status", () => {
+    /**
+     * S3-compatible backends raise these by name and set no status code. The
+     * status check runs first, so a named throttle that DOES carry
+     * `$metadata.httpStatusCode` is classified by the status and the name is
+     * never read: only a status-less error reaches the name comparison.
+     */
+    const THROTTLE_NAMES = [
+        "SlowDown",
+        "ThrottlingException",
+        "TooManyRequestsException",
+        "RequestThrottled",
+        "RequestThrottledException",
+        "ProvisionedThroughputExceededException",
+    ];
+
+    function throwingStore(build: () => Error) {
+        const { client } = createMockS3Client({});
+        (client as unknown as { send: (c: unknown) => Promise<unknown> }).send = async () => {
+            throw build();
+        };
+        return s3Store({ client, bucket: "documents" });
+    }
+
+    for (const name of THROTTLE_NAMES) {
+        test(`${name} without a status maps to StoreUnavailableError`, async () => {
+            const store = throwingStore(() => {
+                const err = new Error("backend is shedding load");
+                err.name = name;
+                return err;
+            });
+            await expect(store.getObject("reports/q4.pdf"))
+                .rejects.toBeInstanceOf(StoreUnavailableError);
+        });
+    }
+
+    test("a 429 is a throttle beside the 503", async () => {
+        const store = throwingStore(() => Object.assign(new Error("too many requests"), {
+            $metadata: { httpStatusCode: 429 },
+        }));
+        await expect(store.headObject("reports/q4.pdf"))
+            .rejects.toBeInstanceOf(StoreUnavailableError);
+    });
+
+    test("an error that is neither a throttle name nor a throttle status is not one", async () => {
+        // The negative half. Without it, widening the name chain to always-true
+        // still passes every case above, and a genuine backend fault would be
+        // reported to the client as "retry shortly".
+        const store = throwingStore(() => {
+            const err = new Error("malformed XML in response");
+            err.name = "InvalidResponse";
+            (err as unknown as { $metadata: { httpStatusCode: number } }).$metadata = {
+                httpStatusCode: 500,
+            };
+            return err;
+        });
+        await expect(store.getObject("reports/q4.pdf"))
+            .rejects.not.toBeInstanceOf(StoreUnavailableError);
+    });
+
+    test("the backend's advised back-off rides along on the throttle", async () => {
+        // Retry-After is echoed so clients and shared caches wait the advised
+        // interval instead of hammering an origin that is already shedding load.
+        const store = throwingStore(() => {
+            const err = new Error("slow down");
+            err.name = "SlowDown";
+            (err as unknown as { $response: { headers: Record<string, string> } }).$response = {
+                headers: { "retry-after": "30" },
+            };
+            return err;
+        });
+        await expect(store.getObject("reports/q4.pdf")).rejects.toMatchObject({
+            retryAfterSeconds: 30,
+        });
+    });
+});
+
+describe("s3 factories refuse a target they cannot address", () => {
+    /**
+     * Both factories reach the same check, and both are worth asserting: the
+     * failure they prevent is a misconfiguration that used to surface as a 502
+     * after a whole upload body had already transferred.
+     */
+    const factories: [string, (opts: unknown) => unknown][] = [
+        ["s3Store", (opts) => s3Store(opts as Parameters<typeof s3Store>[0])],
+        ["s3UploadStore", (opts) => s3UploadStore(opts as Parameters<typeof s3UploadStore>[0])],
+    ];
+
+    const client = { send: async () => ({}) };
+
+    const badClients: [string, unknown][] = [
+        ["null", null],
+        ["undefined", undefined],
+        ["a string", "an-s3-client"],
+        ["a number", 42],
+    ];
+
+    for (const [factory, build] of factories) {
+        for (const [label, bad] of badClients) {
+            test(`${factory} refuses ${label} as the client`, () => {
+                expect(() => build({ client: bad, bucket: "b" }))
+                    .toThrow(new RegExp(`^${factory}: options\\.client is required`));
+            });
+        }
+
+        test(`${factory} refuses options that are absent entirely`, () => {
+            expect(() => build(undefined)).toThrow(TypeError);
+        });
+
+        test(`${factory} refuses a bucket that is not a non-empty string`, () => {
+            for (const bad of [undefined, "", 7, null]) {
+                expect(() => build({ client, bucket: bad }))
+                    .toThrow(new RegExp(`^${factory}: options\\.bucket is required`));
+            }
+        });
+
+        test(`${factory} names the offending value so the message is actionable`, () => {
+            // A misconfiguration report that does not say what it got sends the
+            // reader back to their own config to guess.
+            expect(() => build({ client, bucket: "" })).toThrow(/got ""/);
+        });
+
+        test(`${factory} accepts a well-formed target`, () => {
+            // The positive half: without it, a check mutated to always-throw
+            // still passes every case above.
+            expect(() => build({ client, bucket: "documents" })).not.toThrow();
+        });
+    }
 });
