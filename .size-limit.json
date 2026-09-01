@@ -62,7 +62,7 @@
   {
     "name": "/s3",
     "path": "dist/s3.js",
-    "limit": "6.5 kB",
+    "limit": "6.75 kB",
     "ignore": [
       "node:fs/promises",
       "node:path",

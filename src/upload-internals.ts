@@ -246,7 +246,8 @@ export function redactUploadToken(
   uploadToken: string | undefined,
   auditKey: string,
 ): unknown {
-  if (uploadToken === undefined || uploadToken === "" || !(err instanceof Error)) return err;
+  // Absent and empty are the same case: nothing to search for.
+  if (!uploadToken || !(err instanceof Error)) return err;
   const path = (err as { path?: unknown }).path;
   const carriesToken = err.message.includes(uploadToken)
     || (typeof err.stack === "string" && err.stack.includes(uploadToken))
