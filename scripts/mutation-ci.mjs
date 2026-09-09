@@ -13,6 +13,9 @@
  *
  * Usage: `bun run test:mutation:ci` (or `node scripts/mutation-ci.mjs`).
  * Scope to one module with `MUTATION_MODULES=http.ts node scripts/...`.
+ * `--list` prints the module names as a JSON array; the nightly workflow
+ * runs one job per module from it, because the whole set in sequence takes
+ * longer than a runner job may live.
  */
 import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
@@ -127,6 +130,14 @@ const FLOORS = {
     "fs.ts": 72,       // baseline 85.66 on win32 incl. the write store; lower on CI (the win32-only device/ADS guard block is unreachable on Linux, its mutants survive there)
     "hono.ts": 80,     // baseline 100.00 (5 mutants; tolerates one survivor)
 };
+
+// `--list` prints the module names as JSON and exits, so the CI matrix is
+// derived from FLOORS rather than restated in the workflow file: a module
+// added here is sharded on the next nightly without anyone editing YAML.
+if (process.argv.includes("--list")) {
+    console.log(JSON.stringify(Object.keys(FLOORS)));
+    process.exit(0);
+}
 
 const require = createRequire(import.meta.url);
 const pkgDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
