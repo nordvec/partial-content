@@ -1,5 +1,5 @@
 /**
- * HTTP Range header parser and response builder (RFC 7233 + RFC 9110).
+ * HTTP Range header parser and response builder (RFC 9110).
  *
  * Pure functions for building RFC-compliant HTTP responses that serve
  * files from any storage backend (S3, R2, GCS, local disk). Handles
@@ -20,20 +20,22 @@
  * multi-range overhead.
  */
 
+import { NON_FIELD_VALUE_BYTES, resolveMediaType } from "./media-type.ts";
+
 // ─── Types ──────────────────────────────────────────────────────────────────
 
 /** A validated, clamped byte range with inclusive bounds. */
 export interface ParsedRange {
-  /** First byte position (0-indexed). */
-  start: number;
-  /**
-   * Last byte position (inclusive). May equal {@link OPEN_ENDED} on the
-   * single-round-trip fast path, meaning "to end of object" -- the range's
-   * true end is unknown until the backend responds. Adapters MUST treat
-   * `end === OPEN_ENDED` as an open-ended read (`bytes=start-`, or omit the
-   * count) rather than emitting the sentinel as a literal last-byte-pos.
-   */
-  end: number;
+    /** First byte position (0-indexed). */
+    start: number;
+    /**
+     * Last byte position (inclusive). May equal {@link OPEN_ENDED} on the
+     * single-round-trip fast path, meaning "to end of object" -- the range's
+     * true end is unknown until the backend responds. Adapters MUST treat
+     * `end === OPEN_ENDED` as an open-ended read (`bytes=start-`, or omit the
+     * count) rather than emitting the sentinel as a literal last-byte-pos.
+     */
+    end: number;
 }
 
 /**
@@ -48,95 +50,100 @@ export const OPEN_ENDED = Number.MAX_SAFE_INTEGER;
 
 /** True when a range is the fast-path open-ended form (`bytes=start-`). */
 export function isOpenEndedRange(range: { end: number } | undefined | null): boolean {
-  return range?.end === OPEN_ENDED;
+    return range?.end === OPEN_ENDED;
 }
 
 /** Options for building range response headers. */
 export interface RangeResponseHeaderOpts {
-  /**
-   * Total object size in bytes, or `undefined` when the total is unknown --
-   * a `bytes a-b/*` partial response from a streaming origin that does not
-   * know its full length (RFC 7233 Section 4.2). Unknown is valid ONLY
-   * alongside a `range`: a 206's `Content-Length` is the range span, so the
-   * total is not needed to size the body and is emitted as `*`. A full (200)
-   * response has no length without it and rejects `undefined`.
-   */
-  totalSize: number | undefined;
-  /** Parsed range, or null for a full-content response. */
-  range: ParsedRange | null;
-  /** MIME type from storage metadata. */
-  contentType: string | undefined;
-  /** ETag from storage metadata, for conditional caching. */
-  etag: string | undefined;
-  /**
-   * Last-Modified date from storage metadata.
-   *
-   * Accepts any string parseable by `Date.parse()` (ISO 8601, IMF-fixdate,
-   * RFC 850, asctime). The library normalizes it to IMF-fixdate
-   * (e.g. "Sun, 29 Jun 2025 12:00:00 GMT") before emitting the
-   * `Last-Modified` response header, because ISO strings are not valid
-   * HTTP-dates and would break `If-Modified-Since` revalidation.
-   */
-  lastModified: string | undefined;
-  /**
-   * RFC 9530 representation digest for end-to-end integrity.
-   *
-   * When provided, emitted as `Repr-Digest: sha-256=:<base64>:` on 200/206
-   * responses. The digest covers the *full representation* (not the partial
-   * range), so it remains stable across range requests.
-   *
-   * Storage backends typically provide this (S3: `x-amz-checksum-sha256`
-   * on objects uploaded with a SHA-256 checksum). It must be the raw base64
-   * of a 32-byte SHA-256 (43 base64 chars plus optional `=` padding, no
-   * prefix, no colons); anything else is silently not emitted, because a
-   * malformed or wrong-algorithm value framed as `sha-256=:...:` would be a
-   * false integrity assertion.
-   */
-  digest?: string;
-  /**
-   * Whether `Content-Digest` may accompany `Repr-Digest` on a full (200)
-   * response. Set `false` when the client sent
-   * `Want-Content-Digest: sha-256=0` (see {@link clientWantsContentDigest})
-   * or when the response answers a HEAD request: a HEAD message transfers no
-   * content, so a representation-valued `Content-Digest` would be false
-   * there (RFC 9530 Appendix B.2 computes the HEAD `Content-Digest` over
-   * empty content). Partial (206) responses never carry `Content-Digest`.
-   * @default true
-   */
-  contentDigest?: boolean;
-  /**
-   * Whether `Repr-Digest` may be emitted. Set `false` when the client
-   * declined it via `Want-Repr-Digest: sha-256=0` (see
-   * {@link clientWantsDigest}). The two Want-* fields negotiate
-   * independently (RFC 9530 Section 4): declining `Repr-Digest` never
-   * suppresses a wanted `Content-Digest`, and vice versa.
-   * @default true
-   */
-  reprDigest?: boolean;
-  /**
-   * Cache-Control directive to include in the response.
-   *
-   * The library never generates cache directives on its own. It only echoes
-   * a value you provide. Common patterns:
-   *   - `"private, no-cache"` (revalidate every request)
-   *   - `"private, max-age=3600"` (cache 1 hour)
-   *   - `"public, max-age=31536000, immutable"` (content-addressed)
-   */
-  cacheControl?: string;
+    /**
+     * Total object size in bytes, or `undefined` when the total is unknown --
+     * a `bytes a-b/*` partial response from a streaming origin that does not
+     * know its full length (RFC 9110 Section 14.4). Unknown is valid ONLY
+     * alongside a `range`: a 206's `Content-Length` is the range span, so the
+     * total is not needed to size the body and is emitted as `*`. A full (200)
+     * response has no length without it and rejects `undefined`.
+     */
+    totalSize: number | undefined;
+    /** Parsed range, or null for a full-content response. */
+    range: ParsedRange | null;
+    /** MIME type from storage metadata. */
+    contentType: string | undefined;
+    /** ETag from storage metadata, for conditional caching. */
+    etag: string | undefined;
+    /**
+     * Last-Modified date from storage metadata.
+     *
+     * Accepts any string parseable by `Date.parse()` (ISO 8601, IMF-fixdate,
+     * RFC 850, asctime). The library normalizes it to IMF-fixdate
+     * (e.g. "Sun, 29 Jun 2025 12:00:00 GMT") before emitting the
+     * `Last-Modified` response header, because ISO strings are not valid
+     * HTTP-dates and would break `If-Modified-Since` revalidation.
+     */
+    lastModified: string | undefined;
+    /**
+     * RFC 9530 representation digest for end-to-end integrity.
+     *
+     * When provided, emitted as `Repr-Digest: sha-256=:<base64>:` on 200/206
+     * responses. The digest covers the *full representation* (not the partial
+     * range), so it remains stable across range requests.
+     *
+     * Storage backends typically provide this (S3: `x-amz-checksum-sha256`
+     * on objects uploaded with a SHA-256 checksum). It must be the raw base64
+     * of a 32-byte SHA-256 (43 base64 chars plus optional `=` padding, no
+     * prefix, no colons); anything else is silently not emitted, because a
+     * malformed or wrong-algorithm value framed as `sha-256=:...:` would be a
+     * false integrity assertion.
+     */
+    digest?: string;
+    /**
+     * Whether `Content-Digest` may accompany `Repr-Digest` on a full (200)
+     * response. Set `false` when the client sent
+     * `Want-Content-Digest: sha-256=0` (see {@link clientWantsContentDigest})
+     * or when the response answers a HEAD request: a HEAD message transfers no
+     * content, so a representation-valued `Content-Digest` would be false
+     * there (RFC 9530 Appendix B.2 computes the HEAD `Content-Digest` over
+     * empty content). Partial (206) responses never carry `Content-Digest`.
+     * @default true
+     */
+    contentDigest?: boolean;
+    /**
+     * Whether `Repr-Digest` may be emitted. Set `false` when the client
+     * declined it via `Want-Repr-Digest: sha-256=0` (see
+     * {@link clientWantsDigest}). The two Want-* fields negotiate
+     * independently (RFC 9530 Section 4): declining `Repr-Digest` never
+     * suppresses a wanted `Content-Digest`, and vice versa.
+     * @default true
+     */
+    reprDigest?: boolean;
+    /**
+     * Cache-Control directive to include in the response.
+     *
+     * The library never generates cache directives on its own. It only echoes
+     * a value you provide. Common patterns:
+     *   - `"private, no-cache"` (revalidate every request)
+     *   - `"private, max-age=3600"` (cache 1 hour)
+     *   - `"public, max-age=31536000, immutable"` (content-addressed)
+     */
+    cacheControl?: string;
 }
 
 /** Result of building range response headers. */
 export interface RangeResponseHeaders {
-  /** HTTP status code: 200 for full content, 206 for partial, 304 for not modified, 412 for precondition failure, 416 for unsatisfiable. */
-  status: 200 | 206 | 304 | 412 | 416;
-  /** Headers to set on the response. */
-  headers: Record<string, string>;
+    /**
+     * HTTP status code: 200 for full content, 206 for partial, 304 for not
+     * modified, 412 for precondition failure, 416 for unsatisfiable. The union
+     * may gain a member in a minor release: give a switch over it a default
+     * branch.
+     */
+    status: 200 | 206 | 304 | 412 | 416;
+    /** Headers to set on the response. */
+    headers: Record<string, string>;
 }
 
 /** Result of the full conditional request evaluation chain. */
 export interface EvaluatedRequest extends RangeResponseHeaders {
-  /** Parsed range, or null if full content or an error status. */
-  range: ParsedRange | null;
+    /** Parsed range, or null if full content or an error status. */
+    range: ParsedRange | null;
 }
 
 // ─── Parser ─────────────────────────────────────────────────────────────────
@@ -144,7 +151,7 @@ export interface EvaluatedRequest extends RangeResponseHeaders {
 /**
  * Parse an HTTP Range header value into a validated byte range.
  *
- * Supports three RFC 7233 forms:
+ * Supports three RFC 9110 Section 14.1.2 forms:
  *   - `bytes=0-499`   (first 500 bytes)
  *   - `bytes=500-`    (everything from byte 500 onward)
  *   - `bytes=-500`    (last 500 bytes, suffix range)
@@ -168,26 +175,26 @@ export interface EvaluatedRequest extends RangeResponseHeaders {
  * @param totalSize - Total file size in bytes
  */
 export function parseRangeHeader(
-  rangeHeader: string | null | undefined,
-  totalSize: number,
+    rangeHeader: string | null | undefined,
+    totalSize: number,
 ): ParsedRange | "unsatisfiable" | null {
-  // Reject corrupt metadata: NaN, Infinity, negative, or non-integer sizes
-  // would produce invalid Content-Range headers downstream.
-  if (!Number.isSafeInteger(totalSize) || totalSize < 0) return null;
-  if (!rangeHeader || totalSize <= 0) return null;
+    // Reject corrupt metadata: NaN, Infinity, negative, or non-integer sizes
+    // would produce invalid Content-Range headers downstream.
+    if (!Number.isSafeInteger(totalSize) || totalSize < 0) return null;
+    if (!rangeHeader || totalSize <= 0) return null;
 
-  // RFC 9110 Section 14.1: "Range units are case-insensitive."
-  const lower = rangeHeader.toLowerCase();
-  if (!lower.startsWith("bytes=")) return null;
+    // RFC 9110 Section 14.1: "Range units are case-insensitive."
+    const lower = rangeHeader.toLowerCase();
+    if (!lower.startsWith("bytes=")) return null;
 
-  const rangeSpec = rangeHeader.slice(6); // Strip "bytes=" (preserves original casing for value)
+    const rangeSpec = rangeHeader.slice(6); // Strip "bytes=" (preserves original casing for value)
 
-  // Single range only on this fast path. Multi-range (comma-separated) is
-  // served as multipart/byteranges via parseRanges; this path handles the
-  // common single-seek that media elements and PDF viewers emit.
-  if (rangeSpec.includes(",")) return null;
+    // Single range only on this fast path. Multi-range (comma-separated) is
+    // served as multipart/byteranges via parseRanges; this path handles the
+    // common single-seek that media elements and PDF viewers emit.
+    if (rangeSpec.includes(",")) return null;
 
-  return parseOneRange(rangeSpec, totalSize);
+    return parseOneRange(rangeSpec, totalSize);
 }
 
 /**
@@ -195,67 +202,72 @@ export function parseRangeHeader(
  * against a known total size. Shared by {@link parseRangeHeader} (single) and
  * {@link parseRanges} (multipart).
  *
- * Returns a clamped {@link ParsedRange}, `"unsatisfiable"` for valid syntax
- * that cannot be honored (start past EOF, zero-length suffix), or `null` for
- * malformed syntax.
+ * Returns a clamped {@link ParsedRange}, `"unsatisfiable"` for a valid
+ * range-spec that cannot be honored (start past EOF, zero-length suffix), or
+ * `null` for malformed syntax or an invalid int-range (last-pos below
+ * first-pos), judged before satisfiability.
  */
 function parseOneRange(spec: string, totalSize: number): ParsedRange | "unsatisfiable" | null {
-  const dashIndex = spec.indexOf("-");
-  if (dashIndex === -1) return null;
+    const dashIndex = spec.indexOf("-");
+    if (dashIndex === -1) return null;
 
-  const startStr = spec.slice(0, dashIndex).trim();
-  const endStr = spec.slice(dashIndex + 1).trim();
+    const startStr = spec.slice(0, dashIndex).trim();
+    const endStr = spec.slice(dashIndex + 1).trim();
 
-  // Suffix range: bytes=-500 (last 500 bytes)
-  if (startStr === "") {
-    const suffixLength = parsePos(endStr);
-    if (isNaN(suffixLength)) return null;
-    // bytes=-0 is a zero-length suffix: valid syntax but unsatisfiable
-    if (suffixLength <= 0) return "unsatisfiable";
-    const start = Math.max(0, totalSize - suffixLength);
-    return { start, end: totalSize - 1 };
-  }
+    // Suffix range: bytes=-500 (last 500 bytes)
+    if (startStr === "") {
+        const suffixLength = parsePos(endStr);
+        if (isNaN(suffixLength)) return null;
+        // bytes=-0 is a zero-length suffix: valid syntax but unsatisfiable
+        if (suffixLength <= 0) return "unsatisfiable";
+        const start = Math.max(0, totalSize - suffixLength);
+        return { start, end: totalSize - 1 };
+    }
 
-  const start = parsePos(startStr);
-  if (isNaN(start)) return null;
+    const start = parsePos(startStr);
+    if (isNaN(start)) return null;
 
-  // Unsatisfiable: start beyond file (valid syntax, cannot be honored)
-  if (start >= totalSize) return "unsatisfiable";
+    // Closed range: bytes=500-600; an empty last-pos is the open-ended form
+    // bytes=500-.
+    const lastPos = endStr === "" ? undefined : parsePos(endStr);
+    if (lastPos !== undefined && isNaN(lastPos)) return null;
 
-  // Open-ended range: bytes=500-
-  if (endStr === "") {
-    return { start, end: totalSize - 1 };
-  }
+    // RFC 9110 Section 14.1.1: "An int-range is invalid if the last-pos
+    // value is present and less than the first-pos", and one invalid
+    // range-spec makes the whole ranges-specifier invalid. Section 14.2
+    // permits ignoring such a Range header entirely: ignore = serve full 200.
+    // Judged on the unclamped values and BEFORE satisfiability, so a malformed
+    // or invalid spec is never reported as merely out of bounds.
+    if (lastPos !== undefined && start > lastPos) return null;
 
-  let end = parsePos(endStr);
-  if (isNaN(end)) return null;
+    // Unsatisfiable: start beyond file (valid syntax, cannot be honored)
+    if (start >= totalSize) return "unsatisfiable";
 
-  // Clamp end to file boundary
-  end = Math.min(end, totalSize - 1);
-
-  // RFC 9110 Section 14.1.1: "An int-range is invalid if the last-pos
-  // value is present and less than the first-pos", and one invalid
-  // range-spec makes the whole ranges-specifier invalid. Section 14.2
-  // permits ignoring such a Range header entirely: ignore = serve full 200.
-  if (start > end) return null;
-
-  return { start, end };
+    // Clamp end to file boundary
+    return { start, end: Math.min(lastPos ?? totalSize - 1, totalSize - 1) };
 }
 
 // ─── Multiple Ranges (multipart/byteranges, RFC 9110 Section 14) ────────────
 
-/** Default cap on distinct coalesced ranges before a request degrades to 200. */
-export const MAX_RANGES_DEFAULT = 50;
+/**
+ * Default cap on distinct coalesced ranges before a request degrades to 200.
+ *
+ * Every part costs a backend read and its own framing, so the cap bounds how
+ * much work one request can buy. Media players and document viewers ask for
+ * one range, or a handful; a request for more is the multipart amplification
+ * shape that RFC 9110 Section 14.2 lets a server ignore.
+ */
+export const MAX_RANGES_DEFAULT = 8;
 
 /** A validated, coalesced set of satisfiable ranges. */
 export interface RangeSet {
-  /**
-   * Coalesced satisfiable ranges (length >= 1) in REQUEST order: each part
-   * keeps the position of its earliest-appearing contributor, honoring the
-   * RFC 9110 Section 15.3.7.2 SHOULD on part ordering. A length of 1 is
-   * served as a normal single 206; length > 1 as multipart/byteranges.
-   */
-  ranges: ParsedRange[];
+    /**
+     * Coalesced satisfiable ranges (length >= 1) in REQUEST order: each part
+     * keeps the position of its earliest-appearing contributor, honoring the
+     * RFC 9110 Section 15.3.7.2 SHOULD on part ordering. A length of 1 is
+     * served as a normal single 206; length > 1 as multipart/byteranges.
+     */
+    ranges: ParsedRange[];
 }
 
 /**
@@ -292,59 +304,60 @@ export interface RangeSet {
  * header (serve 200), matching single-range leniency.
  */
 export function parseRanges(
-  rangeHeader: string | null | undefined,
-  totalSize: number,
-  maxRanges: number = MAX_RANGES_DEFAULT,
+    rangeHeader: string | null | undefined,
+    totalSize: number,
+    maxRanges: number = MAX_RANGES_DEFAULT,
 ): RangeSet | "unsatisfiable" | null {
-  if (!Number.isSafeInteger(totalSize) || totalSize < 0) return null;
-  if (!rangeHeader || totalSize <= 0) return null;
+    if (!Number.isSafeInteger(totalSize) || totalSize < 0) return null;
+    if (!rangeHeader || totalSize <= 0) return null;
 
-  const lower = rangeHeader.toLowerCase();
-  if (!lower.startsWith("bytes=")) return null;
+    const lower = rangeHeader.toLowerCase();
+    if (!lower.startsWith("bytes=")) return null;
 
-  const specs = rangeHeader.slice(6).split(",");
-  const satisfiable: OrderedRange[] = [];
-  let sawUnsatisfiable = false;
+    const specs = rangeHeader.slice(6).split(",");
+    const satisfiable: OrderedRange[] = [];
+    let sawUnsatisfiable = false;
 
-  for (const rawSpec of specs) {
-    const spec = rawSpec.trim();
-    if (spec === "") continue; // RFC 9110 Section 5.6.1 list rule: skip empties
-    const parsed = parseOneRange(spec, totalSize);
-    if (parsed === null) return null; // malformed element -> ignore whole header
-    if (parsed === "unsatisfiable") {
-      sawUnsatisfiable = true;
-      continue;
+    for (const rawSpec of specs) {
+        const spec = rawSpec.trim();
+        if (spec === "") continue; // RFC 9110 Section 5.6.1 list rule: skip empties
+        const parsed = parseOneRange(spec, totalSize);
+        if (parsed === null) return null; // malformed element -> ignore whole header
+        if (parsed === "unsatisfiable") {
+            sawUnsatisfiable = true;
+            continue;
+        }
+        // Position in the request's range-set, kept through coalescing for the
+        // RFC 9110 Section 15.3.7.2 part-order SHOULD.
+        satisfiable.push({ ...parsed, order: satisfiable.length });
     }
-    // Position in the request's range-set, kept through coalescing for the
-    // RFC 9110 Section 15.3.7.2 part-order SHOULD.
-    satisfiable.push({ ...parsed, order: satisfiable.length });
-  }
 
-  if (satisfiable.length === 0) {
-    // Valid syntax but nothing in range -> 416; nothing at all -> serve 200.
-    return sawUnsatisfiable ? "unsatisfiable" : null;
-  }
+    if (satisfiable.length === 0) {
+        // Valid syntax but nothing in range -> 416; nothing at all -> serve 200.
+        return sawUnsatisfiable ? "unsatisfiable" : null;
+    }
 
-  const coalesced = coalesceRanges(satisfiable);
+    const coalesced = coalesceRanges(satisfiable);
 
-  // Amplification defense: too many distinct parts -> serve the full 200.
-  // The classic whole-file-tiling vector needs no separate check: gap
-  // coalescing merges any set whose parts would tile the representation
-  // into a single range (coalesced parts are always separated by more than
-  // the framing overhead), and a single range serves as a plain 206 with
-  // no multipart framing, exactly like parseRangeHeader.
-  if (coalesced.length > maxRanges) return null;
+    // Amplification defense: too many distinct parts -> serve the full 200.
+    // The classic whole-file-tiling vector needs no separate check: gap
+    // coalescing merges any set whose parts would tile the representation
+    // into a single range (coalesced parts are always separated by more than
+    // the framing overhead), and a single range serves as a plain 206 with
+    // no multipart framing, exactly like parseRangeHeader. Written as a
+    // negated `<=` so a NaN cap fails closed instead of disabling the check.
+    if (!(coalesced.length <= maxRanges)) return null;
 
-  // Emit parts in request order (a coalesced part inherits its earliest
-  // contributor's position), per the Section 15.3.7.2 SHOULD.
-  coalesced.sort((a, b) => a.order - b.order);
+    // Emit parts in request order (a coalesced part inherits its earliest
+    // contributor's position), per the Section 15.3.7.2 SHOULD.
+    coalesced.sort((a, b) => a.order - b.order);
 
-  return { ranges: coalesced.map(({ start, end }) => ({ start, end })) };
+    return { ranges: coalesced.map(({ start, end }) => ({ start, end })) };
 }
 
 /** A parsed range annotated with its position in the request's range-set. */
 interface OrderedRange extends ParsedRange {
-  order: number;
+    order: number;
 }
 
 /**
@@ -364,19 +377,19 @@ const COALESCE_GAP_BYTES = 80;
  * the request position of its earliest-appearing contributor.
  */
 function coalesceRanges(ranges: OrderedRange[]): OrderedRange[] {
-  const sorted = [...ranges].sort((a, b) => a.start - b.start || a.end - b.end);
-  const merged: OrderedRange[] = [{ ...sorted[0]! }];
-  for (let i = 1; i < sorted.length; i++) {
-    const cur = sorted[i]!;
-    const last = merged[merged.length - 1]!;
-    if (cur.start <= last.end + 1 + COALESCE_GAP_BYTES) {
-      if (cur.end > last.end) last.end = cur.end;
-      if (cur.order < last.order) last.order = cur.order;
-    } else {
-      merged.push({ ...cur });
+    const sorted = ranges.toSorted((a, b) => a.start - b.start || a.end - b.end);
+    const merged: OrderedRange[] = [{ ...sorted[0]! }];
+    for (let i = 1; i < sorted.length; i++) {
+        const cur = sorted[i]!;
+        const last = merged[merged.length - 1]!;
+        if (cur.start <= last.end + 1 + COALESCE_GAP_BYTES) {
+            if (cur.end > last.end) last.end = cur.end;
+            if (cur.order < last.order) last.order = cur.order;
+        } else {
+            merged.push({ ...cur });
+        }
     }
-  }
-  return merged;
+    return merged;
 }
 
 /**
@@ -392,14 +405,14 @@ const MULTIPART_BOUNDARY_RE = /^[0-9A-Za-z'()+_,\-./:=? ]{0,69}[0-9A-Za-z'()+_,\
  * in body content by construction.
  */
 export function generateMultipartBoundary(): string {
-  const uuid = globalThis.crypto?.randomUUID?.();
-  if (uuid) return `partialcontent${uuid.replace(/-/g, "")}`;
-  // Fallback for runtimes without randomUUID: 16 random bytes as hex.
-  const bytes = new Uint8Array(16);
-  globalThis.crypto.getRandomValues(bytes);
-  let hex = "";
-  for (const b of bytes) hex += b.toString(16).padStart(2, "0");
-  return `partialcontent${hex}`;
+    const uuid = globalThis.crypto?.randomUUID?.();
+    if (uuid) return `partialcontent${uuid.replace(/-/g, "")}`;
+    // Fallback for runtimes without randomUUID: 16 random bytes as hex.
+    const bytes = new Uint8Array(16);
+    globalThis.crypto.getRandomValues(bytes);
+    let hex = "";
+    for (const b of bytes) hex += b.toString(16).padStart(2, "0");
+    return `partialcontent${hex}`;
 }
 
 /**
@@ -408,26 +421,26 @@ export function generateMultipartBoundary(): string {
  * body bytes and a trailing CRLF follow (the caller emits those).
  */
 export function buildMultipartPartHeader(
-  boundary: string,
-  range: ParsedRange,
-  totalSize: number,
-  contentType: string | undefined,
+    boundary: string,
+    range: ParsedRange,
+    totalSize: number,
+    contentType: string | undefined,
 ): string {
-  const ct = contentType ? `Content-Type: ${sanitizeHeaderValue(contentType)}\r\n` : "";
-  return `--${boundary}\r\n${ct}Content-Range: bytes ${range.start}-${range.end}/${totalSize}\r\n\r\n`;
+    const ct = contentType ? `Content-Type: ${resolveMediaType(contentType).value}\r\n` : "";
+    return `--${boundary}\r\n${ct}Content-Range: bytes ${range.start}-${range.end}/${totalSize}\r\n\r\n`;
 }
 
 /** The closing delimiter for a multipart/byteranges body: `--BOUNDARY-- CRLF`. */
 export function multipartEpilogue(boundary: string): string {
-  return `--${boundary}--\r\n`;
+    return `--${boundary}--\r\n`;
 }
 
 /** Result of {@link buildMultipartHeaders}. */
 export interface MultipartResponse {
-  status: 206;
-  headers: Record<string, string>;
-  /** Exact byte length of the full multipart body (framing + all part bytes). */
-  contentLength: number;
+    status: 206;
+    headers: Record<string, string>;
+    /** Exact byte length of the full multipart body (framing + all part bytes). */
+    contentLength: number;
 }
 
 /**
@@ -441,70 +454,55 @@ export interface MultipartResponse {
  * every part header).
  */
 export function buildMultipartHeaders(opts: {
-  boundary: string;
-  ranges: ParsedRange[];
-  totalSize: number;
-  contentType: string | undefined;
-  etag?: string;
-  lastModified?: string;
-  cacheControl?: string;
-  digest?: string;
+    boundary: string;
+    ranges: ParsedRange[];
+    totalSize: number;
+    contentType: string | undefined;
+    etag?: string;
+    lastModified?: string;
+    cacheControl?: string;
+    digest?: string;
 }): MultipartResponse {
-  const { boundary, ranges, totalSize, contentType, etag, lastModified, cacheControl, digest } = opts;
+    const { boundary, ranges, totalSize, contentType, etag, lastModified, cacheControl, digest } = opts;
 
-  if (!Number.isSafeInteger(totalSize) || totalSize < 0) {
-    throw new RangeError(
-      `buildMultipartHeaders: totalSize must be a non-negative safe integer, got ${totalSize}`,
-    );
-  }
-  // The boundary is interpolated into the top-level Content-Type AND the
-  // body framing, and the Content-Length math assumes the exact string the
-  // caller will frame parts with. Silently sanitizing would desync the two,
-  // so an invalid token throws instead. RFC 2046 Section 5.1.1 grammar:
-  // 1-70 bchars, not ending in a space. {@link generateMultipartBoundary}
-  // always satisfies this; the check exists for hand-supplied boundaries.
-  if (!MULTIPART_BOUNDARY_RE.test(boundary)) {
-    throw new RangeError(
-      "buildMultipartHeaders: boundary must be 1-70 RFC 2046 boundary characters and must not end with a space",
-    );
-  }
-
-  let contentLength = 0;
-  for (const range of ranges) {
-    // Same guard the single-range builder applies: bounds the range parser
-    // could never produce (non-integer or unordered positions, an end at or
-    // past the total, the OPEN_ENDED sentinel) must throw rather than
-    // serialize an invalid Content-Range into a part header.
-    if (
-      !Number.isSafeInteger(range.start) || !Number.isSafeInteger(range.end)
-      || range.start < 0 || range.start > range.end || range.end >= totalSize
-    ) {
-      throw new RangeError(
-        `buildMultipartHeaders: invalid range ${range.start}-${range.end} for totalSize ${totalSize}`,
-      );
+    assertTotalSize("buildMultipartHeaders", totalSize);
+    // The boundary is interpolated into the top-level Content-Type AND the
+    // body framing, and the Content-Length math assumes the exact string the
+    // caller will frame parts with. Silently sanitizing would desync the two,
+    // so an invalid token throws instead. RFC 2046 Section 5.1.1 grammar:
+    // 1-70 bchars, not ending in a space. {@link generateMultipartBoundary}
+    // always satisfies this; the check exists for hand-supplied boundaries.
+    if (!MULTIPART_BOUNDARY_RE.test(boundary)) {
+        throw new RangeError("buildMultipartHeaders: invalid RFC 2046 boundary");
     }
-    const partHeader = buildMultipartPartHeader(boundary, range, totalSize, contentType);
-    // Framing is ASCII, but Content-Type may carry obs-text; count real bytes.
-    contentLength += utf8ByteLength(partHeader);
-    contentLength += range.end - range.start + 1; // the part body
-    contentLength += 2; // trailing CRLF after each part body
-  }
-  contentLength += utf8ByteLength(multipartEpilogue(boundary));
 
-  const headers: Record<string, string> = {
-    "Accept-Ranges": "bytes",
-    "Content-Type": `multipart/byteranges; boundary=${boundary}`,
-    "Content-Length": String(contentLength),
-  };
-  if (etag) headers["ETag"] = sanitizeHeaderValue(etag);
-  if (lastModified) headers["Last-Modified"] = toHttpDate(lastModified) ?? sanitizeHeaderValue(lastModified);
-  // Repr-Digest covers the full representation, so it is valid on a partial
-  // multipart response; Content-Digest is omitted (it would have to cover the
-  // assembled parts, not the representation).
-  if (digest) emitDigestFields(headers, digest, true, false);
-  if (cacheControl) headers["Cache-Control"] = sanitizeHeaderValue(cacheControl);
+    let contentLength = 0;
+    for (const range of ranges) {
+        assertServedRange("buildMultipartHeaders", range, totalSize);
+        const partHeader = buildMultipartPartHeader(boundary, range, totalSize, contentType);
+        // Framing is ASCII, but Content-Type may carry obs-text; count real bytes.
+        contentLength += utf8ByteLength(partHeader);
+        contentLength += range.end - range.start + 1; // the part body
+        contentLength += 2; // trailing CRLF after each part body
+    }
+    contentLength += utf8ByteLength(multipartEpilogue(boundary));
 
-  return { status: 206, headers, contentLength };
+    const headers: Record<string, string> = {
+        "Accept-Ranges": "bytes",
+        // A parameter value is a token or a quoted-string (RFC 9110 Section
+        // 5.6.6), and bchars include tspecials (`:`, `=`, `/`, space, ...).
+        // bchars hold no DQUOTE or backslash, so wrapping needs no escaping.
+        "Content-Type": `multipart/byteranges; boundary=${/^[\w'+.-]+$/.test(boundary) ? boundary : `"${boundary}"`}`,
+        "Content-Length": String(contentLength),
+    };
+    setValidators(headers, etag, lastModified);
+    // Repr-Digest covers the full representation, so it is valid on a partial
+    // multipart response; Content-Digest is omitted (it would have to cover the
+    // assembled parts, not the representation).
+    if (digest) emitDigestFields(headers, digest, true, false);
+    if (cacheControl) headers["Cache-Control"] = sanitizeHeaderValue(cacheControl);
+
+    return { status: 206, headers, contentLength };
 }
 
 /** Shared UTF-8 encoder: allocating one per call is pure waste in the
@@ -512,16 +510,16 @@ export function buildMultipartHeaders(opts: {
 const UTF8_ENCODER = new TextEncoder();
 
 /** Byte length of a string as UTF-8 (framing math must count bytes, not code units). */
-function utf8ByteLength(s: string): number {
-  return UTF8_ENCODER.encode(s).byteLength;
+export function utf8ByteLength(s: string): number {
+    return UTF8_ENCODER.encode(s).byteLength;
 }
 
-// ─── Conditional Request Helpers (RFC 9110 / RFC 7232) ──────────────────────
+// ─── Conditional Request Helpers (RFC 9110 Section 13) ──────────────────────
 
 /**
  * Check if a conditional GET request is "fresh" (resource not modified).
  *
- * Implements RFC 7232 Section 3.2 (If-None-Match) and Section 3.3
+ * Implements RFC 9110 Section 13.1.2 (If-None-Match) and Section 13.1.3
  * (If-Modified-Since). `If-None-Match` takes precedence per the spec.
  *
  * When this returns true, the server should respond with 304 Not Modified
@@ -532,70 +530,69 @@ function utf8ByteLength(s: string): number {
  * @param lastModified - Current resource Last-Modified date string
  */
 export function isConditionalFresh(
-  reqHeaders: { get(name: string): string | null },
-  etag: string | undefined,
-  lastModified: string | undefined,
+    reqHeaders: { get(name: string): string | null },
+    etag: string | undefined,
+    lastModified: string | undefined,
 ): boolean {
-  const ifNoneMatch = reqHeaders.get("if-none-match");
-  const ifModifiedSince = reqHeaders.get("if-modified-since");
+    const ifNoneMatch = reqHeaders.get("if-none-match");
+    const ifModifiedSince = reqHeaders.get("if-modified-since");
 
-  // No conditional headers -> not a conditional request
-  if (!ifNoneMatch && !ifModifiedSince) return false;
+    // No conditional headers -> not a conditional request
+    if (!ifNoneMatch && !ifModifiedSince) return false;
 
-  // Request `Cache-Control: no-cache` is deliberately IGNORED here.
-  // RFC 9111 aims that directive at caches, not origin
-  // conditional evaluation, and a 304 IS the end-to-end revalidation the
-  // client asked for. Critically, spec-compliant fetch clients (undici,
-  // browsers) auto-append `Cache-Control: no-cache` to any request carrying
-  // manual conditional headers -- honoring it would make 304 unreachable for
-  // every programmatic revalidation. Hard reloads need no special case: they
-  // omit the validators entirely, so this function already returns false.
+    // Request `Cache-Control: no-cache` is deliberately IGNORED here.
+    // RFC 9111 aims that directive at caches, not origin
+    // conditional evaluation, and a 304 IS the end-to-end revalidation the
+    // client asked for. Critically, spec-compliant fetch clients (undici,
+    // browsers) auto-append `Cache-Control: no-cache` to any request carrying
+    // manual conditional headers -- honoring it would make 304 unreachable for
+    // every programmatic revalidation. Hard reloads need no special case: they
+    // omit the validators entirely, so this function already returns false.
 
-  // If-None-Match takes precedence (RFC 7232 Section 6)
-  if (ifNoneMatch) {
-    // Wildcard: "a representation exists" (RFC 9110 Section 8.8.3).
-    // Must be checked before the !etag guard.
-    if (ifNoneMatch.trim() === "*") return true;
-    if (!etag) return false;
-    // Parse comma-separated list of ETags, compare each.
-    // Supports both strong and weak comparison (W/ prefix stripping).
-    const normalizedEtag = stripWeakPrefix(etag);
-    return parseETagList(ifNoneMatch).some(
-      (candidate) => stripWeakPrefix(candidate) === normalizedEtag,
-    );
-  }
-
-  // If-Modified-Since (only evaluated when If-None-Match is absent)
-  if (ifModifiedSince && lastModified) {
-    const modifiedDate = parseHttpSeconds(lastModified);
-    const sinceDate = parseRequestHttpSeconds(ifModifiedSince);
-    if (!isNaN(modifiedDate) && !isNaN(sinceDate)) {
-      // Future dates are ignored (evaluate to "modified"). RFC 9110
-      // Section 13.1.3 requires interpreting the timestamp "in terms of
-      // the origin server's clock", and a future date cannot be a
-      // timestamp this origin ever generated -- it is clock skew or a
-      // fabricated value. RFC 2616 Section 14.25 made ignoring it
-      // explicit; the conservative full response is kept here because a
-      // skewed future date would otherwise be "fresh" forever (every
-      // real Last-Modified compares <= to it, a permanent false 304).
-      if (sinceDate > Date.now()) return false;
-      return modifiedDate <= sinceDate;
+    // If-None-Match takes precedence (RFC 9110 Section 13.2.2)
+    if (ifNoneMatch) {
+        // Wildcard: "a representation exists" (RFC 9110 Section 8.8.3).
+        // Must be checked before the !etag guard.
+        if (ifNoneMatch.trim() === "*") return true;
+        etag = normalizeETag(etag);
+        if (!etag) return false;
+        // Parse comma-separated list of ETags, compare each.
+        // Supports both strong and weak comparison (W/ prefix stripping).
+        const normalizedEtag = stripWeakPrefix(etag);
+        return parseETagList(ifNoneMatch).some((candidate) => stripWeakPrefix(candidate) === normalizedEtag);
     }
-  }
 
-  return false;
+    // If-Modified-Since (only evaluated when If-None-Match is absent)
+    if (ifModifiedSince && lastModified) {
+        const modifiedDate = parseHttpSeconds(lastModified);
+        const sinceDate = parseRequestHttpSeconds(ifModifiedSince);
+        if (!isNaN(modifiedDate) && !isNaN(sinceDate)) {
+            // Future dates are ignored (evaluate to "modified"). RFC 9110
+            // Section 13.1.3 requires interpreting the timestamp "in terms of
+            // the origin server's clock", and a future date cannot be a
+            // timestamp this origin ever generated -- it is clock skew or a
+            // fabricated value. RFC 2616 Section 14.25 made ignoring it
+            // explicit; the conservative full response is kept here because a
+            // skewed future date would otherwise be "fresh" forever (every
+            // real Last-Modified compares <= to it, a permanent false 304).
+            if (sinceDate > Date.now()) return false;
+            return modifiedDate <= sinceDate;
+        }
+    }
+
+    return false;
 }
 
 /**
  * Check if a request's preconditions have failed.
  *
- * Implements RFC 7232 Section 3.1 (If-Match) and Section 3.4
+ * Implements RFC 9110 Section 13.1.1 (If-Match) and Section 13.1.4
  * (If-Unmodified-Since). `If-Match` takes precedence per the spec.
  *
  * When this returns true, the server MUST respond with 412 Precondition
  * Failed and skip processing the request body.
  *
- * Evaluation order per RFC 7232 Section 6:
+ * Evaluation order per RFC 9110 Section 13.2.2:
  *   1. isPreconditionFailure -> 412 (this function)
  *   2. isConditionalFresh    -> 304
  *   3. Process range / serve content
@@ -608,63 +605,62 @@ export function isConditionalFresh(
  *   metadata (e.g. the read orchestrator) should pass `true` explicitly.
  */
 export function isPreconditionFailure(
-  reqHeaders: { get(name: string): string | null },
-  etag: string | undefined,
-  lastModified: string | undefined,
-  exists?: boolean,
+    reqHeaders: { get(name: string): string | null },
+    etag: string | undefined,
+    lastModified: string | undefined,
+    exists?: boolean,
 ): boolean {
-  // If-Match (RFC 7232 Section 3.1)
-  const ifMatch = reqHeaders.get("if-match");
-  if (ifMatch) {
-    // RFC 9110 Section 13.1.1: "If-Match: *" is false when the server has
-    // no current representation. Existence is threaded from the caller;
-    // when omitted, inferred from etag presence.
-    if (ifMatch.trim() === "*") {
-      const present = exists ?? (etag !== undefined);
-      return !present;
+    // If-Match (RFC 9110 Section 13.1.1)
+    const ifMatch = reqHeaders.get("if-match");
+    if (ifMatch) {
+        // RFC 9110 Section 13.1.1: "If-Match: *" is false when the server has
+        // no current representation. Existence is threaded from the caller;
+        // when omitted, inferred from etag presence.
+        if (ifMatch.trim() === "*") {
+            const present = exists ?? etag !== undefined;
+            return !present;
+        }
+        // No server ETag -> precondition fails (cannot confirm match)
+        etag = normalizeETag(etag);
+        if (!etag) return true;
+        // Strong comparison only. RFC 9110 Section 13.1.1: "A recipient
+        // MUST use the strong comparison function when comparing entity-tags
+        // for If-Match." This means: (a) both sides must be strong validators
+        // (no W/ prefix), and (b) the quoted values must match exactly.
+        // If the server's ETag is weak, it cannot satisfy If-Match because
+        // a weak validator only asserts semantic equivalence, not byte equality.
+        if (etag.startsWith("W/")) return true;
+        const matches = parseETagList(ifMatch).some((candidate) => !candidate.startsWith("W/") && candidate === etag);
+        return !matches;
     }
-    // No server ETag -> precondition fails (cannot confirm match)
-    if (!etag) return true;
-    // Strong comparison only. RFC 9110 Section 13.1.1: "A recipient
-    // MUST use the strong comparison function when comparing entity-tags
-    // for If-Match." This means: (a) both sides must be strong validators
-    // (no W/ prefix), and (b) the quoted values must match exactly.
-    // If the server's ETag is weak, it cannot satisfy If-Match because
-    // a weak validator only asserts semantic equivalence, not byte equality.
-    if (etag.startsWith("W/")) return true;
-    const matches = parseETagList(ifMatch).some(
-      (candidate) => !candidate.startsWith("W/") && candidate === etag,
-    );
-    return !matches;
-  }
 
-  // If-Unmodified-Since (RFC 7232 Section 3.4)
-  // Only evaluated when If-Match is absent.
-  const ifUnmodifiedSince = reqHeaders.get("if-unmodified-since");
-  if (ifUnmodifiedSince) {
-    // RFC 9110 Section 13.1.4: "A recipient MUST ignore the
-    // If-Unmodified-Since header field if the resource does not have
-    // a modification date available." No date = ignore = no failure.
-    if (!lastModified) return false;
-    const modifiedDate = parseHttpSeconds(lastModified);
-    const sinceDate = parseRequestHttpSeconds(ifUnmodifiedSince);
-    if (!isNaN(modifiedDate) && !isNaN(sinceDate)) {
-      // Precondition fails if the resource was modified after the client's date
-      return modifiedDate > sinceDate;
+    // If-Unmodified-Since (RFC 9110 Section 13.1.4)
+    // Only evaluated when If-Match is absent.
+    const ifUnmodifiedSince = reqHeaders.get("if-unmodified-since");
+    if (ifUnmodifiedSince) {
+        // RFC 9110 Section 13.1.4: "A recipient MUST ignore the
+        // If-Unmodified-Since header field if the resource does not have
+        // a modification date available." No date = ignore = no failure.
+        if (!lastModified) return false;
+        const modifiedDate = parseHttpSeconds(lastModified);
+        const sinceDate = parseRequestHttpSeconds(ifUnmodifiedSince);
+        if (!isNaN(modifiedDate) && !isNaN(sinceDate)) {
+            // Precondition fails if the resource was modified after the client's date
+            return modifiedDate > sinceDate;
+        }
+        // RFC 9110 Section 13.1.4: "A recipient MUST ignore the
+        // If-Unmodified-Since header field if the received field-value
+        // is not a valid HTTP-date." Unparseable dates are ignored.
+        return false;
     }
-    // RFC 9110 Section 13.1.4: "A recipient MUST ignore the
-    // If-Unmodified-Since header field if the received field-value
-    // is not a valid HTTP-date." Unparseable dates are ignored.
+
     return false;
-  }
-
-  return false;
 }
 
 /**
  * Check if a Range request's `If-Range` precondition is "fresh".
  *
- * RFC 7233 Section 3.2: If the client sends `If-Range`, the server MUST
+ * RFC 9110 Section 13.1.5: If the client sends `If-Range`, the server MUST
  * only honor the Range when the validator matches. If it doesn't match,
  * the resource has changed since the client cached it, so serving a partial
  * response would result in data corruption (new bytes appended to old content).
@@ -677,49 +673,50 @@ export function isPreconditionFailure(
  * @param lastModified - Current resource Last-Modified date string
  */
 export function isRangeFresh(
-  reqHeaders: { get(name: string): string | null },
-  etag: string | undefined,
-  lastModified: string | undefined,
+    reqHeaders: { get(name: string): string | null },
+    etag: string | undefined,
+    lastModified: string | undefined,
 ): boolean {
-  const ifRange = reqHeaders.get("if-range");
+    const ifRange = reqHeaders.get("if-range");
 
-  // No If-Range header -> range is always fresh (honor the Range)
-  if (!ifRange) return true;
+    // No If-Range header -> range is always fresh (honor the Range)
+    if (!ifRange) return true;
 
-  // If-Range as ETag (contains a quote character)
-  if (ifRange.includes('"')) {
-    if (!etag) return false;
-    const client = ifRange.trim();
-    // RFC 7233 Section 3.2: If-Range requires a STRONG validator. If either
-    // side is weak, the representations may be byte-different, so honoring
-    // the range could splice mismatched bytes onto the client's cached body.
-    if (client.startsWith("W/") || etag.startsWith("W/")) return false;
-    return client === etag; // both strong: exact quoted match, no W/ stripping
-  }
-
-  // If-Range as HTTP-date. RFC 9110 Section 13.1.5 evaluation:
-  //   1. "If the HTTP-date validator provided is not a strong validator in
-  //      the sense defined by Section 8.8.2.2, the condition is false."
-  //   2. The condition is true only if the date EXACTLY matches the
-  //      representation's Last-Modified. A lenient `<=` would honor the
-  //      range when the current Last-Modified is older than the client's
-  //      cached date (clock skew, restored backup), even though the bytes
-  //      may differ -- splicing corrupted content.
-  // Step 1 is implemented with the Section 8.8.2.2 one-second rule: the
-  // Last-Modified second must have fully elapsed, otherwise the
-  // representation could have been written twice within it (two different
-  // byte sequences sharing one validator) and honoring the range could
-  // splice bytes across them.
-  if (lastModified) {
-    const lastMod = parseHttpSeconds(lastModified);
-    const ifRangeDate = parseRequestHttpSeconds(ifRange);
-    if (!isNaN(lastMod) && !isNaN(ifRangeDate)) {
-      return lastMod === ifRangeDate && Date.now() - lastMod >= 1000;
+    // If-Range as ETag (contains a quote character)
+    if (ifRange.includes('"')) {
+        etag = normalizeETag(etag);
+        if (!etag) return false;
+        const client = ifRange.trim();
+        // RFC 9110 Section 13.1.5: If-Range requires a STRONG validator. If either
+        // side is weak, the representations may be byte-different, so honoring
+        // the range could splice mismatched bytes onto the client's cached body.
+        if (client.startsWith("W/") || etag.startsWith("W/")) return false;
+        return client === etag; // both strong: exact quoted match, no W/ stripping
     }
-  }
 
-  // Cannot validate -> ignore the range (return full resource)
-  return false;
+    // If-Range as HTTP-date. RFC 9110 Section 13.1.5 evaluation:
+    //   1. "If the HTTP-date validator provided is not a strong validator in
+    //      the sense defined by Section 8.8.2.2, the condition is false."
+    //   2. The condition is true only if the date EXACTLY matches the
+    //      representation's Last-Modified. A lenient `<=` would honor the
+    //      range when the current Last-Modified is older than the client's
+    //      cached date (clock skew, restored backup), even though the bytes
+    //      may differ -- splicing corrupted content.
+    // Step 1 is implemented with the Section 8.8.2.2 one-second rule: the
+    // Last-Modified second must have fully elapsed, otherwise the
+    // representation could have been written twice within it (two different
+    // byte sequences sharing one validator) and honoring the range could
+    // splice bytes across them.
+    if (lastModified) {
+        const lastMod = parseHttpSeconds(lastModified);
+        const ifRangeDate = parseRequestHttpSeconds(ifRange);
+        if (!isNaN(lastMod) && !isNaN(ifRangeDate)) {
+            return lastMod === ifRangeDate && Date.now() - lastMod >= 1000;
+        }
+    }
+
+    // Cannot validate -> ignore the range (return full resource)
+    return false;
 }
 
 // ─── Response Builder ───────────────────────────────────────────────────────
@@ -728,7 +725,7 @@ export function isRangeFresh(
  * Build HTTP response headers for a full or partial content response.
  *
  * Always includes `Accept-Ranges: bytes` to advertise range support
- * (even on 200 responses, per RFC 7233 Section 2.3).
+ * (even on 200 responses, per RFC 9110 Section 14.3).
  *
  * Handles:
  *   - 200 OK (full content, when range is null)
@@ -740,92 +737,63 @@ export function isRangeFresh(
  * @returns Status code and headers dict ready to pass to `new Response()`.
  */
 export function buildRangeResponseHeaders(opts: RangeResponseHeaderOpts): RangeResponseHeaders {
-  const { totalSize, range, contentType, etag, lastModified, digest, cacheControl, contentDigest, reprDigest } = opts;
+    const { totalSize, range, contentType, etag, lastModified, digest, cacheControl, contentDigest, reprDigest } = opts;
 
-  // Validate totalSize to prevent invalid Content-Length / Content-Range headers.
-  // Content-Length MUST be a non-negative integer (RFC 9110 Section 8.6).
-  // `undefined` is the unknown-total sentinel (`bytes a-b/*`); it is only
-  // admissible on a partial response and is re-checked on the 200 path below.
-  if (totalSize !== undefined && (!Number.isSafeInteger(totalSize) || totalSize < 0)) {
-    throw new RangeError(
-      `buildRangeResponseHeaders: totalSize must be a non-negative safe integer or undefined, got ${totalSize}`,
-    );
-  }
+    // Validate totalSize to prevent invalid Content-Length / Content-Range headers.
+    // Content-Length MUST be a non-negative integer (RFC 9110 Section 8.6).
+    // `undefined` is the unknown-total sentinel (`bytes a-b/*`); it is only
+    // admissible on a partial response and is re-checked on the 200 path below.
+    if (totalSize !== undefined) assertTotalSize("buildRangeResponseHeaders", totalSize);
 
-  const headers: Record<string, string> = {};
+    const headers: Record<string, string> = {};
 
-  // Always advertise range support
-  headers["Accept-Ranges"] = "bytes";
+    // Always advertise range support
+    headers["Accept-Ranges"] = "bytes";
 
-  if (contentType) {
-    // MIME types commonly originate from stored upload metadata
-    // (attacker-influenced at upload time); header-sanitize like every
-    // other metadata-derived value.
-    headers["Content-Type"] = sanitizeHeaderValue(contentType);
-  }
-
-  if (etag) {
-    headers["ETag"] = sanitizeHeaderValue(etag);
-  }
-
-  if (lastModified) {
-    // Strip CRLF from raw fallback to prevent header injection on unparseable dates
-    headers["Last-Modified"] = toHttpDate(lastModified) ?? sanitizeHeaderValue(lastModified);
-  }
-
-  // RFC 9530: Repr-Digest covers the full representation; Content-Digest
-  // equals it only on a full-body response. Each field is gated by its own
-  // Want-* negotiation (Section 4), independently of the other.
-  if (digest) {
-    emitDigestFields(
-      headers,
-      digest,
-      reprDigest !== false,
-      range === null && contentDigest !== false,
-    );
-  }
-
-  if (range) {
-    // Reject bounds the parser could never produce: non-integer or unordered
-    // positions, an end at/past a known total, or the OPEN_ENDED sentinel
-    // reaching serialization (adapters must resolve it to served bounds
-    // first -- emitting it would put a 16-digit last-byte-pos on the wire).
-    if (
-      !Number.isSafeInteger(range.start) || !Number.isSafeInteger(range.end)
-      || range.start < 0 || range.start > range.end
-      || (totalSize !== undefined ? range.end >= totalSize : range.end === OPEN_ENDED)
-    ) {
-      throw new RangeError(
-        `buildRangeResponseHeaders: invalid range ${range.start}-${range.end} `
-        + `for totalSize ${totalSize ?? "*"}`,
-      );
+    if (contentType) {
+        // MIME types commonly originate from stored upload metadata
+        // (attacker-influenced at upload time): a value off the media-type
+        // grammar is replaced, never emitted.
+        headers["Content-Type"] = resolveMediaType(contentType).value;
     }
-    // 206 Partial Content. The body length is the range span, so an unknown
-    // total is emitted honestly as `*` (RFC 7233 Section 4.2) rather than a
-    // fabricated number.
-    const rangeLength = range.end - range.start + 1;
-    headers["Content-Length"] = String(rangeLength);
-    headers["Content-Range"] = `bytes ${range.start}-${range.end}/${totalSize ?? "*"}`;
-    if (cacheControl) headers["Cache-Control"] = sanitizeHeaderValue(cacheControl);
-    return { status: 206, headers };
-  }
 
-  // 200 OK (full content) -- a bodyful full response cannot be sized without a
-  // known total, so the unknown sentinel is an adapter bug on this path.
-  if (totalSize === undefined) {
-    throw new RangeError(
-      "buildRangeResponseHeaders: a full (non-range) response requires a known totalSize",
-    );
-  }
-  headers["Content-Length"] = String(totalSize);
-  if (cacheControl) headers["Cache-Control"] = sanitizeHeaderValue(cacheControl);
-  return { status: 200, headers };
+    setValidators(headers, etag, lastModified);
+
+    // RFC 9530: Repr-Digest covers the full representation; Content-Digest
+    // equals it only on a full-body response. Each field is gated by its own
+    // Want-* negotiation (Section 4), independently of the other.
+    if (digest) {
+        emitDigestFields(headers, digest, reprDigest !== false, range === null && contentDigest !== false);
+    }
+
+    if (range) {
+        // OPEN_ENDED must be resolved to served bounds before serialization;
+        // emitting it would put a 16-digit last-byte-pos on the wire.
+        assertServedRange("buildRangeResponseHeaders", range, totalSize);
+        // 206 Partial Content. The body length is the range span, so an unknown
+        // total is emitted honestly as `*` (RFC 9110 Section 14.4) rather than a
+        // fabricated number.
+        const rangeLength = range.end - range.start + 1;
+        headers["Content-Length"] = String(rangeLength);
+        headers["Content-Range"] = `bytes ${range.start}-${range.end}/${totalSize ?? "*"}`;
+        if (cacheControl) headers["Cache-Control"] = sanitizeHeaderValue(cacheControl);
+        return { status: 206, headers };
+    }
+
+    // 200 OK (full content) -- a bodyful full response cannot be sized without a
+    // known total, so the unknown sentinel is an adapter bug on this path.
+    if (totalSize === undefined) {
+        throw new RangeError("buildRangeResponseHeaders: a full (non-range) response requires a known totalSize");
+    }
+    headers["Content-Length"] = String(totalSize);
+    if (cacheControl) headers["Cache-Control"] = sanitizeHeaderValue(cacheControl);
+    return { status: 200, headers };
 }
 
 /**
  * Build 416 Range Not Satisfiable response headers.
  *
- * Per RFC 7233 Section 4.4, the response MUST include a Content-Range
+ * Per RFC 9110 Section 15.5.17, the response MUST include a Content-Range
  * header with the unsatisfied-range syntax: `bytes * /totalSize`.
  *
  * Deliberately omits ETag, Last-Modified, and Content-Type. These are
@@ -833,42 +801,38 @@ export function buildRangeResponseHeaders(opts: RangeResponseHeaderOpts): RangeR
  * on error responses can poison shared caches.
  */
 export function build416Headers(totalSize: number): RangeResponseHeaders {
-  // Same corrupt-metadata guard as the sibling builders: NaN, Infinity,
-  // negative, or fractional sizes would serialize a grammar-invalid
-  // `Content-Range: bytes */NaN` (complete-length = 1*DIGIT).
-  if (!Number.isSafeInteger(totalSize) || totalSize < 0) {
-    throw new RangeError(
-      `build416Headers: totalSize must be a non-negative safe integer, got ${totalSize}`,
-    );
-  }
-  return {
-    status: 416,
-    headers: {
-      "Accept-Ranges": "bytes",
-      "Content-Range": `bytes */${totalSize}`,
-      "Content-Length": "0",
-    },
-  };
+    // Same corrupt-metadata guard as the sibling builders: NaN, Infinity,
+    // negative, or fractional sizes would serialize a grammar-invalid
+    // `Content-Range: bytes */NaN` (complete-length = 1*DIGIT).
+    assertTotalSize("build416Headers", totalSize);
+    return {
+        status: 416,
+        headers: {
+            "Accept-Ranges": "bytes",
+            "Content-Range": `bytes */${totalSize}`,
+            "Content-Length": "0",
+        },
+    };
 }
 
 // ─── Content-Range Parser ───────────────────────────────────────────────────
 
 /** Result of parsing a Content-Range response header. */
 export interface ParsedContentRange {
-  /** First byte of the range (inclusive, 0-indexed). */
-  start: number;
-  /** Last byte of the range (inclusive). */
-  end: number;
-  /** Total size of the complete representation. */
-  totalSize: number;
+    /** First byte of the range (inclusive, 0-indexed). */
+    start: number;
+    /** Last byte of the range (inclusive). */
+    end: number;
+    /** Total size of the complete representation, or `undefined` for `*` (unknown). */
+    totalSize: number | undefined;
 }
 
 /**
  * Parse a `Content-Range` response header into structured fields.
  *
- * Understands the two RFC 7233 Section 4.2 forms:
+ * Understands the two RFC 9110 Section 14.4 forms:
  *   - `bytes 0-499/1000` (byte range with known total)
- *   - `bytes 0-499/*`    (byte range with unknown total, returns `totalSize: -1`)
+ *   - `bytes 0-499/*`    (byte range with unknown total, returns `totalSize: undefined`)
  *
  * The unsatisfied-range form (`bytes * /1000`) is NOT parsed because it carries
  * no range information -- callers should check the HTTP status (416) instead.
@@ -891,57 +855,48 @@ export interface ParsedContentRange {
  * // => { start: 0, end: 499, totalSize: 1000 }
  *
  * const unknown = parseContentRange("bytes 0-499/*");
- * // => { start: 0, end: 499, totalSize: -1 }
+ * // => { start: 0, end: 499, totalSize: undefined }
  * ```
  */
-export function parseContentRange(
-  header: string | null | undefined,
-): ParsedContentRange | null {
-  if (!header) return null;
+export function parseContentRange(header: string | null | undefined): ParsedContentRange | null {
+    if (!header) return null;
 
-  // RFC 7233 Section 4.2: content-range = byte-content-range / other-content-range
-  // byte-content-range = bytes-unit SP ( byte-range-resp / unsatisfied-range )
-  // Case-insensitive unit per RFC 9110 Section 14.1.
-  const lower = header.toLowerCase();
-  if (!lower.startsWith("bytes ")) return null;
+    // RFC 9110 Section 14.4: Content-Range = range-unit SP ( range-resp /
+    // unsatisfied-range ), where range-resp = incl-range "/" ( complete-length
+    // / "*" ). Case-insensitive unit per RFC 9110 Section 14.1.
+    const lower = header.toLowerCase();
+    if (!lower.startsWith("bytes ")) return null;
 
-  const spec = header.slice(6); // Strip "bytes "
+    const spec = header.slice(6); // Strip "bytes "
 
-  // Reject unsatisfied-range form: "bytes */1000"
-  if (spec.startsWith("*")) return null;
+    // Reject unsatisfied-range form: "bytes */1000"
+    if (spec.startsWith("*")) return null;
 
-  // Parse "start-end/total" or "start-end/*"
-  const slashIdx = spec.indexOf("/");
-  if (slashIdx === -1) return null;
+    // Parse "start-end/total" or "start-end/*"
+    const slashIdx = spec.indexOf("/");
+    if (slashIdx === -1) return null;
 
-  const rangePart = spec.slice(0, slashIdx).trim();
-  const totalPart = spec.slice(slashIdx + 1).trim();
+    const rangePart = spec.slice(0, slashIdx).trim();
+    const totalPart = spec.slice(slashIdx + 1).trim();
 
-  const dashIdx = rangePart.indexOf("-");
-  if (dashIdx === -1) return null;
+    const dashIdx = rangePart.indexOf("-");
+    if (dashIdx === -1) return null;
 
-  const startStr = rangePart.slice(0, dashIdx).trim();
-  const endStr = rangePart.slice(dashIdx + 1).trim();
+    const startStr = rangePart.slice(0, dashIdx).trim();
+    const endStr = rangePart.slice(dashIdx + 1).trim();
 
-  if (!startStr || !endStr) return null;
+    if (!startStr || !endStr) return null;
 
-  const start = parseStrictInt(startStr);
-  const end = parseStrictInt(endStr);
-  if (isNaN(start) || isNaN(end)) return null;
-  if (start > end) return null;
+    const start = parseStrictInt(startStr);
+    const end = parseStrictInt(endStr);
+    if (isNaN(start) || isNaN(end)) return null;
+    if (start > end) return null;
 
-  // Total: "*" means unknown (use -1 sentinel), otherwise must be a valid integer.
-  let totalSize: number;
-  if (totalPart === "*") {
-    totalSize = -1;
-  } else {
-    totalSize = parseStrictInt(totalPart);
-    if (isNaN(totalSize) || totalSize < 0) return null;
-    // Sanity: end must be < totalSize when total is known.
-    if (end >= totalSize) return null;
-  }
-
-  return { start, end, totalSize };
+    // Total: "*" means unknown, otherwise a valid integer the range ends inside.
+    if (totalPart === "*") return { start, end, totalSize: undefined };
+    const totalSize = parseStrictInt(totalPart);
+    if (isNaN(totalSize) || end >= totalSize) return null;
+    return { start, end, totalSize };
 }
 
 /**
@@ -952,16 +907,16 @@ export function parseContentRange(
  * same leniency is deliberate in the sibling range-spec parser.
  */
 function parseStrictInt(s: string): number {
-  if (!/^\d+$/.test(s)) return NaN;
-  const n = Number(s);
-  if (n > Number.MAX_SAFE_INTEGER) return NaN;
-  return n;
+    if (!/^\d+$/.test(s)) return NaN;
+    const n = Number(s);
+    if (n > Number.MAX_SAFE_INTEGER) return NaN;
+    return n;
 }
 
 /**
  * Build 412 Precondition Failed response headers.
  *
- * Per RFC 7232 Section 4.2, a 412 response indicates that one or more
+ * Per RFC 9110 Section 15.5.13, a 412 response indicates that one or more
  * conditions in the request headers (If-Match, If-Unmodified-Since)
  * evaluated to false.
  *
@@ -969,56 +924,51 @@ function parseStrictInt(s: string): number {
  * Content-Type) to prevent cache poisoning.
  */
 export function build412Headers(): RangeResponseHeaders {
-  return {
-    status: 412,
-    headers: {
-      // Explicit Content-Length: 0 for enterprise proxies (HAProxy, Envoy)
-      // that require it on bodyless responses to avoid chunked-encoding timeouts.
-      "Content-Length": "0",
-    },
-  };
+    return {
+        status: 412,
+        headers: {
+            // Explicit Content-Length: 0 for enterprise proxies (HAProxy, Envoy)
+            // that require it on bodyless responses to avoid chunked-encoding timeouts.
+            "Content-Length": "0",
+        },
+    };
 }
 
 /**
  * Build 304 Not Modified response headers.
  *
- * Per RFC 7232 Section 4.1, a 304 response MUST NOT contain a message
+ * Per RFC 9110 Section 15.4.5, a 304 response MUST NOT contain a message
  * body and SHOULD NOT include representation headers (Content-Type,
  * Content-Length, Content-Encoding, Content-Language, Content-Range).
  *
  * Only includes: ETag, Last-Modified, and Cache-Control.
  */
 export function build304Headers(
-  etag: string | undefined,
-  lastModified: string | undefined,
-  cacheControl?: string,
+    etag: string | undefined,
+    lastModified: string | undefined,
+    cacheControl?: string,
 ): RangeResponseHeaders {
-  const headers: Record<string, string> = {};
+    const headers: Record<string, string> = {};
 
-  if (etag) {
-    headers["ETag"] = sanitizeHeaderValue(etag);
-  }
-  // RFC 7232 Section 4.1: "a sender SHOULD NOT generate representation
-  // metadata other than the above listed fields unless said metadata exists
-  // for the purpose of guiding cache updates (e.g., Last-Modified might be
-  // useful if the response does not have an ETag field)."
-  // When ETag is present, Last-Modified is redundant (ETag is the stronger
-  // validator). Omitting it reduces 304 size (RFC 9110 Section 15.4.5 asks a
-  // 304 sender for representation metadata only for cache-update purposes).
-  if (lastModified && !etag) {
-    headers["Last-Modified"] = toHttpDate(lastModified) ?? sanitizeHeaderValue(lastModified);
-  }
-  if (cacheControl) {
-    headers["Cache-Control"] = sanitizeHeaderValue(cacheControl);
-  }
+    // RFC 9110 Section 15.4.5: "a sender SHOULD NOT generate representation
+    // metadata other than the above listed fields unless said metadata exists
+    // for the purpose of guiding cache updates (e.g., Last-Modified might be
+    // useful if the response does not have an ETag field)."
+    // When ETag is present, Last-Modified is redundant (ETag is the stronger
+    // validator), so it is emitted only on a 304 that carries no ETag.
+    const tag = normalizeETag(etag);
+    setValidators(headers, tag, tag ? undefined : lastModified);
+    if (cacheControl) {
+        headers["Cache-Control"] = sanitizeHeaderValue(cacheControl);
+    }
 
-  return { status: 304, headers };
+    return { status: 304, headers };
 }
 
 /**
  * Evaluate a conditional request and return the correct HTTP response.
  *
- * Implements the full RFC 7232 Section 6 evaluation chain in the correct
+ * Implements the full RFC 9110 Section 13.2.2 evaluation chain in the correct
  * order. This is the recommended entry point for most consumers -- it
  * eliminates the risk of misordering the evaluation steps.
  *
@@ -1043,118 +993,79 @@ export function build304Headers(
  * @returns Status, headers, and the parsed range (null if full content or error status).
  */
 export function evaluateConditionalRequest(
-  reqHeaders: { get(name: string): string | null },
-  meta: {
-    totalSize: number;
-    contentType?: string;
-    etag?: string;
-    lastModified?: string;
-    cacheControl?: string;
-    /** RFC 9530 SHA-256 digest (raw base64, no prefix). Emitted as `Repr-Digest` on 200/206. */
-    digest?: string;
-  },
-  opts?: {
-    /**
-     * Request method this evaluation answers. Range/If-Range are honored
-     * only for `"GET"`; `"HEAD"` additionally suppresses `Content-Digest`.
-     * Only these two methods have read-conditional semantics: writes go
-     * through `evaluateConditionalWrite`, whose 412 rules differ.
-     * @default "GET"
-     */
-    method?: "GET" | "HEAD";
-  },
+    reqHeaders: { get(name: string): string | null },
+    meta: {
+        totalSize: number;
+        contentType?: string;
+        etag?: string;
+        lastModified?: string;
+        cacheControl?: string;
+        /** RFC 9530 SHA-256 digest (raw base64, no prefix). Emitted as `Repr-Digest` on 200/206. */
+        digest?: string;
+    },
+    opts?: {
+        /**
+         * Request method this evaluation answers. Range/If-Range are honored
+         * only for `"GET"`; `"HEAD"` additionally suppresses `Content-Digest`.
+         * Only these two methods have read-conditional semantics: writes go
+         * through `evaluateConditionalWrite`, whose 412 rules differ.
+         * @default "GET"
+         */
+        method?: "GET" | "HEAD";
+    },
 ): EvaluatedRequest {
-  // Guard against corrupt metadata from storage adapters. NaN, Infinity,
-  // negative, or fractional sizes would produce invalid Content-Range /
-  // Content-Length headers. Content-Length MUST be a non-negative integer
-  // (RFC 9110 Section 8.6). Fail loudly so the caller notices the adapter bug.
-  if (!Number.isSafeInteger(meta.totalSize) || meta.totalSize < 0) {
-    throw new RangeError(
-      `evaluateConditionalRequest: totalSize must be a non-negative safe integer, got ${meta.totalSize}`,
-    );
-  }
-  // Pre-compute the HTTP-date once. toHttpDate calls Date.parse + toUTCString
-  // which together cost ~190ns. Without caching, the orchestrator would call
-  // it up to 4 times on the same string (isPreconditionFailure,
-  // isConditionalFresh, isRangeFresh, and the final header builder).
-  const httpDate = meta.lastModified ? toHttpDate(meta.lastModified) : undefined;
-  // Use the normalized IMF-fixdate for all downstream calls.
-  // If toHttpDate returned undefined (unparseable), fall back to sanitized
-  // raw string. This matches the standalone builders (build304Headers,
-  // buildRangeResponseHeaders) which apply the same sanitizeHeaderValue on
-  // their fallback path.
-  const normalizedLastModified = httpDate ?? (meta.lastModified ? sanitizeHeaderValue(meta.lastModified) : undefined);
+    // Guard against corrupt metadata from storage adapters. NaN, Infinity,
+    // negative, or fractional sizes would produce invalid Content-Range /
+    // Content-Length headers. Content-Length MUST be a non-negative integer
+    // (RFC 9110 Section 8.6). Fail loudly so the caller notices the adapter bug.
+    assertTotalSize("evaluateConditionalRequest", meta.totalSize);
+    // The predicates and builders normalize the entity-tag and Last-Modified
+    // identically (normalizeETag, httpLastModified / parseHttpSeconds), so
+    // what is compared is what is emitted.
+    const { etag, lastModified, cacheControl } = meta;
 
-  // Step 1: Preconditions (If-Match / If-Unmodified-Since)
-  // Pass exists: true because metadata was already fetched (the resource exists).
-  if (isPreconditionFailure(reqHeaders, meta.etag, normalizedLastModified, true)) {
-    return { ...build412Headers(), range: null };
-  }
-
-  // Step 2: Freshness (If-None-Match / If-Modified-Since)
-  if (isConditionalFresh(reqHeaders, meta.etag, normalizedLastModified)) {
-    // Pass pre-formatted date directly to avoid another toHttpDate call.
-    const headers: Record<string, string> = {};
-    if (meta.etag) headers["ETag"] = sanitizeHeaderValue(meta.etag);
-    // RFC 7232 Section 4.1: omit Last-Modified when ETag is present (see build304Headers).
-    if (normalizedLastModified && !meta.etag) headers["Last-Modified"] = normalizedLastModified;
-    if (meta.cacheControl) headers["Cache-Control"] = sanitizeHeaderValue(meta.cacheControl);
-    return { status: 304, headers, range: null };
-  }
-
-  // Step 3-4: Range validation and parsing. RFC 9110 Section 14.2: range
-  // handling is defined only for GET; a server MUST ignore Range (and with
-  // it If-Range, Section 13.1.5) for any other method.
-  const method = (opts?.method ?? "GET").toUpperCase();
-  const rangeHeader = method === "GET" ? reqHeaders.get("range") : null;
-  const rangeFresh = rangeHeader !== null
-    && isRangeFresh(reqHeaders, meta.etag, normalizedLastModified);
-  const parsed = rangeFresh && rangeHeader
-    ? parseRangeHeader(rangeHeader, meta.totalSize)
-    : null;
-
-  // Step 5: Build response
-  if (parsed === "unsatisfiable") {
-    return { ...build416Headers(meta.totalSize), range: null };
-  }
-
-  // Inline the header building to avoid another toHttpDate call inside
-  // buildRangeResponseHeaders.
-  const headers: Record<string, string> = {};
-  headers["Accept-Ranges"] = "bytes";
-  if (meta.contentType) headers["Content-Type"] = sanitizeHeaderValue(meta.contentType);
-  if (meta.etag) headers["ETag"] = sanitizeHeaderValue(meta.etag);
-  if (normalizedLastModified) headers["Last-Modified"] = normalizedLastModified;
-
-  // RFC 9530: Repr-Digest and Content-Digest. Each field is emitted only
-  // when its own Want-* member accepts sha-256 (absent header = accept);
-  // the two negotiate independently, so a declined Repr-Digest never
-  // suppresses a wanted Content-Digest. Content-Digest additionally
-  // requires a full GET response (a 206 slice and an empty HEAD body both
-  // diverge from the representation digest).
-  if (meta.digest) {
-    const wantRepr = clientWantsDigest(reqHeaders);
-    const wantContent = parsed === null
-      && method !== "HEAD"
-      && clientWantsContentDigest(reqHeaders);
-    if (wantRepr || wantContent) {
-      emitDigestFields(headers, meta.digest, wantRepr, wantContent);
+    // Step 1: Preconditions (If-Match / If-Unmodified-Since)
+    // Pass exists: true because metadata was already fetched (the resource exists).
+    if (isPreconditionFailure(reqHeaders, etag, lastModified, true)) {
+        return { ...build412Headers(), range: null };
     }
-  }
 
-  // Emit Cache-Control on 200/206 (not only 304) so standalone orchestrator
-  // consumers get complete response headers without a framework adapter.
-  if (meta.cacheControl) headers["Cache-Control"] = sanitizeHeaderValue(meta.cacheControl);
+    // Step 2: Freshness (If-None-Match / If-Modified-Since)
+    if (isConditionalFresh(reqHeaders, etag, lastModified)) {
+        return { ...build304Headers(etag, lastModified, cacheControl), range: null };
+    }
 
-  if (parsed) {
-    const rangeLength = parsed.end - parsed.start + 1;
-    headers["Content-Length"] = String(rangeLength);
-    headers["Content-Range"] = `bytes ${parsed.start}-${parsed.end}/${meta.totalSize}`;
-    return { status: 206, headers, range: parsed };
-  }
+    // Step 3-4: Range validation and parsing. RFC 9110 Section 14.2: range
+    // handling is defined only for GET; a server MUST ignore Range (and with
+    // it If-Range, Section 13.1.5) for any other method.
+    const method = (opts?.method ?? "GET").toUpperCase();
+    const rangeHeader = method === "GET" ? reqHeaders.get("range") : null;
+    const rangeFresh = rangeHeader !== null && isRangeFresh(reqHeaders, etag, lastModified);
+    const parsed = rangeFresh && rangeHeader ? parseRangeHeader(rangeHeader, meta.totalSize) : null;
 
-  headers["Content-Length"] = String(meta.totalSize);
-  return { status: 200, headers, range: parsed };
+    // Step 5: Build response
+    if (parsed === "unsatisfiable") {
+        return { ...build416Headers(meta.totalSize), range: null };
+    }
+
+    // RFC 9530: Repr-Digest and Content-Digest negotiate independently (each
+    // by its own Want-* field); Content-Digest additionally needs a full GET
+    // body, since a 206 slice and an empty HEAD body both diverge from the
+    // representation digest.
+    return {
+        ...buildRangeResponseHeaders({
+            totalSize: meta.totalSize,
+            range: parsed,
+            contentType: meta.contentType,
+            etag,
+            lastModified,
+            digest: meta.digest,
+            reprDigest: clientWantsDigest(reqHeaders),
+            contentDigest: method !== "HEAD" && clientWantsContentDigest(reqHeaders),
+            cacheControl,
+        }),
+        range: parsed,
+    };
 }
 
 // ─── Write-Side Orchestrator ────────────────────────────────────────────────
@@ -1164,11 +1075,12 @@ export function evaluateConditionalRequest(
  *
  * Discriminated union on `proceed`:
  * - `{ proceed: true }` -- safe to execute the write.
- * - `{ proceed: false, status: 412, headers }` -- return 412 to the client.
+ * - `{ proceed: false, status, headers }` -- answer with `status`. This
+ *   function produces 412; `428` (RFC 6585 Section 3, Precondition Required)
+ *   is in the union for a caller that refuses an unconditional write, and the
+ *   union may gain a member in a minor release.
  */
-export type EvaluatedWrite =
-  | { proceed: true }
-  | { proceed: false; status: 412; headers: Record<string, string> };
+export type EvaluatedWrite = { proceed: true } | { proceed: false; status: 412 | 428; headers: Record<string, string> };
 
 /**
  * Evaluate conditional headers for a **write** request (PUT, PATCH, DELETE).
@@ -1209,72 +1121,68 @@ export type EvaluatedWrite =
  * @param meta - Current resource state
  */
 export function evaluateConditionalWrite(
-  reqHeaders: { get(name: string): string | null },
-  meta: {
-    etag?: string;
-    lastModified?: string;
-    /**
-     * Whether the target resource currently exists. Used to evaluate
-     * `If-None-Match: *` (PUT-if-absent / create-only pattern).
-     *
-     * When omitted, existence is inferred from `etag !== undefined`.
-     */
-    exists?: boolean;
-  },
-): EvaluatedWrite {
-  // Normalize lastModified once, same pattern as the read orchestrator.
-  const httpDate = meta.lastModified ? toHttpDate(meta.lastModified) : undefined;
-  const normalizedLastModified = httpDate ?? (meta.lastModified ? sanitizeHeaderValue(meta.lastModified) : undefined);
-
-  // Helper: build 412 headers, including the current ETag when available
-  // so the client can resync without a follow-up GET.
-  const make412 = (): EvaluatedWrite => ({
-    proceed: false,
-    status: 412 as const,
-    headers: {
-      "Content-Length": "0",
-      ...(meta.etag ? { ETag: sanitizeHeaderValue(meta.etag) } : {}),
+    reqHeaders: { get(name: string): string | null },
+    meta: {
+        etag?: string;
+        lastModified?: string;
+        /**
+         * Whether the target resource currently exists. Used to evaluate
+         * `If-None-Match: *` (PUT-if-absent / create-only pattern).
+         *
+         * When omitted, existence is inferred from `etag !== undefined`.
+         */
+        exists?: boolean;
     },
-  });
+): EvaluatedWrite {
+    const etag = normalizeETag(meta.etag);
 
-  // Step 1: If-Match / If-Unmodified-Since -> 412
-  // Thread existence so If-Match:* is evaluated correctly.
-  if (isPreconditionFailure(reqHeaders, meta.etag, normalizedLastModified, meta.exists)) {
-    return make412();
-  }
+    // Helper: build 412 headers, including the current ETag when available
+    // so the client can resync without a follow-up GET.
+    const make412 = (): EvaluatedWrite => ({
+        proceed: false,
+        status: 412 as const,
+        headers: {
+            "Content-Length": "0",
+            ...(etag ? { ETag: etag } : {}),
+        },
+    });
 
-  // Step 2: If-None-Match -> 412 (NOT 304)
-  // RFC 9110 Section 13.1.2: "if the request method is not GET or HEAD,
-  // the server MUST respond with a 412 (Precondition Failed) status code."
-  const ifNoneMatch = reqHeaders.get("if-none-match");
-  if (ifNoneMatch) {
-    if (ifNoneMatch.trim() === "*") {
-      // Create-only. If existence is genuinely unknowable, FAIL CLOSED.
-      // A loud error beats a silent overwrite of an existing resource.
-      if (meta.exists === undefined && meta.etag === undefined) {
-        throw new Error(
-          "evaluateConditionalWrite: 'If-None-Match: *' (create-only) requires a known " +
-          "existence state. Pass meta.exists explicitly -- refusing to guess and risk " +
-          "overwriting an existing resource.",
-        );
-      }
-      const resourceExists = meta.exists ?? (meta.etag !== undefined);
-      if (resourceExists) {
+    // Step 1: If-Match / If-Unmodified-Since -> 412
+    // Thread existence so If-Match:* is evaluated correctly.
+    if (isPreconditionFailure(reqHeaders, meta.etag, meta.lastModified, meta.exists)) {
         return make412();
-      }
-    } else if (meta.etag) {
-      // Check if any client-provided ETag matches the current resource.
-      const normalizedEtag = stripWeakPrefix(meta.etag);
-      const matches = parseETagList(ifNoneMatch).some(
-        (candidate) => stripWeakPrefix(candidate) === normalizedEtag,
-      );
-      if (matches) {
-        return make412();
-      }
     }
-  }
 
-  return { proceed: true };
+    // Step 2: If-None-Match -> 412 (NOT 304)
+    // RFC 9110 Section 13.1.2: "if the request method is not GET or HEAD,
+    // the server MUST respond with a 412 (Precondition Failed) status code."
+    const ifNoneMatch = reqHeaders.get("if-none-match");
+    if (ifNoneMatch) {
+        if (ifNoneMatch.trim() === "*") {
+            // Create-only. If existence is genuinely unknowable, FAIL CLOSED.
+            // A loud error beats a silent overwrite of an existing resource.
+            if (meta.exists === undefined && meta.etag === undefined) {
+                throw new Error(
+                    "evaluateConditionalWrite: 'If-None-Match: *' requires a known existence state; pass meta.exists",
+                );
+            }
+            const resourceExists = meta.exists ?? meta.etag !== undefined;
+            if (resourceExists) {
+                return make412();
+            }
+        } else if (etag) {
+            // Check if any client-provided ETag matches the current resource.
+            const normalizedEtag = stripWeakPrefix(etag);
+            const matches = parseETagList(ifNoneMatch).some(
+                (candidate) => stripWeakPrefix(candidate) === normalizedEtag,
+            );
+            if (matches) {
+                return make412();
+            }
+        }
+    }
+
+    return { proceed: true };
 }
 
 /**
@@ -1296,53 +1204,90 @@ export function evaluateConditionalWrite(
  * });
  * ```
  */
-export function fromNodeHeaders(
-  headers: Record<string, string | string[] | undefined>,
-): { get(name: string): string | null } {
-  // Normalize keys to lowercase at construction time so lookups
-  // work regardless of the caller's casing convention.
-  //
-  // Null prototype: header names are attacker-controlled and "__proto__"
-  // is a legal HTTP field name. On a plain object, assigning it would hit
-  // the prototype setter (an array value would REPLACE the prototype), and
-  // get("constructor") would return Object's constructor instead of null.
-  const lower: Record<string, string | string[] | undefined> = Object.create(null);
-  for (const key in headers) {
-    lower[key.toLowerCase()] = headers[key];
-  }
-  return {
-    get(name: string): string | null {
-      const val = lower[name.toLowerCase()];
-      if (val === undefined) return null;
-      // Node.js joins multi-value headers with ', ' for most headers,
-      // but some proxies pass arrays. Join to match HTTP semantics.
-      return Array.isArray(val) ? val.join(", ") : val;
-    },
-  };
+export function fromNodeHeaders(headers: Record<string, string | string[] | undefined>): {
+    get(name: string): string | null;
+} {
+    // Normalize keys to lowercase at construction time so lookups
+    // work regardless of the caller's casing convention.
+    //
+    // Null prototype: header names are attacker-controlled and "__proto__"
+    // is a legal HTTP field name. On a plain object, assigning it would hit
+    // the prototype setter (an array value would REPLACE the prototype), and
+    // get("constructor") would return Object's constructor instead of null.
+    const lower: Record<string, string | string[] | undefined> = Object.create(null);
+    for (const key in headers) {
+        lower[key.toLowerCase()] = headers[key];
+    }
+    return {
+        get(name: string): string | null {
+            const val = lower[name.toLowerCase()];
+            if (val === undefined) return null;
+            // Node.js joins multi-value headers with ', ' for most headers,
+            // but some proxies pass arrays. Join to match HTTP semantics.
+            return Array.isArray(val) ? val.join(", ") : val;
+        },
+    };
 }
 
 // ─── ETag Generation ────────────────────────────────────────────────────────
 
-/** Metadata from a storage backend used to derive an entity-tag. */
+/**
+ * Metadata from a storage backend used to derive an entity-tag.
+ *
+ * The field names are the ones an `ObjectStore` already reports, so a store's
+ * HEAD result is a valid argument on its own:
+ *
+ * ```typescript
+ * const etag = generateETag(await store.headObject(key));
+ * ```
+ *
+ * Properties beyond these three are ignored, which is what lets a whole
+ * `ObjectMetadata` be passed. `digest` is one of them, deliberately: an RFC
+ * 9530 `Repr-Digest` is a content digest of the representation, not the
+ * version identifier a backend maintains, and it is absent on most stores.
+ * When metadata carries both, `etag` decides the validator and `digest` is
+ * never read.
+ */
 export interface ETagSource {
-  /**
-   * Backend version identifier that changes whenever the stored bytes
-   * change (S3/Azure ETag, GCS hash). Yields a STRONG validator: strength
-   * requires exactly that property, not that the value is a content digest
-   * (an S3 multipart-upload ETag is not one, yet every rewrite changes it).
-   * Never pass a value that can stay constant across a byte change. May
-   * include surrounding quotes or a `W/` prefix, both of which are
-   * normalized.
-   */
-  hash?: string;
-  /** Object size in bytes. With `mtime`, yields a WEAK validator when no hash exists. */
-  size?: number;
-  /**
-   * Last-modified: `Date`, epoch-ms number, or any `Date.parse()`-able string.
-   * Floor to whole seconds for consistency with emitted `Last-Modified` headers.
-   */
-  mtime?: Date | number | string;
+    /**
+     * Backend version identifier that changes whenever the stored bytes
+     * change (S3/Azure ETag, GCS hash). Yields a STRONG validator: strength
+     * requires exactly that property, not that the value is a content digest
+     * (an S3 multipart-upload ETag is not one, yet every rewrite changes it).
+     * Never pass a value that can stay constant across a byte change. May
+     * include surrounding quotes or a `W/` prefix, both of which are
+     * normalized.
+     */
+    etag?: string;
+    /**
+     * Object size in bytes. With `lastModified`, yields a WEAK validator when
+     * no `etag` exists.
+     */
+    contentLength?: number;
+    /**
+     * Last-modified: `Date`, epoch-ms number, or any `Date.parse()`-able string.
+     * Floored to whole seconds for consistency with emitted `Last-Modified`
+     * headers.
+     */
+    lastModified?: Date | number | string;
 }
+
+/**
+ * Field names {@link generateETag} does not read, mapped to the
+ * {@link ETagSource} field that carries the same metadata.
+ *
+ * A JavaScript caller reaches `generateETag` with no compiler to check the
+ * shape, and each of these names reads as absent. The answer would then be no
+ * validator at all, or a weak `W/"<size>-<mtime>"` for a store that has a
+ * strong one: a cache-correctness failure with no error, refusing `If-Range`
+ * resumes and turning every `If-Match` write into a 412. Refusing the call
+ * makes it arrive as a stack trace instead.
+ */
+const RETIRED_ETAG_SOURCE_FIELDS: ReadonlyMap<string, keyof ETagSource> = new Map([
+    ["hash", "etag"],
+    ["size", "contentLength"],
+    ["mtime", "lastModified"],
+]);
 
 /**
  * Derive an entity-tag from storage metadata.
@@ -1350,63 +1295,126 @@ export interface ETagSource {
  * This is a **formatter**, not a hasher. It classifies what the storage backend
  * already provides into the correct validator strength per RFC 9110 Section 8.8.1:
  *
- * - `hash` present        -> strong `"<hash>"` (a content digest asserts byte equality)
- * - `size` + `mtime` only -> weak `W/"<size>-<mtime>"` (cannot assert byte equality;
- *                            mtime resolution is coarse, collisions exist)
- * - insufficient metadata -> `undefined` (caller omits ETag; never fabricate a
- *                            validator we cannot stand behind)
+ * - `etag` present                       -> strong `"<etag>"` (the backend asserts
+ *                                           byte equality)
+ * - `contentLength` + `lastModified` only -> weak `W/"<size>-<mtime>"` (cannot assert
+ *                                           byte equality; mtime resolution is coarse,
+ *                                           collisions exist)
+ * - insufficient metadata                -> `undefined` (caller omits ETag; never
+ *                                           fabricate a validator we cannot stand behind)
  *
  * The dangerous failure mode is emitting a strong or size-only validator that ignores
  * modification, which would serve stale 304s. Every `undefined` return guards that.
  *
- * @param source - Storage metadata to derive the ETag from
+ * @param source - Storage metadata to derive the ETag from, such as an
+ *   `ObjectStore` HEAD result
  * @returns A correctly-typed ETag string, or `undefined` if insufficient metadata
+ * @throws TypeError if `source` is not an object, or carries a retired field
+ *   name whose value would otherwise be read as absent
  */
 export function generateETag(source: ETagSource): string | undefined {
-  // Strong path: a content digest is a byte-exact validator.
-  if (source.hash) {
-    const raw = source.hash.trim();
-    if (!raw) return toWeakETag(source);
+    assertETagSourceFields(source);
+    // Strong path: the backend's own version identifier is a byte-exact
+    // validator. An empty opaque-tag identifies no version, so it falls back.
+    const tag = normalizeETag(source.etag);
+    return tag && !tag.endsWith('""') ? tag : toWeakETag(source);
+}
 
+/** A well-formed entity-tag (RFC 9110 Section 8.8.3): `[W/] DQUOTE *etagc DQUOTE`. */
+const ETAG_RE = /^(W\/)?"[\x21\x23-\x7e\x80-\xff]*"$/;
+
+/**
+ * The one entity-tag form the package both emits and compares. A well-formed
+ * tag is kept as given; a store tag that is unquoted, carries interior DQUOTE
+ * or bytes outside `etagc`, or has surrounding whitespace is re-quoted around
+ * its sanitized body, and a body that sanitizes to empty yields `undefined`
+ * (no validator).
+ */
+function normalizeETag(etag: string | undefined): string | undefined {
+    if (!etag || ETAG_RE.test(etag)) return etag || undefined;
+    const raw = etag.trim();
     const stripped = stripWeakPrefix(raw);
-    const weak = stripped !== raw; // W/ prefix was present
-    // Strip anchoring quotes, then enforce etagc grammar (removes interior
-    // DQUOTE/DEL/controls) so the emitted tag is always well-formed.
-    const unquoted = sanitizeETagBody(stripped.replace(/^"|"$/g, ""));
-    if (unquoted) return `${weak ? "W/" : ""}"${unquoted}"`;
-
-    // Hash cleaned to empty (was just quotes) -> fall through to weak path
-    return toWeakETag(source);
-  }
-
-  return toWeakETag(source);
+    const body = sanitizeETagBody(stripped.replace(/^"|"$/g, ""));
+    return body ? `${stripped !== raw ? "W/" : ""}"${body}"` : undefined;
 }
 
 /**
- * Attempt to build a weak ETag from size + mtime.
+ * Reject an argument that cannot produce the validator its author intended.
+ *
+ * Only the retired field names are refused. Any other extra property is
+ * ignored on purpose, because the supported call passes a whole store HEAD
+ * result and that carries fields (`digest`, `pin`) an entity-tag never reads.
+ */
+function assertETagSourceFields(source: ETagSource): void {
+    if (source === null || typeof source !== "object") {
+        throw new TypeError(
+            `generateETag: expected storage metadata, received ${source === null ? "null" : typeof source}`,
+        );
+    }
+    for (const [retired, current] of RETIRED_ETAG_SOURCE_FIELDS) {
+        // Only a field the caller wrote, and only when the replacement is
+        // absent: a store HEAD result may carry a same-named field of its own
+        // beside the one generateETag reads.
+        if (Object.hasOwn(source, retired) && source[current] === undefined) {
+            throw new TypeError(`generateETag: "${retired}" is not a field of ETagSource; pass it as "${current}"`);
+        }
+    }
+}
+
+/**
+ * Attempt to build a weak ETag from contentLength + lastModified.
  * Returns `undefined` if either is missing or invalid.
  */
 function toWeakETag(source: ETagSource): string | undefined {
-  if (source.size === undefined || !Number.isFinite(source.size) || source.size < 0) return undefined;
+    if (source.contentLength === undefined || !Number.isFinite(source.contentLength) || source.contentLength < 0)
+        return undefined;
 
-  const ms = toEpochMs(source.mtime);
-  if (ms === undefined) return undefined;
+    const ms = toEpochMs(source.lastModified);
+    if (ms === undefined) return undefined;
 
-  const sizeHex = Math.floor(source.size).toString(16);
-  // Floor mtime to seconds to match the emitted Last-Modified header resolution.
-  // Without this, the ETag and Last-Modified would disagree on sub-second jitter.
-  const mtimeHex = Math.floor(ms / 1000).toString(16);
-  return `W/"${sizeHex}-${mtimeHex}"`;
+    const sizeHex = Math.floor(source.contentLength).toString(16);
+    // Floor mtime to seconds to match the emitted Last-Modified header resolution.
+    // Without this, the ETag and Last-Modified would disagree on sub-second jitter.
+    const mtimeHex = Math.floor(ms / 1000).toString(16);
+    return `W/"${sizeHex}-${mtimeHex}"`;
 }
 
 /** Convert a Date, number, or string to epoch milliseconds, or undefined if unparseable. */
 function toEpochMs(m: Date | number | string | undefined): number | undefined {
-  if (m === undefined) return undefined;
-  const t = m instanceof Date ? m.getTime() : typeof m === "number" ? m : Date.parse(m);
-  return Number.isNaN(t) ? undefined : t;
+    if (m === undefined) return undefined;
+    const t = m instanceof Date ? m.getTime() : typeof m === "number" ? m : parseStoreDate(m);
+    return Number.isNaN(t) ? undefined : t;
 }
 
 // ─── Internal Helpers ───────────────────────────────────────────────────────
+
+/**
+ * Bounds the range parser could never produce (non-integer or unordered
+ * positions, an end at or past a known total, the OPEN_ENDED sentinel with an
+ * unknown one) throw rather than serialize an invalid Content-Range.
+ */
+function assertServedRange(fn: string, range: ParsedRange, totalSize: number | undefined): void {
+    if (
+        !Number.isSafeInteger(range.start) ||
+        !Number.isSafeInteger(range.end) ||
+        range.start < 0 ||
+        range.start > range.end ||
+        (totalSize !== undefined ? range.end >= totalSize : range.end === OPEN_ENDED)
+    ) {
+        throw new RangeError(`${fn}: invalid range ${range.start}-${range.end} for totalSize ${totalSize ?? "*"}`);
+    }
+}
+
+/**
+ * Content-Length and complete-length are `1*DIGIT` (RFC 9110 Sections 8.6
+ * and 14.4): a NaN, infinite, negative or fractional size from corrupt store
+ * metadata throws rather than serializing an invalid field.
+ */
+function assertTotalSize(fn: string, n: number): void {
+    if (!Number.isSafeInteger(n) || n < 0) {
+        throw new RangeError(`${fn}: totalSize must be a non-negative safe integer, got ${n}`);
+    }
+}
 
 /**
  * Strip bytes outside RFC 9110 field-value grammar to prevent HTTP header
@@ -1418,14 +1426,14 @@ function toEpochMs(m: Date | number | string | undefined): number | undefined {
  * not build itself (e.g. the web adapter's signed-URL `Location`).
  */
 export function sanitizeHeaderValue(s: string): string {
-  // Strip every byte outside RFC 9110 field-value grammar (HTAB, SP,
-  // visible ASCII, obs-text). CR/LF alone is not enough: Node writeHead,
-  // undici Headers, and Workers all THROW on any other control byte
-  // (\x00-\x08, \x0B, \x0C, \x7F), which would turn a poisoned metadata
-  // value into a runtime crash instead of a clean response. The character
-  // class mirrors Node's own invalid-header-char check, so anything that
-  // survives is writable on every runtime.
-  return s.replace(/[^\t\x20-\x7e\x80-ÿ]/g, "");
+    // Strip every byte outside RFC 9110 field-value grammar (HTAB, SP,
+    // visible ASCII, obs-text). CR/LF alone is not enough: Node writeHead,
+    // undici Headers, and Workers all THROW on any other control byte
+    // (\x00-\x08, \x0B, \x0C, \x7F), which would turn a poisoned metadata
+    // value into a runtime crash instead of a clean response. The character
+    // class mirrors Node's own invalid-header-char check, so anything that
+    // survives is writable on every runtime.
+    return s.replace(NON_FIELD_VALUE_BYTES, "");
 }
 
 /**
@@ -1441,7 +1449,7 @@ const SHA256_BASE64_RE = /^[A-Za-z0-9+/]{43}=?$/;
 
 /** Is this the raw base64 of a 32-byte SHA-256? One definition, package-wide. */
 export function isSha256Base64(value: unknown): value is string {
-  return typeof value === "string" && SHA256_BASE64_RE.test(value);
+    return typeof value === "string" && SHA256_BASE64_RE.test(value);
 }
 
 /**
@@ -1462,40 +1470,40 @@ export function isSha256Base64(value: unknown): value is string {
  * via `Want-Content-Digest`.
  */
 function emitDigestFields(
-  headers: Record<string, string>,
-  digest: string,
-  emitRepr: boolean,
-  emitContent: boolean,
+    headers: Record<string, string>,
+    digest: string,
+    emitRepr: boolean,
+    emitContent: boolean,
 ): void {
-  const trimmed = digest.trim();
-  if (!SHA256_BASE64_RE.test(trimmed)) return;
-  const value = `sha-256=:${trimmed}:`;
-  if (emitRepr) headers["Repr-Digest"] = value;
-  if (emitContent) headers["Content-Digest"] = value;
+    const trimmed = digest.trim();
+    if (!SHA256_BASE64_RE.test(trimmed)) return;
+    const value = `sha-256=:${trimmed}:`;
+    if (emitRepr) headers["Repr-Digest"] = value;
+    if (emitContent) headers["Content-Digest"] = value;
 }
 
 /**
  * Sanitize an ETag body to RFC 9110 Section 8.8.3 `etagc` grammar:
  * `%x21 / %x23-7E / obs-text` -- i.e. field-value bytes MINUS DQUOTE
- * (0x22), which is the entity-tag delimiter. A backend hash containing an
+ * (0x22), which is the entity-tag delimiter. A backend ETag containing an
  * embedded quote would otherwise emit a structurally-broken ETag like
  * `"abc"def"` that no cache can parse (silently defeating revalidation).
  * DEL (0x7F) and control bytes are already removed by sanitizeHeaderValue.
  */
 function sanitizeETagBody(s: string): string {
-  return sanitizeHeaderValue(s).replace(/"/g, "");
+    return sanitizeHeaderValue(s).replace(/"/g, "");
 }
 
 /** Strip the `W/` weak validator prefix from an ETag for comparison. */
 function stripWeakPrefix(etag: string): string {
-  return etag.startsWith("W/") ? etag.slice(2) : etag;
+    return etag.startsWith("W/") ? etag.slice(2) : etag;
 }
 
 /**
  * Parse a list of ETags from an If-None-Match or If-Match header.
  *
  * Quote-aware: correctly handles commas inside ETag values, which are
- * valid per RFC 7232 Section 2.3 (etagc includes %x2C). A naive
+ * valid per RFC 9110 Section 8.8.3 (etagc includes %x2C). A naive
  * `.split(",")` would incorrectly split `"ver,1", "ver,2"` into four
  * fragments instead of two ETags.
  *
@@ -1503,59 +1511,59 @@ function stripWeakPrefix(etag: string): string {
  * `entity-tag` grammar of RFC 9110 Section 8.8.3.
  */
 function parseETagList(header: string): string[] {
-  const tags: string[] = [];
-  let i = 0;
-  const len = header.length;
+    const tags: string[] = [];
+    let i = 0;
+    const len = header.length;
 
-  while (i < len) {
-    // Skip whitespace and comma separators
-    while (i < len && (header[i] === " " || header[i] === "\t" || header[i] === ",")) i++;
-    if (i >= len) break;
+    while (i < len) {
+        // Skip whitespace and comma separators
+        while (i < len && (header[i] === " " || header[i] === "\t" || header[i] === ",")) i++;
+        if (i >= len) break;
 
-    const start = i;
+        const start = i;
 
-    // Check for W/ weak prefix
-    if (header[i] === "W" && i + 1 < len && header[i + 1] === "/") {
-      i += 2;
+        // Check for W/ weak prefix
+        if (header[i] === "W" && i + 1 < len && header[i + 1] === "/") {
+            i += 2;
+        }
+
+        // Must start with a double quote
+        if (i >= len || header[i] !== '"') {
+            // Not a valid ETag, skip to next comma or end
+            while (i < len && header[i] !== ",") i++;
+            continue;
+        }
+        i++; // skip opening quote
+
+        // Scan for closing quote, validating each character is a valid etagc.
+        // RFC 9110 Section 8.8.3: etagc = %x21 / %x23-7E / obs-text
+        // obs-text = %x80-FF (extended ASCII / UTF-8 continuation bytes)
+        // Characters outside the etagc grammar are rejected, not laundered.
+        let valid = true;
+        while (i < len && header[i] !== '"') {
+            const c = header.charCodeAt(i);
+            // Valid etagc: 0x21 (!) or 0x23-0x7E (#..~) or >= 0x80 (obs-text)
+            // Invalid: 0x00-0x20 (controls + space), 0x22 ("), 0x7F (DEL)
+            // 0x22 is the quote terminator so it's handled by the while condition.
+            if (c < 0x21 || c === 0x7f) {
+                valid = false;
+                break;
+            }
+            i++;
+        }
+
+        if (!valid) {
+            // Invalid etagc character found, skip this malformed ETag
+            while (i < len && header[i] !== ",") i++;
+            continue;
+        }
+
+        if (i < len) i++; // skip closing quote
+
+        tags.push(header.slice(start, i));
     }
 
-    // Must start with a double quote
-    if (i >= len || header[i] !== '"') {
-      // Not a valid ETag, skip to next comma or end
-      while (i < len && header[i] !== ",") i++;
-      continue;
-    }
-    i++; // skip opening quote
-
-    // Scan for closing quote, validating each character is a valid etagc.
-    // RFC 9110 Section 8.8.3: etagc = %x21 / %x23-7E / obs-text
-    // obs-text = %x80-FF (extended ASCII / UTF-8 continuation bytes)
-    // Characters outside the etagc grammar are rejected, not laundered.
-    let valid = true;
-    while (i < len && header[i] !== '"') {
-      const c = header.charCodeAt(i);
-      // Valid etagc: 0x21 (!) or 0x23-0x7E (#..~) or >= 0x80 (obs-text)
-      // Invalid: 0x00-0x20 (controls + space), 0x22 ("), 0x7F (DEL)
-      // 0x22 is the quote terminator so it's handled by the while condition.
-      if (c < 0x21 || c === 0x7F) {
-        valid = false;
-        break;
-      }
-      i++;
-    }
-
-    if (!valid) {
-      // Invalid etagc character found, skip this malformed ETag
-      while (i < len && header[i] !== ",") i++;
-      continue;
-    }
-
-    if (i < len) i++; // skip closing quote
-
-    tags.push(header.slice(start, i));
-  }
-
-  return tags;
+    return tags;
 }
 
 /**
@@ -1572,13 +1580,13 @@ function parseETagList(header: string): string[] {
  * here is safe and avoids unnecessary full-file fallback.
  */
 function parsePos(str: string): number {
-  if (!/^\d+$/.test(str)) return NaN;
-  const n = Number(str);
-  // Cap values that lost integer precision. Any realistic file size
-  // fits in MAX_SAFE_INTEGER (9 PB). The downstream Math.min clamp
-  // narrows to the actual file boundary.
-  if (n > Number.MAX_SAFE_INTEGER) return Number.MAX_SAFE_INTEGER;
-  return n;
+    if (!/^\d+$/.test(str)) return NaN;
+    const n = Number(str);
+    // Cap values that lost integer precision. Any realistic file size
+    // fits in MAX_SAFE_INTEGER (9 PB). The downstream Math.min clamp
+    // narrows to the actual file boundary.
+    if (n > Number.MAX_SAFE_INTEGER) return Number.MAX_SAFE_INTEGER;
+    return n;
 }
 
 /**
@@ -1587,16 +1595,17 @@ function parsePos(str: string): number {
  * HTTP-dates (RFC 9110 Section 5.6.7) have 1-second resolution, but storage
  * backends often provide ISO-8601 timestamps with millisecond precision
  * (e.g. "2025-06-29T12:00:00.500Z"). The emitted Last-Modified header is
- * floored to whole seconds via `toHttpDate()`, so the client echoes back a
+ * floored to whole seconds and clamped to now, so the client echoes back a
  * date without sub-second granularity. If we compare the raw millisecond
  * timestamp against the floored client date, the skew defeats 304, triggers
  * spurious 412s, and breaks If-Range validation.
  *
- * Floor both sides to seconds so comparisons match the HTTP wire format.
+ * Floor both sides to seconds, and clamp a future store date to now, so
+ * comparisons match the HTTP wire format.
  */
 function parseHttpSeconds(s: string): number {
-  const t = Date.parse(s);
-  return Number.isNaN(t) ? NaN : Math.floor(t / 1000) * 1000;
+    // NaN survives Math.min, so an unparseable value stays "no date".
+    return Math.floor(Math.min(parseStoreDate(s), Date.now()) / 1000) * 1000;
 }
 
 // RFC 9110 Section 5.6.7 HTTP-date grammar: IMF-fixdate, obsolete RFC 850,
@@ -1608,11 +1617,11 @@ function parseHttpSeconds(s: string): number {
 // not (e.g. "31 Feb", "12:00:99"), and JS date construction ROLLS those over
 // instead of rejecting them.
 const IMF_FIXDATE_RE =
-  /^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), (\d{2}) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{4} (\d{2}):(\d{2}):(\d{2}) GMT$/;
+    /^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), (\d{2}) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{4} (\d{2}):(\d{2}):(\d{2}) GMT$/;
 const RFC850_DATE_RE =
-  /^(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday), (\d{2})-(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-\d{2} (\d{2}):(\d{2}):(\d{2}) GMT$/;
+    /^(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday), (\d{2})-(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-\d{2} (\d{2}):(\d{2}):(\d{2}) GMT$/;
 const ASCTIME_DATE_RE =
-  /^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) ([ \d]\d) (\d{2}):(\d{2}):(\d{2}) (\d{4})$/;
+    /^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) ([ \d]\d) (\d{2}):(\d{2}):(\d{2}) (\d{4})$/;
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
 /**
@@ -1634,18 +1643,19 @@ const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "
  *
  * Returns whole-second-floored ms (matching {@link parseHttpSeconds}) or NaN.
  */
-function roundTripSeconds(
-  monthIdx: number, day: number, hh: number, mm: number, ss: number, epoch: number,
-): number {
-  if (Number.isNaN(epoch)) return NaN;
-  const d = new Date(epoch);
-  if (
-    d.getUTCMonth() !== monthIdx || d.getUTCDate() !== day
-    || d.getUTCHours() !== hh || d.getUTCMinutes() !== mm || d.getUTCSeconds() !== ss
-  ) {
-    return NaN;
-  }
-  return Math.floor(epoch / 1000) * 1000;
+function roundTripSeconds(monthIdx: number, day: number, hh: number, mm: number, ss: number, epoch: number): number {
+    if (Number.isNaN(epoch)) return NaN;
+    const d = new Date(epoch);
+    if (
+        d.getUTCMonth() !== monthIdx ||
+        d.getUTCDate() !== day ||
+        d.getUTCHours() !== hh ||
+        d.getUTCMinutes() !== mm ||
+        d.getUTCSeconds() !== ss
+    ) {
+        return NaN;
+    }
+    return Math.floor(epoch / 1000) * 1000;
 }
 
 /**
@@ -1656,55 +1666,77 @@ function roundTripSeconds(
  * (adapters may hand us ISO 8601; that is our own input, not wire input).
  */
 function parseRequestHttpSeconds(s: string): number {
-  // IMF-fixdate and RFC 850 both carry an explicit GMT zone, so Date.parse
-  // reads them as UTC (and applies the RFC 850 two-digit-year pivot). The
-  // round-trip guard then rejects a day/time the grammar admits but the
-  // calendar rolled over.
-  const gmt = IMF_FIXDATE_RE.exec(s) ?? RFC850_DATE_RE.exec(s);
-  if (gmt) {
-    const [, day, mon, hh, mm, ss] = gmt;
-    return roundTripSeconds(
-      MONTHS.indexOf(mon!), Number(day), Number(hh), Number(mm), Number(ss), Date.parse(s),
-    );
-  }
-  // asctime carries no zone designator; RFC 9110 says it is UTC. Date.parse
-  // would interpret it as LOCAL time, skewing comparisons by the server's
-  // offset, so build the timestamp explicitly.
-  const m = ASCTIME_DATE_RE.exec(s);
-  if (m) {
-    const [, mon, day, hh, mm, ss, year] = m;
-    const monthIdx = MONTHS.indexOf(mon!);
-    const epoch = Date.UTC(Number(year), monthIdx, Number(day), Number(hh), Number(mm), Number(ss));
-    return roundTripSeconds(monthIdx, Number(day), Number(hh), Number(mm), Number(ss), epoch);
-  }
-  return NaN;
+    // IMF-fixdate and RFC 850 both carry an explicit GMT zone, so Date.parse
+    // reads them as UTC (and applies the RFC 850 two-digit-year pivot). The
+    // round-trip guard then rejects a day/time the grammar admits but the
+    // calendar rolled over.
+    const gmt = IMF_FIXDATE_RE.exec(s) ?? RFC850_DATE_RE.exec(s);
+    if (gmt) {
+        const [, day, mon, hh, mm, ss] = gmt;
+        return roundTripSeconds(MONTHS.indexOf(mon!), Number(day), Number(hh), Number(mm), Number(ss), Date.parse(s));
+    }
+    // asctime carries no zone designator; RFC 9110 says it is UTC. Date.parse
+    // would interpret it as LOCAL time, skewing comparisons by the server's
+    // offset, so build the timestamp explicitly.
+    const m = ASCTIME_DATE_RE.exec(s);
+    if (m) {
+        const [, mon, day, hh, mm, ss, year] = m;
+        const monthIdx = MONTHS.indexOf(mon!);
+        const epoch = Date.UTC(Number(year), monthIdx, Number(day), Number(hh), Number(mm), Number(ss));
+        return roundTripSeconds(monthIdx, Number(day), Number(hh), Number(mm), Number(ss), epoch);
+    }
+    return NaN;
 }
 
 /**
- * Normalize a date string to IMF-fixdate (RFC 9110 Section 5.6.7).
- *
- * `Date.prototype.toUTCString()` produces exactly the IMF-fixdate format
- * (e.g. "Sun, 29 Jun 2025 12:00:00 GMT") and floors to whole seconds,
- * fixing both format and sub-second granularity issues.
- *
- * Returns `undefined` for unparseable input so the caller can fall back.
- *
- * Single-entry memo: hot serving paths normalize the same Last-Modified
- * string on every request for the same object (stores that cache metadata
- * even hand back the same string reference, making the hit a pointer
- * compare). Date.parse + toUTCString together cost ~190ns per call and the
- * evaluation chain needs the normalized form on every conditional request.
+ * A store timestamp without a zone designator. ECMAScript reads a zoneless
+ * date-time as LOCAL time, so the same stored value would emit a different
+ * Last-Modified on every server zone; store metadata is UTC by convention.
  */
-let httpDateMemoIn: string | undefined;
-let httpDateMemoOut: string | undefined;
+const ZONELESS_ISO_RE = /^(\d{4}-\d\d-\d\d)[T ]([\d:.]+)$/;
 
-function toHttpDate(s: string): string | undefined {
-  if (s === httpDateMemoIn) return httpDateMemoOut;
-  const t = Date.parse(s);
-  const out = Number.isNaN(t) ? undefined : new Date(t).toUTCString();
-  httpDateMemoIn = s;
-  httpDateMemoOut = out;
-  return out;
+/** Parse store-supplied date text to epoch ms (NaN when unparseable); zoneless means UTC. */
+function parseStoreDate(s: string): number {
+    const m = ZONELESS_ISO_RE.exec(s.trim());
+    return Date.parse(m ? `${m[1]}T${m[2]}Z` : s);
+}
+
+/**
+ * Format a store Last-Modified as IMF-fixdate (RFC 9110 Section 5.6.7),
+ * floored to whole seconds by `toUTCString()`. Unparseable input is emitted
+ * header-sanitized as given.
+ *
+ * RFC 9110 Section 8.8.2.1: an origin MUST NOT send a Last-Modified later
+ * than its own clock, so a future value is replaced by now. The clamp is
+ * applied on every call, outside the memo, because "now" moves while the
+ * memoized parse does not; {@link parseHttpSeconds} applies the same clamp
+ * so conditionals compare against what was emitted.
+ *
+ * Single-entry memo: hot serving paths format the same Last-Modified string
+ * on every request for the same object.
+ */
+let memoIn: string | undefined;
+let memoMs = NaN;
+let memoOut = "";
+
+function httpLastModified(s: string): string {
+    if (s !== memoIn) {
+        memoIn = s;
+        memoMs = parseStoreDate(s);
+        memoOut = Number.isNaN(memoMs) ? sanitizeHeaderValue(s) : new Date(memoMs).toUTCString();
+    }
+    return memoMs > Date.now() ? new Date().toUTCString() : memoOut;
+}
+
+/** Emit the validators of a 200/206/304 response from store metadata. */
+function setValidators(
+    headers: Record<string, string>,
+    etag: string | undefined,
+    lastModified: string | undefined,
+): void {
+    const tag = normalizeETag(etag);
+    if (tag) headers["ETag"] = tag;
+    if (lastModified) headers["Last-Modified"] = httpLastModified(lastModified);
 }
 
 /**
@@ -1728,7 +1760,7 @@ function toHttpDate(s: string): string | undefined {
  * uses internally -- digest emission behaves identically at every layer.
  */
 export function clientWantsDigest(reqHeaders: { get(name: string): string | null }): boolean {
-  return wantsSha256(reqHeaders.get("want-repr-digest")) ?? true;
+    return wantsSha256(reqHeaders.get("want-repr-digest")) ?? true;
 }
 
 /**
@@ -1738,7 +1770,7 @@ export function clientWantsDigest(reqHeaders: { get(name: string): string | null
  * (unsolicited digests are permitted).
  */
 export function clientWantsContentDigest(reqHeaders: { get(name: string): string | null }): boolean {
-  return wantsSha256(reqHeaders.get("want-content-digest")) ?? true;
+    return wantsSha256(reqHeaders.get("want-content-digest")) ?? true;
 }
 
 /**
@@ -1754,37 +1786,37 @@ export function clientWantsContentDigest(reqHeaders: { get(name: string): string
  * embed commas) do not occur in conformant input.
  */
 function wantsSha256(want: string | null): boolean | null {
-  if (!want) return null;
+    if (!want) return null;
 
-  const lower = want.toLowerCase();
-  let verdict: boolean | undefined;
-  let sawMember = false;
-  for (const entry of lower.split(",")) {
-    const trimmed = entry.trim();
-    if (!trimmed) continue;
-    sawMember = true;
-    // Strip Structured Fields parameters before reading the value, so a
-    // bare key with parameters ("sha-256;x=1") still parses.
-    const member = trimmed.split(";")[0]!.trim();
-    if (!member.startsWith("sha-256")) continue;
-    // Guard against matching hypothetical future algorithms like "sha-256-v2".
-    // After the "sha-256" prefix, the next character must be '=' (weight),
-    // end-of-member (bare key), or whitespace.
-    const nextChar = member[7]; // "sha-256".length === 7
-    if (nextChar !== undefined && nextChar !== "=" && nextChar !== " ") continue;
-    const eqIdx = member.indexOf("=");
-    if (eqIdx === -1) {
-      verdict = true; // bare key: RFC 8941 boolean true
-      continue;
+    const lower = want.toLowerCase();
+    let verdict: boolean | undefined;
+    let sawMember = false;
+    for (const entry of lower.split(",")) {
+        const trimmed = entry.trim();
+        if (!trimmed) continue;
+        sawMember = true;
+        // Strip Structured Fields parameters before reading the value, so a
+        // bare key with parameters ("sha-256;x=1") still parses.
+        const member = trimmed.split(";")[0]!.trim();
+        if (!member.startsWith("sha-256")) continue;
+        // Guard against matching hypothetical future algorithms like "sha-256-v2".
+        // After the "sha-256" prefix, the next character must be '=' (weight),
+        // end-of-member (bare key), or whitespace.
+        const nextChar = member[7]; // "sha-256".length === 7
+        if (nextChar !== undefined && nextChar !== "=" && nextChar !== " ") continue;
+        const eqIdx = member.indexOf("=");
+        if (eqIdx === -1) {
+            verdict = true; // bare key: RFC 8941 boolean true
+            continue;
+        }
+        const weight = Number(member.slice(eqIdx + 1).trim());
+        // Weight 0 means explicitly unwanted
+        verdict = !Number.isNaN(weight) && weight > 0;
     }
-    const weight = Number(member.slice(eqIdx + 1).trim());
-    // Weight 0 means explicitly unwanted
-    verdict = !Number.isNaN(weight) && weight > 0;
-  }
 
-  if (verdict !== undefined) return verdict;
-  // Members were present but sha-256 was not among them: the client asked
-  // for algorithms we do not provide. An unparseable/empty field value is
-  // treated as no preference.
-  return sawMember ? false : null;
+    if (verdict !== undefined) return verdict;
+    // Members were present but sha-256 was not among them: the client asked
+    // for algorithms we do not provide. An unparseable/empty field value is
+    // treated as no preference.
+    return sawMember ? false : null;
 }

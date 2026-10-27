@@ -26,8 +26,8 @@ const TRANSIENT_OPEN_ERRNOS: ReadonlySet<string> = new Set(["EMFILE", "ENFILE", 
 
 /** True when an open failure is worth retrying a moment later. */
 export function isTransientOpenError(err: unknown): boolean {
-  const code = (err as NodeJS.ErrnoException | undefined)?.code;
-  return code !== undefined && TRANSIENT_OPEN_ERRNOS.has(code);
+    const code = (err as NodeJS.ErrnoException | undefined)?.code;
+    return code !== undefined && TRANSIENT_OPEN_ERRNOS.has(code);
 }
 
 /**
@@ -36,18 +36,18 @@ export function isTransientOpenError(err: unknown): boolean {
  * `opener` is injectable for tests; production always uses `fs.open`.
  */
 export async function openWithRetry(
-  path: string,
-  flags: string,
-  attempts = 5,
-  baseDelayMs = 40,
-  opener: (p: string, f: string) => Promise<FileHandle> = open,
+    path: string,
+    flags: string,
+    attempts = 5,
+    baseDelayMs = 40,
+    opener: (p: string, f: string) => Promise<FileHandle> = open,
 ): Promise<FileHandle> {
-  for (let attempt = 1; ; attempt++) {
-    try {
-      return await opener(path, flags);
-    } catch (err) {
-      if (attempt >= attempts || !isTransientOpenError(err)) throw err;
-      await new Promise<void>((resolve) => setTimeout(resolve, baseDelayMs * attempt));
+    for (let attempt = 1; ; attempt++) {
+        try {
+            return await opener(path, flags);
+        } catch (err) {
+            if (attempt >= attempts || !isTransientOpenError(err)) throw err;
+            await new Promise<void>((resolve) => setTimeout(resolve, baseDelayMs * attempt));
+        }
     }
-  }
 }

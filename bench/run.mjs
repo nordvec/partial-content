@@ -14,6 +14,18 @@
  * - autocannon: 40 connections, 5 s per scenario, one warmup second discarded
  *   by taking autocannon's steady-state aggregates. The client runs in a
  *   separate process so its own parse cost never throttles the server column.
+ *
+ * Two metrics per cell
+ * - Throughput (req/s), which answers what this machine did today.
+ * - CPU per request (microseconds, user and system split), which answers what
+ *   the server code costs. Every server runs inside THIS process and the load
+ *   generator is a child process, so `process.cpuUsage()` bracketed around the
+ *   measured window counts the serving work and none of the client's. Only one
+ *   server is under load at a time, so the delta is attributable to that
+ *   column. The window also contains this process's idle event-loop polling,
+ *   which is the same for every column and is why a cell whose generator is
+ *   saturated (see BENCHMARKS.md) reports a CPU figure inflated by amortizing
+ *   that idle cost over fewer requests.
  */
 import { createServer } from "node:http";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
@@ -41,40 +53,40 @@ await writeFile(join(root, "large.bin"), randomBytes(1024 * 1024));
 // @polka/url), so this keeps the key-extraction cost comparable across
 // columns. Fixture names contain no percent-encoding.
 function keyOf(req) {
-  const url = req.url;
-  const q = url.indexOf("?");
-  return q === -1 ? url.slice(1) : url.slice(1, q);
+    const url = req.url;
+    const q = url.indexOf("?");
+    return q === -1 ? url.slice(1) : url.slice(1, q);
 }
 
 const servers = {
-  "partial-content": createServer((req, res) => {
-    void pcHandler(req, res);
-  }),
-  // Opt-in hot-object cache (nginx open_file_cache semantics, 1 s TTL):
-  // the apples-to-apples row for sirv, which also serves cached metadata.
-  "partial-content (cache)": createServer((req, res) => {
-    void pcCachedHandler(req, res);
-  }),
-  "send": createServer((req, res) => {
-    send(req, keyOf(req), { root }).pipe(res);
-  }),
-  "sirv": createServer(sirv(root, { etag: true, maxAge: 0, dev: false })),
+    "partial-content": createServer((req, res) => {
+        void pcHandler(req, res);
+    }),
+    // Opt-in hot-object cache (nginx open_file_cache semantics, 1 s TTL):
+    // the apples-to-apples row for sirv, which also serves cached metadata.
+    "partial-content (cache)": createServer((req, res) => {
+        void pcCachedHandler(req, res);
+    }),
+    send: createServer((req, res) => {
+        send(req, keyOf(req), { root }).pipe(res);
+    }),
+    sirv: createServer(sirv(root, { etag: true, maxAge: 0, dev: false })),
 };
 const pcHandler = serveObject(fsStore({ root }), {
-  key: keyOf,
-  mime: () => "application/octet-stream",
-  disposition: "inline",
+    key: keyOf,
+    mime: () => "application/octet-stream",
+    disposition: "inline",
 });
 const pcCachedHandler = serveObject(fsStore({ root, cache: { ttlMs: 1000 } }), {
-  key: keyOf,
-  mime: () => "application/octet-stream",
-  disposition: "inline",
+    key: keyOf,
+    mime: () => "application/octet-stream",
+    disposition: "inline",
 });
 
 const ports = {};
 for (const [name, srv] of Object.entries(servers)) {
-  await new Promise((resolve) => srv.listen(0, resolve));
-  ports[name] = srv.address().port;
+    await new Promise((resolve) => srv.listen(0, resolve));
+    ports[name] = srv.address().port;
 }
 
 // Raw client: fetch() auto-appends `Cache-Control: no-cache` to requests
@@ -82,49 +94,49 @@ for (const [name, srv] of Object.entries(servers)) {
 // would then never answer 304. autocannon sends clean headers, so
 // verification must too.
 function rawGet(port, path, headers = {}) {
-  return new Promise((resolve, reject) => {
-    const req = request({ host: "127.0.0.1", port, path, headers }, (res) => {
-      let bytes = 0;
-      res.on("data", (chunk) => { bytes += chunk.length; });
-      res.on("end", () => resolve({ status: res.statusCode, bytes, headers: res.headers }));
+    return new Promise((resolve, reject) => {
+        const req = request({ host: "127.0.0.1", port, path, headers }, (res) => {
+            let bytes = 0;
+            res.on("data", (chunk) => {
+                bytes += chunk.length;
+            });
+            res.on("end", () => resolve({ status: res.statusCode, bytes, headers: res.headers }));
+        });
+        req.on("error", reject);
+        req.end();
     });
-    req.on("error", reject);
-    req.end();
-  });
 }
 
 async function etagFor(name, path) {
-  const res = await rawGet(ports[name], path);
-  return res.headers.etag;
+    const res = await rawGet(ports[name], path);
+    return res.headers.etag;
 }
 
 // scenario -> { path, headers?, expectStatus, expectBytes }
 const scenarios = {
-  "GET 4 KB (200)": { path: "/small.bin", expectStatus: 200, expectBytes: 4096 },
-  "GET 1 MB (200)": { path: "/large.bin", expectStatus: 200, expectBytes: 1024 * 1024 },
-  "Range 64 KB of 1 MB (206)": {
-    path: "/large.bin",
-    headers: { Range: "bytes=0-65535" },
-    expectStatus: 206,
-    expectBytes: 65536,
-  },
-  "Revalidation (304)": {
-    path: "/small.bin",
-    headers: async (name) => ({ "If-None-Match": await etagFor(name, "/small.bin") }),
-    expectStatus: 304,
-    expectBytes: 0,
-  },
+    "GET 4 KB (200)": { path: "/small.bin", expectStatus: 200, expectBytes: 4096 },
+    "GET 1 MB (200)": { path: "/large.bin", expectStatus: 200, expectBytes: 1024 * 1024 },
+    "Range 64 KB of 1 MB (206)": {
+        path: "/large.bin",
+        headers: { Range: "bytes=0-65535" },
+        expectStatus: 206,
+        expectBytes: 65536,
+    },
+    "Revalidation (304)": {
+        path: "/small.bin",
+        headers: async (name) => ({ "If-None-Match": await etagFor(name, "/small.bin") }),
+        expectStatus: 304,
+        expectBytes: 0,
+    },
 };
 
 async function verify(name, scenario) {
-  const headers = typeof scenario.headers === "function"
-    ? await scenario.headers(name)
-    : scenario.headers ?? {};
-  const res = await rawGet(ports[name], scenario.path, headers);
-  if (res.status !== scenario.expectStatus || res.bytes !== scenario.expectBytes) {
-    return `status=${res.status} bytes=${res.bytes} (expected ${scenario.expectStatus}/${scenario.expectBytes})`;
-  }
-  return null;
+    const headers = typeof scenario.headers === "function" ? await scenario.headers(name) : (scenario.headers ?? {});
+    const res = await rawGet(ports[name], scenario.path, headers);
+    if (res.status !== scenario.expectStatus || res.bytes !== scenario.expectBytes) {
+        return `status=${res.status} bytes=${res.bytes} (expected ${scenario.expectStatus}/${scenario.expectBytes})`;
+    }
+    return null;
 }
 
 // The load generator runs in a SEPARATE process. In-process, autocannon's
@@ -133,70 +145,113 @@ async function verify(name, scenario) {
 // column equally and drowning real differences in client cost.
 const autocannonBin = createRequire(import.meta.url).resolve("autocannon/autocannon.js");
 
-function bench(name, scenario, headers) {
-  const args = [
-    autocannonBin,
-    `http://127.0.0.1:${ports[name]}${scenario.path}`,
-    "-c", String(CONNECTIONS),
-    "-d", String(DURATION),
-    "--json",
-  ];
-  for (const [k, v] of Object.entries(headers ?? {})) {
-    args.push("-H", `${k}=${v}`);
-  }
-  return new Promise((resolve, reject) => {
-    execFile(process.execPath, args, { maxBuffer: 64 * 1024 * 1024 }, (err, stdout) => {
-      if (err) return reject(err);
-      resolve(JSON.parse(stdout));
+function runAutocannon(name, scenario, headers) {
+    const args = [
+        autocannonBin,
+        `http://127.0.0.1:${ports[name]}${scenario.path}`,
+        "-c",
+        String(CONNECTIONS),
+        "-d",
+        String(DURATION),
+        "--json",
+    ];
+    for (const [k, v] of Object.entries(headers ?? {})) {
+        args.push("-H", `${k}=${v}`);
+    }
+    return new Promise((resolve, reject) => {
+        execFile(process.execPath, args, { maxBuffer: 64 * 1024 * 1024 }, (err, stdout) => {
+            if (err) return reject(err);
+            resolve(JSON.parse(stdout));
+        });
     });
-  });
+}
+
+/**
+ * One measured cell: throughput from the external generator, CPU per request
+ * from this process. The CPU bracket opens after the child is spawned and
+ * closes when it exits, so it spans exactly the window the request count
+ * covers. `requests.total` is every completed response, 304s included, which
+ * is the denominator that makes the figure cost-per-request rather than
+ * cost-per-success.
+ */
+async function bench(name, scenario, headers) {
+    const cpuStart = process.cpuUsage();
+    const result = await runAutocannon(name, scenario, headers);
+    const cpu = process.cpuUsage(cpuStart);
+    const requests = result.requests.total;
+    return {
+        result,
+        reqPerSec: result.requests.average,
+        p99: result.latency.p99,
+        // Guard the division rather than the input: a cell that served nothing has
+        // no cost per request to report, and a fabricated 0 would read as free.
+        cpuUserPerReq: requests > 0 ? cpu.user / requests : undefined,
+        cpuSystemPerReq: requests > 0 ? cpu.system / requests : undefined,
+        requests,
+    };
+}
+
+function formatThroughput(cell) {
+    return `${Math.round(cell.reqPerSec).toLocaleString("en-US")} req/s (p99 ${cell.p99} ms)`;
+}
+
+function formatCpu(cell) {
+    if (cell.cpuUserPerReq === undefined) return "no requests completed";
+    return `${cell.cpuUserPerReq.toFixed(1)} + ${cell.cpuSystemPerReq.toFixed(1)} us/req`;
 }
 
 const rows = [];
 for (const [scenarioName, scenario] of Object.entries(scenarios)) {
-  const row = { scenario: scenarioName };
-  for (const name of Object.keys(servers)) {
-    const mismatch = await verify(name, scenario);
-    if (mismatch) {
-      row[name] = `unsupported (${mismatch})`;
-      continue;
+    const row = { scenario: scenarioName, cells: {} };
+    for (const name of Object.keys(servers)) {
+        const mismatch = await verify(name, scenario);
+        if (mismatch) {
+            row.cells[name] = { unsupported: `unsupported (${mismatch})` };
+            continue;
+        }
+        const headers =
+            typeof scenario.headers === "function" ? await scenario.headers(name) : (scenario.headers ?? {});
+        row.cells[name] = await bench(name, scenario, headers);
     }
-    const headers = typeof scenario.headers === "function"
-      ? await scenario.headers(name)
-      : scenario.headers ?? {};
-    const r = await bench(name, scenario, headers);
-    row[name] = `${Math.round(r.requests.average).toLocaleString("en-US")} req/s (p99 ${r.latency.p99} ms)`;
-  }
-  rows.push(row);
-  console.error(`done: ${scenarioName}`);
+    rows.push(row);
+    console.error(`done: ${scenarioName}`);
 }
 
 console.log(`\nNode ${process.version}, ${CONNECTIONS} connections, ${DURATION}s per cell, loopback\n`);
 const names = Object.keys(servers);
-console.log(`| Scenario | ${names.join(" | ")} |`);
-console.log(`|---|${names.map(() => "---").join("|")}|`);
-for (const row of rows) {
-  console.log(`| ${row.scenario} | ${names.map((n) => row[n]).join(" | ")} |`);
+
+function printTable(title, format) {
+    console.log(`### ${title}\n`);
+    console.log(`| Scenario | ${names.join(" | ")} |`);
+    console.log(`|---|${names.map(() => "---").join("|")}|`);
+    for (const row of rows) {
+        const cells = names.map((n) => row.cells[n].unsupported ?? format(row.cells[n]));
+        console.log(`| ${row.scenario} | ${cells.join(" | ")} |`);
+    }
+    console.log("");
 }
+
+printTable("Throughput", formatThroughput);
+printTable("CPU per request (user + system), server process only", formatCpu);
 
 // Footnote datum: sirv's 304 throughput comes from pre-rendering complete
 // header sets for the directory at boot (files created afterwards 404).
 // Measure sirv in the configuration that CAN serve runtime-created files
 // (dev: true, per-request lookup) for the like-for-like comparison.
 {
-  const devSrv = createServer(sirv(root, { etag: true, maxAge: 0, dev: true }));
-  await new Promise((resolve) => devSrv.listen(0, resolve));
-  ports["sirv (dev)"] = devSrv.address().port;
-  const scenario = scenarios["Revalidation (304)"];
-  const mismatch = await verify("sirv (dev)", scenario);
-  if (mismatch) {
-    console.log(`\nsirv dev-mode (runtime-file-capable) 304: unsupported (${mismatch})`);
-  } else {
-    const headers = await scenario.headers("sirv (dev)");
-    const r = await bench("sirv (dev)", scenario, headers);
-    console.log(`\nsirv dev-mode (runtime-file-capable) 304: ${Math.round(r.requests.average).toLocaleString("en-US")} req/s (p99 ${r.latency.p99} ms)`);
-  }
-  await new Promise((r) => devSrv.close(r));
+    const devSrv = createServer(sirv(root, { etag: true, maxAge: 0, dev: true }));
+    await new Promise((resolve) => devSrv.listen(0, resolve));
+    ports["sirv (dev)"] = devSrv.address().port;
+    const scenario = scenarios["Revalidation (304)"];
+    const mismatch = await verify("sirv (dev)", scenario);
+    if (mismatch) {
+        console.log(`\nsirv dev-mode (runtime-file-capable) 304: unsupported (${mismatch})`);
+    } else {
+        const headers = await scenario.headers("sirv (dev)");
+        const cell = await bench("sirv (dev)", scenario, headers);
+        console.log(`\nsirv dev-mode (runtime-file-capable) 304: ${formatThroughput(cell)}, ${formatCpu(cell)}`);
+    }
+    await new Promise((r) => devSrv.close(r));
 }
 
 for (const srv of Object.values(servers)) await new Promise((r) => srv.close(r));

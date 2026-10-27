@@ -12,16 +12,18 @@ const root = await mkdtemp(join(tmpdir(), "pc-prof-"));
 await writeFile(join(root, "small.bin"), randomBytes(4 * 1024));
 
 const handler = serveObject(fsStore({ root }), {
-  key: () => "small.bin",
-  mime: () => "application/octet-stream",
-  disposition: "inline",
+    key: () => "small.bin",
+    mime: () => "application/octet-stream",
+    disposition: "inline",
 });
-const server = createServer((req, res) => { void handler(req, res); });
+const server = createServer((req, res) => {
+    void handler(req, res);
+});
 await new Promise((r) => server.listen(18777, r));
 console.log("ready");
 
 // Self-terminate gracefully so --cpu-prof flushes (Windows has no SIGTERM).
 setTimeout(() => {
-  server.close(() => process.exit(0));
-  setTimeout(() => process.exit(0), 500);
+    server.close(() => process.exit(0));
+    setTimeout(() => process.exit(0), 500);
 }, 12_000);

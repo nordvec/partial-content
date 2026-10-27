@@ -15,22 +15,30 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          bun-version: latest
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.4
       - run: bun install --frozen-lockfile
-      - run: bun test --isolate --timeout 30000
+      - run: bun run test
 
   cross-runtime:
     name: build once, smoke on Node + Bun + Deno
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          bun-version: latest
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.4
+      # The declared engine floor, not the runner's preinstalled Node.
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
       - run: bun install --frozen-lockfile
       # Build the shipped artifact once; every runtime smoke-tests the same dist/.
       - name: Build dist
@@ -47,8 +55,10 @@ jobs:
       # body types must stay `new Response(...)`-assignable.
       - name: Check consumer types compile under DOM lib
         run: bunx tsc --noEmit -p smoke/tsconfig.consumer.json
-      - name: Smoke on Node (runner built-in)
+      - name: Smoke on Node 24
         run: node smoke/smoke.mjs
+      - name: Smoke the Node bridge on Node 24
+        run: node smoke/node-bridge.mjs
       - name: Smoke on Bun
         run: bun smoke/smoke.mjs
       # Deno via npm (no third-party action to pin); --allow-read for the dist import.

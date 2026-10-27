@@ -1,15 +1,9 @@
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
-import {
-    S3Client,
-    CreateBucketCommand,
-    PutObjectCommand,
-    DeleteObjectCommand,
-} from "@aws-sdk/client-s3";
+import { S3Client, CreateBucketCommand, PutObjectCommand, DeleteObjectCommand } from "@aws-sdk/client-s3";
 import { s3Store } from "../s3";
 import { serveObject } from "../web";
 import { ObjectChangedError } from "../object-store";
 import { asStream } from "./helpers";
-import type { ObjectStream } from "../index";
 
 /**
  * LIVE integration tests against a real S3-compatible endpoint.
@@ -60,13 +54,15 @@ describe.skipIf(!configured)("s3Store: LIVE S3-compatible endpoint", () => {
             const name = (err as Error).name;
             if (name !== "BucketAlreadyOwnedByYou" && name !== "BucketAlreadyExists") throw err;
         }
-        await client.send(new PutObjectCommand({
-            Bucket: BUCKET,
-            Key: KEY,
-            Body: CONTENT,
-            ContentType: "application/octet-stream",
-            ChecksumAlgorithm: "SHA256",
-        }));
+        await client.send(
+            new PutObjectCommand({
+                Bucket: BUCKET,
+                Key: KEY,
+                Body: CONTENT,
+                ContentType: "application/octet-stream",
+                ChecksumAlgorithm: "SHA256",
+            }),
+        );
         store = s3Store({ client, bucket: BUCKET });
     });
 
@@ -118,27 +114,23 @@ describe.skipIf(!configured)("s3Store: LIVE S3-compatible endpoint", () => {
         const pinned = await store.getObject(KEY, { range: { start: 0, end: 4 }, ifMatch: meta.etag });
         expect(new TextDecoder().decode(await drain(asStream(pinned.body)))).toBe("01234");
 
-        await expect(
-            store.getObject(KEY, { ifMatch: '"0123456789abcdef0123456789abcdef"' }),
-        ).rejects.toBeInstanceOf(ObjectChangedError);
+        await expect(store.getObject(KEY, { ifMatch: '"0123456789abcdef0123456789abcdef"' })).rejects.toBeInstanceOf(
+            ObjectChangedError,
+        );
     });
 
     test("serveObject end-to-end: 206 and 304 against the live backend", async () => {
         const handler = serveObject(store, { cacheControl: "private, no-cache" });
 
-        const partial = await handler(
-            new Request("http://x/f", { headers: { Range: "bytes=30-35" } }),
-            { key: KEY },
-        );
+        const partial = await handler(new Request("http://x/f", { headers: { Range: "bytes=30-35" } }), { key: KEY });
         expect(partial.status).toBe(206);
         expect(partial.headers.get("Content-Range")).toBe("bytes 30-35/36");
         expect(await partial.text()).toBe("uvwxyz");
 
         const etag = partial.headers.get("ETag")!;
-        const revalidated = await handler(
-            new Request("http://x/f", { headers: { "If-None-Match": etag } }),
-            { key: KEY },
-        );
+        const revalidated = await handler(new Request("http://x/f", { headers: { "If-None-Match": etag } }), {
+            key: KEY,
+        });
         expect(revalidated.status).toBe(304);
     });
 
@@ -154,19 +146,24 @@ describe.skipIf(!configured)("s3Store: LIVE S3-compatible endpoint", () => {
     test("overwrite invalidates the old pin (real TOCTOU semantics)", async () => {
         const before = await store.headObject(KEY);
 
-        await client.send(new PutObjectCommand({
-            Bucket: BUCKET,
-            Key: KEY,
-            Body: new TextEncoder().encode("REPLACED-CONTENT-DIFFERENT-LENGTH!"),
-        }));
+        await client.send(
+            new PutObjectCommand({
+                Bucket: BUCKET,
+                Key: KEY,
+                Body: new TextEncoder().encode("REPLACED-CONTENT-DIFFERENT-LENGTH!"),
+            }),
+        );
 
-        await expect(
-            store.getObject(KEY, { ifMatch: before.etag }),
-        ).rejects.toBeInstanceOf(ObjectChangedError);
+        await expect(store.getObject(KEY, { ifMatch: before.etag })).rejects.toBeInstanceOf(ObjectChangedError);
 
         // Restore for other tests / reruns.
-        await client.send(new PutObjectCommand({
-            Bucket: BUCKET, Key: KEY, Body: CONTENT, ChecksumAlgorithm: "SHA256",
-        }));
+        await client.send(
+            new PutObjectCommand({
+                Bucket: BUCKET,
+                Key: KEY,
+                Body: CONTENT,
+                ChecksumAlgorithm: "SHA256",
+            }),
+        );
     });
 });

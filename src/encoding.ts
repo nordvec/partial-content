@@ -15,14 +15,16 @@
  * @packageDocumentation
  */
 
+import { parseMediaType } from "./media-type.ts";
+
 // ─── Parsing ────────────────────────────────────────────────────────────────
 
 /** One parsed Accept-Encoding member: a content coding and its quality. */
 export interface AcceptEncodingEntry {
-  /** Content coding token, lowercased (`"br"`, `"gzip"`, `"*"`, ...). */
-  coding: string;
-  /** Quality value in [0, 1]; 0 means "not acceptable". */
-  q: number;
+    /** Content coding token, lowercased (`"br"`, `"gzip"`, `"*"`, ...); `x-gzip` is reported as `"gzip"`. */
+    coding: string;
+    /** Quality value in [0, 1]; 0 means "not acceptable". */
+    q: number;
 }
 
 /** RFC 9110 token for a content coding (or the `*` wildcard). */
@@ -48,29 +50,37 @@ const QVALUE_RE = /^(?:0(?:\.[0-9]{0,3})?|1(?:\.0{0,3})?)$/;
  * listed", which per spec means only `identity` is acceptable.
  */
 export function parseAcceptEncoding(header: string): AcceptEncodingEntry[] {
-  const byCoding = new Map<string, number>();
-  for (const rawMember of header.split(",")) {
-    const parts = rawMember.split(";");
-    const coding = parts[0]!.trim().toLowerCase();
-    if (!CODING_RE.test(coding)) continue;
-    let q = 1;
-    let malformed = false;
-    for (let i = 1; i < parts.length; i++) {
-      const param = parts[i]!.trim();
-      const eq = param.indexOf("=");
-      if (eq === -1) { malformed = true; break; }
-      const name = param.slice(0, eq).trim().toLowerCase();
-      if (name !== "q") continue; // unknown parameters are ignored
-      const value = param.slice(eq + 1).trim();
-      if (!QVALUE_RE.test(value)) { malformed = true; break; }
-      q = Number(value);
+    const byCoding = new Map<string, number>();
+    for (const rawMember of header.split(",")) {
+        const parts = rawMember.split(";");
+        const token = parts[0]!.trim().toLowerCase();
+        if (!CODING_RE.test(token)) continue;
+        // RFC 9110 Section 8.4.1.3: a recipient SHOULD treat x-gzip as gzip.
+        const coding = token === "x-gzip" ? "gzip" : token;
+        let q = 1;
+        let malformed = false;
+        for (let i = 1; i < parts.length; i++) {
+            const param = parts[i]!.trim();
+            const eq = param.indexOf("=");
+            if (eq === -1) {
+                malformed = true;
+                break;
+            }
+            const name = param.slice(0, eq).trim().toLowerCase();
+            if (name !== "q") continue; // unknown parameters are ignored
+            const value = param.slice(eq + 1).trim();
+            if (!QVALUE_RE.test(value)) {
+                malformed = true;
+                break;
+            }
+            q = Number(value);
+        }
+        if (malformed) continue;
+        // Last-wins on duplicates; Map preserves first-insertion order, so
+        // re-setting keeps field position while updating the quality.
+        byCoding.set(coding, q);
     }
-    if (malformed) continue;
-    // Last-wins on duplicates; Map preserves first-insertion order, so
-    // re-setting keeps field position while updating the quality.
-    byCoding.set(coding, q);
-  }
-  return [...byCoding].map(([coding, q]) => ({ coding, q }));
+    return [...byCoding].map(([coding, q]) => ({ coding, q }));
 }
 
 // ─── Negotiation ────────────────────────────────────────────────────────────
@@ -100,36 +110,33 @@ export function parseAcceptEncoding(header: string): AcceptEncodingEntry[] {
  * - This library never emits 406 for encoding: identity remains the universal
  *   fallback, the behavior every production file server ships.
  */
-export function negotiateEncoding(
-  header: string | null,
-  available: readonly string[],
-): string[] {
-  if (header === null) return [];
-  const entries = parseAcceptEncoding(header);
-  if (entries.length === 0) return [];
+export function negotiateEncoding(header: string | null, available: readonly string[]): string[] {
+    if (header === null) return [];
+    const entries = parseAcceptEncoding(header);
+    if (entries.length === 0) return [];
 
-  let star: number | undefined;
-  const explicit = new Map<string, number>();
-  for (const { coding, q } of entries) {
-    if (coding === "*") star = q;
-    else explicit.set(coding, q);
-  }
+    let star: number | undefined;
+    const explicit = new Map<string, number>();
+    for (const { coding, q } of entries) {
+        if (coding === "*") star = q;
+        else explicit.set(coding, q);
+    }
 
-  // Identity's effective quality: explicit entry, else wildcard, else 0
-  // (unlisted identity stays ACCEPTABLE as the fallback, but expresses no
-  // preference, so any explicitly listed coding outranks it).
-  const identityQ = explicit.get("identity") ?? star ?? 0;
+    // Identity's effective quality: explicit entry, else wildcard, else 0
+    // (unlisted identity stays ACCEPTABLE as the fallback, but expresses no
+    // preference, so any explicitly listed coding outranks it).
+    const identityQ = explicit.get("identity") ?? star ?? 0;
 
-  const ranked: Array<{ coding: string; q: number; idx: number }> = [];
-  for (let idx = 0; idx < available.length; idx++) {
-    const coding = available[idx]!.toLowerCase();
-    const q = explicit.get(coding) ?? star;
-    if (q === undefined || q <= 0) continue;
-    if (q < identityQ) continue;
-    ranked.push({ coding, q, idx });
-  }
-  ranked.sort((a, b) => b.q - a.q || a.idx - b.idx);
-  return ranked.map((r) => r.coding);
+    const ranked: Array<{ coding: string; q: number; idx: number }> = [];
+    for (let idx = 0; idx < available.length; idx++) {
+        const coding = available[idx]!.toLowerCase();
+        const q = explicit.get(coding) ?? star;
+        if (q === undefined || q <= 0) continue;
+        if (q < identityQ) continue;
+        ranked.push({ coding, q, idx });
+    }
+    ranked.sort((a, b) => b.q - a.q || a.idx - b.idx);
+    return ranked.map((r) => r.coding);
 }
 
 // ─── Compressibility Gate ───────────────────────────────────────────────────
@@ -141,32 +148,32 @@ export function negotiateEncoding(
  * compressed ones, so unknown types default to "don't negotiate" (safe).
  */
 const COMPRESSIBLE_APPLICATION_SUBTYPES = new Set([
-  "json",
-  "xml",
-  "xml-dtd",
-  "javascript",
-  "ecmascript",
-  "wasm",
-  "x-www-form-urlencoded",
-  "toml",
-  "yaml",
-  "sql",
-  "rtf",
-  "postscript",
-  "tar",
-  "x-tar",
-  "x-sh",
+    "json",
+    "xml",
+    "xml-dtd",
+    "javascript",
+    "ecmascript",
+    "wasm",
+    "x-www-form-urlencoded",
+    "toml",
+    "yaml",
+    "sql",
+    "rtf",
+    "postscript",
+    "tar",
+    "x-tar",
+    "x-sh",
 ]);
 
 const COMPRESSIBLE_EXACT = new Set([
-  "font/ttf",
-  "font/otf",
-  "font/collection",
-  "image/bmp",
-  "image/x-icon",
-  "image/vnd.microsoft.icon",
-  "message/rfc822",
-  "model/gltf-binary",
+    "font/ttf",
+    "font/otf",
+    "font/collection",
+    "image/bmp",
+    "image/x-icon",
+    "image/vnd.microsoft.icon",
+    "message/rfc822",
+    "model/gltf-binary",
 ]);
 
 /**
@@ -183,21 +190,20 @@ const COMPRESSIBLE_EXACT = new Set([
  * probe on it.
  */
 export function isCompressibleMime(mime: string): boolean {
-  const semi = mime.indexOf(";");
-  const essence = (semi === -1 ? mime : mime.slice(0, semi)).trim().toLowerCase();
-  if (essence.startsWith("text/")) return essence !== "text/event-stream";
-  if (COMPRESSIBLE_EXACT.has(essence)) return true;
-  const slash = essence.indexOf("/");
-  if (slash === -1) return false;
-  const subtype = essence.slice(slash + 1);
-  if (essence.startsWith("application/") && COMPRESSIBLE_APPLICATION_SUBTYPES.has(subtype)) {
-    return true;
-  }
-  const plus = subtype.lastIndexOf("+");
-  if (plus !== -1) {
-    const suffix = subtype.slice(plus + 1);
-    return suffix === "json" || suffix === "xml" || suffix === "yaml"
-      || suffix === "toml" || suffix === "text";
-  }
-  return false;
+    const essence = parseMediaType(mime)?.essence;
+    if (essence === undefined) return false;
+    if (essence.startsWith("text/")) return essence !== "text/event-stream";
+    if (COMPRESSIBLE_EXACT.has(essence)) return true;
+    const slash = essence.indexOf("/");
+    if (slash === -1) return false;
+    const subtype = essence.slice(slash + 1);
+    if (essence.startsWith("application/") && COMPRESSIBLE_APPLICATION_SUBTYPES.has(subtype)) {
+        return true;
+    }
+    const plus = subtype.lastIndexOf("+");
+    if (plus !== -1) {
+        const suffix = subtype.slice(plus + 1);
+        return suffix === "json" || suffix === "xml" || suffix === "yaml" || suffix === "toml" || suffix === "text";
+    }
+    return false;
 }

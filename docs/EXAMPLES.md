@@ -35,6 +35,48 @@ app.get("/files/:key", (c) => {
 });
 ```
 
+## Raw `http.createServer` (no framework)
+
+The Node adapter takes `(IncomingMessage, ServerResponse)`, which is the raw
+`http` server's own callback signature, so there is nothing to bridge:
+
+```typescript
+import { createServer } from "node:http";
+import { serveObject } from "partial-content/node";
+import { fsStore } from "partial-content/fs";
+import { lookupMime } from "partial-content/mime";
+
+const store = fsStore({ root: "/var/data/uploads" });
+
+// Everything below /files/ is one storage key. Percent-decoding is yours to
+// do (the URL carries `%20`, the storage key does not); the store rejects
+// traversal, NUL bytes, and Windows device names on top of whatever you pass.
+const keyOf = (req: { url?: string | undefined }) =>
+  decodeURIComponent(new URL(req.url ?? "/", "http://localhost").pathname.slice("/files/".length));
+
+const files = serveObject(store, {
+  key: keyOf,
+  // Without a mime the response is application/octet-stream, which no browser
+  // renders inline: a PDF or video downloads instead of playing.
+  mime: (req) => lookupMime(keyOf(req)),
+  disposition: "inline",
+  // 206 range serving, 304/412 conditionals, and HEAD are all handled here;
+  // anything that is not GET/HEAD/OPTIONS is answered 405.
+});
+
+createServer((req, res) => {
+  if (req.url?.startsWith("/files/")) {
+    void files(req, res);
+    return;
+  }
+  res.writeHead(404).end();
+}).listen(3000);
+```
+
+`serveObject` never throws at the caller: storage failures are mapped to the
+truthful status (404, 502, 503 with `Retry-After`) and reported to `onError`,
+so the returned promise settling is the only signal the request is done.
+
 ## Kernel only: the evaluation flow
 
 ```
@@ -213,7 +255,8 @@ throws rather than guess and overwrite.
 Nothing to wire: `serveObject` serves `Range: bytes=0-99,5000-5099` as a
 `multipart/byteranges` 206 with an exact precomputed `Content-Length`, parts
 in request order, gap/overlap coalescing, and the `maxRanges` amplification
-cap. Each part costs one ranged `getObject`, so tune the cap to your backend:
+cap. Up to `maxBackendReads` parts each cost one ranged `getObject`, so tune
+both to your backend:
 
 ```typescript
 import { serveObject } from "partial-content/web";
@@ -222,7 +265,9 @@ import type { ObjectStore } from "partial-content";
 declare const store: ObjectStore;
 
 const handler = serveObject(store, {
-  maxRanges: 5,   // at most 5 backend reads per request (default 50)
+  maxRanges: 5,         // more than 5 coalesced ranges serve the full 200 (default 8)
+  maxBackendReads: 2,   // parts past 2 are cut from one buffered span read when
+                        // the span is under 256 KiB (default 8)
 });
 // maxRanges: 1 disables multipart entirely: multi-range requests degrade to
 // a full 200 and every request costs at most one backend read.
@@ -354,6 +399,46 @@ const downloads = serveObject(fsStore({ root }), { disposition: "attachment" });
 // BEFORE calling the handler, exactly like the serving side.
 ```
 
+On a raw Node server the dialect handlers are still Fetch handlers, so the
+route converts with `toWebRequest` and writes back with `sendResponse`, and
+everything between the two (routing, the session check) stays yours:
+
+```typescript
+import { createServer } from "node:http";
+import { toWebRequest, sendResponse } from "partial-content/node";
+import { createTusHandler } from "partial-content/tus";
+import { fsUploadStore } from "partial-content/fs";
+
+// Your session check.
+declare function authorized(req: Request): Promise<boolean>;
+
+const uploads = createTusHandler(fsUploadStore({ root: "/var/data/files" }), {
+  key: () => crypto.randomUUID(),
+  location: (token) => `/files/upload/${token}`,
+  resolveToken: (req) => new URL(req.url).pathname.split("/")[3] || undefined,
+  policy: { maxSize: 1024 * 1024 * 1024 },
+});
+
+createServer(async (req, res) => {
+  if (!req.url?.startsWith("/files/upload")) {
+    res.writeHead(404).end();
+    return;
+  }
+  // The configured origin, not the client's Host header, is what the
+  // `Location` on a 201 is built from.
+  const request = toWebRequest(req, { origin: "https://files.example.com" });
+  const response = (await authorized(request)) ? await uploads(request) : new Response(null, { status: 401 });
+  await sendResponse(res, response);
+}).listen(3000);
+```
+
+A chunked PATCH with no `Content-Length` (the ordinary tus shape for a
+stream of unknown length) arrives as a `Request` with no length rather than a
+fabricated one. A sender that opens a body and then goes quiet is torn down
+after `readStallTimeoutMs` (60 s), because a `Request` body is read outside
+the server's own `requestTimeout`. The bridge never answers
+`Expect: 100-continue` itself; see `onExpectContinue` in `docs/API.md`.
+
 Browser clients: any tus 1.0 client works unmodified. Give it the creation
 URL as its endpoint; the `Location` header on the 201 is the upload resource
 every follow-up request (offset probe, append, termination) targets, and the
@@ -377,14 +462,23 @@ import { fsUploadStore } from "partial-content/fs";
 
 const root = "/var/data/files";
 const store = fsUploadStore({ root });
-// e.g. hourly: reap uploads idle longer than the policy's max age.
-// The cutoff is IDLENESS-anchored (lastAppendAt, falling back to createdAt),
-// while maxAgeSeconds is measured from creation: different clocks, so pick
-// this from the retention you actually want rather than deriving it from the
-// policy. It must also comfortably exceed your longest single append, since
-// the sweep holds no lock and an append in flight has not moved lastAppendAt
-// yet, so a short cutoff can reap a resource that is being written to.
-await store.sweepExpired(Date.now() - 24 * 60 * 60 * 1000);
+
+// e.g. hourly. The two cutoffs are different clocks and at least one is
+// required, because a sweep with neither reclaims nothing while looking like
+// a retention control.
+const MAX_AGE_SECONDS = 24 * 60 * 60;
+const now = Date.now();
+await store.sweepExpired({
+  // Abandoned transfers: anchored on the last append, falling back to
+  // creation. Keep it comfortably longer than your longest single append,
+  // since the sweep holds no lock and an append in flight has not moved
+  // lastAppendAt yet, so a short cutoff can reap a resource being written to.
+  idleSinceMs: now - 4 * 60 * 60 * 1000,
+  // The lifetime every request already refuses the resource for. Derived from
+  // the same policy value, so a resource becomes reclaimable at the moment it
+  // stops being usable rather than lingering until it also goes idle.
+  createdBeforeMs: now - MAX_AGE_SECONDS * 1000,
+});
 ```
 
 ## Resumable uploads: a custom ResumableWriteStore
@@ -434,11 +528,14 @@ interface UploadBackend {
     offset: number,
     body: ReadableStream<Uint8Array> | Uint8Array,
     opts: { maxBytes?: number; now: number; signal?: AbortSignal },
-  ): Promise<{ bytesWritten: number; crossedBound?: number }>;
+  ): Promise<{ bytesWritten: number; crossedBound?: number; interrupted: boolean }>;
   markInvalidated(uploadToken: string): Promise<void>;
   publishAtomically(uploadToken: string): Promise<{ etag?: string; digest?: string }>;
   discard(uploadToken: string): Promise<void>;
-  reapIdleSince(olderThanMs: number): Promise<number>;
+  reap(cutoff: {
+    idleSinceMs?: number;
+    createdBeforeMs?: number;
+  }): Promise<{ removed: number; failed: number }>;
 }
 declare const backend: UploadBackend;
 
@@ -452,7 +549,7 @@ const myUploadStore: ResumableWriteStore = {
                                // with durable state (see below)
   // Both are typed `true`: the orchestrator refuses a store that reports
   // false, so there is no value to write here other than the honest one.
-  digestOnComplete: false as const, // "sha256" ONLY if you verify before publishing
+  digestOnComplete: false as const, // e.g. ["sha-256"] ONLY if you verify before publishing
   // Disclosures, not switches. Nothing branches on them; they tell whoever
   // picks this store what they are picking:
   exactOffsetRecovery: true,   // only if the derived offset is crash-durable
@@ -492,8 +589,8 @@ const myUploadStore: ResumableWriteStore = {
       // resumable uploads exist to prevent.
       offset: await backend.sumDurableBytes(uploadToken),
       length: record.length,            // immutable once known
-      isComplete: record.isComplete,
-      isInvalidated: record.isInvalidated, // terminal; recorded durably
+      // One lifecycle field; "invalidated" is terminal and recorded durably.
+      status: record.isInvalidated ? "invalidated" : record.isComplete ? "complete" : "incomplete",
       createdAt: record.createdAt,
       lastAppendAt: record.lastAppendAt,
       metadata: record.metadata,
@@ -527,7 +624,7 @@ const myUploadStore: ResumableWriteStore = {
     // holder that stalled MID-call and came back. `now` is recorded as
     // lastAppendAt. Report the bytes made DURABLE (the next getUploadState
     // must agree) plus the bound the body tried to cross, if any.
-    const { bytesWritten, crossedBound } = await backend.append(
+    const { bytesWritten, crossedBound, interrupted } = await backend.append(
       uploadToken, offset, body, { maxBytes, now, signal },
     );
 
@@ -546,13 +643,17 @@ const myUploadStore: ResumableWriteStore = {
     if (crossedBound !== undefined) {
       throw new UploadAppendBoundError(uploadToken, offset + bytesWritten);
     }
-    return { bytesWritten };
+    // Report whether the write stopped before the body ran out. Only the code
+    // draining the body knows, so it is a fact the store returns rather than
+    // one the caller infers: an abort signal says something asked the write to
+    // yield, never what happened to the bytes.
+    return { bytesWritten, interrupted };
   },
 
-  async completeUpload(uploadToken, { expectedDigest, now }) {
+  async completeUpload(uploadToken, { expectedDigests, now }) {
     // Publish atomically: after success the object is readable under its
     // key; after ANY failure nothing new is visible to readers. If you
-    // declared digestOnComplete: "sha256", verify expectedDigest against
+    // listed algorithms in digestOnComplete, verify expectedDigests against
     // the assembled bytes BEFORE publishing and throw an
     // UploadDigestMismatchError-named error on mismatch.
     const { etag, digest } = await backend.publishAtomically(uploadToken);
@@ -566,14 +667,21 @@ const myUploadStore: ResumableWriteStore = {
     await backend.discard(uploadToken);
   },
 
-  async sweepExpired(olderThanMs) {
-    // Optional: reap resources idle since before the cutoff (epoch ms).
+  async sweepExpired({ idleSinceMs, createdBeforeMs }) {
+    // Optional, and it takes two independent clocks because a resource can be
+    // past its lifetime while still looking busy: honor whichever the caller
+    // gave, reaping a resource that matches either.
     // Reclaim the BYTES, not just the record: do what abortUpload does to
     // each resource. A metadata-only sweep strands the data with nothing
     // left pointing at it, which is a storage-limitation gap, not a cleanup.
     // Runs without the upload's lock (a store has no locker), so the caller's
-    // cutoff must exceed the longest single append the deployment permits.
-    return { removed: await backend.reapIdleSince(olderThanMs) };
+    // idle cutoff must exceed the longest single append the deployment permits.
+    // Isolate each resource and report what could not be reclaimed as
+    // `failed`: one resource your backend refuses to delete must not end the
+    // scan, or a single busy upload stops a scheduled sweep from reclaiming
+    // anything and it reports success by not throwing. What stays is retried
+    // by the next pass; `failed` is what the caller alerts on.
+    return backend.reap({ idleSinceMs, createdBeforeMs });
   },
 };
 ```

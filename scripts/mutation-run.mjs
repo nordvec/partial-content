@@ -6,21 +6,9 @@
  * find (see mutation-sandbox.mjs). Every argument after the script name is
  * forwarded to Stryker unchanged.
  */
-import { spawnSync } from "node:child_process";
-import { createRequire } from "node:module";
-import path from "node:path";
-import { pkgDir, clearSandboxes, guardSandboxes } from "./mutation-sandbox.mjs";
-
-const require = createRequire(import.meta.url);
-const strykerPkgJson = require.resolve("@stryker-mutator/core/package.json");
-const strykerPkg = require("@stryker-mutator/core/package.json");
-const binRel = typeof strykerPkg.bin === "string" ? strykerPkg.bin : strykerPkg.bin.stryker;
-const strykerBin = path.resolve(path.dirname(strykerPkgJson), binRel);
+import { clearSandboxes, guardSandboxes, runStryker } from "./mutation-sandbox.mjs";
 
 guardSandboxes();
-const run = spawnSync(process.execPath, [strykerBin, "run", ...process.argv.slice(2)], {
-  cwd: pkgDir,
-  stdio: "inherit",
-});
+const run = runStryker(process.argv.slice(2));
 clearSandboxes();
 process.exit(run.status ?? 1);

@@ -1,4 +1,5 @@
 import { describe, test, expect } from "bun:test";
+import { drain } from "./helpers";
 import {
     azureStore,
     ObjectNotFoundError,
@@ -21,9 +22,7 @@ const ETAG = '"0x8DAZURE"';
  * compile time instead of leaving the mock satisfying a contract nobody has.
  */
 type AzureContainerClient = AzureStoreOptions["containerClient"];
-type AzureSasOptions = Parameters<
-    ReturnType<AzureContainerClient["getBlobClient"]>["generateSasUrl"]
->[0];
+type AzureSasOptions = Parameters<ReturnType<AzureContainerClient["getBlobClient"]>["generateSasUrl"]>[0];
 
 interface MockAzureOpts {
     missing?: boolean;
@@ -57,7 +56,12 @@ interface MockAzureOpts {
     sasCalls?: AzureSasOptions[];
     /** generateSasUrl throws (client not constructed with a shared-key credential). */
     sasError?: Error;
+    /** Runs inside generateSasUrl, before it answers. */
+    onSign?: () => void;
 }
+
+/** The SDK's refusal when the client holds no shared-key credential. */
+const NO_SHARED_KEY = "Can only generate the SAS when the client is initialized with a shared key credential";
 
 function restError(statusCode: number): Error {
     const err = new Error(`azure rest error ${statusCode}`);
@@ -116,40 +120,40 @@ function mockContainer(opts: MockAzureOpts = {}): AzureContainerClient {
                         lastModified: LAST_MODIFIED,
                     };
                 },
-                async download(
-                    offset?: number,
-                    count?: number,
-                    options?: { conditions?: { ifMatch?: string } },
-                ) {
+                async download(offset?: number, count?: number, options?: { conditions?: { ifMatch?: string } }) {
                     opts.calls?.push({ offset, count, ifMatch: options?.conditions?.ifMatch });
                     if (opts.missing) throw restError(404);
                     if (opts.throttled) throw restError(503);
                     if (opts.genericError) throw new Error("azure generic failure");
                     if (opts.conditionFails && options?.conditions?.ifMatch) throw restError(412);
                     if (opts.conditionFailsNoStatus && options?.conditions?.ifMatch) {
-                        throw restErrorMessageOnly("The condition specified using HTTP conditional header(s) is not met: ConditionNotMet");
+                        throw restErrorMessageOnly(
+                            "The condition specified using HTTP conditional header(s) is not met: ConditionNotMet",
+                        );
                     }
 
                     // Azure answers 206 + Content-Range for ANY ranged download,
                     // including offset-only (open-ended) reads.
                     const isRanged = count !== undefined || (offset !== undefined && offset > 0);
-                    const end = count !== undefined
-                        ? Math.min(offset! + count - 1, CONTENT.length - 1)
-                        : CONTENT.length - 1;
+                    const end =
+                        count !== undefined ? Math.min(offset! + count - 1, CONTENT.length - 1) : CONTENT.length - 1;
                     const slice = CONTENT.subarray(offset ?? 0, end + 1);
                     const nodeStream = Object.assign(iterate(Buffer.from(slice)), {
-                        destroy() { opts.onDestroy?.(); },
+                        destroy() {
+                            opts.onDestroy?.();
+                        },
                     });
                     return {
-                        readableStreamBody: opts.blobBody || opts.noBody
-                            ? undefined
-                            : nodeStream as unknown as NodeJS.ReadableStream & AsyncIterable<Buffer>,
-                        blobBody: opts.blobBody
-                            ? Promise.resolve(new Blob([Uint8Array.from(slice)]))
-                            : undefined,
+                        readableStreamBody:
+                            opts.blobBody || opts.noBody
+                                ? undefined
+                                : (nodeStream as unknown as NodeJS.ReadableStream & AsyncIterable<Buffer>),
+                        blobBody: opts.blobBody ? Promise.resolve(new Blob([Uint8Array.from(slice)])) : undefined,
                         contentLength: opts.noLength ? undefined : slice.length,
                         contentRange: isRanged
-                            ? (opts.badContentRange ? "bytes garbage" : `bytes ${offset}-${end}/${CONTENT.length}`)
+                            ? opts.badContentRange
+                                ? "bytes garbage"
+                                : `bytes ${offset}-${end}/${CONTENT.length}`
                             : undefined,
                         etag: ETAG,
                         lastModified: LAST_MODIFIED,
@@ -157,19 +161,13 @@ function mockContainer(opts: MockAzureOpts = {}): AzureContainerClient {
                 },
                 async generateSasUrl(options: AzureSasOptions) {
                     opts.sasCalls?.push(options);
+                    opts.onSign?.();
                     if (opts.sasError) throw opts.sasError;
                     return "https://account.blob.example/documents/doc.pdf?sv=2025&sig=abc";
                 },
             };
         },
     };
-}
-
-async function drain(body: ReadableStream<Uint8Array> | Uint8Array): Promise<string> {
-    if (body instanceof Uint8Array) return Buffer.from(body).toString("utf8");
-    const chunks: Uint8Array[] = [];
-    for await (const chunk of body) chunks.push(chunk);
-    return Buffer.concat(chunks).toString("utf8");
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -262,16 +260,12 @@ describe("azureStore: getObject (single round trip)", () => {
 
     test("412 ConditionNotMet maps to ObjectChangedError", async () => {
         const store = azureStore({ containerClient: mockContainer({ conditionFails: true }) });
-        await expect(
-            store.getObject("doc.pdf", { ifMatch: ETAG }),
-        ).rejects.toBeInstanceOf(ObjectChangedError);
+        await expect(store.getObject("doc.pdf", { ifMatch: ETAG })).rejects.toBeInstanceOf(ObjectChangedError);
     });
 
     test("412 with no numeric statusCode (message-only RestError) still maps to ObjectChangedError", async () => {
         const store = azureStore({ containerClient: mockContainer({ conditionFailsNoStatus: true }) });
-        await expect(
-            store.getObject("doc.pdf", { ifMatch: ETAG }),
-        ).rejects.toBeInstanceOf(ObjectChangedError);
+        await expect(store.getObject("doc.pdf", { ifMatch: ETAG })).rejects.toBeInstanceOf(ObjectChangedError);
     });
 
     test("throws ObjectNotFoundError on 404", async () => {
@@ -293,26 +287,36 @@ describe("azureStore: degenerate SDK responses", () => {
 
     test("unparseable Content-Range fails loudly (byte accounting untrustworthy)", async () => {
         const store = azureStore({ containerClient: mockContainer({ badContentRange: true }) });
-        await expect(
-            store.getObject("doc.pdf", { range: { start: 5, end: 9 } }),
-        ).rejects.toThrow(/unparseable Content-Range/);
+        await expect(store.getObject("doc.pdf", { range: { start: 5, end: 9 } })).rejects.toThrow(
+            /unparseable Content-Range/,
+        );
     });
 
     test("unparseable Content-Range destroys the live download socket before throwing", async () => {
         let destroyed = false;
         const store = azureStore({
-            containerClient: mockContainer({ badContentRange: true, onDestroy: () => { destroyed = true; } }),
+            containerClient: mockContainer({
+                badContentRange: true,
+                onDestroy: () => {
+                    destroyed = true;
+                },
+            }),
         });
-        await expect(
-            store.getObject("doc.pdf", { range: { start: 5, end: 9 } }),
-        ).rejects.toThrow(/unparseable Content-Range/);
+        await expect(store.getObject("doc.pdf", { range: { start: 5, end: 9 } })).rejects.toThrow(
+            /unparseable Content-Range/,
+        );
         expect(destroyed).toBe(true);
     });
 
     test("missing contentLength on download destroys the live socket before throwing", async () => {
         let destroyed = false;
         const store = azureStore({
-            containerClient: mockContainer({ noLength: true, onDestroy: () => { destroyed = true; } }),
+            containerClient: mockContainer({
+                noLength: true,
+                onDestroy: () => {
+                    destroyed = true;
+                },
+            }),
         });
         await expect(store.getObject("doc.pdf")).rejects.toThrow(/no contentLength/);
         expect(destroyed).toBe(true);
@@ -408,21 +412,49 @@ describe("azureStore: createSignedUrl", () => {
         expect("cacheControl" in (sasCalls[1] ?? {})).toBe(false);
     });
 
-    test("a client that cannot sign propagates the SDK's error", async () => {
-        // Without a shared-key credential generateSasUrl throws; the adapter
-        // lets it propagate (the web adapter reports a throwing
-        // createSignedUrl via onError and answers 502), never masks it as ok.
-        const store = azureStore({
-            containerClient: mockContainer({
-                sasError: new RangeError(
-                    "Can only generate the SAS when the client is initialized with a shared key credential",
-                ),
-            }),
-        });
+    test("a client without a shared-key credential declines with ok: false and the SDK's error as cause", async () => {
+        // Declining means "this store cannot sign here": the caller streams instead.
+        const sasError = new RangeError(NO_SHARED_KEY);
+        const store = azureStore({ containerClient: mockContainer({ sasError }) });
 
-        await expect(
-            store.createSignedUrl!("doc.pdf", { expiresInSeconds: 60 }),
-        ).rejects.toThrow(/shared key credential/);
+        const result = await store.createSignedUrl!("doc.pdf", { expiresInSeconds: 60 });
+        expect(result).toMatchObject({ ok: false, code: "no-credential", error: NO_SHARED_KEY });
+        expect("cause" in result && result.cause).toBe(sasError);
+    });
+
+    test("a signer failure on a client that can sign throws, never declines", async () => {
+        const store = azureStore({ containerClient: mockContainer({ sasError: new Error("key vault unreachable") }) });
+        await expect(store.createSignedUrl!("doc.pdf", { expiresInSeconds: 60 })).rejects.toThrow(
+            "key vault unreachable",
+        );
+    });
+
+    test("a RangeError other than the missing-credential refusal throws", async () => {
+        const store = azureStore({
+            containerClient: mockContainer({ sasError: new RangeError("Must provide 'permissions' and 'expiresOn'") }),
+        });
+        await expect(store.createSignedUrl!("doc.pdf", { expiresInSeconds: 60 })).rejects.toBeInstanceOf(RangeError);
+    });
+
+    test("an aborted signal rejects with its reason before anything is signed", async () => {
+        const sasCalls: AzureSasOptions[] = [];
+        const store = azureStore({ containerClient: mockContainer({ sasCalls }) });
+        const reason = new Error("client went away");
+
+        const signOpts = { expiresInSeconds: 60, signal: AbortSignal.abort(reason) };
+
+        await expect(store.createSignedUrl!("doc.pdf", signOpts)).rejects.toBe(reason);
+        expect(sasCalls).toHaveLength(0);
+    });
+
+    test("an abort while signing rejects with its reason, never a URL", async () => {
+        const controller = new AbortController();
+        const reason = new Error("client went away");
+        const store = azureStore({ containerClient: mockContainer({ onSign: () => controller.abort(reason) }) });
+
+        const signOpts = { expiresInSeconds: 60, signal: controller.signal };
+
+        await expect(store.createSignedUrl!("doc.pdf", signOpts)).rejects.toBe(reason);
     });
 });
 

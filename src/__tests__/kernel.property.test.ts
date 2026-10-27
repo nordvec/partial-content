@@ -38,7 +38,10 @@ import {
 // astral) minus lone surrogates, so the security invariants see the inputs a
 // naive `fc.string()` would rarely produce.
 const arbitraryText = fc
-    .array(fc.integer({ min: 0, max: 0x10ffff }).filter((c) => c < 0xd800 || c > 0xdfff), { maxLength: 48 })
+    .array(
+        fc.integer({ min: 0, max: 0x10ffff }).filter((c) => c < 0xd800 || c > 0xdfff),
+        { maxLength: 48 },
+    )
     .map((codes) => String.fromCodePoint(...codes));
 
 // A single char guaranteed to survive sanitizeHeaderValue untouched: TAB, or
@@ -111,7 +114,7 @@ describe("Content-Range build/parse round-trip", () => {
         );
     });
 
-    test("an unknown total emits `/*` and parses back to the -1 sentinel", () => {
+    test("an unknown total emits `/*` and parses back to an undefined total", () => {
         fc.assert(
             fc.property(validRange, ({ start, end }) => {
                 const res = buildRangeResponseHeaders({
@@ -122,7 +125,7 @@ describe("Content-Range build/parse round-trip", () => {
                     lastModified: undefined,
                 });
                 expect(res.headers["Content-Range"]).toBe(`bytes ${start}-${end}/*`);
-                expect(parseContentRange(res.headers["Content-Range"])).toEqual({ start, end, totalSize: -1 });
+                expect(parseContentRange(res.headers["Content-Range"])).toEqual({ start, end, totalSize: undefined });
             }),
         );
     });
@@ -148,7 +151,7 @@ describe("parseContentRange properties", () => {
                 if (r === null) return;
                 expect(r.start).toBeGreaterThanOrEqual(0);
                 expect(r.end).toBeGreaterThanOrEqual(r.start);
-                if (r.totalSize !== -1) {
+                if (r.totalSize !== undefined) {
                     expect(r.totalSize).toBeGreaterThanOrEqual(0);
                     expect(r.end).toBeLessThan(r.totalSize);
                 }
@@ -188,7 +191,7 @@ describe("parseRanges properties", () => {
                 // Gap-coalesced: DISTINCT parts are separated by more than the
                 // 80-byte framing overhead (checked pairwise in byte order;
                 // parts are emitted in REQUEST order, not ascending order).
-                const byStart = [...r.ranges].sort((a, b) => a.start - b.start);
+                const byStart = [...r.ranges].toSorted((a, b) => a.start - b.start);
                 for (let i = 1; i < byStart.length; i++) {
                     expect(byStart[i]!.start).toBeGreaterThan(byStart[i - 1]!.end + 81);
                 }
@@ -212,26 +215,25 @@ describe("buildMultipartHeaders properties", () => {
     // so the generator draws in-bounds spans of bounded length (cheap
     // placeholder bodies). Overlap stays allowed: the builder does pure byte
     // arithmetic over whatever order the caller framed.
-    const multipartCase = fc
-        .integer({ min: 1, max: 2 ** 40 })
-        .chain((totalSize) => {
-            const part = fc
-                .integer({ min: 0, max: totalSize - 1 })
-                .chain((start) => fc
+    const multipartCase = fc.integer({ min: 1, max: 2 ** 40 }).chain((totalSize) => {
+        const part = fc
+            .integer({ min: 0, max: totalSize - 1 })
+            .chain((start) =>
+                fc
                     .integer({ min: 0, max: Math.min(256, totalSize - 1 - start) })
-                    .map((len) => ({ start, end: start + len })));
-            return fc.record({
-                boundary: fc.stringMatching(/^[a-zA-Z0-9]{1,40}$/),
-                ranges: fc.array(part, { minLength: 1, maxLength: 8 }),
-                totalSize: fc.constant(totalSize),
-                // Include obs-text (0x80-0xff) content types so the UTF-8 byte
-                // counting (not code-unit counting) is exercised on both sides.
-                contentType: fc.option(
-                    fc.oneof(fc.constant("text/plain"), fc.constant("application/pdf"), arbitraryText),
-                    { nil: undefined },
-                ),
-            });
+                    .map((len) => ({ start, end: start + len })),
+            );
+        return fc.record({
+            boundary: fc.stringMatching(/^[a-zA-Z0-9]{1,40}$/),
+            ranges: fc.array(part, { minLength: 1, maxLength: 8 }),
+            totalSize: fc.constant(totalSize),
+            // Include obs-text (0x80-0xff) content types so the UTF-8 byte
+            // counting (not code-unit counting) is exercised on both sides.
+            contentType: fc.option(fc.oneof(fc.constant("text/plain"), fc.constant("application/pdf"), arbitraryText), {
+                nil: undefined,
+            }),
         });
+    });
 
     test("advertised Content-Length equals the real assembled multipart body length", () => {
         fc.assert(
@@ -263,18 +265,16 @@ describe("buildMultipartHeaders properties", () => {
         // The bounds guard, not silent emission of an invalid Content-Range:
         // parity with buildRangeResponseHeaders for every out-of-bounds excess.
         fc.assert(
-            fc.property(
-                fc.integer({ min: 1, max: 100_000 }),
-                fc.integer({ min: 0, max: 300 }),
-                (totalSize, excess) => {
-                    expect(() => buildMultipartHeaders({
+            fc.property(fc.integer({ min: 1, max: 100_000 }), fc.integer({ min: 0, max: 300 }), (totalSize, excess) => {
+                expect(() =>
+                    buildMultipartHeaders({
                         boundary: "B",
                         ranges: [{ start: 0, end: totalSize + excess }],
                         totalSize,
                         contentType: "text/plain",
-                    })).toThrow(RangeError);
-                },
-            ),
+                    }),
+                ).toThrow(RangeError);
+            }),
             { numRuns: 200 },
         );
     });
@@ -285,12 +285,9 @@ describe("buildMultipartHeaders properties", () => {
 describe("generateETag properties", () => {
     const etagSource = fc.record(
         {
-            hash: fc.option(arbitraryText, { nil: undefined }),
-            size: fc.option(fc.integer({ min: 0, max: 2 ** 40 }), { nil: undefined }),
-            mtime: fc.option(
-                fc.oneof(fc.date(), fc.integer(), fc.string()),
-                { nil: undefined },
-            ),
+            etag: fc.option(arbitraryText, { nil: undefined }),
+            contentLength: fc.option(fc.integer({ min: 0, max: 2 ** 40 }), { nil: undefined }),
+            lastModified: fc.option(fc.oneof(fc.date(), fc.integer(), fc.string()), { nil: undefined }),
         },
         { requiredKeys: [] },
     );

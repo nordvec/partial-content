@@ -35,12 +35,12 @@ describe("buildContentDisposition type handling", () => {
 
     test("inline with no filename", () => {
         const result = buildContentDisposition(null, { type: "inline" });
-        expect(result).toBe('inline; filename=document');
+        expect(result).toBe("inline; filename=document");
     });
 
     test("inline with custom fallback", () => {
         const result = buildContentDisposition(null, { type: "inline", fallback: "preview.pdf" });
-        expect(result).toBe('inline; filename=preview.pdf');
+        expect(result).toBe("inline; filename=preview.pdf");
     });
 });
 
@@ -83,9 +83,7 @@ describe("buildContentDisposition RFC 2616 quoting", () => {
         // advises not to rely on quoted-pair alone (user agents mishandle
         // `\"`), so a filename* parameter carries the quote unambiguously.
         const result = buildContentDisposition('the "plans".pdf');
-        expect(result).toBe(
-            'attachment; filename="the \\"plans\\".pdf"; filename*=UTF-8\'\'the%20%22plans%22.pdf',
-        );
+        expect(result).toBe('attachment; filename="the \\"plans\\".pdf"; filename*=UTF-8\'\'the%20%22plans%22.pdf');
     });
 
     test("multiple double-quotes are all escaped, with filename* companion", () => {
@@ -131,9 +129,7 @@ describe("buildContentDisposition backslash handling", () => {
         // path\to\"file".pdf -> basename is '"file".pdf' -> quotes escaped,
         // plus the unambiguous filename* form for the embedded quotes.
         const result = buildContentDisposition('path\\to\\"file".pdf');
-        expect(result).toBe(
-            'attachment; filename="\\"file\\".pdf"; filename*=UTF-8\'\'%22file%22.pdf',
-        );
+        expect(result).toBe('attachment; filename="\\"file\\".pdf"; filename*=UTF-8\'\'%22file%22.pdf');
     });
 });
 
@@ -252,19 +248,19 @@ describe("buildContentDisposition path traversal", () => {
 
 describe("buildContentDisposition fallback", () => {
     test("null input uses default fallback", () => {
-        expect(buildContentDisposition(null)).toBe('attachment; filename=document');
+        expect(buildContentDisposition(null)).toBe("attachment; filename=document");
     });
 
     test("undefined input uses default fallback", () => {
-        expect(buildContentDisposition(undefined)).toBe('attachment; filename=document');
+        expect(buildContentDisposition(undefined)).toBe("attachment; filename=document");
     });
 
     test("empty string uses default fallback", () => {
-        expect(buildContentDisposition("")).toBe('attachment; filename=document');
+        expect(buildContentDisposition("")).toBe("attachment; filename=document");
     });
 
     test("custom fallback", () => {
-        expect(buildContentDisposition(null, { fallback: "export.csv" })).toBe('attachment; filename=export.csv');
+        expect(buildContentDisposition(null, { fallback: "export.csv" })).toBe("attachment; filename=export.csv");
     });
 
     test("filename that sanitizes to empty falls through to a SANITIZED fallback", () => {
@@ -279,8 +275,7 @@ describe("buildContentDisposition fallback", () => {
     });
 
     test("both filename and fallback empty after sanitization use the constant", () => {
-        expect(buildContentDisposition("‮‮", { fallback: "///" }))
-            .toBe("attachment; filename=document");
+        expect(buildContentDisposition("‮‮", { fallback: "///" })).toBe("attachment; filename=document");
     });
 });
 
@@ -298,8 +293,7 @@ describe("buildContentDisposition type parameter is not trusted", () => {
     });
 
     test("inline is preserved", () => {
-        expect(buildContentDisposition("f.pdf", { type: "inline" }))
-            .toBe("inline; filename=f.pdf");
+        expect(buildContentDisposition("f.pdf", { type: "inline" })).toBe("inline; filename=f.pdf");
     });
 });
 
@@ -338,7 +332,7 @@ describe("buildContentDisposition stream route patterns", () => {
 
     test("inline with null filename", () => {
         const result = buildContentDisposition(null, { type: "inline" });
-        expect(result).toBe('inline; filename=document');
+        expect(result).toBe("inline; filename=document");
     });
 
     test("attachment for non-previewable type", () => {
@@ -411,14 +405,14 @@ describe("buildContentDisposition surrogate pair safety", () => {
     test("lone high surrogate is stripped from RFC 8187 encoding", () => {
         // Manually create a string with a lone high surrogate at the end
         // This simulates what happens when .slice(0, N) splits an emoji
-        const withLoneSurrogate = "report" + String.fromCharCode(0xD83C) + ".pdf";
+        const withLoneSurrogate = "report" + String.fromCharCode(0xd83c) + ".pdf";
         // Should not throw URIError from encodeURIComponent
         const result = buildContentDisposition(withLoneSurrogate);
         expect(result).toContain("attachment");
     });
 
     test("lone low surrogate is stripped from RFC 8187 encoding", () => {
-        const withLoneSurrogate = "report" + String.fromCharCode(0xDFFF) + ".pdf";
+        const withLoneSurrogate = "report" + String.fromCharCode(0xdfff) + ".pdf";
         const result = buildContentDisposition(withLoneSurrogate);
         expect(result).toContain("attachment");
     });
@@ -448,8 +442,7 @@ describe("buildContentDisposition encoding boundary precision", () => {
         // char), which must be preserved verbatim. A negated character class in
         // the traversal regex would eat "..v" and corrupt the name to
         // "archive2.zip".
-        expect(buildContentDisposition("archive..v2.zip"))
-            .toBe("attachment; filename=archive..v2.zip");
+        expect(buildContentDisposition("archive..v2.zip")).toBe("attachment; filename=archive..v2.zip");
     });
 
     test("a separator at index 0 still triggers basename extraction", () => {
@@ -457,8 +450,7 @@ describe("buildContentDisposition encoding boundary precision", () => {
         // `lastSep >= 0`, not `> 0`: index 0 is a real separator position, so
         // the leading slash must be sliced off, yielding the bare token. A
         // strict `> 0` would keep "/report.pdf" and force quoting.
-        expect(buildContentDisposition("/report.pdf"))
-            .toBe("attachment; filename=report.pdf");
+        expect(buildContentDisposition("/report.pdf")).toBe("attachment; filename=report.pdf");
     });
 
     test("a token-safe hex-escaped name emits filename UNQUOTED alongside filename*", () => {
@@ -466,8 +458,9 @@ describe("buildContentDisposition encoding boundary precision", () => {
         // %-doubled fallback "report%2520.pdf" is still a valid token, so the
         // legacy filename= parameter stays unquoted. This pins the token branch
         // inside the filename* builder that the looser %2520 test never asserts.
-        expect(buildContentDisposition("report%20.pdf"))
-            .toBe("attachment; filename=report%2520.pdf; filename*=UTF-8''report%2520.pdf");
+        expect(buildContentDisposition("report%20.pdf")).toBe(
+            "attachment; filename=report%2520.pdf; filename*=UTF-8''report%2520.pdf",
+        );
     });
 
     test("our attr-char percent-encoder emits UPPERCASE hex digits", () => {
@@ -557,5 +550,35 @@ describe("isInlineSafeMediaType", () => {
         expect(forUntrusted("a.png", "image/png")).toStartWith("inline");
         expect(forUntrusted("x.svg", "image/svg+xml")).toStartWith("attachment");
         expect(forUntrusted("p.html", "text/html")).toStartWith("attachment");
+    });
+});
+
+describe("dot-segment and over-long filenames", () => {
+    test.each([".", "..", "a/..", "dir\\."])("%s falls back instead of naming a dot segment", (name) => {
+        expect(buildContentDisposition(name)).toBe("attachment; filename=document");
+        expect(buildContentDisposition(name, { fallback: "export.csv" })).toBe("attachment; filename=export.csv");
+    });
+
+    test("a name over 255 UTF-8 bytes is cut to 255, keeping the extension", () => {
+        const header = buildContentDisposition(`${"a".repeat(400)}.pdf`);
+        const name = /filename=([^;]+)$/.exec(header)![1]!;
+        expect(name.length).toBe(255);
+        expect(name.endsWith(".pdf")).toBe(true);
+    });
+
+    test("the cut counts UTF-8 bytes and never splits a code point", () => {
+        // U+00E6 is two bytes and U+1F600 four in UTF-8.
+        const header = buildContentDisposition(`${"æ".repeat(100)}${"\u{1F600}".repeat(30)}.pdf`);
+        const encoded = /filename\*=UTF-8''(.+)$/.exec(header)![1]!;
+        const name = decodeURIComponent(encoded);
+        expect(new TextEncoder().encode(name).byteLength).toBeLessThanOrEqual(255);
+        expect(name.endsWith(".pdf")).toBe(true);
+        expect(name).not.toContain("�");
+        expect(name).toMatch(/^(?:æ|\u{1F600})+\.pdf$/u);
+    });
+
+    test("a name at exactly 255 bytes is unchanged", () => {
+        const exact = `${"b".repeat(251)}.txt`;
+        expect(buildContentDisposition(exact)).toBe(`attachment; filename=${exact}`);
     });
 });

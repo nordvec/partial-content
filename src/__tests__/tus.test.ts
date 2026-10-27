@@ -1,11 +1,24 @@
 import { describe, test, expect } from "bun:test";
 import {
-    createTusHandler, parseUploadMetadata, webCryptoChecksum,
-    TUS_EXPOSED_HEADERS, UPLOAD_EXPOSED_HEADERS, type TusHandlerOptions,
+    createTusHandler,
+    parseUploadMetadata,
+    webCryptoChecksum,
+    TUS_EXPOSED_HEADERS,
+    type TusHandlerOptions,
 } from "../tus";
-import { UploadNotFoundError, type ResumableWriteStore, type StoredUploadState } from "../upload-store";
+import { UPLOAD_EXPOSED_HEADERS } from "../upload";
+import {
+    UploadDestinationConflictError,
+    UploadNotFoundError,
+    type ResumableWriteStore,
+    type StoredUploadState,
+} from "../upload-store";
 import { UploadLockTimeoutError } from "../upload-locker";
 import type { UploadResourceEvent } from "../upload-orchestrator";
+import type { UploadPolicy } from "../upload-engine";
+
+/** Handler options a test overrides; its policy may omit the required maxSize. */
+type TusOverrides = Omit<Partial<TusHandlerOptions>, "policy"> & { policy?: UploadPolicy };
 
 const NOW = 1_800_000_000_000;
 const BASE = "http://localhost/files";
@@ -31,12 +44,16 @@ function fakeStore(over: Partial<ResumableWriteStore> = {}) {
         exactOffsetRecovery: true,
         atomicCompletion: true,
         enforcesOffsetCheck: true,
-        digestOnComplete: "sha256",
+        digestOnComplete: ["sha-256"],
         async createUpload(opts) {
             const uploadToken = `u${++seq}`;
             uploads.set(uploadToken, {
-                key: opts.key, bytes: new Uint8Array(0), length: opts.length,
-                isComplete: false, isInvalidated: false, createdAt: opts.now,
+                key: opts.key,
+                bytes: new Uint8Array(0),
+                length: opts.length,
+                isComplete: false,
+                isInvalidated: false,
+                createdAt: opts.now,
                 metadata: opts.metadata,
             });
             return { uploadToken };
@@ -46,15 +63,19 @@ function fakeStore(over: Partial<ResumableWriteStore> = {}) {
             if (!u) throw new UploadNotFoundError(token);
             return {
                 key: u.key,
-                offset: u.bytes.byteLength, length: u.length, isComplete: u.isComplete,
-                isInvalidated: u.isInvalidated, createdAt: u.createdAt,
-                lastAppendAt: u.lastAppendAt, metadata: u.metadata,
+                offset: u.bytes.byteLength,
+                length: u.length,
+                status: u.isInvalidated ? "invalidated" : u.isComplete ? "complete" : "incomplete",
+                createdAt: u.createdAt,
+                lastAppendAt: u.lastAppendAt,
+                metadata: u.metadata,
             };
         },
         async appendChunk(token, offset, body, opts) {
             const u = uploads.get(token);
             if (!u) throw new UploadNotFoundError(token);
             let written = 0;
+            let interrupted = false;
             const chunks: Uint8Array[] = [];
             if (body instanceof Uint8Array) {
                 chunks.push(body);
@@ -63,7 +84,10 @@ function fakeStore(over: Partial<ResumableWriteStore> = {}) {
                 const reader = body.getReader();
                 try {
                     for (;;) {
-                        if (opts.signal?.aborted) break;
+                        if (opts.signal?.aborted) {
+                            interrupted = true;
+                            break;
+                        }
                         const { done, value } = await reader.read();
                         if (done) break;
                         chunks.push(value);
@@ -71,16 +95,21 @@ function fakeStore(over: Partial<ResumableWriteStore> = {}) {
                     }
                 } catch {
                     // torn body: keep the flushed prefix
+                    interrupted = true;
                 }
             }
             const merged = new Uint8Array(u.bytes.byteLength + written);
             merged.set(u.bytes, 0);
             let at = u.bytes.byteLength;
-            for (const c of chunks) { merged.set(c, at); at += c.byteLength; }
+            for (const c of chunks) {
+                merged.set(c, at);
+                at += c.byteLength;
+            }
             u.bytes = merged;
             u.lastAppendAt = opts.now;
-            if (opts.signal?.aborted) throw new Error("aborted mid-append");
-            return { bytesWritten: written };
+            // The contract reports a yield rather than raising one.
+            if (opts.signal?.aborted) return { bytesWritten: written, interrupted: true };
+            return { bytesWritten: written, interrupted };
         },
         async completeUpload(token) {
             const u = uploads.get(token);
@@ -130,7 +159,11 @@ function tusRequest(method: string, opts: ReqOpts = {}): Request {
 /** A stream the test releases chunk by chunk. */
 function controlledStream() {
     let controller!: ReadableStreamDefaultController<Uint8Array>;
-    const stream = new ReadableStream<Uint8Array>({ start(c) { controller = c; } });
+    const stream = new ReadableStream<Uint8Array>({
+        start(c) {
+            controller = c;
+        },
+    });
     return {
         stream,
         push: (text: string) => controller.enqueue(bodyOf(text)),
@@ -139,10 +172,7 @@ function controlledStream() {
     };
 }
 
-function makeHandler(
-    opts: Partial<TusHandlerOptions> = {},
-    storeOver: Partial<ResumableWriteStore> = {},
-) {
+function makeHandler(opts: TusOverrides = {}, storeOver: Partial<ResumableWriteStore> = {}) {
     const { store, uploads } = fakeStore(storeOver);
     const handler = createTusHandler(store, {
         key: () => "server-key.bin",
@@ -150,8 +180,55 @@ function makeHandler(
         now: () => NOW,
         graceMs: 0,
         ...opts,
+        policy: { maxSize: Infinity, ...opts.policy },
     });
     return { handler, uploads, store };
+}
+
+/** The handler shape every helper below takes, as `makeHandler` returns it. */
+type TusHandler = (req: Request, ctx?: { uploadToken?: string }) => Promise<Response>;
+
+/** A clean PATCH of `text` at `offset`, declared length and all. */
+function patchBytes(handler: TusHandler, token: string, text: string, offset = 0): Promise<Response> {
+    return handler(
+        tusRequest("PATCH", {
+            headers: {
+                "Content-Type": OFFSET_TYPE,
+                "Upload-Offset": String(offset),
+                "Content-Length": String(bodyOf(text).length),
+            },
+            body: bodyOf(text),
+        }),
+        { uploadToken: token },
+    );
+}
+
+/**
+ * A PATCH whose client disconnects after `text` has been pushed.
+ *
+ * The timing dance is the fragile part and the reason this is one helper:
+ * the bytes have to reach the handler BEFORE the abort, or the test proves
+ * nothing about a partial write, and nine tests each wrote their own copy of
+ * the push / yield / abort / error sequence. The yield is a real await rather
+ * than a fake timer because the handler is reading a stream, and the point is
+ * that a chunk genuinely arrived first.
+ */
+async function abortedPatch(handler: TusHandler, token: string, text: string, offset = 0): Promise<Response> {
+    const ctl = new AbortController();
+    const body = controlledStream();
+    const pending = handler(
+        tusRequest("PATCH", {
+            headers: { "Content-Type": OFFSET_TYPE, "Upload-Offset": String(offset) },
+            body: body.stream,
+            signal: ctl.signal,
+        }),
+        { uploadToken: token },
+    );
+    body.push(text);
+    await new Promise((r) => setTimeout(r, 5));
+    ctl.abort();
+    body.error(new Error("socket gone"));
+    return pending;
 }
 
 function locationToken(res: Response): string {
@@ -185,10 +262,12 @@ describe("version negotiation", () => {
 
     test("an unsupported version answers 412 and the request is not processed", async () => {
         const { handler, uploads } = makeHandler();
-        const res = await handler(tusRequest("POST", {
-            noVersion: true,
-            headers: { "Tus-Resumable": "0.2.2", "Upload-Length": "5" },
-        }));
+        const res = await handler(
+            tusRequest("POST", {
+                noVersion: true,
+                headers: { "Tus-Resumable": "0.2.2", "Upload-Length": "5" },
+            }),
+        );
         expect(res.status).toBe(412);
         expect(uploads.size).toBe(0);
     });
@@ -230,7 +309,7 @@ describe("CORS exposed headers", () => {
     test("every header actually emitted by a full upload flow is in the exposed list", async () => {
         // Drive create -> HEAD -> PATCH-complete with expiration on and collect
         // every response header; each must be exposable or a CORS client breaks.
-        const { handler } = makeHandler({ policy: { maxAgeSeconds: 3600 }});
+        const { handler } = makeHandler({ policy: { maxAgeSeconds: 3600 } });
         const seen = new Set<string>();
         const collect = (res: Response) => res.headers.forEach((_v, k) => seen.add(k.toLowerCase()));
 
@@ -238,21 +317,25 @@ describe("CORS exposed headers", () => {
         collect(created);
         const token = locationToken(created);
         collect(await handler(tusRequest("HEAD", {}), { uploadToken: token }));
-        collect(await handler(tusRequest("PATCH", {
-            headers: { "Content-Type": OFFSET_TYPE, "Upload-Offset": "0", "Content-Length": "4" },
-            body: bodyOf("abcd"),
-        }), { uploadToken: token }));
+        collect(await patchBytes(handler, token, "abcd"));
 
         const exposable = new Set(TUS_EXPOSED_HEADERS.map((h) => h.toLowerCase()));
         // Transport/generic headers a browser reads without CORS exposure.
+        // ETag and Repr-Digest are NOT among them (the CORS-safelisted
+        // response-header names are a closed set), so they must be exposed.
         const alwaysReadable = new Set([
-            "content-type", "content-length", "cache-control", "date",
-            "x-content-type-options", "content-security-policy",
+            "content-type",
+            "content-length",
+            "cache-control",
+            "date",
+            "x-content-type-options",
+            "content-security-policy",
         ]);
-        const protocolHeaders = [...seen].filter((h) => h.startsWith("tus-") || h.startsWith("upload-") || h === "location");
-        for (const h of protocolHeaders) {
+        for (const h of seen) {
             expect(exposable.has(h) || alwaysReadable.has(h)).toBe(true);
         }
+        // The completing PATCH really did carry the object's validator.
+        expect(seen.has("etag")).toBe(true);
     });
 });
 
@@ -264,15 +347,18 @@ describe("OPTIONS", () => {
         expect(res.headers.get("tus-resumable")).toBe("1.0.0");
         expect(res.headers.get("tus-version")).toBe("1.0.0");
         // Honest advertising: no max age configured, so `expiration` is absent.
-        expect(res.headers.get("tus-extension"))
-            .toBe("creation,creation-with-upload,creation-defer-length,termination");
+        expect(res.headers.get("tus-extension")).toBe(
+            "creation,creation-with-upload,creation-defer-length,termination",
+        );
         expect(res.headers.get("tus-max-size")).toBeNull();
     });
 
     test("advertises `expiration` only when a max age is configured", async () => {
-        const { handler: withAge } = makeHandler({ policy: { maxAgeSeconds: 3600 }});
+        const { handler: withAge } = makeHandler({ policy: { maxAgeSeconds: 3600 } });
         const withRes = await withAge(tusRequest("OPTIONS", { noVersion: true }));
-        expect(withRes.headers.get("tus-extension")).toContain("expiration");
+        expect(withRes.headers.get("tus-extension")).toBe(
+            "creation,creation-with-upload,creation-defer-length,termination,expiration",
+        );
 
         const { handler: without } = makeHandler();
         const withoutRes = await without(tusRequest("OPTIONS", { noVersion: true }));
@@ -280,7 +366,7 @@ describe("OPTIONS", () => {
     });
 
     test("advertises Tus-Max-Size when a maximum size is configured", async () => {
-        const { handler } = makeHandler({ policy: { maxSize: 1024 }});
+        const { handler } = makeHandler({ policy: { maxSize: 1024 } });
         const res = await handler(tusRequest("OPTIONS", { noVersion: true }));
         expect(res.headers.get("tus-max-size")).toBe("1024");
     });
@@ -315,9 +401,11 @@ describe("creation", () => {
 
     test("both Upload-Length and Upload-Defer-Length answers 400", async () => {
         const { handler } = makeHandler();
-        const res = await handler(tusRequest("POST", {
-            headers: { "Upload-Length": "10", "Upload-Defer-Length": "1" },
-        }));
+        const res = await handler(
+            tusRequest("POST", {
+                headers: { "Upload-Length": "10", "Upload-Defer-Length": "1" },
+            }),
+        );
         expect(res.status).toBe(400);
     });
 
@@ -342,17 +430,19 @@ describe("creation", () => {
 
     test("a malformed Content-Length on a creation with content answers 400", async () => {
         const { handler, uploads } = makeHandler();
-        const res = await handler(tusRequest("POST", {
-            headers: { "Upload-Length": "10", "Content-Type": OFFSET_TYPE, "Content-Length": "0x10" },
-            body: bodyOf("hello"),
-        }));
+        const res = await handler(
+            tusRequest("POST", {
+                headers: { "Upload-Length": "10", "Content-Type": OFFSET_TYPE, "Content-Length": "0x10" },
+                body: bodyOf("hello"),
+            }),
+        );
         expect(res.status).toBe(400);
         expect(await res.text()).toBe("invalid Content-Length header");
         expect(uploads.size).toBe(0);
     });
 
     test("Upload-Length above the maximum answers 413 with Tus-Max-Size", async () => {
-        const { handler } = makeHandler({ policy: { maxSize: 4 }});
+        const { handler } = makeHandler({ policy: { maxSize: 4 } });
         const res = await handler(tusRequest("POST", { headers: { "Upload-Length": "100" } }));
         expect(res.status).toBe(413);
         expect(res.headers.get("tus-max-size")).toBe("4");
@@ -363,14 +453,19 @@ describe("creation", () => {
     test("decoded metadata reaches the key callback and the stored resource", async () => {
         const seen: Array<Record<string, string>> = [];
         const { handler, uploads } = makeHandler({
-            key: ({ metadata }) => { seen.push(metadata); return "k1"; },
-        });
-        const res = await handler(tusRequest("POST", {
-            headers: {
-                "Upload-Length": "5",
-                "Upload-Metadata": `filename ${b64("plan.pdf")},empty`,
+            key: ({ metadata }) => {
+                seen.push(metadata);
+                return "k1";
             },
-        }));
+        });
+        const res = await handler(
+            tusRequest("POST", {
+                headers: {
+                    "Upload-Length": "5",
+                    "Upload-Metadata": `filename ${b64("plan.pdf")},empty`,
+                },
+            }),
+        );
         expect(res.status).toBe(201);
         expect(seen[0]).toEqual({ filename: "plan.pdf", empty: "" });
         expect(uploads.get("u1")!.metadata).toEqual({ filename: "plan.pdf", empty: "" });
@@ -381,12 +476,14 @@ describe("creation", () => {
         // report it, so a client resuming from a cold start recovers the
         // filename and type it no longer holds.
         const { handler } = makeHandler();
-        await handler(tusRequest("POST", {
-            headers: {
-                "Upload-Length": "5",
-                "Upload-Metadata": `filename ${b64("pl an,å.pdf")},empty`,
-            },
-        }));
+        await handler(
+            tusRequest("POST", {
+                headers: {
+                    "Upload-Length": "5",
+                    "Upload-Metadata": `filename ${b64("pl an,å.pdf")},empty`,
+                },
+            }),
+        );
         const res = await handler(tusRequest("HEAD"), { uploadToken: "u1" });
         expect(res.status).toBe(200);
         // Values are base64 (so a comma, a space, or a non-ASCII byte inside
@@ -394,7 +491,8 @@ describe("creation", () => {
         expect(res.headers.get("upload-metadata")).toBe(`filename ${b64("pl an,å.pdf")},empty`);
         // The echo is exactly what the parser accepts back.
         expect(parseUploadMetadata(res.headers.get("upload-metadata"))).toEqual({
-            filename: "pl an,å.pdf", empty: "",
+            filename: "pl an,å.pdf",
+            empty: "",
         });
     });
 
@@ -413,7 +511,10 @@ describe("creation", () => {
         const { handler, uploads } = makeHandler();
         await handler(tusRequest("POST", { headers: { "Upload-Length": "5" } }));
         uploads.get("u1")!.metadata = {
-            "we ird": "x", "com,ma": "y", "line\r\nbreak": "z", ok: "fine",
+            "we ird": "x",
+            "com,ma": "y",
+            "line\r\nbreak": "z",
+            ok: "fine",
         };
         const res = await handler(tusRequest("HEAD"), { uploadToken: "u1" });
         expect(res.headers.get("upload-metadata")).toBe(`ok ${b64("fine")}`);
@@ -422,16 +523,18 @@ describe("creation", () => {
     test("malformed Upload-Metadata answers 400 before any store call", async () => {
         const { handler, uploads } = makeHandler();
         for (const value of [
-            "filename ###",             // not base64
-            `k ${b64("a")} extra`,      // three tokens in one pair
+            "filename ###", // not base64
+            `k ${b64("a")} extra`, // three tokens in one pair
             `k ${b64("a")},k ${b64("b")}`, // duplicate key
             `bad,key ${b64("a")}`.replace("bad", "sp ace x"), // key with space
-            "k /w==",                   // valid base64, not UTF-8
-            ",",                        // empty pair
+            "k /w==", // valid base64, not UTF-8
+            ",", // empty pair
         ]) {
-            const res = await handler(tusRequest("POST", {
-                headers: { "Upload-Length": "5", "Upload-Metadata": value },
-            }));
+            const res = await handler(
+                tusRequest("POST", {
+                    headers: { "Upload-Length": "5", "Upload-Metadata": value },
+                }),
+            );
             expect(res.status).toBe(400);
         }
         expect(uploads.size).toBe(0);
@@ -446,8 +549,7 @@ describe("parseUploadMetadata", () => {
     });
 
     test("pairs decode, bare keys carry empty values, whitespace around pairs is tolerated", () => {
-        expect(parseUploadMetadata(`a ${b64("x")}, b ${b64("æøå")} ,c`))
-            .toEqual({ a: "x", b: "æøå", c: "" });
+        expect(parseUploadMetadata(`a ${b64("x")}, b ${b64("æøå")} ,c`)).toEqual({ a: "x", b: "æøå", c: "" });
     });
 
     test("malformed input returns null", () => {
@@ -465,10 +567,12 @@ describe("parseUploadMetadata", () => {
 describe("creation-with-upload", () => {
     test("a partial body is accepted and the 201 reports the applied offset", async () => {
         const { handler, uploads } = makeHandler();
-        const res = await handler(tusRequest("POST", {
-            headers: { "Upload-Length": "10", "Content-Type": OFFSET_TYPE, "Content-Length": "5" },
-            body: bodyOf("hello"),
-        }));
+        const res = await handler(
+            tusRequest("POST", {
+                headers: { "Upload-Length": "10", "Content-Type": OFFSET_TYPE, "Content-Length": "5" },
+                body: bodyOf("hello"),
+            }),
+        );
         expect(res.status).toBe(201);
         expect(res.headers.get("upload-offset")).toBe("5");
         expect(uploads.get("u1")!.isComplete).toBe(false);
@@ -476,10 +580,12 @@ describe("creation-with-upload", () => {
 
     test("a full body completes the upload at creation", async () => {
         const { handler, uploads } = makeHandler();
-        const res = await handler(tusRequest("POST", {
-            headers: { "Upload-Length": "10", "Content-Type": OFFSET_TYPE, "Content-Length": "10" },
-            body: bodyOf("0123456789"),
-        }));
+        const res = await handler(
+            tusRequest("POST", {
+                headers: { "Upload-Length": "10", "Content-Type": OFFSET_TYPE, "Content-Length": "10" },
+                body: bodyOf("0123456789"),
+            }),
+        );
         expect(res.status).toBe(201);
         expect(res.headers.get("upload-offset")).toBe("10");
         expect(uploads.get("u1")!.isComplete).toBe(true);
@@ -487,10 +593,12 @@ describe("creation-with-upload", () => {
 
     test("a body under any other Content-Type is not upload content", async () => {
         const { handler, uploads } = makeHandler();
-        const res = await handler(tusRequest("POST", {
-            headers: { "Upload-Length": "10", "Content-Type": "text/plain", "Content-Length": "5" },
-            body: bodyOf("hello"),
-        }));
+        const res = await handler(
+            tusRequest("POST", {
+                headers: { "Upload-Length": "10", "Content-Type": "text/plain", "Content-Length": "5" },
+                body: bodyOf("hello"),
+            }),
+        );
         expect(res.status).toBe(201);
         expect(res.headers.get("upload-offset")).toBeNull();
         expect(uploads.get("u1")!.bytes.byteLength).toBe(0);
@@ -503,10 +611,7 @@ describe("HEAD", () => {
     test("reports offset, length, no-store, and the version echo", async () => {
         const { handler } = makeHandler();
         const token = await createUpload(handler, { "Upload-Length": "10" });
-        await handler(tusRequest("PATCH", {
-            headers: { "Content-Type": OFFSET_TYPE, "Upload-Offset": "0", "Content-Length": "4" },
-            body: bodyOf("abcd"),
-        }), { uploadToken: token });
+        await patchBytes(handler, token, "abcd");
 
         const res = await handler(tusRequest("HEAD"), { uploadToken: token });
         expect(res.status).toBe(200);
@@ -556,7 +661,7 @@ describe("HEAD", () => {
 // ─── PATCH (core + creation-defer-length) ────────────────────────────────────
 
 describe("PATCH", () => {
-    async function withUpload(opts: Partial<TusHandlerOptions> = {}, length = "10") {
+    async function withUpload(opts: TusOverrides = {}, length = "10") {
         const made = makeHandler(opts);
         const token = await createUpload(made.handler, { "Upload-Length": length });
         return { ...made, token };
@@ -564,10 +669,7 @@ describe("PATCH", () => {
 
     test("happy path: 204 with the new Upload-Offset", async () => {
         const { handler, token } = await withUpload();
-        const res = await handler(tusRequest("PATCH", {
-            headers: { "Content-Type": OFFSET_TYPE, "Upload-Offset": "0", "Content-Length": "4" },
-            body: bodyOf("abcd"),
-        }), { uploadToken: token });
+        const res = await patchBytes(handler, token, "abcd");
         expect(res.status).toBe(204);
         expect(res.headers.get("upload-offset")).toBe("4");
         expect(res.headers.get("tus-resumable")).toBe("1.0.0");
@@ -578,9 +680,13 @@ describe("PATCH", () => {
         const { store, uploads } = fakeStore();
         const spy: ResumableWriteStore = {
             ...store,
-            getUploadState: (t, opts) => { reads++; return store.getUploadState(t, opts); },
+            getUploadState: (t, opts) => {
+                reads++;
+                return store.getUploadState(t, opts);
+            },
         };
         const handler = createTusHandler(spy, {
+            policy: { maxSize: Infinity },
             key: () => "server-key.bin",
             location: (tok) => `/files/${tok}`,
             now: () => NOW,
@@ -588,10 +694,7 @@ describe("PATCH", () => {
         });
         const token = await createUpload(handler, { "Upload-Length": "10" });
         reads = 0;
-        const res = await handler(tusRequest("PATCH", {
-            headers: { "Content-Type": OFFSET_TYPE, "Upload-Offset": "0", "Content-Length": "4" },
-            body: bodyOf("abcd"),
-        }), { uploadToken: token });
+        const res = await patchBytes(handler, token, "abcd");
         expect(res.status).toBe(204);
         expect(res.headers.get("upload-offset")).toBe("4");
         // The orchestrator's single locked pre-evaluation read is the whole
@@ -603,14 +706,8 @@ describe("PATCH", () => {
 
     test("the final PATCH publishes the upload", async () => {
         const { handler, token, uploads } = await withUpload();
-        await handler(tusRequest("PATCH", {
-            headers: { "Content-Type": OFFSET_TYPE, "Upload-Offset": "0", "Content-Length": "6" },
-            body: bodyOf("abcdef"),
-        }), { uploadToken: token });
-        const res = await handler(tusRequest("PATCH", {
-            headers: { "Content-Type": OFFSET_TYPE, "Upload-Offset": "6", "Content-Length": "4" },
-            body: bodyOf("ghij"),
-        }), { uploadToken: token });
+        await patchBytes(handler, token, "abcdef");
+        const res = await patchBytes(handler, token, "ghij", 6);
         expect(res.status).toBe(204);
         expect(res.headers.get("upload-offset")).toBe("10");
         expect(uploads.get(token)!.isComplete).toBe(true);
@@ -618,25 +715,57 @@ describe("PATCH", () => {
 
     test("a retried final PATCH is answered idempotently with 204", async () => {
         const { handler, token, uploads } = await withUpload({}, "4");
-        await handler(tusRequest("PATCH", {
-            headers: { "Content-Type": OFFSET_TYPE, "Upload-Offset": "0", "Content-Length": "4" },
-            body: bodyOf("abcd"),
-        }), { uploadToken: token });
+        await patchBytes(handler, token, "abcd");
         expect(uploads.get(token)!.isComplete).toBe(true);
-        const res = await handler(tusRequest("PATCH", {
-            headers: { "Content-Type": OFFSET_TYPE, "Upload-Offset": "4", "Content-Length": "0" },
-        }), { uploadToken: token });
+        const res = await handler(
+            tusRequest("PATCH", {
+                headers: { "Content-Type": OFFSET_TYPE, "Upload-Offset": "4", "Content-Length": "0" },
+            }),
+            { uploadToken: token },
+        );
         expect(res.status).toBe(204);
         expect(res.headers.get("upload-offset")).toBe("4");
     });
 
+    test("a final PATCH carrying content past the end answers 400", async () => {
+        const { handler, token, uploads } = await withUpload({}, "4");
+        await patchBytes(handler, token, "abcd");
+        expect(uploads.get(token)!.isComplete).toBe(true);
+        // Upload-Length fixes the total at four bytes, so a fifth has nowhere
+        // to go; 204 would acknowledge content that reached no store.
+        const res = await patchBytes(handler, token, "e", 4);
+        expect(res.status).toBe(400);
+        expect(await res.text()).toContain("inconsistent");
+        expect(uploads.get(token)!.bytes.byteLength).toBe(4);
+    });
+
     test("a wrong Content-Type answers 415", async () => {
         const { handler, token } = await withUpload();
-        const res = await handler(tusRequest("PATCH", {
-            headers: { "Content-Type": "application/json", "Upload-Offset": "0", "Content-Length": "2" },
-            body: bodyOf("{}"),
-        }), { uploadToken: token });
+        const res = await handler(
+            tusRequest("PATCH", {
+                headers: { "Content-Type": "application/json", "Upload-Offset": "0", "Content-Length": "2" },
+                body: bodyOf("{}"),
+            }),
+            { uploadToken: token },
+        );
         expect(res.status).toBe(415);
+    });
+
+    test("an off-grammar Content-Type answers 415 even when its essence matches", async () => {
+        for (const contentType of [
+            "application/offset+octet-stream;, text/html",
+            "application/offset+octet-stream; bare",
+        ]) {
+            const { handler, token } = await withUpload();
+            const res = await handler(
+                tusRequest("PATCH", {
+                    headers: { "Content-Type": contentType, "Upload-Offset": "0", "Content-Length": "2" },
+                    body: bodyOf("ab"),
+                }),
+                { uploadToken: token },
+            );
+            expect(res.status).toBe(415);
+        }
     });
 
     test("a missing Content-Type answers 415", async () => {
@@ -663,55 +792,57 @@ describe("PATCH", () => {
 
     test("a malformed Content-Length answers 400", async () => {
         const { handler, token } = await withUpload();
-        const res = await handler(tusRequest("PATCH", {
-            headers: { "Content-Type": OFFSET_TYPE, "Upload-Offset": "0", "Content-Length": "0x4" },
-            body: bodyOf("abcd"),
-        }), { uploadToken: token });
+        const res = await handler(
+            tusRequest("PATCH", {
+                headers: { "Content-Type": OFFSET_TYPE, "Upload-Offset": "0", "Content-Length": "0x4" },
+                body: bodyOf("abcd"),
+            }),
+            { uploadToken: token },
+        );
         expect(res.status).toBe(400);
         expect(await res.text()).toBe("invalid Content-Length header");
     });
 
     test("the content type is matched by essence: parameters and casing do not matter", async () => {
         const { handler, token } = await withUpload();
-        const res = await handler(tusRequest("PATCH", {
-            headers: {
-                "Content-Type": "Application/Offset+Octet-Stream ; part=1",
-                "Upload-Offset": "0",
-                "Content-Length": "4",
-            },
-            body: bodyOf("abcd"),
-        }), { uploadToken: token });
+        const res = await handler(
+            tusRequest("PATCH", {
+                headers: {
+                    "Content-Type": "Application/Offset+Octet-Stream ; part=1",
+                    "Upload-Offset": "0",
+                    "Content-Length": "4",
+                },
+                body: bodyOf("abcd"),
+            }),
+            { uploadToken: token },
+        );
         expect(res.status).toBe(204);
         expect(res.headers.get("upload-offset")).toBe("4");
     });
 
     test("a PATCH without a token answers 404 with a plain-text body", async () => {
         const { handler } = makeHandler();
-        const res = await handler(tusRequest("PATCH", {
-            headers: { "Content-Type": OFFSET_TYPE, "Upload-Offset": "0" },
-        }));
+        const res = await handler(
+            tusRequest("PATCH", {
+                headers: { "Content-Type": OFFSET_TYPE, "Upload-Offset": "0" },
+            }),
+        );
         expect(res.status).toBe(404);
         expect(await res.text()).toBe("upload not found");
     });
 
     test("a stale offset answers 409 without an offset header and without writing", async () => {
         const { handler, token, uploads } = await withUpload();
-        const res = await handler(tusRequest("PATCH", {
-            headers: { "Content-Type": OFFSET_TYPE, "Upload-Offset": "5", "Content-Length": "2" },
-            body: bodyOf("xy"),
-        }), { uploadToken: token });
+        const res = await patchBytes(handler, token, "xy", 5);
         expect(res.status).toBe(409);
         expect(res.headers.get("upload-offset")).toBeNull();
         expect(uploads.get(token)!.bytes.byteLength).toBe(0);
     });
 
     test("an append crossing the maximum size answers 413", async () => {
-        const { handler } = makeHandler({ policy: { maxSize: 4 }});
+        const { handler } = makeHandler({ policy: { maxSize: 4 } });
         const token = await createUpload(handler, { "Upload-Defer-Length": "1" });
-        const res = await handler(tusRequest("PATCH", {
-            headers: { "Content-Type": OFFSET_TYPE, "Upload-Offset": "0", "Content-Length": "10" },
-            body: bodyOf("0123456789"),
-        }), { uploadToken: token });
+        const res = await patchBytes(handler, token, "0123456789");
         expect(res.status).toBe(413);
         expect(res.headers.get("tus-max-size")).toBe("4");
     });
@@ -725,24 +856,30 @@ describe("PATCH", () => {
             locker: {
                 acquire: async (uploadToken) => {
                     if (armed) throw new UploadLockTimeoutError(uploadToken);
-                    return { release() { /* no-op setup lock */ }, signal: new AbortController().signal };
+                    return {
+                        release() {
+                            /* no-op setup lock */
+                        },
+                        signal: new AbortController().signal,
+                        lease: new AbortController().signal,
+                    };
                 },
             },
         });
         armed = true;
-        const res = await handler(tusRequest("PATCH", {
-            headers: { "Content-Type": OFFSET_TYPE, "Upload-Offset": "0", "Content-Length": "1" },
-            body: bodyOf("x"),
-        }), { uploadToken: token });
+        const res = await patchBytes(handler, token, "x");
         expect(res.status).toBe(423);
     });
 
     test("an unknown upload answers 404", async () => {
         const { handler } = makeHandler();
-        const res = await handler(tusRequest("PATCH", {
-            headers: { "Content-Type": OFFSET_TYPE, "Upload-Offset": "0", "Content-Length": "1" },
-            body: bodyOf("x"),
-        }), { uploadToken: "nope" });
+        const res = await handler(
+            tusRequest("PATCH", {
+                headers: { "Content-Type": OFFSET_TYPE, "Upload-Offset": "0", "Content-Length": "1" },
+                body: bodyOf("x"),
+            }),
+            { uploadToken: "nope" },
+        );
         expect(res.status).toBe(404);
         expect(await res.text()).toBe("upload not found");
     });
@@ -751,13 +888,14 @@ describe("PATCH", () => {
         const operations: string[] = [];
         const { handler } = makeHandler(
             { onError: (_e, ctx) => operations.push(ctx.operation) },
-            { appendChunk: async () => { throw new Error("backend down"); } },
+            {
+                appendChunk: async () => {
+                    throw new Error("backend down");
+                },
+            },
         );
         const token = await createUpload(handler, { "Upload-Length": "5" });
-        const res = await handler(tusRequest("PATCH", {
-            headers: { "Content-Type": OFFSET_TYPE, "Upload-Offset": "0", "Content-Length": "1" },
-            body: bodyOf("x"),
-        }), { uploadToken: token });
+        const res = await patchBytes(handler, token, "x");
         expect(res.status).toBe(502);
         expect(res.headers.get("content-security-policy")).toBe("default-src 'none'");
         expect(operations).toContain("append");
@@ -773,18 +911,7 @@ describe("PATCH", () => {
         // without an extra HEAD, and one that cannot re-probes and sees the
         // same offset.
         const { handler, token, uploads } = await withUpload();
-        const ctl = new AbortController();
-        const body = controlledStream();
-        const pending = handler(tusRequest("PATCH", {
-            headers: { "Content-Type": OFFSET_TYPE, "Upload-Offset": "0" },
-            body: body.stream,
-            signal: ctl.signal,
-        }), { uploadToken: token });
-        body.push("abc");
-        await new Promise((r) => setTimeout(r, 5));
-        ctl.abort();
-        body.error(new Error("socket gone"));
-        const res = await pending;
+        const res = await abortedPatch(handler, token, "abc");
         expect(res.status).toBe(204);
         expect(res.headers.get("upload-offset")).toBe("3");
         expect(uploads.get(token)!.isComplete).toBe(false);
@@ -796,18 +923,7 @@ describe("PATCH", () => {
         // published; otherwise the client sees offset == length, stops, and
         // the object never becomes readable.
         const { handler, token, uploads } = await withUpload({}, "3");
-        const ctl = new AbortController();
-        const body = controlledStream();
-        const pending = handler(tusRequest("PATCH", {
-            headers: { "Content-Type": OFFSET_TYPE, "Upload-Offset": "0" },
-            body: body.stream,
-            signal: ctl.signal,
-        }), { uploadToken: token });
-        body.push("abc");
-        await new Promise((r) => setTimeout(r, 5));
-        ctl.abort();
-        body.error(new Error("socket gone"));
-        const res = await pending;
+        const res = await abortedPatch(handler, token, "abc");
         expect(res.status).toBe(204);
         expect(res.headers.get("upload-offset")).toBe("3");
         expect(uploads.get(token)!.isComplete).toBe(true);
@@ -820,13 +936,18 @@ describe("creation-defer-length", () => {
     test("a PATCH carrying Upload-Length fixes the length and can complete", async () => {
         const { handler, uploads } = makeHandler();
         const token = await createUpload(handler, { "Upload-Defer-Length": "1" });
-        const res = await handler(tusRequest("PATCH", {
-            headers: {
-                "Content-Type": OFFSET_TYPE, "Upload-Offset": "0",
-                "Upload-Length": "5", "Content-Length": "5",
-            },
-            body: bodyOf("hello"),
-        }), { uploadToken: token });
+        const res = await handler(
+            tusRequest("PATCH", {
+                headers: {
+                    "Content-Type": OFFSET_TYPE,
+                    "Upload-Offset": "0",
+                    "Upload-Length": "5",
+                    "Content-Length": "5",
+                },
+                body: bodyOf("hello"),
+            }),
+            { uploadToken: token },
+        );
         expect(res.status).toBe(204);
         expect(res.headers.get("upload-offset")).toBe("5");
         expect(uploads.get(token)!.isComplete).toBe(true);
@@ -838,13 +959,18 @@ describe("creation-defer-length", () => {
             const token = await createUpload(made.handler, { "Upload-Length": "10" });
             return { ...made, token };
         })();
-        const res = await handler(tusRequest("PATCH", {
-            headers: {
-                "Content-Type": OFFSET_TYPE, "Upload-Offset": "0",
-                "Upload-Length": "12", "Content-Length": "2",
-            },
-            body: bodyOf("ab"),
-        }), { uploadToken: token });
+        const res = await handler(
+            tusRequest("PATCH", {
+                headers: {
+                    "Content-Type": OFFSET_TYPE,
+                    "Upload-Offset": "0",
+                    "Upload-Length": "12",
+                    "Content-Length": "2",
+                },
+                body: bodyOf("ab"),
+            }),
+            { uploadToken: token },
+        );
         expect(res.status).toBe(400);
         expect(await res.text()).toBe("inconsistent upload length");
     });
@@ -852,10 +978,7 @@ describe("creation-defer-length", () => {
     test("a partial PATCH on a deferred-length upload does not complete it", async () => {
         const { handler, uploads } = makeHandler();
         const token = await createUpload(handler, { "Upload-Defer-Length": "1" });
-        const res = await handler(tusRequest("PATCH", {
-            headers: { "Content-Type": OFFSET_TYPE, "Upload-Offset": "0", "Content-Length": "4" },
-            body: bodyOf("abcd"),
-        }), { uploadToken: token });
+        const res = await patchBytes(handler, token, "abcd");
         expect(res.status).toBe(204);
         expect(uploads.get(token)!.isComplete).toBe(false);
         const head = await handler(tusRequest("HEAD"), { uploadToken: token });
@@ -865,13 +988,18 @@ describe("creation-defer-length", () => {
     test("a malformed Upload-Length on PATCH answers 400", async () => {
         const { handler } = makeHandler();
         const token = await createUpload(handler, { "Upload-Defer-Length": "1" });
-        const res = await handler(tusRequest("PATCH", {
-            headers: {
-                "Content-Type": OFFSET_TYPE, "Upload-Offset": "0",
-                "Upload-Length": "five", "Content-Length": "2",
-            },
-            body: bodyOf("ab"),
-        }), { uploadToken: token });
+        const res = await handler(
+            tusRequest("PATCH", {
+                headers: {
+                    "Content-Type": OFFSET_TYPE,
+                    "Upload-Offset": "0",
+                    "Upload-Length": "five",
+                    "Content-Length": "2",
+                },
+                body: bodyOf("ab"),
+            }),
+            { uploadToken: token },
+        );
         expect(res.status).toBe(400);
         expect(await res.text()).toBe("invalid Upload-Length header");
     });
@@ -885,7 +1013,32 @@ describe("checksum extension", () => {
         return Buffer.from(digest).toString("base64");
     }
 
-    function checksumHandler(opts: Partial<TusHandlerOptions> = {}) {
+    type TusHandler = ReturnType<typeof makeHandler>["handler"];
+
+    /** A PATCH at offset 0 declaring `checksum`; the Content-Length header is sent only when `length` is given. */
+    function patchWithChecksum(
+        handler: TusHandler,
+        token: string | undefined,
+        checksum: string,
+        body: ReqOpts["body"],
+        opts: { length?: string; url?: string } = {},
+    ) {
+        return handler(
+            tusRequest("PATCH", {
+                url: opts.url,
+                headers: {
+                    "Content-Type": OFFSET_TYPE,
+                    "Upload-Offset": "0",
+                    ...(opts.length === undefined ? {} : { "Content-Length": opts.length }),
+                    "Upload-Checksum": checksum,
+                },
+                body,
+            }),
+            token === undefined ? undefined : { uploadToken: token },
+        );
+    }
+
+    function checksumHandler(opts: TusOverrides = {}) {
         return makeHandler({ checksum: webCryptoChecksum(), policy: { maxAppendSize: 1024 }, ...opts });
     }
 
@@ -904,14 +1057,7 @@ describe("checksum extension", () => {
                 },
             },
         });
-        const res = await handler(tusRequest("PATCH", {
-            headers: {
-                "Content-Type": OFFSET_TYPE,
-                "Upload-Offset": "0",
-                "Upload-Checksum": `sha1 ${await sha1b64("abcd")}`,
-            },
-            body: bodyOf("abcd"),
-        }), { uploadToken: "no-such-token" });
+        const res = await patchWithChecksum(handler, "no-such-token", `sha1 ${await sha1b64("abcd")}`, bodyOf("abcd"));
 
         expect(res.status).toBe(404);
         // The digest is the expensive half and unambiguously ours; a byte
@@ -923,7 +1069,15 @@ describe("checksum extension", () => {
     test("OPTIONS advertises the extension and its algorithms", async () => {
         const { handler } = checksumHandler();
         const res = await handler(tusRequest("OPTIONS", { noVersion: true }));
-        expect(res.headers.get("tus-extension")).toContain("checksum");
+        expect(res.headers.get("tus-extension")).toBe(
+            "creation,creation-with-upload,creation-defer-length,termination,checksum",
+        );
+        // Both optional extensions at once, in the order they are appended.
+        const { handler: both } = checksumHandler({ policy: { maxAppendSize: 1024, maxAgeSeconds: 60 } });
+        const bothRes = await both(tusRequest("OPTIONS", { noVersion: true }));
+        expect(bothRes.headers.get("tus-extension")).toBe(
+            "creation,creation-with-upload,creation-defer-length,termination,expiration,checksum",
+        );
         expect(res.headers.get("tus-checksum-algorithm")).toBe("sha1,sha256,sha384,sha512");
     });
 
@@ -937,13 +1091,9 @@ describe("checksum extension", () => {
     test("a PATCH with a matching sha1 checksum appends normally", async () => {
         const { handler, uploads } = checksumHandler();
         const token = await createUpload(handler, { "Upload-Length": "4" });
-        const res = await handler(tusRequest("PATCH", {
-            headers: {
-                "Content-Type": OFFSET_TYPE, "Upload-Offset": "0", "Content-Length": "4",
-                "Upload-Checksum": `sha1 ${await sha1b64("abcd")}`,
-            },
-            body: bodyOf("abcd"),
-        }), { uploadToken: token });
+        const res = await patchWithChecksum(handler, token, `sha1 ${await sha1b64("abcd")}`, bodyOf("abcd"), {
+            length: "4",
+        });
         expect(res.status).toBe(204);
         expect(res.headers.get("upload-offset")).toBe("4");
         expect(uploads.get(token)!.isComplete).toBe(true);
@@ -952,13 +1102,9 @@ describe("checksum extension", () => {
     test("a mismatch answers 460 and the chunk never reaches the store", async () => {
         const { handler, uploads } = checksumHandler();
         const token = await createUpload(handler, { "Upload-Length": "4" });
-        const res = await handler(tusRequest("PATCH", {
-            headers: {
-                "Content-Type": OFFSET_TYPE, "Upload-Offset": "0", "Content-Length": "4",
-                "Upload-Checksum": `sha1 ${await sha1b64("NOT-abcd")}`,
-            },
-            body: bodyOf("abcd"),
-        }), { uploadToken: token });
+        const res = await patchWithChecksum(handler, token, `sha1 ${await sha1b64("NOT-abcd")}`, bodyOf("abcd"), {
+            length: "4",
+        });
         expect(res.status).toBe(460);
         expect(res.statusText).toBe("Checksum Mismatch");
         // Discarded means DISCARDED: durable state is untouched, the client's
@@ -970,13 +1116,9 @@ describe("checksum extension", () => {
     test("an unadvertised algorithm answers 400", async () => {
         const { handler } = checksumHandler();
         const token = await createUpload(handler, { "Upload-Length": "4" });
-        const res = await handler(tusRequest("PATCH", {
-            headers: {
-                "Content-Type": OFFSET_TYPE, "Upload-Offset": "0", "Content-Length": "4",
-                "Upload-Checksum": "md5 1B2M2Y8AsgTpgAmY7PhCfg==",
-            },
-            body: bodyOf("abcd"),
-        }), { uploadToken: token });
+        const res = await patchWithChecksum(handler, token, "md5 1B2M2Y8AsgTpgAmY7PhCfg==", bodyOf("abcd"), {
+            length: "4",
+        });
         expect(res.status).toBe(400);
         expect(await res.text()).toBe("unsupported checksum algorithm");
     });
@@ -985,13 +1127,7 @@ describe("checksum extension", () => {
         const { handler } = checksumHandler();
         const token = await createUpload(handler, { "Upload-Length": "4" });
         for (const value of ["sha1", "sha1 ", " sha1", "sha1 not-base64!!", "sha1 ===="]) {
-            const res = await handler(tusRequest("PATCH", {
-                headers: {
-                    "Content-Type": OFFSET_TYPE, "Upload-Offset": "0", "Content-Length": "4",
-                    "Upload-Checksum": value,
-                },
-                body: bodyOf("abcd"),
-            }), { uploadToken: token });
+            const res = await patchWithChecksum(handler, token, value, bodyOf("abcd"), { length: "4" });
             expect(res.status).toBe(400);
             expect(await res.text()).toBe("invalid Upload-Checksum header");
         }
@@ -1003,20 +1139,81 @@ describe("checksum extension", () => {
             checksum: {
                 algorithms: ["sha1"],
                 maxBufferBytes: 3,
-                digest: (_a, bytes) => { digested++; return bytes; },
+                digest: (_a, bytes) => {
+                    digested++;
+                    return bytes;
+                },
             },
         });
         const token = await createUpload(handler, { "Upload-Length": "8" });
-        const res = await handler(tusRequest("PATCH", {
-            headers: {
-                "Content-Type": OFFSET_TYPE, "Upload-Offset": "0", "Content-Length": "8",
-                "Upload-Checksum": `sha1 ${await sha1b64("abcdefgh")}`,
-            },
-            body: bodyOf("abcdefgh"),
-        }), { uploadToken: token });
+        const res = await patchWithChecksum(handler, token, `sha1 ${await sha1b64("abcdefgh")}`, bodyOf("abcdefgh"), {
+            length: "8",
+        });
         expect(res.status).toBe(413);
         expect(digested).toBe(0);
         expect(uploads.get(token)!.bytes.byteLength).toBe(0);
+    });
+
+    /** A body the test can prove was never pulled: the stream only counts reads. */
+    function unreadBody() {
+        const reads = { count: 0 };
+        const stream = new ReadableStream<Uint8Array>(
+            {
+                pull(controller) {
+                    reads.count += 1;
+                    controller.enqueue(bodyOf("abcd"));
+                    controller.close();
+                },
+            },
+            { highWaterMark: 0 },
+        );
+        return { reads, stream };
+    }
+
+    test("a checksummed PATCH the authorize hook refuses never reads or hashes the body", async () => {
+        let digested = 0;
+        let allow = true;
+        const { handler, uploads } = checksumHandler({
+            checksum: {
+                algorithms: ["sha1"],
+                digest: (_a, bytes) => {
+                    digested++;
+                    return bytes;
+                },
+            },
+            authorize: () => (allow ? undefined : new Response("denied", { status: 403 })),
+        });
+        const token = await createUpload(handler, { "Upload-Length": "4" });
+        allow = false;
+        const { reads, stream } = unreadBody();
+        const res = await patchWithChecksum(handler, token, `sha1 ${await sha1b64("abcd")}`, stream, { length: "4" });
+        expect(res.status).toBe(403);
+        expect(reads.count).toBe(0);
+        expect(digested).toBe(0);
+        expect(uploads.get(token)!.bytes.byteLength).toBe(0);
+    });
+
+    test("a declared Content-Length over the buffer cap answers 413 without reading the body", async () => {
+        const { handler } = checksumHandler({
+            checksum: { algorithms: ["sha1"], maxBufferBytes: 3, digest: (_a, bytes) => bytes },
+        });
+        const token = await createUpload(handler, { "Upload-Length": "8" });
+        const { reads, stream } = unreadBody();
+        const res = await patchWithChecksum(handler, token, `sha1 ${await sha1b64("abcdefgh")}`, stream, {
+            length: "8",
+        });
+        expect(res.status).toBe(413);
+        expect(reads.count).toBe(0);
+    });
+
+    test("an authorized checksummed PATCH still verifies and appends", async () => {
+        const { handler, uploads } = checksumHandler({ authorize: () => undefined });
+        const token = await createUpload(handler, { "Upload-Length": "4" });
+        const res = await patchWithChecksum(handler, token, `sha1 ${await sha1b64("abcd")}`, bodyOf("abcd"), {
+            length: "4",
+        });
+        expect(res.status).toBe(204);
+        expect(uploads.get(token)!.bytes.byteLength).toBe(4);
     });
 
     test("without checksum config an Upload-Checksum header is ignored, not enforced", async () => {
@@ -1024,53 +1221,120 @@ describe("checksum extension", () => {
         // verify is dropped, never answered as if the bytes were compared.
         const { handler, uploads } = makeHandler();
         const token = await createUpload(handler, { "Upload-Length": "4" });
-        const res = await handler(tusRequest("PATCH", {
-            headers: {
-                "Content-Type": OFFSET_TYPE, "Upload-Offset": "0", "Content-Length": "4",
-                "Upload-Checksum": `sha1 ${await sha1b64("SOMETHING-ELSE")}`,
-            },
-            body: bodyOf("abcd"),
-        }), { uploadToken: token });
+        const res = await patchWithChecksum(handler, token, `sha1 ${await sha1b64("SOMETHING-ELSE")}`, bodyOf("abcd"), {
+            length: "4",
+        });
         expect(res.status).toBe(204);
         expect(uploads.get(token)!.isComplete).toBe(true);
     });
 
     test("creation-with-upload content verifies too, mismatch included", async () => {
         const { handler, uploads } = checksumHandler();
-        const good = await handler(tusRequest("POST", {
-            headers: {
-                "Upload-Length": "4", "Content-Type": OFFSET_TYPE, "Content-Length": "4",
-                "Upload-Checksum": `sha1 ${await sha1b64("abcd")}`,
-            },
-            body: bodyOf("abcd"),
-        }));
+        const good = await handler(
+            tusRequest("POST", {
+                headers: {
+                    "Upload-Length": "4",
+                    "Content-Type": OFFSET_TYPE,
+                    "Content-Length": "4",
+                    "Upload-Checksum": `sha1 ${await sha1b64("abcd")}`,
+                },
+                body: bodyOf("abcd"),
+            }),
+        );
         expect(good.status).toBe(201);
         expect(good.headers.get("upload-offset")).toBe("4");
 
-        const bad = await handler(tusRequest("POST", {
-            headers: {
-                "Upload-Length": "4", "Content-Type": OFFSET_TYPE, "Content-Length": "4",
-                "Upload-Checksum": `sha1 ${await sha1b64("WRONG")}`,
-            },
-            body: bodyOf("abcd"),
-        }));
+        const bad = await handler(
+            tusRequest("POST", {
+                headers: {
+                    "Upload-Length": "4",
+                    "Content-Type": OFFSET_TYPE,
+                    "Content-Length": "4",
+                    "Upload-Checksum": `sha1 ${await sha1b64("WRONG")}`,
+                },
+                body: bodyOf("abcd"),
+            }),
+        );
         expect(bad.status).toBe(460);
-        // Only the good creation produced a resource with bytes.
-        const withBytes = [...uploads.values()].filter((u) => u.bytes.byteLength > 0);
-        expect(withBytes).toHaveLength(1);
+        // Verification runs before allocation, so the mismatch left no resource.
+        expect(uploads.size).toBe(1);
+    });
+
+    /** A checksummed creation-with-upload POST of an unread "abcd" body. */
+    async function checksummedCreate(handler: TusHandler, headers: Record<string, string> = {}) {
+        const { reads, stream } = unreadBody();
+        const res = await handler(
+            tusRequest("POST", {
+                headers: {
+                    "Upload-Length": "4",
+                    "Content-Type": OFFSET_TYPE,
+                    "Upload-Checksum": `sha1 ${await sha1b64("abcd")}`,
+                    ...headers,
+                },
+                body: stream,
+            }),
+        );
+        return { res, reads };
+    }
+
+    function countingChecksum(opts: { maxBufferBytes?: number } = {}) {
+        const counts = { digests: 0 };
+        const checksum = {
+            algorithms: ["sha1" as const],
+            ...opts,
+            digest: (_a: string, bytes: Uint8Array) => {
+                counts.digests++;
+                return bytes;
+            },
+        };
+        return { counts, checksum };
+    }
+
+    test("a checksummed creation the key callback refuses never reads or hashes the body", async () => {
+        const { counts, checksum } = countingChecksum();
+        const { handler, uploads } = checksumHandler({
+            checksum,
+            key: () => new Response("denied", { status: 403 }),
+        });
+        const { res, reads } = await checksummedCreate(handler);
+        expect(res.status).toBe(403);
+        expect(reads.count).toBe(0);
+        expect(counts.digests).toBe(0);
+        expect(uploads.size).toBe(0);
+    });
+
+    test("a checksummed creation the policy refuses never reads or hashes the body", async () => {
+        const { counts, checksum } = countingChecksum();
+        const { handler, uploads } = checksumHandler({ checksum, policy: { maxAppendSize: 1024, maxSize: 2 } });
+        const { res, reads } = await checksummedCreate(handler);
+        expect(res.status).toBe(413);
+        expect(reads.count).toBe(0);
+        expect(counts.digests).toBe(0);
+        expect(uploads.size).toBe(0);
+    });
+
+    test("a checksummed creation declaring content over the buffer cap answers 413 before key", async () => {
+        const { counts, checksum } = countingChecksum({ maxBufferBytes: 3 });
+        let keyed = 0;
+        const { handler } = checksumHandler({
+            checksum,
+            key: () => {
+                keyed++;
+                return "k";
+            },
+        });
+        const { res, reads } = await checksummedCreate(handler, { "Content-Length": "4" });
+        expect(res.status).toBe(413);
+        expect(reads.count).toBe(0);
+        expect(counts.digests).toBe(0);
+        expect(keyed).toBe(0);
     });
 
     test("a torn body under a checksum answers 400 with durable state untouched", async () => {
         const { handler, uploads } = checksumHandler();
         const token = await createUpload(handler, { "Upload-Length": "8" });
         const body = controlledStream();
-        const pending = handler(tusRequest("PATCH", {
-            headers: {
-                "Content-Type": OFFSET_TYPE, "Upload-Offset": "0",
-                "Upload-Checksum": `sha1 ${await sha1b64("abcdefgh")}`,
-            },
-            body: body.stream,
-        }), { uploadToken: token });
+        const pending = patchWithChecksum(handler, token, `sha1 ${await sha1b64("abcdefgh")}`, body.stream);
         body.push("abcd");
         body.error(new Error("connection reset"));
         const res = await pending;
@@ -1080,13 +1344,128 @@ describe("checksum extension", () => {
 
     test("construction refuses an unbounded verification buffer and empty algorithms", () => {
         const { store } = fakeStore();
-        expect(() => createTusHandler(store, {
-            key: () => "k", location: (t) => `/f/${t}`, checksum: webCryptoChecksum(),
-        })).toThrow(TypeError);
-        expect(() => createTusHandler(store, {
-            key: () => "k", location: (t) => `/f/${t}`, policy: { maxAppendSize: 1024 },
-            checksum: { algorithms: [], digest: (_a, b) => b },
-        })).toThrow(TypeError);
+        expect(() =>
+            createTusHandler(store, {
+                policy: { maxSize: Infinity },
+                key: () => "k",
+                location: (t) => `/f/${t}`,
+                checksum: webCryptoChecksum(),
+            }),
+        ).toThrow(TypeError);
+        expect(() =>
+            createTusHandler(store, {
+                key: () => "k",
+                location: (t) => `/f/${t}`,
+                policy: { maxSize: Infinity, maxAppendSize: 1024 },
+                checksum: { algorithms: [], digest: (_a, b) => b },
+            }),
+        ).toThrow(TypeError);
+    });
+
+    test("the last-resort seam reports the auditKey and projects the error", async () => {
+        // A throwing caller callback on a resource request escapes to the
+        // handler-level catch. That seam reports through the same onError as
+        // every other path, so it substitutes the audit key on the context and
+        // hands the sink an allow-listed projection of the error, never the
+        // message that quotes the capability.
+        const seen: { err: unknown; ctx: { uploadToken?: string; auditKey?: string; operation: string } }[] = [];
+        let token = "";
+        const { handler } = makeHandler({
+            checksum: {
+                algorithms: ["sha1"],
+                maxBufferBytes: 64,
+                digest: () => {
+                    throw new Error(`hasher exploded on ${token}`);
+                },
+            },
+            policy: { maxAppendSize: 1024 },
+            auditKey: () => "doc-42",
+            onError: (err, ctx) => seen.push({ err, ctx }),
+        });
+        token = await createUpload(handler, { "Upload-Length": "4" });
+        const res = await patchWithChecksum(handler, token, `sha1 ${await sha1b64("abcd")}`, bodyOf("abcd"), {
+            length: "4",
+        });
+        expect(res.status).toBe(500);
+        expect(seen).toHaveLength(1);
+        expect(seen[0]!.ctx).toEqual({ auditKey: "doc-42", operation: "handler" });
+        expect(seen[0]!.err).toEqual({ name: "Error", operation: "handler" });
+    });
+
+    test("the last-resort seam finds the token through resolveToken when no ctx carries one", async () => {
+        const seen: { uploadToken?: string; auditKey?: string; operation: string }[] = [];
+        const { handler } = makeHandler({
+            resolveToken: (req) => new URL(req.url).pathname.split("/").pop(),
+            checksum: {
+                algorithms: ["sha1"],
+                maxBufferBytes: 64,
+                digest: () => {
+                    throw new Error("hasher exploded");
+                },
+            },
+            policy: { maxAppendSize: 1024 },
+            auditKey: ({ uploadToken }) => `audit-${uploadToken}`,
+            onError: (_err, ctx) => seen.push(ctx),
+        });
+        const token = await createUpload(handler, { "Upload-Length": "4" });
+        const res = await handler(
+            tusRequest("PATCH", {
+                url: `${BASE}/${token}`,
+                headers: {
+                    "Content-Type": OFFSET_TYPE,
+                    "Upload-Offset": "0",
+                    "Content-Length": "4",
+                    "Upload-Checksum": `sha1 ${await sha1b64("abcd")}`,
+                },
+                body: bodyOf("abcd"),
+            }),
+        );
+        expect(res.status).toBe(500);
+        expect(seen).toStrictEqual([{ auditKey: `audit-${token}`, operation: "handler" }]);
+    });
+
+    test("a throwing auditKey callback still reaches onError, projected and without the token", async () => {
+        // The seam derives the audit key again, guardedly: the callback that
+        // threw once throws again. A configured auditKey promised the token
+        // stays off the sink, so the report carries neither it nor the raw error.
+        const seen: { err: unknown; ctx: object }[] = [];
+        const boom = new Error("auditKey exploded");
+        const { handler } = makeHandler({
+            // Throws on the probe only, so the creation it follows succeeds.
+            auditKey: ({ request }) => {
+                if (request.method === "HEAD") throw boom;
+                return undefined;
+            },
+            onError: (err, ctx) => seen.push({ err, ctx }),
+        });
+        const token = await createUpload(handler, { "Upload-Length": "4" });
+        const res = await handler(tusRequest("HEAD"), { uploadToken: token });
+        expect(res.status).toBe(500);
+        expect(seen).toHaveLength(1);
+        expect(seen[0]!.ctx).toStrictEqual({ operation: "handler" });
+        expect(seen[0]!.err).not.toBe(boom);
+        expect(seen[0]!.err).toMatchObject({ name: "Error", operation: "handler" });
+        expect(JSON.stringify(seen[0]!.err)).not.toContain(token);
+    });
+
+    test("a creation that fails before a token exists asks without one", async () => {
+        const asked: (string | undefined)[] = [];
+        const seen: object[] = [];
+        const { handler } = makeHandler({
+            key: () => {
+                throw new Error("caller bug");
+            },
+            auditKey: ({ uploadToken }) => {
+                asked.push(uploadToken);
+                return uploadToken && `audit-${uploadToken}`;
+            },
+            onError: (_err, ctx) => seen.push(ctx),
+        });
+        const res = await handler(tusRequest("POST", { headers: { "Upload-Length": "5" } }));
+        expect(res.status).toBe(500);
+        // Never a key derived from a token that does not exist.
+        expect(asked.every((t) => t === undefined)).toBe(true);
+        expect(seen).toStrictEqual([{ operation: "handler" }]);
     });
 
     test("a throwing digest is a hardened 500 to onError, never a mismatch", async () => {
@@ -1095,18 +1474,16 @@ describe("checksum extension", () => {
             checksum: {
                 algorithms: ["sha1"],
                 maxBufferBytes: 64,
-                digest: () => { throw new Error("hasher exploded"); },
+                digest: () => {
+                    throw new Error("hasher exploded");
+                },
             },
             onError: (_e, ctx) => errors.push(ctx.operation),
         });
         const token = await createUpload(handler, { "Upload-Length": "4" });
-        const res = await handler(tusRequest("PATCH", {
-            headers: {
-                "Content-Type": OFFSET_TYPE, "Upload-Offset": "0", "Content-Length": "4",
-                "Upload-Checksum": `sha1 ${await sha1b64("abcd")}`,
-            },
-            body: bodyOf("abcd"),
-        }), { uploadToken: token });
+        const res = await patchWithChecksum(handler, token, `sha1 ${await sha1b64("abcd")}`, bodyOf("abcd"), {
+            length: "4",
+        });
         expect(res.status).toBe(500);
         expect(errors).toEqual(["handler"]);
         expect(uploads.get(token)!.bytes.byteLength).toBe(0);
@@ -1138,8 +1515,19 @@ describe("expiration", () => {
     const EXPECTED = new Date(NOW + MAX_AGE * 1000).toUTCString();
     const IMF_RE = /^[A-Z][a-z]{2}, \d{2} [A-Z][a-z]{2} \d{4} \d{2}:\d{2}:\d{2} GMT$/;
 
+    test("a lifetime whose deadline has no IMF-fixdate is refused at construction", async () => {
+        // The date's year has four digits; past 9999 the header would read a
+        // five-digit year, and further out "Invalid Date".
+        const longest = (Date.UTC(10_000, 0) - NOW) / 1000 - 1;
+        expect(() => makeHandler({ policy: { maxAgeSeconds: longest + 1 } })).toThrow("past the year 9999");
+        expect(() => makeHandler({ policy: { maxAgeSeconds: Number.MAX_SAFE_INTEGER } })).toThrow(TypeError);
+        const { handler } = makeHandler({ policy: { maxAgeSeconds: longest } });
+        const res = await handler(tusRequest("POST", { headers: { "Upload-Length": "10" } }));
+        expect(res.headers.get("upload-expires")).toBe("Fri, 31 Dec 9999 23:59:59 GMT");
+    });
+
     test("creation, HEAD, and PATCH carry Upload-Expires in IMF-fixdate format", async () => {
-        const { handler } = makeHandler({ policy: { maxAgeSeconds: MAX_AGE }});
+        const { handler } = makeHandler({ policy: { maxAgeSeconds: MAX_AGE } });
         const createRes = await handler(tusRequest("POST", { headers: { "Upload-Length": "10" } }));
         expect(createRes.headers.get("upload-expires")).toBe(EXPECTED);
         expect(createRes.headers.get("upload-expires")).toMatch(IMF_RE);
@@ -1148,21 +1536,15 @@ describe("expiration", () => {
         const headRes = await handler(tusRequest("HEAD"), { uploadToken: token });
         expect(headRes.headers.get("upload-expires")).toBe(EXPECTED);
 
-        const patchRes = await handler(tusRequest("PATCH", {
-            headers: { "Content-Type": OFFSET_TYPE, "Upload-Offset": "0", "Content-Length": "4" },
-            body: bodyOf("abcd"),
-        }), { uploadToken: token });
+        const patchRes = await patchBytes(handler, token, "abcd");
         expect(patchRes.status).toBe(204);
         expect(patchRes.headers.get("upload-expires")).toBe(EXPECTED);
     });
 
     test("a completed upload carries no Upload-Expires", async () => {
-        const { handler } = makeHandler({ policy: { maxAgeSeconds: MAX_AGE }});
+        const { handler } = makeHandler({ policy: { maxAgeSeconds: MAX_AGE } });
         const token = await createUpload(handler, { "Upload-Length": "4" });
-        const res = await handler(tusRequest("PATCH", {
-            headers: { "Content-Type": OFFSET_TYPE, "Upload-Offset": "0", "Content-Length": "4" },
-            body: bodyOf("abcd"),
-        }), { uploadToken: token });
+        const res = await patchBytes(handler, token, "abcd");
         expect(res.status).toBe(204);
         expect(res.headers.get("upload-expires")).toBeNull();
     });
@@ -1174,21 +1556,17 @@ describe("expiration", () => {
         const token = locationToken(res);
         const head = await handler(tusRequest("HEAD"), { uploadToken: token });
         expect(head.headers.get("upload-expires")).toBeNull();
-        const patch = await handler(tusRequest("PATCH", {
-            headers: { "Content-Type": OFFSET_TYPE, "Upload-Offset": "0", "Content-Length": "4" },
-            body: bodyOf("abcd"),
-        }), { uploadToken: token });
+        const patch = await patchBytes(handler, token, "abcd");
         expect(patch.headers.get("upload-expires")).toBeNull();
     });
 
     test("a completed upload's HEAD carries no Upload-Expires", async () => {
-        const { handler } = makeHandler({ policy: { maxAgeSeconds: MAX_AGE }});
+        const { handler } = makeHandler({ policy: { maxAgeSeconds: MAX_AGE } });
         const token = await createUpload(handler, { "Upload-Length": "0" });
         const head = await handler(tusRequest("HEAD"), { uploadToken: token });
         expect(head.status).toBe(200);
         expect(head.headers.get("upload-expires")).toBeNull();
     });
-
 
     test("a slow streaming creation anchors Upload-Expires at creation start, not stream end", async () => {
         // The creation response's deadline is pinned to when creation STARTED,
@@ -1198,10 +1576,12 @@ describe("expiration", () => {
         let clock = NOW;
         const { handler } = makeHandler({ policy: { maxAgeSeconds: MAX_AGE }, now: () => clock });
         const body = controlledStream();
-        const pending = handler(tusRequest("POST", {
-            headers: { "Upload-Defer-Length": "1", "Content-Type": OFFSET_TYPE },
-            body: body.stream,
-        }));
+        const pending = handler(
+            tusRequest("POST", {
+                headers: { "Upload-Defer-Length": "1", "Content-Type": OFFSET_TYPE },
+                body: body.stream,
+            }),
+        );
         await new Promise((r) => setTimeout(r, 5));
         clock = NOW + 1800 * 1000; // 30 minutes elapse while the body streams
         body.push("abc");
@@ -1212,7 +1592,7 @@ describe("expiration", () => {
         expect(res.headers.get("upload-expires")).toBe(EXPECTED);
     });
 
-    test("an expired upload answers 410", async () => {
+    test("an expired upload answers 410, and the refusal reclaims it", async () => {
         let clock = NOW;
         const { handler } = makeHandler({ policy: { maxAgeSeconds: MAX_AGE }, now: () => clock });
         const token = await createUpload(handler, { "Upload-Length": "10" });
@@ -1220,11 +1600,13 @@ describe("expiration", () => {
         const head = await handler(tusRequest("HEAD"), { uploadToken: token });
         expect(head.status).toBe(410);
         expect(await head.text()).toBe(""); // HEAD is bodyless, errors included
-        const patch = await handler(tusRequest("PATCH", {
-            headers: { "Content-Type": OFFSET_TYPE, "Upload-Offset": "0", "Content-Length": "1" },
-            body: bodyOf("x"),
-        }), { uploadToken: token });
-        expect(patch.status).toBe(410);
+        // The request that condemns the resource also frees it: expiry is
+        // measured from creation while the sweep's clock is idleness, so a
+        // resource kept busy is refused by every request and reachable by no
+        // sweep. The expiration extension allows 404 or 410 here, and after
+        // the bytes are gone 404 is the more truthful of the two.
+        const patch = await patchBytes(handler, token, "x");
+        expect(patch.status).toBe(404);
     });
 });
 
@@ -1235,9 +1617,12 @@ describe("routing and hardening", () => {
         const { handler } = makeHandler();
         const token = await createUpload(handler, { "Upload-Length": "5" });
         // Override to DELETE terminates instead of creating.
-        const res = await handler(tusRequest("POST", {
-            headers: { "X-HTTP-Method-Override": "DELETE" },
-        }), { uploadToken: token });
+        const res = await handler(
+            tusRequest("POST", {
+                headers: { "X-HTTP-Method-Override": "DELETE" },
+            }),
+            { uploadToken: token },
+        );
         expect(res.status).toBe(204);
         expect((await handler(tusRequest("HEAD"), { uploadToken: token })).status).toBe(404);
     });
@@ -1245,9 +1630,12 @@ describe("routing and hardening", () => {
     test("an overridden PATCH still enforces the PATCH content type", async () => {
         const { handler } = makeHandler();
         const token = await createUpload(handler, { "Upload-Length": "5" });
-        const res = await handler(tusRequest("POST", {
-            headers: { "X-HTTP-Method-Override": "patch", "Upload-Offset": "0" },
-        }), { uploadToken: token });
+        const res = await handler(
+            tusRequest("POST", {
+                headers: { "X-HTTP-Method-Override": "patch", "Upload-Offset": "0" },
+            }),
+            { uploadToken: token },
+        );
         expect(res.status).toBe(415);
     });
 
@@ -1284,14 +1672,11 @@ describe("routing and hardening", () => {
     test("auditKey substitution reaches upload events for resource requests", async () => {
         const events: UploadResourceEvent[] = [];
         const { handler } = makeHandler({
-            auditKey: (token) => `audit-${token}`,
+            auditKey: ({ uploadToken }) => `audit-${uploadToken}`,
             onUploadEvent: (e) => events.push(e),
         });
         const token = await createUpload(handler, { "Upload-Length": "4" });
-        await handler(tusRequest("PATCH", {
-            headers: { "Content-Type": OFFSET_TYPE, "Upload-Offset": "0", "Content-Length": "2" },
-            body: bodyOf("ab"),
-        }), { uploadToken: token });
+        await patchBytes(handler, token, "ab");
         const appendEvents = events.filter((e) => e.event.kind === "append-accepted");
         expect(appendEvents.length).toBeGreaterThan(0);
         expect(appendEvents.every((e) => e.auditKey === `audit-${token}`)).toBe(true);
@@ -1300,7 +1685,9 @@ describe("routing and hardening", () => {
     test("a throwing key callback becomes a hardened 500, never an escaped throw", async () => {
         const errors: string[] = [];
         const { handler } = makeHandler({
-            key: () => { throw new Error("caller bug"); },
+            key: () => {
+                throw new Error("caller bug");
+            },
             onError: (_e, ctx) => errors.push(ctx.operation),
         });
         const res = await handler(tusRequest("POST", { headers: { "Upload-Length": "5" } }));
@@ -1324,55 +1711,36 @@ describe("routing and hardening", () => {
 
 describe("policy bounds", () => {
     test("minSize rejects a too-small declared upload with 400", async () => {
-        const { handler } = makeHandler({ policy: { minSize: 5 }});
+        const { handler } = makeHandler({ policy: { minSize: 5 } });
         const res = await handler(tusRequest("POST", { headers: { "Upload-Length": "1" } }));
         expect(res.status).toBe(400);
         expect(await res.text()).toBe("upload violates a size policy");
     });
 
     test("maxAppendSize rejects an oversized append with 413 and no Tus-Max-Size", async () => {
-        const { handler } = makeHandler({ policy: { maxAppendSize: 2 }});
+        const { handler } = makeHandler({ policy: { maxAppendSize: 2 } });
         const token = await createUpload(handler, { "Upload-Length": "10" });
-        const res = await handler(tusRequest("PATCH", {
-            headers: { "Content-Type": OFFSET_TYPE, "Upload-Offset": "0", "Content-Length": "3" },
-            body: bodyOf("abc"),
-        }), { uploadToken: token });
+        const res = await patchBytes(handler, token, "abc");
         expect(res.status).toBe(413);
         // No maximum SIZE is configured, so no Tus-Max-Size rides the 413.
         expect(res.headers.get("tus-max-size")).toBeNull();
     });
 
-
-    test("minAppendSize rejects a small non-final append but exempts the completing one", async () => {
-        const { handler, uploads } = makeHandler({ policy: { minAppendSize: 6 }});
-        const token = await createUpload(handler, { "Upload-Length": "10" });
-        const small = await handler(tusRequest("PATCH", {
-            headers: { "Content-Type": OFFSET_TYPE, "Upload-Offset": "0", "Content-Length": "2" },
-            body: bodyOf("ab"),
-        }), { uploadToken: token });
-        expect(small.status).toBe(400);
-        expect(await small.text()).toBe("upload violates a size policy");
-
-        // The completing tail is however small it is (spec exemption): a
-        // 4-byte upload completes in one small PATCH despite the floor.
-        const tokenSmallFile = await createUpload(handler, { "Upload-Length": "4" });
-        const tail = await handler(tusRequest("PATCH", {
-            headers: { "Content-Type": OFFSET_TYPE, "Upload-Offset": "0", "Content-Length": "4" },
-            body: bodyOf("abcd"),
-        }), { uploadToken: tokenSmallFile });
-        expect(tail.status).toBe(204);
-        expect(uploads.get(tokenSmallFile)!.isComplete).toBe(true);
-    });
-
-
-    test("a small completing creation-with-upload is exempt from minAppendSize", async () => {
-        const { handler, uploads } = makeHandler({ policy: { minAppendSize: 6 }});
-        const res = await handler(tusRequest("POST", {
-            headers: { "Upload-Length": "4", "Content-Type": OFFSET_TYPE, "Content-Length": "4" },
-            body: bodyOf("abcd"),
-        }));
-        expect(res.status).toBe(201);
-        expect(uploads.get("u1")!.isComplete).toBe(true);
+    test("a minAppendSize policy is refused at construction, whatever its value", () => {
+        // The floor's only exemption is an append that completes the upload,
+        // and this dialect infers completion from a known total length. An
+        // upload created under Upload-Defer-Length has none, so every PATCH on
+        // it is refused with a 400 the client cannot act on: tus advertises no
+        // append floor for it to aim at. creation-defer-length is always
+        // offered, so no configuration keeps the floor escapable.
+        expect(() => makeHandler({ policy: { minAppendSize: 6 } })).toThrow(TypeError);
+        expect(() => makeHandler({ policy: { minAppendSize: 0 } })).toThrow(TypeError);
+        // Every other bound stays serviceable over this wire.
+        expect(() =>
+            makeHandler({
+                policy: { maxSize: 10, minSize: 1, maxAppendSize: 6, maxAgeSeconds: 60 },
+            }),
+        ).not.toThrow();
     });
 });
 
@@ -1387,7 +1755,13 @@ describe("HEAD error shapes", () => {
             locker: {
                 acquire: async (uploadToken) => {
                     if (armed) throw new UploadLockTimeoutError(uploadToken);
-                    return { release() { /* no-op setup lock */ }, signal: new AbortController().signal };
+                    return {
+                        release() {
+                            /* no-op setup lock */
+                        },
+                        signal: new AbortController().signal,
+                        lease: new AbortController().signal,
+                    };
                 },
             },
         });
@@ -1400,9 +1774,14 @@ describe("HEAD error shapes", () => {
     });
 
     test("a store failure on HEAD answers a bodyless 502", async () => {
-        const { handler } = makeHandler({}, {
-            getUploadState: async () => { throw new Error("backend down"); },
-        });
+        const { handler } = makeHandler(
+            {},
+            {
+                getUploadState: async () => {
+                    throw new Error("backend down");
+                },
+            },
+        );
         const res = await handler(tusRequest("HEAD"), { uploadToken: "u1" });
         expect(res.status).toBe(502);
         expect(await res.text()).toBe("");
@@ -1423,11 +1802,13 @@ describe("implicit-completion healing", () => {
         const { handler, uploads } = makeHandler();
         const ctl = new AbortController();
         const body = controlledStream();
-        const pending = handler(tusRequest("POST", {
-            headers: { "Upload-Length": "3", "Content-Type": OFFSET_TYPE },
-            body: body.stream,
-            signal: ctl.signal,
-        }));
+        const pending = handler(
+            tusRequest("POST", {
+                headers: { "Upload-Length": "3", "Content-Type": OFFSET_TYPE },
+                body: body.stream,
+                signal: ctl.signal,
+            }),
+        );
         body.push("abc");
         await new Promise((r) => setTimeout(r, 5));
         ctl.abort();
@@ -1439,14 +1820,16 @@ describe("implicit-completion healing", () => {
     });
 
     test("a healed creation with a max age carries no Upload-Expires (it is complete)", async () => {
-        const { handler } = makeHandler({ policy: { maxAgeSeconds: 3600 }});
+        const { handler } = makeHandler({ policy: { maxAgeSeconds: 3600 } });
         const ctl = new AbortController();
         const body = controlledStream();
-        const pending = handler(tusRequest("POST", {
-            headers: { "Upload-Length": "3", "Content-Type": OFFSET_TYPE },
-            body: body.stream,
-            signal: ctl.signal,
-        }));
+        const pending = handler(
+            tusRequest("POST", {
+                headers: { "Upload-Length": "3", "Content-Type": OFFSET_TYPE },
+                body: body.stream,
+                signal: ctl.signal,
+            }),
+        );
         body.push("abc");
         await new Promise((r) => setTimeout(r, 5));
         ctl.abort();
@@ -1457,56 +1840,96 @@ describe("implicit-completion healing", () => {
     });
 
     test("a healed PATCH with a max age carries no Upload-Expires (it is complete)", async () => {
-        const { handler } = makeHandler({ policy: { maxAgeSeconds: 3600 }});
+        const { handler } = makeHandler({ policy: { maxAgeSeconds: 3600 } });
         const token = await createUpload(handler, { "Upload-Length": "3" });
-        const ctl = new AbortController();
-        const body = controlledStream();
-        const pending = handler(tusRequest("PATCH", {
-            headers: { "Content-Type": OFFSET_TYPE, "Upload-Offset": "0" },
-            body: body.stream,
-            signal: ctl.signal,
-        }), { uploadToken: token });
-        body.push("abc");
-        await new Promise((r) => setTimeout(r, 5));
-        ctl.abort();
-        body.error(new Error("socket gone"));
-        const res = await pending;
+        const res = await abortedPatch(handler, token, "abc");
         expect(res.status).toBe(204);
         expect(res.headers.get("upload-expires")).toBeNull();
     });
 
-    test("a failing publish during PATCH healing surfaces as a 502, never a false success", async () => {
-        const { handler } = makeHandler({}, {
-            completeUpload: async () => { throw new Error("publish failed"); },
-        });
+    test("a heal that finds the upload already completed answers it complete (no Upload-Expires)", async () => {
+        // Another request completes the upload between the interrupted append
+        // and its heal, so the heal answers already-complete. The upload is
+        // complete either way, and a completed upload no longer expires.
+        const { store, uploads } = fakeStore();
+        let completedElsewhere = false;
+        const appendChunk = store.appendChunk.bind(store);
+        const getUploadState = store.getUploadState.bind(store);
+        const handler = createTusHandler(
+            {
+                ...store,
+                appendChunk: async (token, offset, body, opts) => {
+                    const written = await appendChunk(token, offset, body, opts);
+                    completedElsewhere = written.interrupted;
+                    return written;
+                },
+                getUploadState: async (token) => {
+                    if (completedElsewhere) uploads.get(token)!.isComplete = true;
+                    return getUploadState(token);
+                },
+            },
+            {
+                key: () => "server-key.bin",
+                location: (token) => `/files/${token}`,
+                now: () => NOW,
+                graceMs: 0,
+                policy: { maxSize: 1024, maxAgeSeconds: 3600 },
+            },
+        );
         const token = await createUpload(handler, { "Upload-Length": "3" });
-        const ctl = new AbortController();
-        const body = controlledStream();
-        const pending = handler(tusRequest("PATCH", {
-            headers: { "Content-Type": OFFSET_TYPE, "Upload-Offset": "0" },
-            body: body.stream,
-            signal: ctl.signal,
-        }), { uploadToken: token });
-        body.push("abc");
-        await new Promise((r) => setTimeout(r, 5));
-        ctl.abort();
-        body.error(new Error("socket gone"));
-        const res = await pending;
+        const res = await abortedPatch(handler, token, "abc");
+        expect(res.status).toBe(204);
+        expect(res.headers.get("upload-offset")).toBe("3");
+        expect(res.headers.get("upload-expires")).toBeNull();
+    });
+
+    test("a failing publish during PATCH healing surfaces as a 502, never a false success", async () => {
+        const { handler } = makeHandler(
+            {},
+            {
+                completeUpload: async () => {
+                    throw new Error("publish failed");
+                },
+            },
+        );
+        const token = await createUpload(handler, { "Upload-Length": "3" });
+        const res = await abortedPatch(handler, token, "abc");
         expect(res.status).toBe(502);
         expect(await res.text()).toBe("storage backend error");
     });
 
+    test("a destination changed under the sealed plan answers 409, never a 502 or a success", async () => {
+        const { handler } = makeHandler(
+            {},
+            {
+                completeUpload: async (t) => {
+                    throw new UploadDestinationConflictError(t);
+                },
+            },
+        );
+        const token = await createUpload(handler, { "Upload-Length": "3" });
+        const res = await patchBytes(handler, token, "abc");
+        expect(res.status).toBe(409);
+        expect(await res.text()).toBe("upload destination changed; nothing was published");
+    });
     test("a failing publish during creation healing surfaces as a 502", async () => {
-        const { handler } = makeHandler({}, {
-            completeUpload: async () => { throw new Error("publish failed"); },
-        });
+        const { handler } = makeHandler(
+            {},
+            {
+                completeUpload: async () => {
+                    throw new Error("publish failed");
+                },
+            },
+        );
         const ctl = new AbortController();
         const body = controlledStream();
-        const pending = handler(tusRequest("POST", {
-            headers: { "Upload-Length": "3", "Content-Type": OFFSET_TYPE },
-            body: body.stream,
-            signal: ctl.signal,
-        }));
+        const pending = handler(
+            tusRequest("POST", {
+                headers: { "Upload-Length": "3", "Content-Type": OFFSET_TYPE },
+                body: body.stream,
+                signal: ctl.signal,
+            }),
+        );
         body.push("abc");
         await new Promise((r) => setTimeout(r, 5));
         ctl.abort();
@@ -1526,7 +1949,7 @@ describe("audit hooks", () => {
         const { handler } = makeHandler({
             policy: { maxAgeSeconds: 60 },
             now: () => clock,
-            auditKey: (token) => `audit-${token}`,
+            auditKey: ({ uploadToken }) => `audit-${uploadToken}`,
             onUploadEvent: (e) => events.push(e),
         });
         const token = await createUpload(handler, { "Upload-Length": "5" });
@@ -1540,7 +1963,7 @@ describe("audit hooks", () => {
     test("cancellation events carry the auditKey", async () => {
         const events: UploadResourceEvent[] = [];
         const { handler } = makeHandler({
-            auditKey: (token) => `audit-${token}`,
+            auditKey: ({ uploadToken }) => `audit-${uploadToken}`,
             onUploadEvent: (e) => events.push(e),
         });
         const token = await createUpload(handler, { "Upload-Length": "5" });
@@ -1557,9 +1980,12 @@ describe("override and never-throw edges", () => {
     test("X-HTTP-Method-Override is ignored on non-POST methods", async () => {
         const { handler } = makeHandler();
         const token = await createUpload(handler, { "Upload-Length": "5" });
-        const res = await handler(tusRequest("HEAD", {
-            headers: { "X-HTTP-Method-Override": "DELETE" },
-        }), { uploadToken: token });
+        const res = await handler(
+            tusRequest("HEAD", {
+                headers: { "X-HTTP-Method-Override": "DELETE" },
+            }),
+            { uploadToken: token },
+        );
         // Still a HEAD: the resource must survive.
         expect(res.status).toBe(200);
         expect((await handler(tusRequest("HEAD"), { uploadToken: token })).status).toBe(200);
@@ -1567,17 +1993,21 @@ describe("override and never-throw edges", () => {
 
     test("an empty override header leaves POST a creation", async () => {
         const { handler } = makeHandler();
-        const res = await handler(tusRequest("POST", {
-            headers: { "X-HTTP-Method-Override": "", "Upload-Length": "5" },
-        }));
+        const res = await handler(
+            tusRequest("POST", {
+                headers: { "X-HTTP-Method-Override": "", "Upload-Length": "5" },
+            }),
+        );
         expect(res.status).toBe(201);
     });
 
     test("a creation-with-upload POST with an empty body reports no offset", async () => {
         const { handler } = makeHandler();
-        const res = await handler(tusRequest("POST", {
-            headers: { "Upload-Length": "10", "Content-Type": OFFSET_TYPE },
-        }));
+        const res = await handler(
+            tusRequest("POST", {
+                headers: { "Upload-Length": "10", "Content-Type": OFFSET_TYPE },
+            }),
+        );
         expect(res.status).toBe(201);
         // No body means no content was applied: no Upload-Offset header.
         expect(res.headers.get("upload-offset")).toBeNull();
@@ -1585,7 +2015,9 @@ describe("override and never-throw edges", () => {
 
     test("a throwing callback without onError configured still answers 500", async () => {
         const { handler } = makeHandler({
-            key: () => { throw new Error("caller bug"); },
+            key: () => {
+                throw new Error("caller bug");
+            },
         });
         const res = await handler(tusRequest("POST", { headers: { "Upload-Length": "5" } }));
         expect(res.status).toBe(500);
@@ -1620,8 +2052,20 @@ describe("HEAD implicit-completion healing", () => {
         expect(uploads.get(token)!.isComplete).toBe(true);
     });
 
+    test("HEAD publishes only for a caller the hook admits to append", async () => {
+        const { handler, uploads } = makeHandler({
+            authorize: ({ operation }) =>
+                operation === "append" ? new Response("read-only", { status: 403 }) : undefined,
+        });
+        const token = await createUpload(handler, { "Upload-Length": "3" });
+        crashWindow(uploads, token, 3);
+        const res = await handler(tusRequest("HEAD"), { uploadToken: token });
+        expect(res.status).toBe(403);
+        expect(uploads.get(token)!.isComplete).toBe(false);
+    });
+
     test("a healed HEAD with a max age drops Upload-Expires (the upload is now complete)", async () => {
-        const { handler, uploads } = makeHandler({ policy: { maxAgeSeconds: 3600 }});
+        const { handler, uploads } = makeHandler({ policy: { maxAgeSeconds: 3600 } });
         const token = await createUpload(handler, { "Upload-Length": "3" });
         crashWindow(uploads, token, 3);
         const res = await handler(tusRequest("HEAD"), { uploadToken: token });
@@ -1634,7 +2078,7 @@ describe("HEAD implicit-completion healing", () => {
     test("HEAD does NOT heal an upload still short of its length", async () => {
         // offset < length: genuinely incomplete. The heal must not fire, and with
         // a max age Upload-Expires still rides the HEAD.
-        const { handler, uploads } = makeHandler({ policy: { maxAgeSeconds: 3600 }});
+        const { handler, uploads } = makeHandler({ policy: { maxAgeSeconds: 3600 } });
         const token = await createUpload(handler, { "Upload-Length": "10" });
         const rec = uploads.get(token)!;
         rec.bytes = new Uint8Array(4);
@@ -1657,10 +2101,12 @@ describe("completeness derivation", () => {
         // to reach yet), and no heal applies while the length is deferred.
         const { handler, uploads } = makeHandler();
         const body = controlledStream();
-        const pending = handler(tusRequest("POST", {
-            headers: { "Upload-Defer-Length": "1", "Content-Type": OFFSET_TYPE },
-            body: body.stream,
-        }));
+        const pending = handler(
+            tusRequest("POST", {
+                headers: { "Upload-Defer-Length": "1", "Content-Type": OFFSET_TYPE },
+                body: body.stream,
+            }),
+        );
         body.push("abc");
         body.close();
         const res = await pending;
@@ -1677,15 +2123,170 @@ describe("completeness derivation", () => {
         const { handler, uploads } = makeHandler();
         const token = await createUpload(handler, { "Upload-Defer-Length": "1" });
         const body = controlledStream();
-        const pending = handler(tusRequest("PATCH", {
-            headers: { "Content-Type": OFFSET_TYPE, "Upload-Offset": "0" },
-            body: body.stream,
-        }), { uploadToken: token });
+        const pending = handler(
+            tusRequest("PATCH", {
+                headers: { "Content-Type": OFFSET_TYPE, "Upload-Offset": "0" },
+                body: body.stream,
+            }),
+            { uploadToken: token },
+        );
         body.push("abc");
         body.close();
         const res = await pending;
         expect(res.status).toBe(204);
         expect(res.headers.get("upload-offset")).toBe("3");
         expect(uploads.get(token)!.isComplete).toBe(false);
+    });
+});
+
+// ─── Completion representation headers (RFC 9530 / RFC 9110) ────────────────
+
+describe("completion representation headers", () => {
+    // A well-formed 32-byte SHA-256 in raw base64, which is the only shape
+    // RFC 9530 Section 3 can frame as `sha-256=:...:`.
+    const DIGEST = "LPJNul+wow4m6DsqxbninhsWHlwfp0JecwQzYpOLmCQ=";
+
+    /** A handler whose completion reports exactly the given digest and etag. */
+    function reporting(published: { digest?: string; etag?: string }) {
+        return makeHandler({}, { completeUpload: async () => published });
+    }
+
+    test("a creation-with-upload that completes describes the published object", async () => {
+        const { handler } = reporting({ digest: DIGEST, etag: '"done"' });
+        const res = await handler(
+            tusRequest("POST", {
+                headers: { "Upload-Length": "4", "Content-Type": OFFSET_TYPE, "Content-Length": "4" },
+                body: bodyOf("abcd"),
+            }),
+        );
+        expect(res.status).toBe(201);
+        expect(res.headers.get("repr-digest")).toBe(`sha-256=:${DIGEST}:`);
+        expect(res.headers.get("etag")).toBe('"done"');
+    });
+
+    test("a plain creation describes nothing (no bytes, no published object)", async () => {
+        const { handler } = reporting({ digest: DIGEST, etag: '"done"' });
+        const res = await handler(tusRequest("POST", { headers: { "Upload-Length": "4" } }));
+        expect(res.status).toBe(201);
+        expect(res.headers.get("repr-digest")).toBeNull();
+        expect(res.headers.get("etag")).toBeNull();
+    });
+
+    test("a PATCH that completes describes the published object", async () => {
+        const { handler } = reporting({ digest: DIGEST, etag: '"done"' });
+        const token = await createUpload(handler, { "Upload-Length": "4" });
+        const res = await patchBytes(handler, token, "abcd");
+        expect(res.status).toBe(204);
+        expect(res.headers.get("repr-digest")).toBe(`sha-256=:${DIGEST}:`);
+        expect(res.headers.get("etag")).toBe('"done"');
+    });
+
+    test("a PATCH that leaves the upload incomplete describes nothing", async () => {
+        const { handler } = reporting({ digest: DIGEST, etag: '"done"' });
+        const token = await createUpload(handler, { "Upload-Length": "8" });
+        const res = await patchBytes(handler, token, "abcd");
+        expect(res.status).toBe(204);
+        expect(res.headers.get("repr-digest")).toBeNull();
+        expect(res.headers.get("etag")).toBeNull();
+    });
+
+    test("a healed PATCH describes the object the healing publish produced", async () => {
+        // tus completion is implicit, so an interrupted append whose bytes all
+        // flushed publishes on a second orchestrator call. The representation
+        // belongs to THAT call, and the response must carry its values.
+        const { handler } = reporting({ digest: DIGEST, etag: '"healed"' });
+        const token = await createUpload(handler, { "Upload-Length": "3" });
+        const res = await abortedPatch(handler, token, "abc");
+        expect(res.status).toBe(204);
+        expect(res.headers.get("repr-digest")).toBe(`sha-256=:${DIGEST}:`);
+        expect(res.headers.get("etag")).toBe('"healed"');
+    });
+
+    test("a healed creation describes the object the healing publish produced", async () => {
+        const { handler } = reporting({ digest: DIGEST, etag: '"healed"' });
+        const ctl = new AbortController();
+        const body = controlledStream();
+        const pending = handler(
+            tusRequest("POST", {
+                headers: { "Upload-Length": "3", "Content-Type": OFFSET_TYPE },
+                body: body.stream,
+                signal: ctl.signal,
+            }),
+        );
+        body.push("abc");
+        await new Promise((r) => setTimeout(r, 5));
+        ctl.abort();
+        body.error(new Error("socket gone"));
+        const res = await pending;
+        expect(res.status).toBe(201);
+        expect(res.headers.get("repr-digest")).toBe(`sha-256=:${DIGEST}:`);
+        expect(res.headers.get("etag")).toBe('"healed"');
+    });
+
+    test("a store that reports no digest sends no Repr-Digest", async () => {
+        // Absence means "not asserted", which is how a client learns nothing
+        // hashed its bytes; it never means "asserted empty".
+        const { handler } = reporting({ etag: '"done"' });
+        const token = await createUpload(handler, { "Upload-Length": "4" });
+        const res = await patchBytes(handler, token, "abcd");
+        expect(res.headers.get("repr-digest")).toBeNull();
+        expect(res.headers.get("etag")).toBe('"done"');
+    });
+
+    test("a digest that is not a 32-byte SHA-256 emits no Repr-Digest at all", async () => {
+        for (const bogus of ["not-base64!!", "AAAA", `sha-256=:${DIGEST}:`, `${DIGEST}EXTRA`]) {
+            const { handler } = reporting({ digest: bogus });
+            const token = await createUpload(handler, { "Upload-Length": "4" });
+            const res = await patchBytes(handler, token, "abcd");
+            expect(res.status).toBe(204);
+            expect(res.headers.get("repr-digest")).toBeNull();
+        }
+    });
+
+    test("a hostile digest cannot inject a header or split the response", async () => {
+        const { handler } = reporting({
+            digest: `${DIGEST}:\r\nX-Injected: yes`,
+            etag: '"done"\r\nX-Injected: yes',
+        });
+        const token = await createUpload(handler, { "Upload-Length": "4" });
+        const res = await patchBytes(handler, token, "abcd");
+        expect(res.status).toBe(204);
+        expect(res.headers.get("x-injected")).toBeNull();
+        expect(res.headers.get("repr-digest")).toBeNull();
+        const etag = res.headers.get("etag")!;
+        expect(etag).not.toContain("\r");
+        expect(etag).not.toContain("\n");
+        expect(etag).toBe('"done"X-Injected: yes');
+    });
+
+    test("an empty etag is an absent ETag, never an empty field", async () => {
+        const { handler } = reporting({ etag: "" });
+        const token = await createUpload(handler, { "Upload-Length": "4" });
+        const res = await patchBytes(handler, token, "abcd");
+        expect(res.headers.get("etag")).toBeNull();
+    });
+
+    test("TUS_EXPOSED_HEADERS names nothing the dialect cannot emit", () => {
+        // The list and the wire must agree in BOTH directions: a name it omits
+        // is a header a cross-origin client cannot read, and a name it carries
+        // for a header never sent describes a wire that does not exist.
+        // `Upload-Checksum` is request-only in the checksum extension and is
+        // therefore not here.
+        const emittable = new Set([
+            "Location",
+            "Tus-Resumable",
+            "Tus-Version",
+            "Tus-Extension",
+            "Tus-Max-Size",
+            "Tus-Checksum-Algorithm",
+            "Upload-Offset",
+            "Upload-Length",
+            "Upload-Defer-Length",
+            "Upload-Metadata",
+            "Upload-Expires",
+            "ETag",
+            "Repr-Digest",
+        ]);
+        for (const h of TUS_EXPOSED_HEADERS) expect(emittable.has(h)).toBe(true);
     });
 });

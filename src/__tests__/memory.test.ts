@@ -1,13 +1,7 @@
 import { describe, test, expect } from "bun:test";
+import { drain } from "./helpers";
 import { serveObject } from "../web";
 import { memoryStore, ObjectNotFoundError, ObjectChangedError } from "../memory";
-
-async function drain(body: ReadableStream<Uint8Array> | Uint8Array): Promise<string> {
-    if (body instanceof Uint8Array) return Buffer.from(body).toString("utf8");
-    const chunks: Uint8Array[] = [];
-    for await (const chunk of body) chunks.push(chunk);
-    return Buffer.concat(chunks).toString("utf8");
-}
 
 describe("memoryStore", () => {
     const objects = {
@@ -86,9 +80,7 @@ describe("memoryStore", () => {
 
     test("ifMatch pin: etag mismatch throws ObjectChangedError", async () => {
         const store = memoryStore({ objects });
-        await expect(
-            store.getObject("hello.txt", { ifMatch: '"stale"' }),
-        ).rejects.toBeInstanceOf(ObjectChangedError);
+        await expect(store.getObject("hello.txt", { ifMatch: '"stale"' })).rejects.toBeInstanceOf(ObjectChangedError);
     });
 
     test("mutating the map between requests simulates an overwrite (retry testing)", async () => {
@@ -101,9 +93,7 @@ describe("memoryStore", () => {
         live["doc.txt"] = { body: "version-two!", etag: '"v2"' };
 
         // Pinned read against the old validator now fails, as a real backend would.
-        await expect(
-            store.getObject("doc.txt", { ifMatch: '"v1"' }),
-        ).rejects.toBeInstanceOf(ObjectChangedError);
+        await expect(store.getObject("doc.txt", { ifMatch: '"v1"' })).rejects.toBeInstanceOf(ObjectChangedError);
 
         // Unpinned read sees the new version.
         const after = await store.getObject("doc.txt");
@@ -114,9 +104,7 @@ describe("memoryStore", () => {
 describe("memoryStore contract edges", () => {
     test("range start beyond EOF throws a loud RangeError (direct-caller contract)", async () => {
         const store = memoryStore({ objects: { k: { body: "hello" } } });
-        await expect(
-            store.getObject("k", { range: { start: 10, end: 20 } }),
-        ).rejects.toThrow(RangeError);
+        await expect(store.getObject("k", { range: { start: 10, end: 20 } })).rejects.toThrow(RangeError);
     });
 
     test("range end beyond EOF is clamped and the SERVED bounds are reported", async () => {
@@ -142,10 +130,7 @@ describe("memoryStore: authoritative-range fast path", () => {
             }) as typeof base.headObject,
         };
         const handler = serveObject(counting);
-        const res = await handler(
-            new Request("http://localhost/f", { headers: { Range: "bytes=2-4" } }),
-            { key: "k" },
-        );
+        const res = await handler(new Request("http://localhost/f", { headers: { Range: "bytes=2-4" } }), { key: "k" });
 
         expect(res.status).toBe(206);
         expect(await res.text()).toBe("234");
@@ -156,10 +141,9 @@ describe("memoryStore: authoritative-range fast path", () => {
 
     test("a start beyond EOF falls back to validation and answers a true 416", async () => {
         const handler = serveObject(memoryStore({ objects: { k: { body: "0123456789" } } }));
-        const res = await handler(
-            new Request("http://localhost/f", { headers: { Range: "bytes=50-60" } }),
-            { key: "k" },
-        );
+        const res = await handler(new Request("http://localhost/f", { headers: { Range: "bytes=50-60" } }), {
+            key: "k",
+        });
 
         expect(res.status).toBe(416);
         expect(res.headers.get("Content-Range")).toBe("bytes */10");
@@ -183,5 +167,18 @@ describe("memoryStore: construction", () => {
 
     test("a map is accepted", () => {
         expect(() => memoryStore({ objects: { "a.txt": { body: "hi" } } })).not.toThrow();
+    });
+});
+
+describe("memoryStore contentType", () => {
+    test("headObject reports the stored contentType as metadata", async () => {
+        const store = memoryStore({ objects: { "a.bin": { body: "x", contentType: "image/png" } } });
+        expect((await store.headObject("a.bin")).contentType).toBe("image/png");
+    });
+
+    test("it is not the served type: an omitted mime stays octet-stream", async () => {
+        const store = memoryStore({ objects: { "a.bin": { body: "x", contentType: "text/html" } } });
+        const res = await serveObject(store)(new Request("http://localhost/a.bin"), { key: "a.bin" });
+        expect(res.headers.get("Content-Type")).toBe("application/octet-stream");
     });
 });

@@ -22,14 +22,15 @@ import { buildContentDisposition } from "../content-disposition";
 function mulberry32(seed: number): () => number {
     let a = seed >>> 0;
     return () => {
-        a |= 0; a = (a + 0x6D2B79F5) | 0;
+        a |= 0;
+        a = (a + 0x6d2b79f5) | 0;
         let t = Math.imul(a ^ (a >>> 15), 1 | a);
         t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
         return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
     };
 }
 
-const rand = mulberry32(0xC0FFEE);
+const rand = mulberry32(0xc0ffee);
 
 /** Characters likely to stress the parsers: digits, separators, controls, unicode. */
 const ALPHABET = "0123456789-,=bytesBYTES */\t\r\n\0%\"'W/\\..‮😀abcxyz";
@@ -94,16 +95,17 @@ describe("parseRangeHeader invariants", () => {
 describe("parseContentRange invariants", () => {
     test("never throws; parsed values are always consistent", () => {
         for (let i = 0; i < ITERATIONS; i++) {
-            const header = i % 2 === 0
-                ? randomString(40)
-                : `bytes ${Math.floor(rand() * 1000)}-${Math.floor(rand() * 1000)}/${rand() < 0.5 ? "*" : Math.floor(rand() * 2000)}`;
+            const header =
+                i % 2 === 0
+                    ? randomString(40)
+                    : `bytes ${Math.floor(rand() * 1000)}-${Math.floor(rand() * 1000)}/${rand() < 0.5 ? "*" : Math.floor(rand() * 2000)}`;
 
             const result = parseContentRange(header);
 
             if (result !== null) {
                 expect(result.start).toBeGreaterThanOrEqual(0);
                 expect(result.end).toBeGreaterThanOrEqual(result.start);
-                if (result.totalSize !== -1) {
+                if (result.totalSize !== undefined) {
                     expect(result.end).toBeLessThan(result.totalSize);
                 }
             }

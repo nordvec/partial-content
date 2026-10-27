@@ -33,7 +33,10 @@ describe("isTransientOpenError", () => {
 describe("openWithRetry", () => {
     test("returns immediately when the first open succeeds (no delay)", async () => {
         let calls = 0;
-        const handle = await openWithRetry("/f", "wx", 5, 1000, async () => { calls++; return HANDLE; });
+        const handle = await openWithRetry("/f", "wx", 5, 1000, async () => {
+            calls++;
+            return HANDLE;
+        });
         expect(handle).toBe(HANDLE);
         expect(calls).toBe(1);
     });
@@ -52,14 +55,20 @@ describe("openWithRetry", () => {
 
     test("rethrows a non-transient error on the FIRST attempt, never retrying", async () => {
         let calls = 0;
-        const opener = async (): Promise<FileHandle> => { calls++; throw errno("EEXIST"); };
+        const opener = async (): Promise<FileHandle> => {
+            calls++;
+            throw errno("EEXIST");
+        };
         await expect(openWithRetry("/f", "wx", 5, 1, opener)).rejects.toThrow("EEXIST");
         expect(calls).toBe(1);
     });
 
     test("gives up after `attempts` transient failures and rethrows the last", async () => {
         let calls = 0;
-        const opener = async (): Promise<FileHandle> => { calls++; throw errno("EMFILE"); };
+        const opener = async (): Promise<FileHandle> => {
+            calls++;
+            throw errno("EMFILE");
+        };
         await expect(openWithRetry("/f", "wx", 3, 1, opener)).rejects.toThrow("EMFILE");
         expect(calls).toBe(3);
     });

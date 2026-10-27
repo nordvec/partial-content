@@ -1,0 +1,87 @@
+{
+  "src/__tests__/azure.test.ts": {
+    "nordvec/complexity": {
+      "count": 1
+    }
+  },
+  "src/__tests__/conformance.test.ts": {
+    "nordvec/complexity": {
+      "count": 1
+    }
+  },
+  "src/__tests__/upload-orchestrator.test.ts": {
+    "nordvec/complexity": {
+      "count": 1
+    }
+  },
+  "src/azure.ts": {
+    "nordvec/complexity": {
+      "count": 1
+    }
+  },
+  "src/cache-control.ts": {
+    "nordvec/complexity": {
+      "count": 1
+    }
+  },
+  "src/fs.ts": {
+    "nordvec/complexity": {
+      "count": 2
+    }
+  },
+  "src/gcs.ts": {
+    "nordvec/complexity": {
+      "count": 2
+    }
+  },
+  "src/http.ts": {
+    "nordvec/complexity": {
+      "count": 1
+    }
+  },
+  "src/kernel.ts": {
+    "nordvec/complexity": {
+      "count": 1
+    }
+  },
+  "src/memory.ts": {
+    "nordvec/complexity": {
+      "count": 1
+    }
+  },
+  "src/node.ts": {
+    "nordvec/complexity": {
+      "count": 1
+    }
+  },
+  "src/s3.ts": {
+    "nordvec/complexity": {
+      "count": 2
+    }
+  },
+  "src/tus.ts": {
+    "nordvec/complexity": {
+      "count": 3
+    }
+  },
+  "src/upload-engine.ts": {
+    "nordvec/complexity": {
+      "count": 2
+    }
+  },
+  "src/upload-internals.ts": {
+    "nordvec/complexity": {
+      "count": 1
+    }
+  },
+  "src/upload-orchestrator.ts": {
+    "nordvec/complexity": {
+      "count": 1
+    }
+  },
+  "src/web.ts": {
+    "nordvec/complexity": {
+      "count": 3
+    }
+  }
+}

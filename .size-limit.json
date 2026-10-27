@@ -2,8 +2,9 @@
   {
     "name": "kernel (.)",
     "path": "dist/index.js",
-    "limit": "6 kB",
+    "limit": "7.25 kB",
     "ignore": [
+      "node:fs",
       "node:fs/promises",
       "node:path",
       "node:stream",
@@ -17,8 +18,9 @@
   {
     "name": "/web",
     "path": "dist/web.js",
-    "limit": "9 kB",
+    "limit": "9.65 kB",
     "ignore": [
+      "node:fs",
       "node:fs/promises",
       "node:path",
       "node:stream",
@@ -32,8 +34,9 @@
   {
     "name": "/node",
     "path": "dist/node.js",
-    "limit": "9.5 kB",
+    "limit": "11.5 kB",
     "ignore": [
+      "node:fs",
       "node:fs/promises",
       "node:path",
       "node:stream",
@@ -47,8 +50,9 @@
   {
     "name": "/hono",
     "path": "dist/hono.js",
-    "limit": "9.25 kB",
+    "limit": "9.7 kB",
     "ignore": [
+      "node:fs",
       "node:fs/promises",
       "node:path",
       "node:stream",
@@ -62,8 +66,9 @@
   {
     "name": "/s3",
     "path": "dist/s3.js",
-    "limit": "6.75 kB",
+    "limit": "9.4 kB",
     "ignore": [
+      "node:fs",
       "node:fs/promises",
       "node:path",
       "node:stream",
@@ -77,8 +82,9 @@
   {
     "name": "/r2",
     "path": "dist/r2.js",
-    "limit": "3.5 kB",
+    "limit": "4.75 kB",
     "ignore": [
+      "node:fs",
       "node:fs/promises",
       "node:path",
       "node:stream",
@@ -92,8 +98,9 @@
   {
     "name": "/gcs",
     "path": "dist/gcs.js",
-    "limit": "5 kB",
+    "limit": "6.7 kB",
     "ignore": [
+      "node:fs",
       "node:fs/promises",
       "node:path",
       "node:stream",
@@ -107,8 +114,9 @@
   {
     "name": "/azure",
     "path": "dist/azure.js",
-    "limit": "5.5 kB",
+    "limit": "7.7 kB",
     "ignore": [
+      "node:fs",
       "node:fs/promises",
       "node:path",
       "node:stream",
@@ -122,8 +130,9 @@
   {
     "name": "/fs",
     "path": "dist/fs.js",
-    "limit": "4 kB",
+    "limit": "6.75 kB",
     "ignore": [
+      "node:fs",
       "node:fs/promises",
       "node:path",
       "node:stream",
@@ -137,8 +146,9 @@
   {
     "name": "/http",
     "path": "dist/http.js",
-    "limit": "2 kB",
+    "limit": "2.25 kB",
     "ignore": [
+      "node:fs",
       "node:fs/promises",
       "node:path",
       "node:stream",
@@ -152,8 +162,9 @@
   {
     "name": "/memory",
     "path": "dist/memory.js",
-    "limit": "2 kB",
+    "limit": "2.75 kB",
     "ignore": [
+      "node:fs",
       "node:fs/promises",
       "node:path",
       "node:stream",
@@ -169,6 +180,7 @@
     "path": "dist/mime.js",
     "limit": "0.75 kB",
     "ignore": [
+      "node:fs",
       "node:fs/promises",
       "node:path",
       "node:stream",
@@ -182,8 +194,9 @@
   {
     "name": "/redis-locker",
     "path": "dist/redis-locker.js",
-    "limit": "2 kB",
+    "limit": "1.75 kB",
     "ignore": [
+      "node:fs",
       "node:fs/promises",
       "node:path",
       "node:stream",
@@ -197,8 +210,9 @@
   {
     "name": "/tus",
     "path": "dist/tus.js",
-    "limit": "7.5 kB",
+    "limit": "9.85 kB",
     "ignore": [
+      "node:fs",
       "node:fs/promises",
       "node:path",
       "node:stream",
@@ -212,8 +226,9 @@
   {
     "name": "/upload",
     "path": "dist/upload.js",
-    "limit": "7 kB",
+    "limit": "9.3 kB",
     "ignore": [
+      "node:fs",
       "node:fs/promises",
       "node:path",
       "node:stream",
@@ -227,6 +242,6 @@
   {
     "name": "conformance (./conformance)",
     "path": "dist/conformance.js",
-    "limit": "4 kB"
+    "limit": "7.3 kB"
   }
 ]

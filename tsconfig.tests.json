@@ -1,0 +1,21 @@
+{
+  // The build tsconfig excludes `__tests__` because those files must never
+  // reach `dist/`. That left the suite typechecked by nothing: a test double
+  // could omit a field its interface requires, and the gap surfaced only as a
+  // confusing assertion failure, or not at all.
+  //
+  // This project covers the tests alone, with the Bun types the suite is
+  // written against. It emits nothing, so the tarball is unaffected.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    // The suite is run by bun, which resolves extensionless relative imports,
+    // so it is checked under the resolver that actually loads it rather than
+    // the one that builds dist/.
+    "module": "preserve",
+    "moduleResolution": "bundler",
+    "types": ["node", "bun"]
+  },
+  "include": ["src"],
+  "exclude": ["node_modules", "dist"]
+}

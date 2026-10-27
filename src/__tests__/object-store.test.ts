@@ -25,6 +25,9 @@ import {
     isObjectNotFoundError,
     isObjectChangedError,
     isStoreUnavailableError,
+    toObjectBody,
+    type ObjectBody,
+    type ObjectStream,
     type StoreErrorClassifiers,
 } from "../object-store";
 
@@ -50,8 +53,17 @@ describe("classifyStoreRead", () => {
         ] as const;
         for (const c of cases) {
             const raw = { kind: c.kind };
-            const caught = await classifyStoreRead("doc.pdf", async () => { throw raw; }, classifiers)
-                .then(() => null, (e: unknown) => e);
+            const caught = await classifyStoreRead(
+                "doc.pdf",
+                async () => {
+                    // oxlint-disable-next-line typescript/only-throw-error -- the raw store rejection is the subject; classification is duck-typed
+                    throw raw;
+                },
+                classifiers,
+            ).then(
+                () => null,
+                (e: unknown) => e,
+            );
             expect(caught).toBeInstanceOf(c.ctor);
             expect((caught as { status: number }).status).toBe(c.status);
             expect((caught as { key: string }).key).toBe("doc.pdf");
@@ -61,8 +73,16 @@ describe("classifyStoreRead", () => {
 
     test("an unclassified error is rethrown untouched (never masked)", async () => {
         const raw = new Error("auth failure");
-        const caught = await classifyStoreRead("k", async () => { throw raw; }, classifiers)
-            .then(() => null, (e: unknown) => e);
+        const caught = await classifyStoreRead(
+            "k",
+            async () => {
+                throw raw;
+            },
+            classifiers,
+        ).then(
+            () => null,
+            (e: unknown) => e,
+        );
         expect(caught).toBe(raw);
     });
 
@@ -72,8 +92,16 @@ describe("classifyStoreRead", () => {
             changed: () => true,
             throttled: () => true,
         };
-        const caught = await classifyStoreRead("k", async () => { throw new Error("x"); }, greedy)
-            .then(() => null, (e: unknown) => e);
+        const caught = await classifyStoreRead(
+            "k",
+            async () => {
+                throw new Error("x");
+            },
+            greedy,
+        ).then(
+            () => null,
+            (e: unknown) => e,
+        );
         expect(caught).toBeInstanceOf(ObjectNotFoundError);
     });
 
@@ -82,8 +110,17 @@ describe("classifyStoreRead", () => {
             notFound: () => false,
             throttled: (e) => (e as { kind?: string }).kind === "throttled",
         };
-        const caught = await classifyStoreRead("k", async () => { throw { kind: "throttled" }; }, noChanged)
-            .then(() => null, (e: unknown) => e);
+        const caught = await classifyStoreRead(
+            "k",
+            async () => {
+                // oxlint-disable-next-line typescript/only-throw-error -- a plain object is what a throttled store rejects with
+                throw { kind: "throttled" };
+            },
+            noChanged,
+        ).then(
+            () => null,
+            (e: unknown) => e,
+        );
         expect(caught).toBeInstanceOf(StoreUnavailableError);
     });
 
@@ -92,8 +129,16 @@ describe("classifyStoreRead", () => {
             notFound: () => false,
             throttled: () => ({ retryAfterSeconds: 45 }),
         };
-        const caught = await classifyStoreRead("k", async () => { throw new Error("busy"); }, withHint)
-            .then(() => null, (e: unknown) => e);
+        const caught = await classifyStoreRead(
+            "k",
+            async () => {
+                throw new Error("busy");
+            },
+            withHint,
+        ).then(
+            () => null,
+            (e: unknown) => e,
+        );
         expect(caught).toBeInstanceOf(StoreUnavailableError);
         expect((caught as StoreUnavailableError).retryAfterSeconds).toBe(45);
     });
@@ -103,8 +148,16 @@ describe("classifyStoreRead", () => {
             notFound: () => false,
             throttled: () => true,
         };
-        const caught = await classifyStoreRead("k", async () => { throw new Error("busy"); }, noHint)
-            .then(() => null, (e: unknown) => e);
+        const caught = await classifyStoreRead(
+            "k",
+            async () => {
+                throw new Error("busy");
+            },
+            noHint,
+        ).then(
+            () => null,
+            (e: unknown) => e,
+        );
         expect(caught).toBeInstanceOf(StoreUnavailableError);
         expect((caught as StoreUnavailableError).retryAfterSeconds).toBeUndefined();
     });
@@ -194,9 +247,18 @@ describe("guardStreamLength", () => {
         await expect(drain(guarded)).rejects.toThrow(/delivered 2 bytes, expected 5/);
     });
 
-    test("errors the stream when the source over-runs the committed length", async () => {
+    test("errors the stream when the source over-runs the committed length, withholding the crossing chunk", async () => {
+        // The over-run is refused at the chunk that crosses, not at the graceful
+        // end: nothing past the committed length is enqueued ahead of the error.
+        const guarded = guardStreamLength(webStreamOf([new Uint8Array([1, 2]), new Uint8Array([3, 4])]), 3);
+        const reader = guarded.getReader();
+        expect((await reader.read()).value).toEqual(new Uint8Array([1, 2]));
+        await expect(reader.read()).rejects.toThrow(/more than 3 bytes/);
+    });
+
+    test("a single chunk over the committed length is refused whole", async () => {
         const guarded = guardStreamLength(webStreamOf([new Uint8Array([1, 2, 3, 4])]), 2);
-        await expect(drain(guarded)).rejects.toThrow(/delivered 4 bytes, expected 2/);
+        await expect(drain(guarded)).rejects.toThrow(/more than 2 bytes/);
     });
 
     test("undefined expectedBytes disables the guard and returns the same stream", () => {
@@ -210,8 +272,12 @@ describe("guardStreamLength", () => {
         // the abort-teardown guarantee is silently broken by the wrapper.
         let cancelledReason: unknown;
         const source = new ReadableStream<Uint8Array>({
-            pull(controller) { controller.enqueue(new Uint8Array([1, 2])); },
-            cancel(reason) { cancelledReason = reason ?? "cancelled"; },
+            pull(controller) {
+                controller.enqueue(new Uint8Array([1, 2]));
+            },
+            cancel(reason) {
+                cancelledReason = reason ?? "cancelled";
+            },
         });
         const guarded = guardStreamLength(source, 100);
         const reader = guarded.getReader();
@@ -325,7 +391,9 @@ describe("nodeStreamToWeb abort propagation", () => {
         }
         const stream = nodeStreamToWeb(gen(), {
             signal: h.signal,
-            destroy: () => { destroyed++; },
+            destroy: () => {
+                destroyed++;
+            },
         });
         const reader = stream.getReader();
         await reader.read();
@@ -443,6 +511,24 @@ describe("reservedKeyGuard", () => {
         expect(() => guard(".uploadsomething")).not.toThrow();
     });
 
+    test("a list of prefixes refuses each, and an empty entry is skipped rather than guarding everything", () => {
+        const guard = reservedKeyGuard([".uploads/", "", ".partial-content-uploads"]);
+        expect(() => guard(".uploads")).toThrow(ObjectNotFoundError);
+        expect(() => guard(".uploads/token")).toThrow(ObjectNotFoundError);
+        expect(() => guard(".partial-content-uploads")).toThrow(ObjectNotFoundError);
+        expect(() => guard(".partial-content-uploads/token.info")).toThrow(ObjectNotFoundError);
+        for (const key of ["", "/", "any/key", ".uploadsomething"]) {
+            expect(() => guard(key)).not.toThrow();
+        }
+    });
+
+    test("a list of only empty entries guards nothing at all", () => {
+        const guard = reservedKeyGuard(["", ""]);
+        for (const key of ["", "/", ".uploads/token", "any/key"]) {
+            expect(() => guard(key)).not.toThrow();
+        }
+    });
+
     test("an empty prefix guards nothing at all", () => {
         const guard = reservedKeyGuard("");
         // The opt-out for a location no upload store shares. It must not
@@ -452,18 +538,37 @@ describe("reservedKeyGuard", () => {
         }
     });
 
-    test("the refusal names the key, so a log says which read was refused", () => {
+    test("the refusal carries the key on its field, never in its message", () => {
         try {
             reservedKeyGuard(".uploads/")(".uploads/secret");
             throw new Error("expected a throw");
         } catch (err) {
             expect(isObjectNotFoundError(err)).toBe(true);
-            expect((err as Error).message).toContain(".uploads/secret");
+            expect((err as ObjectNotFoundError).key).toBe(".uploads/secret");
+            expect((err as Error).message).not.toContain("secret");
         }
     });
 });
 
 // ─── Read-side error matchers ───────────────────────────────────────────────
+
+describe("read-side error text", () => {
+    // A key is commonly a user's filename and a message is printed whole by
+    // every log line and error tracker; only the `key` field may carry it.
+    const KEY = "users/u1/Payslip March.pdf";
+    const errors = [
+        new ObjectNotFoundError(KEY),
+        new ObjectChangedError(KEY),
+        new StoreUnavailableError(KEY, { retryAfterSeconds: 2 }),
+    ];
+
+    test.each(errors.map((e) => [e.name, e] as const))("%s names the failure, not the key", (_name, err) => {
+        expect(err.key).toBe(KEY);
+        expect(err.message).not.toContain("Payslip");
+        expect(err.stack ?? "").not.toContain("Payslip");
+        expect(err.message.length).toBeGreaterThan(0);
+    });
+});
 
 describe("read-side error matchers", () => {
     test("each matches its own class and nothing else", () => {
@@ -492,6 +597,119 @@ describe("read-side error matchers", () => {
             expect(isObjectNotFoundError(value)).toBe(false);
             expect(isObjectChangedError(value)).toBe(false);
             expect(isStoreUnavailableError(value)).toBe(false);
+        }
+    });
+});
+
+// ─── toObjectBody ────────────────────────────────────────────────────────────
+
+// Wide in, narrow out. A store keeps whatever type its source handed it, and
+// `ObjectStream.body` keeps the ArrayBuffer-backed form a consumer can pass
+// straight to `new Response(...)` under DOM lib. Both halves are asserted
+// here: the type of the input the call accepts, and the identity of what it
+// hands back.
+
+describe("toObjectBody", () => {
+    test("a readFile-shaped Buffer satisfies the input position", () => {
+        // `readFile` resolves to Buffer<ArrayBufferLike>, the widest byte body
+        // a store hands back. The annotation is the assertion: without the
+        // wide input position this line does not compile.
+        const fromReadFile: Buffer<ArrayBufferLike> = Buffer.from("chunk");
+        const body: ObjectStream["body"] = toObjectBody(fromReadFile);
+        // Already ArrayBuffer-backed, so the narrowing costs no copy. Compared
+        // through `===` because the narrow and wide types share no assignable
+        // direction, which is the point of the split.
+        expect(body === fromReadFile).toBe(true);
+    });
+
+    test("a store builds an ObjectStream from a wide body with no cast", () => {
+        const bytes: Uint8Array = Buffer.from("hello world");
+        const stream: ObjectStream = {
+            body: toObjectBody(bytes),
+            contentLength: bytes.byteLength,
+            totalSize: bytes.byteLength,
+        };
+        expect(stream.body === bytes).toBe(true);
+    });
+
+    test("a SharedArrayBuffer-backed view is copied, not relabelled", () => {
+        // This view is the one input `new Response(...)` genuinely rejects, so
+        // relabelling it would move the failure to the consumer's response
+        // construction instead of resolving it here.
+        const shared = new Uint8Array(new SharedArrayBuffer(4));
+        shared.set([1, 2, 3, 4]);
+
+        const body = toObjectBody(shared);
+        if (!(body instanceof Uint8Array)) throw new Error("expected a byte body");
+        expect(body).not.toBe(shared);
+        expect(body.buffer).toBeInstanceOf(ArrayBuffer);
+        expect(Array.from(body)).toEqual([1, 2, 3, 4]);
+    });
+
+    test("a stream body is handed back unwrapped and still yields its chunks", async () => {
+        const source: ReadableStream<Uint8Array> = new ReadableStream<Uint8Array>({
+            start(controller) {
+                controller.enqueue(new Uint8Array([1, 2]));
+                controller.enqueue(new Uint8Array([3]));
+                controller.close();
+            },
+        });
+
+        const body: ObjectBody = toObjectBody(source);
+        // No length guard is requested here, so no transform is interposed.
+        expect(body === source).toBe(true);
+        if (body instanceof Uint8Array) throw new Error("expected a stream body");
+
+        const chunks: number[] = [];
+        for await (const chunk of body) chunks.push(...chunk);
+        expect(chunks).toEqual([1, 2, 3]);
+    });
+});
+
+// ─── guardStreamLength and FixedLengthStream ────────────────────────────────
+
+describe("guardStreamLength fixes the length where the runtime can", () => {
+    function bodyOf(n: number): ReadableStream<Uint8Array> {
+        return new ReadableStream({
+            start(c) {
+                c.enqueue(new Uint8Array(n));
+                c.close();
+            },
+        });
+    }
+
+    test("a FixedLengthStream global is applied with the committed length", async () => {
+        const lengths: number[] = [];
+        class StubFixedLengthStream extends TransformStream<Uint8Array, Uint8Array> {
+            constructor(length: number) {
+                super();
+                lengths.push(length);
+            }
+        }
+        const g = globalThis as { FixedLengthStream?: unknown };
+        g.FixedLengthStream = StubFixedLengthStream;
+        try {
+            const out = guardStreamLength(bodyOf(7), 7);
+            expect((await new Response(out).arrayBuffer()).byteLength).toBe(7);
+            expect(lengths).toEqual([7]);
+            guardStreamLength(bodyOf(1), undefined);
+            expect(lengths).toEqual([7]);
+        } finally {
+            delete g.FixedLengthStream;
+        }
+    });
+
+    test("the length check still runs beside it", async () => {
+        const g = globalThis as { FixedLengthStream?: unknown };
+        g.FixedLengthStream = class extends TransformStream<Uint8Array, Uint8Array> {
+            constructor(_length: number) {
+                super();
+            }
+        };
+        try {
+            await expect(new Response(guardStreamLength(bodyOf(3), 7)).arrayBuffer()).rejects.toThrow();
+        } finally {
+            delete g.FixedLengthStream;
         }
     });
 });

@@ -1,6 +1,11 @@
 import { describe, test, expect } from "bun:test";
 import { redisUploadLocker, type RedisLockerClient } from "../redis-locker";
-import { UploadLockTimeoutError, isUploadLockTimeoutError, UPLOAD_PREEMPTED } from "../upload-locker";
+import {
+    UploadLockTimeoutError,
+    isUploadLockTimeoutError,
+    UPLOAD_LEASE_LOST,
+    UPLOAD_PREEMPTED,
+} from "../upload-locker";
 
 /**
  * In-memory Redis-protocol fake: SET NX PX with TTLs, the two Lua scripts the
@@ -12,9 +17,7 @@ import { UploadLockTimeoutError, isUploadLockTimeoutError, UPLOAD_PREEMPTED } fr
  * jitter cannot decide the outcome. `onRenew` fires after a PEXPIRE that
  * positively extended the holder's own key.
  */
-function fakeRedis(
-    { now = Date.now, onRenew }: { now?: () => number; onRenew?: () => void } = {},
-) {
+function fakeRedis({ now = Date.now, onRenew }: { now?: () => number; onRenew?: () => void } = {}) {
     const store = new Map<string, { value: string; expiresAt: number }>();
     const channels = new Map<string, Set<(message: string) => void>>();
     const evals: string[] = [];
@@ -78,22 +81,31 @@ function fakeRedis(
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
+/** The locker names a resource by its token's SHA-256 in hex, never the token. */
+const TOK_DIGEST = Array.from(
+    new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode("tok"))),
+    (b) => b.toString(16).padStart(2, "0"),
+).join("");
+const TOK_KEY = `partial-content:lock:${TOK_DIGEST}`;
+/** The one channel every preempt request of the default-prefix locker travels on. */
+const PREEMPTS = "partial-content:lock:preempt";
+
 describe("redisUploadLocker", () => {
     test("uncontended acquire takes the key with a TTL and release frees it", async () => {
         const { client, store } = fakeRedis();
         const locker = redisUploadLocker(client, { ttlMs: 5_000 });
         const lock = await locker.acquire("tok");
-        expect(store.has("partial-content:lock:tok")).toBe(true);
+        expect(store.has(TOK_KEY)).toBe(true);
         lock.release();
         await sleep(5);
-        expect(store.has("partial-content:lock:tok")).toBe(false);
+        expect(store.has(TOK_KEY)).toBe(false);
         // The resource is immediately reacquirable.
         const again = await locker.acquire("tok");
         again.release();
     });
 
     test("a waiter aborts the holder's signal and takes the lock on yield", async () => {
-        const { client, store } = fakeRedis();
+        const { client } = fakeRedis();
         const locker = redisUploadLocker(client, { ttlMs: 5_000, pollIntervalMs: 10 });
         const lockA = await locker.acquire("tok");
         // Yield at the "next safe boundary": release when the signal aborts.
@@ -108,26 +120,27 @@ describe("redisUploadLocker", () => {
     });
 
     test("the preempt signal aborts at most once across repeated publishes", async () => {
-        const { client, store } = fakeRedis();
+        const { client } = fakeRedis();
         const locker = redisUploadLocker(client, { ttlMs: 5_000 });
         const lock = await locker.acquire("tok");
         let preempts = 0;
-        lock.signal.addEventListener("abort", () => { preempts++; });
-        await client.publish("partial-content:lock:preempt:tok", "preempt");
-        await client.publish("partial-content:lock:preempt:tok", "preempt");
-        await client.publish("partial-content:lock:preempt:tok", "preempt");
+        lock.signal.addEventListener("abort", () => {
+            preempts++;
+        });
+        await client.publish(PREEMPTS, TOK_DIGEST);
+        await client.publish(PREEMPTS, TOK_DIGEST);
+        await client.publish(PREEMPTS, TOK_DIGEST);
         expect(preempts).toBe(1);
         expect(lock.signal.aborted).toBe(true);
         lock.release();
     });
 
     test("a holder that never yields times the waiter out with UploadLockTimeoutError", async () => {
-        const { client, store } = fakeRedis();
+        const { client } = fakeRedis();
         const locker = redisUploadLocker(client, { ttlMs: 60_000, pollIntervalMs: 10 });
         const lock = await locker.acquire("tok");
         const started = Date.now();
-        await expect(locker.acquire("tok", { timeoutMs: 80 }))
-            .rejects.toThrow(UploadLockTimeoutError);
+        await expect(locker.acquire("tok", { timeoutMs: 80 })).rejects.toThrow(UploadLockTimeoutError);
         expect(Date.now() - started).toBeGreaterThanOrEqual(80);
         lock.release();
     });
@@ -137,12 +150,12 @@ describe("redisUploadLocker", () => {
         const locker = redisUploadLocker(client, { ttlMs: 5_000 });
         const lockA = await locker.acquire("tok");
         // Steal: the key vanishes (expiry) and another instance takes it.
-        store.delete("partial-content:lock:tok");
-        await client.set("partial-content:lock:tok", "someone-else", { NX: true, PX: 5_000 });
+        store.delete(TOK_KEY);
+        await client.set(TOK_KEY, "someone-else", { NX: true, PX: 5_000 });
         lockA.release();
         await sleep(5);
         // A's release must NOT have removed the new holder's lock.
-        expect(store.get("partial-content:lock:tok")?.value).toBe("someone-else");
+        expect(store.get(TOK_KEY)?.value).toBe("someone-else");
     });
 
     test("the watchdog renews a held lock past its original TTL, without false preempts", async () => {
@@ -157,7 +170,9 @@ describe("redisUploadLocker", () => {
         let clock = 0;
         const { client, store, evals } = fakeRedis({
             now: () => clock,
-            onRenew: () => { clock += Math.floor((ttlMs * 2) / 3); },
+            onRenew: () => {
+                clock += Math.floor((ttlMs * 2) / 3);
+            },
         });
         const locker = redisUploadLocker(client, { ttlMs, onError: (_e, ctx) => errors.push(ctx.operation) });
         const lock = await locker.acquire("tok");
@@ -166,7 +181,7 @@ describe("redisUploadLocker", () => {
         // Nothing but a renewal advances the clock, so passing the original TTL
         // is itself the proof that they landed and carried the hold past it.
         expect(clock).toBeGreaterThan(ttlMs);
-        expect(store.has("partial-content:lock:tok")).toBe(true);
+        expect(store.has(TOK_KEY)).toBe(true);
         // A healthy hold never preempts itself and never reports.
         expect(lock.signal.aborted).toBe(false);
         expect(errors).toEqual([]);
@@ -174,11 +189,13 @@ describe("redisUploadLocker", () => {
     });
 
     test("a renewal that THROWS preempts the holder and reports operation renew", async () => {
-        const { client, store } = fakeRedis();
+        const { client } = fakeRedis();
         const errors: string[] = [];
         const throwing: RedisLockerClient = {
             ...client,
-            eval: async () => { throw new Error("connection lost"); },
+            eval: async () => {
+                throw new Error("connection lost");
+            },
         };
         const locker = redisUploadLocker(throwing, {
             ttlMs: 90,
@@ -195,20 +212,35 @@ describe("redisUploadLocker", () => {
         // Crash model: the holder's connection is gone (renewals fail), so
         // the SET's PX is what frees the resource. The waiter must get the
         // lock roughly at TTL, well inside its acquire timeout.
-        const { client, store } = fakeRedis();
+        const { client } = fakeRedis();
         const holderClient: RedisLockerClient = {
             ...client,
-            eval: async () => { throw new Error("connection lost"); },
+            eval: async () => {
+                throw new Error("connection lost");
+            },
         };
         const holderLocker = redisUploadLocker(holderClient, { ttlMs: 60 });
+        // Captured BEFORE the holder acquires, so it is at or before the SET
+        // the TTL runs from. This is the only sound origin: the elapsed time
+        // is measured against the instant the key was written, and everything
+        // after it (building the second locker, its subscribe) is TTL that has
+        // already been spent.
+        const heldFrom = Date.now();
         await holderLocker.acquire("tok");
 
         const locker = redisUploadLocker(client, { ttlMs: 60, pollIntervalMs: 10 });
-        const started = Date.now();
         const lock = await locker.acquire("tok", { timeoutMs: 2_000 });
-        const waited = Date.now() - started;
-        expect(waited).toBeGreaterThanOrEqual(40);
-        expect(waited).toBeLessThan(1_000);
+
+        // The lock became free by TTL, not by a steal: it cannot be taken
+        // before the holder's key expires, and the holder never releases it
+        // (its eval throws, which is the crash this models). Load can only
+        // lengthen the wait, never shorten it, so the bound holds on any
+        // machine. Measuring from the WAITER's start instead compared against
+        // the wrong origin and made a slow machine look like an early acquire.
+        expect(Date.now() - heldFrom).toBeGreaterThanOrEqual(60);
+        // The upper bound is `acquire` itself: it REJECTS once its timeout is
+        // exhausted, so a returned lock already proves the waiter did not fall
+        // through to it.
         lock.release();
     });
 
@@ -216,7 +248,9 @@ describe("redisUploadLocker", () => {
         const { client, store, evals } = fakeRedis();
         const failingSubscribe: RedisLockerClient = {
             ...client,
-            subscribe: async () => { throw new Error("subscriber connection down"); },
+            subscribe: async () => {
+                throw new Error("subscriber connection down");
+            },
         };
         const locker = redisUploadLocker(failingSubscribe, { ttlMs: 30_000 });
         // The SET won the key, then subscribe failed (a failover downing the
@@ -229,11 +263,11 @@ describe("redisUploadLocker", () => {
         await sleep(5);
         // The compare-and-delete release ran on the fencing id: the key is free.
         expect(evals).toContain("del");
-        expect(store.has("partial-content:lock:tok")).toBe(false);
+        expect(store.has(TOK_KEY)).toBe(false);
         // The resource is immediately reacquirable, not blocked until the TTL.
         const okLocker = redisUploadLocker(client, { ttlMs: 30_000 });
         const lock = await okLocker.acquire("tok");
-        expect(store.has("partial-content:lock:tok")).toBe(true);
+        expect(store.has(TOK_KEY)).toBe(true);
         lock.release();
     });
 
@@ -270,11 +304,11 @@ describe("redisUploadLocker", () => {
         await sleep(5);
         // The SET won the key. A subscribe that never answers must not leave it
         // held for the full 30s TTL with no watchdog and no release closure.
-        expect(store.has("partial-content:lock:tok")).toBe(false);
+        expect(store.has(TOK_KEY)).toBe(false);
     });
 
     test("a preempt publish that never answers cannot park the acquire past its deadline", async () => {
-        const { client, store } = fakeRedis();
+        const { client } = fakeRedis();
         const reports: Array<{ name: unknown; operation: string }> = [];
         const hangingPublish: RedisLockerClient = {
             ...client,
@@ -297,13 +331,12 @@ describe("redisUploadLocker", () => {
     });
 
     test("a renewal that never answers preempts the holder, because silence is not confirmation", async () => {
-        const { client, store } = fakeRedis();
+        const { client } = fakeRedis();
         const errors: string[] = [];
         const hangingRenew: RedisLockerClient = {
             ...client,
-            eval: (script, keys, args) => (script.includes('"PEXPIRE"')
-                ? new Promise<number>(() => {})
-                : client.eval(script, keys, args)),
+            eval: (script, keys, args) =>
+                script.includes('"PEXPIRE"') ? new Promise<number>(() => {}) : client.eval(script, keys, args),
         };
         // Renew interval is ttl/3 = 100ms: the first renewal is issued at 100ms
         // and must be judged unconfirmed by 200ms. Without that bound the holder
@@ -315,7 +348,8 @@ describe("redisUploadLocker", () => {
         const lock = await locker.acquire("tok");
         await sleep(450);
         expect(lock.signal.aborted).toBe(true);
-        expect(lock.signal.reason).toBe(UPLOAD_PREEMPTED);
+        expect(lock.signal.reason).toBe(UPLOAD_LEASE_LOST);
+        expect(lock.lease.reason).toBe(UPLOAD_LEASE_LOST);
         // Reported as its own cause, distinguishable from a renewal that
         // answered "not yours" and from a connection that refused it.
         expect(errors).toContain("renew: Upload lock renewal did not answer within the renew interval");
@@ -326,7 +360,9 @@ describe("redisUploadLocker", () => {
         const { client, evals } = fakeRedis();
         const failingSet: RedisLockerClient = {
             ...client,
-            set: async () => { throw new Error("SET refused"); },
+            set: async () => {
+                throw new Error("SET refused");
+            },
         };
         const locker = redisUploadLocker(failingSet, { ttlMs: 30_000 });
         // A SET whose answer never arrived is not a lock: treating the failure
@@ -337,7 +373,7 @@ describe("redisUploadLocker", () => {
     });
 
     test("a preempt arriving after release does not abort the released lock's signal", async () => {
-        const { client, store } = fakeRedis();
+        const { client } = fakeRedis();
         const locker = redisUploadLocker(client, { ttlMs: 5_000 });
         const lock = await locker.acquire("tok");
         lock.release();
@@ -345,16 +381,18 @@ describe("redisUploadLocker", () => {
         // window still reaches this listener. A holder that has already let go
         // must not have its signal aborted: the abort means "yield your write",
         // and a released lock has no write to yield.
-        void client.publish("partial-content:lock:preempt:tok", "preempt");
+        void client.publish(PREEMPTS, TOK_DIGEST);
         expect(lock.signal.aborted).toBe(false);
     });
 
     test("a failing unsubscribe is absorbed and reported with its error and operation", async () => {
-        const { client, store } = fakeRedis();
+        const { client } = fakeRedis();
         const reports: Array<{ message: unknown; operation: string }> = [];
         const failingUnsubscribe: RedisLockerClient = {
             ...client,
-            subscribe: async () => () => { throw new Error("unsubscribe down"); },
+            subscribe: async () => () => {
+                throw new Error("unsubscribe down");
+            },
         };
         const locker = redisUploadLocker(failingUnsubscribe, {
             ttlMs: 5_000,
@@ -367,15 +405,19 @@ describe("redisUploadLocker", () => {
     });
 
     test("onError is optional: absorbed failures stay absorbed with no sink configured", async () => {
-        const { client, store } = fakeRedis();
+        const { client } = fakeRedis();
         // Four absorbed paths at once and nowhere to report any of them: the
         // watchdog's renewal answers "not yours", the unsubscribe throws, the
         // release DEL cannot delete, and a waiter's preempt publish fails.
         const sinkless: RedisLockerClient = {
             set: client.set,
             eval: async () => 0,
-            publish: async () => { throw new Error("publish down"); },
-            subscribe: async () => () => { throw new Error("unsubscribe down"); },
+            publish: async () => {
+                throw new Error("publish down");
+            },
+            subscribe: async () => () => {
+                throw new Error("unsubscribe down");
+            },
         };
         const locker = redisUploadLocker(sinkless, { ttlMs: 300, pollIntervalMs: 10 });
         const holder = await locker.acquire("tok");
@@ -390,10 +432,12 @@ describe("redisUploadLocker", () => {
     });
 
     test("a release DEL that rejects needs no sink either", async () => {
-        const { client, store } = fakeRedis();
+        const { client } = fakeRedis();
         const failingEval: RedisLockerClient = {
             ...client,
-            eval: async () => { throw new Error("eval down"); },
+            eval: async () => {
+                throw new Error("eval down");
+            },
         };
         const locker = redisUploadLocker(failingEval, { ttlMs: 5_000 });
         const lock = await locker.acquire("tok");
@@ -408,14 +452,14 @@ describe("redisUploadLocker", () => {
         const { client, channels } = fakeRedis();
         const locker = redisUploadLocker(client, { ttlMs: 5_000 });
         const lock = await locker.acquire("tok");
-        expect(channels.get("partial-content:lock:preempt:tok")?.size).toBe(1);
+        expect(channels.get(PREEMPTS)?.size).toBe(1);
         lock.release();
         await sleep(5);
-        expect(channels.get("partial-content:lock:preempt:tok")?.size ?? 0).toBe(0);
+        expect(channels.get(PREEMPTS)?.size ?? 0).toBe(0);
     });
 
     test("a failed release DEL is absorbed and reported with operation release", async () => {
-        const { client, store } = fakeRedis();
+        const { client } = fakeRedis();
         const errors: string[] = [];
         let acquired = false;
         const flaky: RedisLockerClient = {
@@ -437,19 +481,21 @@ describe("redisUploadLocker", () => {
     });
 
     test("a failed preempt publish is absorbed, reported, and waiting continues", async () => {
-        const { client, store } = fakeRedis();
+        const { client } = fakeRedis();
         const errors: string[] = [];
         const mute: RedisLockerClient = {
             ...client,
-            publish: async () => { throw new Error("pubsub down"); },
+            publish: async () => {
+                throw new Error("pubsub down");
+            },
         };
         const locker = redisUploadLocker(mute, {
-            ttlMs: 60_000, pollIntervalMs: 10,
+            ttlMs: 60_000,
+            pollIntervalMs: 10,
             onError: (_e, ctx) => errors.push(ctx.operation),
         });
         const lock = await locker.acquire("tok");
-        await expect(locker.acquire("tok", { timeoutMs: 60 }))
-            .rejects.toThrow(UploadLockTimeoutError);
+        await expect(locker.acquire("tok", { timeoutMs: 60 })).rejects.toThrow(UploadLockTimeoutError);
         expect(errors).toContain("preempt-publish");
         lock.release();
     });
@@ -463,7 +509,7 @@ describe("redisUploadLocker", () => {
         });
         const lock = await locker.acquire("tok");
         // The lock is stolen out from under the holder.
-        store.delete("partial-content:lock:tok");
+        store.delete(TOK_KEY);
         await sleep(120);
         expect(lock.signal.aborted).toBe(true);
         expect(errors).toContain("renew");
@@ -482,17 +528,17 @@ describe("redisUploadLocker", () => {
     });
 
     test("after release, a late publish never aborts the old holder's signal", async () => {
-        const { client, store } = fakeRedis();
+        const { client } = fakeRedis();
         const locker = redisUploadLocker(client, { ttlMs: 5_000 });
         const lock = await locker.acquire("tok");
         lock.release();
         await sleep(5);
-        await client.publish("partial-content:lock:preempt:tok", "preempt");
+        await client.publish(PREEMPTS, TOK_DIGEST);
         expect(lock.signal.aborted).toBe(false);
     });
 
     test("construction refuses non-positive or fractional timings", () => {
-        const { client, store } = fakeRedis();
+        const { client } = fakeRedis();
         expect(() => redisUploadLocker(client, { ttlMs: 0 })).toThrow(TypeError);
         expect(() => redisUploadLocker(client, { acquireTimeoutMs: -1 })).toThrow(TypeError);
         expect(() => redisUploadLocker(client, { acquireTimeoutMs: 0 })).toThrow(TypeError);
@@ -504,13 +550,13 @@ describe("redisUploadLocker", () => {
         const { client, store, channels } = fakeRedis();
         const locker = redisUploadLocker(client, { ttlMs: 5_000, keyPrefix: "acme:" });
         const lock = await locker.acquire("tok");
-        expect(store.has("acme:tok")).toBe(true);
-        expect(channels.has("acme:preempt:tok")).toBe(true);
+        expect(store.has(`acme:${TOK_DIGEST}`)).toBe(true);
+        expect(channels.has("acme:preempt")).toBe(true);
         lock.release();
     });
 
     test("timeout errors from this locker match the orchestrator's contention matcher", async () => {
-        const { client, store } = fakeRedis();
+        const { client } = fakeRedis();
         const locker = redisUploadLocker(client, { ttlMs: 60_000, pollIntervalMs: 10 });
         const lock = await locker.acquire("tok");
         try {
@@ -537,12 +583,16 @@ describe("subscribe that misses the acquire deadline", () => {
                 // The failover shape: the subscriber connection answers, but
                 // only after the caller has already given up on it.
                 return new Promise((resolve) => {
-                    releaseSubscribe = () => { resolve(client.subscribe(channel, onMessage)); };
+                    releaseSubscribe = () => {
+                        resolve(client.subscribe(channel, onMessage));
+                    };
                 });
             },
         };
         const locker = redisUploadLocker(slow, {
-            ttlMs: 30_000, acquireTimeoutMs: 60, pollIntervalMs: 10,
+            ttlMs: 30_000,
+            acquireTimeoutMs: 60,
+            pollIntervalMs: 10,
         });
 
         await expect(locker.acquire("tok")).rejects.toThrow(UploadLockTimeoutError);
@@ -564,8 +614,7 @@ describe("subscribe that misses the acquire deadline", () => {
 // ─── A rejected option says which one it was ────────────────────────────────
 
 describe("redisUploadLocker: construction", () => {
-    const build = (opts: Record<string, unknown>) => () =>
-        redisUploadLocker(fakeRedis().client, opts);
+    const build = (opts: Record<string, unknown>) => () => redisUploadLocker(fakeRedis().client, opts);
 
     test("each option is named individually, with the value that was wrong", () => {
         // Listing three option names and leaving the caller to work out which
@@ -598,13 +647,12 @@ describe("redisUploadLocker: construction", () => {
 
 describe("renewal after release", () => {
     test("a renewal still in flight when release() runs reports nothing", async () => {
-        const { client, store } = fakeRedis();
+        const { client } = fakeRedis();
         const errors: string[] = [];
         const hangingRenew: RedisLockerClient = {
             ...client,
-            eval: (script, keys, args) => (script.includes('"PEXPIRE"')
-                ? new Promise<number>(() => {})
-                : client.eval(script, keys, args)),
+            eval: (script, keys, args) =>
+                script.includes('"PEXPIRE"') ? new Promise<number>(() => {}) : client.eval(script, keys, args),
         };
         const locker = redisUploadLocker(hangingRenew, {
             ttlMs: 300,
@@ -628,11 +676,12 @@ describe("renewal after release", () => {
         const { client } = fakeRedis();
         const stolen: RedisLockerClient = {
             ...client,
-            eval: (script, keys, args) => (script.includes('"PEXPIRE"')
-                // The hold-id no longer matches, which is what a stolen lock
-                // looks like from the holder's side.
-                ? Promise.resolve(0)
-                : client.eval(script, keys, args)),
+            eval: (script, keys, args) =>
+                script.includes('"PEXPIRE"')
+                    ? // The hold-id no longer matches, which is what a stolen lock
+                      // looks like from the holder's side.
+                      Promise.resolve(0)
+                    : client.eval(script, keys, args),
         };
         // No onError: the optional call must stay optional, or a locker built
         // without a sink throws inside its own watchdog.
@@ -641,7 +690,8 @@ describe("renewal after release", () => {
         await sleep(250);
 
         expect(lock.signal.aborted).toBe(true);
-        expect(lock.signal.reason).toBe(UPLOAD_PREEMPTED);
+        expect(lock.signal.reason).toBe(UPLOAD_LEASE_LOST);
+        expect(lock.lease.reason).toBe(UPLOAD_LEASE_LOST);
         // The point is that the optional call stayed optional: a locker built
         // without a sink must not throw inside its own watchdog.
         lock.release();
@@ -656,9 +706,8 @@ describe("acquire auditKey", () => {
         const contexts: Array<{ uploadToken?: string; auditKey?: string; operation: string }> = [];
         const failingRelease: RedisLockerClient = {
             ...client,
-            eval: (script, keys, args) => (script.includes('"DEL"')
-                ? Promise.reject(new Error("DEL refused"))
-                : client.eval(script, keys, args)),
+            eval: (script, keys, args) =>
+                script.includes('"DEL"') ? Promise.reject(new Error("DEL refused")) : client.eval(script, keys, args),
         };
         const locker = redisUploadLocker(failingRelease, {
             onError: (_e, ctx) => contexts.push(ctx),
@@ -682,9 +731,8 @@ describe("acquire auditKey", () => {
         const contexts: Array<{ uploadToken?: string; auditKey?: string; operation: string }> = [];
         const failingRelease: RedisLockerClient = {
             ...client,
-            eval: (script, keys, args) => (script.includes('"DEL"')
-                ? Promise.reject(new Error("DEL refused"))
-                : client.eval(script, keys, args)),
+            eval: (script, keys, args) =>
+                script.includes('"DEL"') ? Promise.reject(new Error("DEL refused")) : client.eval(script, keys, args),
         };
         const locker = redisUploadLocker(failingRelease, {
             onError: (_e, ctx) => contexts.push(ctx),

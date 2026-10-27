@@ -126,13 +126,41 @@ async function withServer(
 describe("node adapter failure paths", () => {
     test("throwing key extractor becomes a 500, not a rejected handler", async () => {
         const handler = serveObject(fsStore({ root }), {
-            key: () => { throw new Error("router blew up"); },
+            key: () => {
+                throw new Error("router blew up");
+            },
         });
-        await withServer((req, res) => { void handler(req, res); }, async (base) => {
-            const res = await fetch(`${base}/anything`);
-            expect(res.status).toBe(500);
-            expect(await res.text()).toBe("Internal Server Error");
+        await withServer(
+            (req, res) => {
+                void handler(req, res);
+            },
+            async (base) => {
+                const res = await fetch(`${base}/anything`);
+                expect(res.status).toBe(500);
+                expect(await res.text()).toBe("Internal Server Error");
+            },
+        );
+    });
+
+    test("under an auditKey, a throwing extractor reports the projection, never the raw error", async () => {
+        const errors: unknown[] = [];
+        const handler = serveObject(fsStore({ root }), {
+            key: () => {
+                throw new TypeError("no object at private/report.pdf");
+            },
+            auditKey: () => "audit-1",
+            onError: (err) => errors.push(err),
         });
+        await withServer(
+            (req, res) => {
+                void handler(req, res);
+            },
+            async (base) => {
+                expect((await fetch(`${base}/anything`)).status).toBe(500);
+            },
+        );
+        expect(errors).toEqual([{ name: "TypeError", operation: "context" }]);
+        expect(JSON.stringify(errors)).not.toContain("report.pdf");
     });
 
     test("synchronous writeHead failure is contained: stream released, server survives", async () => {
@@ -143,14 +171,18 @@ describe("node adapter failure paths", () => {
         let cancelled = false;
         const store: ObjectStore = {
             supportsRange: true,
-            async headObject() { return { contentLength: 5 }; },
+            async headObject() {
+                return { contentLength: 5 };
+            },
             async getObject() {
                 return {
                     body: new ReadableStream<Uint8Array<ArrayBuffer>>({
                         pull(controller) {
                             controller.enqueue(new TextEncoder().encode("01234"));
                         },
-                        cancel() { cancelled = true; },
+                        cancel() {
+                            cancelled = true;
+                        },
                     }),
                     contentLength: 5,
                     totalSize: 5,
@@ -158,20 +190,25 @@ describe("node adapter failure paths", () => {
             },
         };
         const handler = serveObject(store, { key: () => "x" });
-        await withServer((req, res) => {
-            res.writeHead = ((): never => {
-                throw new Error("socket torn down mid-write");
-            }) as unknown as typeof res.writeHead;
-            void handler(req, res);
-        }, async (base) => {
-            // The client sees a dropped connection; the assertion is that the
-            // process survives and the storage stream is cancelled.
-            await fetch(`${base}/x`).catch(() => { /* torn socket is expected */ });
-            for (let i = 0; i < 50 && !cancelled; i++) {
-                await new Promise((r) => setTimeout(r, 10));
-            }
-            expect(cancelled).toBe(true);
-        });
+        await withServer(
+            (req, res) => {
+                res.writeHead = ((): never => {
+                    throw new Error("socket torn down mid-write");
+                }) as unknown as typeof res.writeHead;
+                void handler(req, res);
+            },
+            async (base) => {
+                // The client sees a dropped connection; the assertion is that the
+                // process survives and the storage stream is cancelled.
+                await fetch(`${base}/x`).catch(() => {
+                    /* torn socket is expected */
+                });
+                for (let i = 0; i < 50 && !cancelled; i++) {
+                    await new Promise((r) => setTimeout(r, 10));
+                }
+                expect(cancelled).toBe(true);
+            },
+        );
     });
 
     test("array-valued request headers are joined per RFC 9110 field-line rules", async () => {
@@ -180,14 +217,17 @@ describe("node adapter failure paths", () => {
         const handler = serveObject(fsStore({ root }), {
             key: (req) => new URL(req.url!, "http://localhost").pathname.slice(1),
         });
-        await withServer((req, res) => {
-            req.headers["set-cookie"] = ["a=1", "b=2"];
-            void handler(req, res);
-        }, async (base) => {
-            const res = await fetch(`${base}/hello.txt`);
-            expect(res.status).toBe(200);
-            expect(await res.text()).toBe("0123456789abcdefghij");
-        });
+        await withServer(
+            (req, res) => {
+                req.headers["set-cookie"] = ["a=1", "b=2"];
+                void handler(req, res);
+            },
+            async (base) => {
+                const res = await fetch(`${base}/hello.txt`);
+                expect(res.status).toBe(200);
+                expect(await res.text()).toBe("0123456789abcdefghij");
+            },
+        );
     });
 
     test("a stalled reader (backpressure with no drain) is torn down by writeStallTimeoutMs", async () => {
@@ -199,12 +239,18 @@ describe("node adapter failure paths", () => {
         let readerCancelled = false;
         const store: ObjectStore = {
             supportsRange: true,
-            async headObject() { return { contentLength: 5 }; },
+            async headObject() {
+                return { contentLength: 5 };
+            },
             async getObject() {
                 return {
                     body: new ReadableStream<Uint8Array<ArrayBuffer>>({
-                        pull(controller) { controller.enqueue(new TextEncoder().encode("01234")); },
-                        cancel() { readerCancelled = true; },
+                        pull(controller) {
+                            controller.enqueue(new TextEncoder().encode("01234"));
+                        },
+                        cancel() {
+                            readerCancelled = true;
+                        },
                     }),
                     contentLength: 5,
                     totalSize: 5,
@@ -222,11 +268,20 @@ describe("node adapter failure paths", () => {
         const res = Object.assign(new EventEmitter(), {
             headersSent: false,
             destroyed: false,
-            writeHead(this: { headersSent: boolean }) { this.headersSent = true; return this; },
+            writeHead(this: { headersSent: boolean }) {
+                this.headersSent = true;
+                return this;
+            },
             // Permanent backpressure: never returns true, never emits 'drain'.
-            write() { return false; },
-            end() { /* no-op */ },
-            destroy(this: { destroyed: boolean }) { this.destroyed = true; },
+            write() {
+                return false;
+            },
+            end() {
+                /* no-op */
+            },
+            destroy(this: { destroyed: boolean }) {
+                this.destroyed = true;
+            },
         }) as unknown as ServerResponse;
 
         await handler(req, res);
@@ -270,22 +325,27 @@ describe("node adapter failure paths", () => {
         const handler = serveObject(store, {
             key: (req) => new URL(req.url!, "http://localhost").pathname.slice(1),
         });
-        await withServer((req, res) => { void handler(req, res); }, async (base) => {
-            // Headers were already sent (200 + Content-Length: 10), so the
-            // only correct signal is a torn connection: the body read fails.
-            let failed = false;
-            try {
-                const res = await fetch(`${base}/doc`);
-                await res.arrayBuffer();
-            } catch {
-                failed = true;
-            }
-            expect(failed).toBe(true);
+        await withServer(
+            (req, res) => {
+                void handler(req, res);
+            },
+            async (base) => {
+                // Headers were already sent (200 + Content-Length: 10), so the
+                // only correct signal is a torn connection: the body read fails.
+                let failed = false;
+                try {
+                    const res = await fetch(`${base}/doc`);
+                    await res.arrayBuffer();
+                } catch {
+                    failed = true;
+                }
+                expect(failed).toBe(true);
 
-            // The server must remain healthy for subsequent requests.
-            const again = await fetch(`${base}/ok`);
-            expect(again.status).toBe(200);
-            expect(await again.text()).toBe("0123456789");
-        });
+                // The server must remain healthy for subsequent requests.
+                const again = await fetch(`${base}/ok`);
+                expect(again.status).toBe(200);
+                expect(await again.text()).toBe("0123456789");
+            },
+        );
     });
 });

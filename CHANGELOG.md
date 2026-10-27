@@ -1,5 +1,1120 @@
 # Changelog
 
+## 5.0.0 (2026-10-27)
+
+The write path stops inferring facts it can observe. Forty-five changes are
+breaking; `docs/UPGRADING.md` walks each one, and "Changed (breaking)" below
+lists the ones no other section carries. A 4.0.1 patch was prepared and never
+published; its five corrections ship here, under "Upload responses 4.0.0 sent
+that were never conformant".
+
+### License
+
+This release changes the license from MIT to Apache License 2.0. Versions up
+to and including 4.0.0, the last published release, remain under the MIT
+License exactly as published; 5.0.0 and every later version are licensed under
+Apache-2.0. The tarball now carries the full `LICENSE` text and a `NOTICE`
+file, and `package.json` declares `"license": "Apache-2.0"`. Apache-2.0 adds an
+express patent grant; redistributions must keep the license text and the
+`NOTICE` contents (section 4).
+
+### Security
+
+Every defect below is present in **4.0.0**, the published release under
+support, and several are older than that release; each is fixed in 5.0.0. The
+supported-version policy is the latest published release, so upgrading to
+5.0.0 is the remedy whichever version is deployed; there is no patch release.
+Each entry names the deployments it reaches. A deployment serving only reads,
+with no upload store, is reached only by the entries marked "read path".
+
+- **A holder whose lock was stolen mid-body could place bytes where the new
+  holder had already written** (`s3UploadStore`, `gcsUploadStore`,
+  `azureUploadStore`, `fsUploadStore`). The upload lock serializes writers but expires, and a
+  body can stream for longer than the lock lives. The write that lands after
+  such a stall was computed from state read before it: the S3 adapter parked
+  its sub-part remainder unconditionally, so a stale remainder was counted
+  after the parts the winner had since committed and published at an offset
+  the client never sent it for; the GCS adapter wrote its chunk object under
+  an index the winner already held, replacing the winner's bytes; the Azure
+  adapter staged its block under an index the winner already held, and Azure
+  replaces a staged block under an existing id. All three now fence the
+  write. The S3 park lands only where no tail exists (`If-None-Match: *`)
+  and carries the offset its bytes belong at, and a tail is counted only at
+  that offset. The GCS chunk write is conditional on the object's absence
+  (`ifGenerationMatch: 0`). The Azure adapter records every accepted block in
+  its info blob under the same conditional write as the rest of the record,
+  re-reads that record before each stage, and refuses an index the record
+  already counts; a listing that disagrees with the record inside the accepted
+  prefix invalidates the upload rather than publishing it. The one window
+  the Azure fence cannot close lies between a stale holder's read of the
+  record and its stage of the same index: if the winner stages that index in
+  between, the stale block replaces the winner's, and the listing still
+  agrees with the record when the two blocks are the same size, because the
+  record counts blocks and bytes, not the content of each block. The record
+  admits one acknowledgement per index, so only one of the two holders is
+  told its block was accepted; the block that holds the index on the blob is
+  whichever staged last. The filesystem adapter tested the signal that
+  reports a lost lease only before each read of the body, so a read already
+  in flight when the lease went resolved afterwards and its bytes were
+  written at an offset the new holder had since made durable; it is tested on
+  both sides of the read now.
+- **The bookkeeping record was written unconditionally** (`gcsUploadStore`,
+  `azureUploadStore`, `fsUploadStore`, `s3UploadStore`, `r2UploadStore`). The record is the
+  only place an upload's invalidation lives, and a writer wrote it back with
+  nothing pinning it to the version it had read, so a record that changed in
+  between was overwritten: the GCS, Azure and filesystem adapters wrote a
+  whole snapshot taken before the new holder's changes, and the S3 adapter
+  re-read and merged but could still write over an invalidation recorded
+  after its read. Either way the flag was cleared and a terminally dead
+  upload was appendable again. Every record write is now conditional on the
+  version it read (GCS `ifGenerationMatch`, with `0` at creation; Azure and
+  S3 the ETag; R2 `onlyIf`; the filesystem keeps each fact in its own
+  write-once file, so only `progress.json` is ever replaced), a refused S3,
+  GCS or Azure write re-reads, merges the terminal flags one-way and retries,
+  failing after three refused attempts, and the length and published ETag
+  are taken from the fresh copy. A read the merge cannot make fails the write
+  rather than falling back to the caller's snapshot. The mechanism is
+  described under "Adapter bookkeeping is written conditionally".
+- **An upload reaped while an append was in flight came back** (`s3UploadStore`,
+  `gcsUploadStore`, `azureUploadStore`, `r2UploadStore`, `fsUploadStore`).
+  The append's closing record write
+  recreated the bookkeeping the abort or sweep had just deleted, from the
+  snapshot the append held, so a cancelled or expired upload was reachable and
+  appendable again under its old token. (On R2 and the filesystem the
+  recreated record named a multipart upload or a data file that was already
+  gone, so it was inert, but it still read as a live upload.) A record write
+  now requires the record
+  to exist: a missing one answers the append `UploadNotFoundError`, and the
+  bytes that append had already written are discarded (the S3 part belongs to
+  a multipart upload that was aborted, and S3 discards it; the GCS chunk object
+  is deleted; the Azure blob's staged state is discarded under the same
+  condition as an abort). The S3 sub-part tail is a separate object that
+  outlived the reap: the append that observes the reap deletes it, and
+  `sweepExpired` reclaims a tail whose sidecar is gone, judged on its own last
+  write, so no upload bytes remain once the record is gone. The conformance harness gains
+  `swept-resource-is-not-resurrected`, so a custom store is held to it.
+- **A completion was attributed to whatever object sat at the key**
+  (`s3UploadStore`, `r2UploadStore`). When the multipart upload was gone, the adapter read the
+  object at the destination key and, if one existed, reported it as this
+  upload's, ETag included. A key that another writer published in the meantime,
+  or that held an object before the upload began, was reported as a completed
+  upload, and `onUploadComplete` fired for bytes this upload never wrote.
+  Completion now records a random publication id and stamps it on the object
+  it publishes (S3 object metadata, R2 `customMetadata`), and a later probe
+  or completion retry adopts the object at the key only when it carries that
+  id, never by size or part count. A record written before the id was minted
+  holds none: a publish it had in flight attributes nothing, and only a
+  completion it had already recorded is adopted, by its stamped ETag or the
+  length it fixed. The R2 adapter read the object at the key the same way
+  (`head`, then reported its ETag) with no check on what it was, and a 5.0 R2
+  store cannot adopt a pre-5.0 publication. A custom R2 bucket `head()` must
+  return `customMetadata`.
+- **A completion that crashed between the rename and the sidecar write read
+  as an invalidated upload** (`fsUploadStore`). The retry found the data file
+  gone and recorded the upload invalidated, although the object had been
+  published, so the client's only recovery for a lost completion response
+  answered 410 for an object that existed. The staged copy's identity is now
+  recorded in `publication.json` before the copy is linked at the key, and a
+  retry adopts the object at the key by file identity.
+- **A partial chunk cleanup after the compose recomposed a suffix onto the
+  key** (`gcsUploadStore`). Completion deleted the chunk objects before
+  recording the upload complete; a crash or a refused delete partway left a
+  live record over the surviving chunks, and the retry composed those onto the
+  destination key, a shorter object over the complete one. The record is
+  written before any chunk is deleted, and a retry answers from it.
+- **Two uploads to one Azure key shared a block namespace** (`azureUploadStore`).
+  Block ids carried a sequence number and nothing else, so a second upload to
+  the same key summed the first one's staged blocks into its offset, committed
+  them into its object, and overwrote them with its own sequence numbers.
+  Block ids now carry a segment of the upload id, and an upload counts,
+  commits and heals from its own segment only. The raw id width is unchanged,
+  so a blob still holding blocks from a 4.x upload accepts the new ids; those
+  blocks carry no segment and belong to no upload, so an upload in flight
+  across the upgrade reads as lost, never as another upload's bytes.
+- **The Azure discard checked, then deleted** (`azureUploadStore`). Abort and
+  sweep read the destination blob's properties to tell staged-only state from
+  a published object and deleted unconditionally; a commit landing between the
+  two requests was the object the delete removed. By default the discard now
+  writes nothing at the destination key: staged blocks are left to Azure's own
+  seven-day collection of uncommitted blocks, so no blob, event or version
+  appears at the key. `discardStaged: "commit-empty"` reclaims them at once by
+  committing an empty block list create-only (`If-None-Match: *`), which drops
+  every unlisted staged block and which the service refuses when a committed
+  blob is already there, and then deleting the zero-byte blob it left pinned to
+  the ETag that commit returned, so a writer that commits in between keeps its
+  blob; a delete the service refuses (a retention policy) throws. With that
+  option the zero-byte blob is briefly visible at the key and raises a
+  `BlobCreated` event, and a container with versioning or soft delete may keep
+  a copy of it.
+- **An Azure record could outgrow the metadata ceiling after creation**
+  (`azureUploadStore`). The info blob's record lives in blob metadata, which
+  Azure caps at 8 KiB, and it grows after creation by the append timestamp, the
+  published ETag and now the block ledger. A key and caller metadata that fit
+  at creation put the first append's write over the cap, leaving a live upload
+  no append could advance and no completion could record. Creation measures
+  the record with every later field at its widest and refuses one that could
+  cross a 7 KiB ceiling.
+- **A first-time length below the durable offset was recorded** (engine). A
+  deferred-length upload whose first length-fixing request declared a total
+  smaller than the bytes already durable persisted it, and every later probe
+  and append answered `length-inconsistent` forever. The total is refused
+  before it is fixed.
+- **An undeclared-size append bypassed `minAppendSize`** (engine).
+  The floor exempts a completing append, and the exemption keyed on the
+  client's statement alone, so a client stating completion on a request that
+  declared no size, at an offset with room left to a known length, sent a body
+  of any size below the floor and kept the upload open. A non-completing
+  request that declared no size passed the floor too, because the test
+  required a declared content size to run at all. The exemption now
+  applies only where the engine can hold the statement to the post-condition
+  before the write: a declared content size, a deferred length, or a zero
+  bound at the durable end.
+- **A creation that failed after publishing lost its token** (orchestrator).
+  A creation carrying the whole body that published its object and then failed
+  in the completion hook, or failed mid-body after a durable prefix landed,
+  reported a store error with no token, so the client had no `Location` to
+  repeat its completing request against and the at-least-once delivery that
+  `onUploadComplete` documents was unreachable. The outcome carries the token,
+  which the dialect renders as `Location`.
+- **A completion could publish an object short of what the upload held**
+  (`gcsUploadStore`, `s3UploadStore`). Both adapters assembled from a listing
+  taken under a record read that was already stale. On GCS a completion that
+  had lost its lock composed whatever chunks its listing returned, and the
+  winner had by then published the whole object and reaped the chunks it
+  consumed, so the loser composed the survivors, or nothing, over the
+  complete object and reported that as its own completion. On S3 two
+  completers reach the commit from separate part listings, and the loser's
+  can be short by the tail the winner has since lifted into a part, which
+  publishes a truncated object over the complete one; the backend cannot
+  catch it, because it was never told what the total should be. The GCS
+  record is re-read after the listing and a settled completion is answered
+  from rather than composed over, and the S3 assembled size is checked
+  against `expectedLength` and the length the upload declared after the
+  seal, and the GCS listing is likewise taken after the seal.
+- **A reclaim deleted the record that named the objects it was reclaiming**
+  (`gcsUploadStore`). Abort and sweep listed an upload's chunks, deleted
+  them, and deleted the record last. An append landing in that window wrote a
+  chunk the listing had not seen, and the record that was the only thing
+  naming it was then deleted, so the bytes stayed in the bucket with nothing
+  able to reach or reclaim them: a deletion that reported success while
+  retaining data. The record delete is now pinned to the generation read
+  before the listing, so an append that moved it has the delete refused and
+  the pass repeats over what it had not seen.
+- **Damaged upload bookkeeping was read on trust and reported as nothing**
+  (`fsUploadStore`, with the not-found it shares with `gcsUploadStore`,
+  `r2UploadStore`, `azureUploadStore` and `s3UploadStore`, whose damaged
+  record was a plain error answered as a server failure). The filesystem sidecar was parsed
+  and used without a shape check, so a record holding a wrong-typed field fed
+  it into offset math, and the sweep compared a non-numeric clock that never
+  ages; it is now validated like every other adapter's record and, when it
+  fails, aged by modification time like a torn one. A record of a completion
+  without its size is damaged the same way, where it was a plain error. A torn sidecar's parse
+  error was carried as the not-found's `cause`, and its text quotes the
+  record, object key included. Every adapter now answers damaged bookkeeping
+  with an `UploadNotFoundError` whose `cause` is an error named
+  `UploadStateCorruptError` carrying nothing read from storage; the client
+  still receives not-found (a resource nobody can resume is unknown to the
+  protocol), and the orchestrator reports it to `onError`, where an
+  expired token stays silent, so corruption on disk is no longer
+  indistinguishable from a resource that ended.
+- **A filesystem error named the file to every caller** (`fsStore`,
+  `fsUploadStore`). An operating-system error such as `EACCES`, `EISDIR` or
+  `EIO` carries the resolved path in its message, stack, `path` and `dest`,
+  and that path holds the object key or the upload token; only an error that
+  reached `onError` was redacted, so a direct caller logging a rejection
+  printed both. Every method of both stores now rejects with each such path
+  replaced by `<path>`, along the whole `cause` chain; `code` and the class
+  are kept, and a not-found still carries its key on `key`.
+- **The storage key reached the error sink past `auditKey`** (read path, both
+  upload dialects, `s3UploadStore`, `fsUploadStore`). `auditKey` substitutes an opaque id for
+  the filename-bearing key in the reported context, and the error handed over
+  beside that context still carried the key: in a store error's message and
+  `key` property, in an fs errno's `path`, in the backend error carried as
+  `cause`, and, on the tus handler's outermost seam, as the raw upload token.
+  A tus creation was worse: its events and errors, including those of the
+  publish of an implicitly complete creation, carried the raw upload token
+  with an `auditKey` set, because no key was asked for until a token
+  existed.
+  Four more seams reported without the identifiers they already held: a
+  throttled S3 state read and a failing cancel-abort, whose errors name the
+  destination key, and a throwing resumption hook, whose error quotes the
+  location built from the token. Under an `auditKey` the read path and both
+  upload dialects now hand `onError` a `ProjectedError` (`name`, `code?`,
+  `status?`, `operation?`, `cause?`, with the `cause` chain projected the same
+  way; exported from `partial-content/web`) instead of the raw error. What
+  reaches the sink is an allow-list of fields that name a failure class, so
+  the message, the stack and every other property, any of which can carry the
+  token or the key in any spelling, stay behind. A throwing context extractor
+  in the hono and node adapters is projected the same way, and the tus
+  creation asks `auditKey` for the token the store minted before any event or
+  error names the resource. Without an `auditKey` the raw error is handed
+  over unchanged. An `onError` that branched on the error's message, class or
+  properties under an `auditKey` must branch on `name`, `code` or `status`.
+  For a custom store's own sink, `redactErrorText` scrubs a whole error,
+  searching both spellings of a key (a filesystem adapter resolves the
+  forward-slash spelling a consumer writes through the platform path module
+  first, so on a backslash platform the errno's `path` and `dest` carried the
+  filename past a single-spelling search).
+- **An error message named the object key wherever the error went** (read
+  path, every store). `ObjectNotFoundError`, `ObjectChangedError` and
+  `StoreUnavailableError` spliced the key into their message, as did the
+  adapters' own failures (a missing `ContentLength`, an empty body, an
+  unparseable `Content-Range`, an origin status), the web adapter's
+  served-range and byte-count refusals, and the upload store's reserved-prefix
+  refusal. The `onError` scrub reaches only what passes through `onError`; an
+  error a consumer catches from a store call, or logs from its own framework,
+  carried the key in free text that no field-level redaction reaches. The
+  upload stores' conflict and missing-generation failures named their
+  bookkeeping objects, whose names embed the upload token, a bearer
+  credential for the upload. A message now names the failure alone. The key stays on the error's `key`
+  field and in the `onError` context, where it can be dropped, hashed or
+  redacted by name. The backend error carried as `cause` is the backend's own
+  and is not rewritten; `redactErrorText` scrubs a whole chain for a sink that
+  needs it.
+- **Multipart bytes past a part's range reached the wire** (read path). A
+  chunk that crossed the part's span was framed and written before the span
+  check ran, so the tail of a representation that changed under the read was
+  delivered inside a well-formed part before the response errored. The chunk
+  is withheld.
+- **`httpStore` served the sibling upload store's namespace** (read path). The
+  five other read stores refuse keys under their upload store's prefix; the
+  http adapter, which cannot know which store sits behind its origin, refused
+  nothing, so an origin fronting any of them served in-flight bytes and
+  key-bearing sidecars to a read handler. It now refuses both prefixes by
+  default (`reservedPrefix` overrides), and refuses them on every spelling an
+  origin can resolve the key to: a key there becomes a URL path, and a path
+  is percent-decoded and its dot segments resolved before it names anything,
+  so `%2Euploads/x` and `a/../.uploads/x` both arrive at the workspace past a
+  literal compare. The store's own encoder leaves none of that reachable, but
+  `url` belongs to the consumer. The documented `url` example also
+  interpolated the key into the request line unencoded; `encodeKeyPath` is
+  exported and the example uses it.
+- **The fs reserved-prefix guard checked the key, not the path** (read path,
+  `fsStore`). A key spelled with mixed separators, a different case or dot
+  segments resolved into the reserved directory past the guard. The guard is
+  applied to the path the key resolves to, and the compare folds case and
+  normal form on every platform: both belong to the volume, not the runtime,
+  so a case-insensitive volume under a POSIX runtime opens the workspace as
+  `.Uploads/` and a normalizing one opens it decomposed. Where the reserved
+  prefix carries a segment that does not fit the 8.3 shape, a path segment of
+  the generated-alias shape is refused within the prefix's own depth, since
+  such an alias answers to the directory under a name no folding relates to
+  the prefix. `fsUploadStore` refuses a publish key into its own workspace
+  through the same guard, where it folded case on Windows only and accepted
+  a generated alias such as `UPLOAD~1/`.
+- **`fsStore` followed symbolic links out of its root by default** (read path,
+  `fsStore`). 4.0.0 documented that links under the root were followed by
+  design, so a link planted in the served tree (an upload tree, an extracted
+  archive) served any file the process could read. The store now contains
+  every key to the root's real path: the key's links are resolved and the
+  result must sit inside the real root, and the open itself refuses a link in
+  the final component (`O_NOFOLLOW`) where the platform has it. A link from one
+  place in the root to another still serves; one that leaves it, or that
+  reaches the reserved upload workspace, answers `ObjectNotFoundError`.
+  `symlinks: "follow"` restores the old resolution for a root whose layout
+  links to content kept elsewhere on purpose, and any other value contains.
+  The check and the open are two steps, so a writer that can swap a directory
+  under the root for a link between them is outside what the option defends
+  against. This is a breaking default: see `docs/UPGRADING.md`.
+- **A FIFO at a served path blocked the thread pool** (read path, `fsStore`,
+  POSIX). The store opened the path before it checked that it was a regular
+  file, and opening a FIFO parks a thread until a writer appears, so a few
+  requests for a planted FIFO exhausted the pool the whole process shares. The
+  open is non-blocking and a path that is not a regular file is refused.
+- **Uploads were published through a link outside the root** (`fsUploadStore`).
+  The workspace directory and the publish destination were created and
+  renamed into with no check of where their links led, so a directory link
+  under the root, or a linked `.uploads`, redirected a completed upload to
+  any location the process could write. Creation and publication now resolve
+  the real root first and publish only inside it.
+- **The S3 offset a client had been told could go down** (`s3UploadStore`).
+  Lifting the sub-part tail into a part deleted the tail before the part that
+  replaced it was committed, so a transient failure between the two lowered
+  the durable offset below what the client had been acknowledged, and the
+  client, resuming from the lower offset, wrote different bytes over ones it
+  had been told were safe. Completion lifted the tail before it checked the
+  assembled size, so a refusal left a short part behind. A parked tail now
+  leaves its slot only after its bytes are durable in a part or in a replacing
+  tail, and the assembled size is checked before the tail is lifted, so the
+  derived offset never falls below an acknowledged one. The one exception is
+  an unstamped tail written by a 4.x store, which is removed before its part
+  is sent.
+- **A GCS read committed its status before the first byte** (read path,
+  `gcsStore`). `getObject` returned a stream at once, so an object deleted or
+  replaced between the metadata read and the first chunk was answered `200`
+  and then failed mid-body, a truncated success the client could not tell from
+  a complete one. The first chunk is awaited before the status is committed: a
+  pinned read that finds the object missing or replaced raises
+  `ObjectChangedError`, and an unpinned one that finds it missing raises
+  `ObjectNotFoundError`, each answered as its status.
+- **R2 wrote an unaligned remainder as a short multipart part**
+  (`r2UploadStore`). R2 requires every part but the last to be the same size,
+  and a part written short for a remainder can never be followed by another,
+  so an upload whose chunks were not a multiple of the part size could not
+  complete. The remainder is now a tail object (`<prefix>/<id>.<uuid>.part`)
+  that the manifest names (`tail: { id, size }`); the manifest's conditional
+  write is the fence, the previous tail is deleted only after the manifest
+  that replaces it is durable, and completion uploads a tail still parked as
+  the one short final part R2 permits. `sweepExpired` reaps tails.
+- **Active XML content rendered inline without the sandbox** (read path).
+  4.0.0 added `Content-Security-Policy: sandbox` to inline SVG, HTML, XHTML and
+  generic XML only. Every `+xml` structured-syntax type (RFC 6839 Section 4.1)
+  and `text/xsl` can run a stylesheet or script when opened as a top-level
+  document, and all of them now get the sandbox when served `inline`.
+- **A multi-range request cost one backend read per part, and a `NaN` cap
+  disabled the cap** (read path). Each part of a `multipart/byteranges`
+  response was its own ranged `getObject`, so one request with 50 ranges, the
+  old `maxRanges` default, drove 50 reads against a metered backend. A
+  `maxRanges` of `NaN` compared false against every count and so allowed
+  unlimited ranges. `maxRanges` now defaults to 8 and fails closed:
+  `serveObject` throws a `TypeError` for a value that is not a safe integer of
+  at least 1, and `parseRanges` answers the full `200` for a `NaN` cap. The new
+  `maxBackendReads` (default 8) bounds the pinned per-part reads; past it the
+  parts are cut from one buffered read of the span covering them when that span
+  is under 256 KiB, and the response is the full `200` otherwise.
+- **A tokenless `DELETE` or `GET` could create and publish an empty object**
+  (`createUploadHandler`). Every request without an upload token was routed to
+  creation, and creation was gated on the completeness header alone, so a
+  `DELETE` or `GET` carrying `Upload-Complete: ?1` created an empty upload and
+  published it at whatever key `key()` chose. Only `POST`, `PUT` and `PATCH`
+  create (draft-ietf-httpbis-resumable-upload Section 4.2.1); any other method
+  without a token answers `405` with `Allow: POST, PUT, PATCH, OPTIONS`.
+- **`Upload-Metadata` was unbounded** (`createTusHandler`). Every pair was
+  decoded and handed to `key()` and the store, so the header size was work and
+  storage a client chose, and a pair named `__proto__` or `constructor`
+  landed on an object with a prototype. The header is now limited to 4096
+  bytes and 32 pairs (`400` beyond, configurable with `metadataLimits`), and
+  the parsed result has a null prototype, so those names are ordinary entries.
+  Configured checksum algorithm names are matched case-insensitively: a
+  configured `SHA1` never matched a request before.
+- **A checksummed request was buffered and hashed before it was admitted**
+  (`createTusHandler` with `checksum`, since 2.2.0). The Checksum extension
+  verifies content before it is stored, which means buffering and hashing up
+  to `checksum.maxBufferBytes`, and any client could make the server do that
+  work for a request it would refuse: a `PATCH` under a token naming nothing
+  or refused by `authorize`, or a creation-with-upload `POST` the policy or
+  the `key` callback refuses, times concurrency. A `PATCH` is now judged by
+  the new lock-free `orchestrator.admit(uploadToken, { authorize })` first
+  (so `authorize` can run twice for one checksummed `PATCH`, on the same key
+  and metadata, while the offset stays the append's to judge under the lock),
+  and a creation verifies only after the policy and `key` admit it and before
+  anything is allocated, so a mismatch leaves no resource behind. A declared
+  `Content-Length` over the cap is refused `413` from the header alone on
+  both.
+- **A completion could overwrite a key written after it began, adopt a
+  same-shape foreign object, or omit an acknowledged append** (every upload
+  store). 4.0.0 composed the object from a listing and committed it
+  unconditionally, so a key another writer published in the meantime was
+  overwritten, an object at the key that merely matched the upload's size was
+  taken for its own, and an append acknowledged after the listing was left out
+  of the published object. Completion is now a sealed plan: it durably seals
+  the upload at the `expectedLength` the caller acknowledged and records the
+  state of the destination key, refuses every later append, takes the
+  assembly plan only after the seal, and publishes under the provider's own
+  precondition on the recorded destination state. A key written after the seal
+  raises `UploadDestinationConflictError`, which the orchestrator answers from
+  any store call and both dialects map to `409`; nothing is published and the
+  upload stays sealed for an operator to reconcile. Two windows remain. The R2
+  multipart `complete()` takes no precondition, so an object written in the
+  instant between the check of the key and the publish is overwritten (a
+  zero-byte upload has no such window). The filesystem adapter replaces an
+  existing object by moving it aside and linking the new one, so a reader sees
+  the key empty briefly.
+- **A comma-separated media type could skip the sandbox** (read path). In
+  `>= 1.2.0, < 5.0.0` a stored type such as `image/png, text/html` was judged
+  by its first member, so `isInlineSafeMediaType` (2.3.0 and later) called it
+  inline-safe and the read handler added no `Content-Security-Policy:
+  sandbox`, while a browser extracting a MIME type (WHATWG Fetch) renders the
+  last member, here HTML. Every media type is now parsed by one RFC 9110
+  parser (`media-type.ts`); an off-grammar value, any comma included, is
+  served as `application/octet-stream` and is never inline-safe.
+
+One item in this section rests on a trust that ends with the upgrade window: a
+4.x S3 tail carries no offset stamp and is counted where it is found, until the
+first append after the upgrade replaces it. A 4.x S3 completion record is not in
+that class, because completion is terminal and no later write restamps it; such
+a record is held to the length it fixed for as long as it lives, and only one
+that fixed no length is taken on the key's existence, as it always was. The
+Cloudflare Workers runtime is not exercised by the cross-runtime smoke check, so
+the transparent-compression refusal is observed against Node, Deno and Bun only.
+
+### Node.js 24 or later
+
+`engines.node` is `>=24.0.0` (was `>=20.0.0`). Node.js 20 reached end of life
+in April 2026, and the repository that builds and tests the package requires
+Node.js 24, so a lower floor was a claim nothing verified. Bun, Deno and the
+edge runtimes are unaffected.
+
+### The engine no longer guesses whether a request carries content
+
+A request that declares no content size is an unknown, and the old code
+resolved that unknown in opposite directions in two branches of one function.
+No resolution was right for every client, because the question cannot be
+answered before the body is read.
+
+`AppendIntent.hasContent`, `CreateIntent.hasContent` and the internal
+fast path for completing an upload already at its declared length are gone. The
+engine now returns a bound and a post-condition, and the post-condition is
+evaluated against the bytes the store reports as durable. A completing append
+at the declared end is an ordinary append whose bound is zero further bytes, so
+a body carrying content is refused by the same mechanism that refuses every
+other over-append, with the registered `inconsistent-upload-length` problem
+type on the revisions that define one.
+
+One consequence is worth stating on its own: **`minAppendSize` now binds.** It
+was advertised in `Upload-Limit` and enforced only for a request that declared
+its size, so any chunked request slipped past the floor entirely. A
+non-completing append that declares no size is now refused before any byte
+moves. A completing append stays exempt, so a client that cannot state a size
+can still finish.
+
+That exemption needs a wire on which a request can assert its own completion,
+and tus is not one: it infers completion from a known total, so a deferred
+length can never claim it and every chunked append would meet a floor it can
+neither escape nor discover. **`createTusHandler` now refuses `minAppendSize`
+at construction** rather than serving an endpoint that answers 400 forever. Set
+it on the IETF dialect, which advertises `min-append-size` and lets a request
+say it is finished.
+
+### Refusals that cost no more than a refusal
+
+- **A size floor is checked before any byte moves**, on the total the request
+  would fix, so a first completing append below the server's `minSize` is
+  refused without recording a length the upload could never publish.
+- **A duplicate completing retry leaves a byte-complete upload intact.** A
+  completing request that arrives again at the declared end, with or without a
+  `Content-Length`, crosses a zero bound, and a zero bound is not terminal: the
+  retry is refused with the upload still completable. A body that does carry
+  bytes into that zero bound is answered as the representation's inconsistency
+  it is (`length-inconsistent` for a declared length, `size-exceeded` for the
+  policy ceiling), never as this request's ceiling, which a client would try to
+  meet with a smaller chunk that can never fit.
+- **A completed upload no longer expires.** `maxAgeSeconds` bounds partial
+  bytes nothing will finish and the right to keep appending, and a finished
+  upload has neither. Expiring it answered `not-found` to the client's
+  idempotent completing retry, which is the only recovery a resumable protocol
+  has for a lost response, and permanently stranded a completion report whose
+  first delivery failed. Reaping the finished resource's bookkeeping stays
+  `sweepExpired`'s job. Invalidation still overrides completion.
+
+### `appendChunk` reports whether it ran to the end of the body
+
+`AppendChunkResult` gains `interrupted`. Only the code draining the body knows
+whether it stopped early, and the caller was previously inferring it from an
+abort signal, which says that something asked the write to yield and nothing
+about what happened to the bytes. Every store must now return the field.
+
+### `sweepExpired` takes two clocks and requires one
+
+`sweepExpired(cutoff)` accepts `idleSinceMs`, `createdBeforeMs`, or both, and
+throws when given neither. Reclamation previously keyed on idleness alone while
+the lifetime limit is measured from creation, so a resource could sit past the
+lifetime that every request refused it for and remain invisible to the sweep
+indefinitely: a client sending one byte a minute kept it alive for the sweep
+while being refused by the protocol, and nothing could ever reclaim the bytes.
+
+`sweepExpired` resolves `{ removed, failed }`. A resource the pass condemned but
+could not remove (a denied delete, a throttled backend, a file held open) stays
+in place, is counted in `failed`, and is retried on the next pass; it no longer
+rejects the whole sweep. The sweep still rejects on an unreadable listing or an
+aborted signal. **Alert on `failed`**: a monitor that alerted on a rejected
+sweep no longer hears about a resource it cannot remove. A custom store must
+return the field.
+
+The upload path also discards a resource on the terminal outcomes it produces
+itself: a digest mismatch, and a resource refused as expired or invalidated. A
+failed digest previously left a fully staged representation that no client
+could reach or delete.
+
+### Capability flags can be wrong, and the harness checks them
+
+`enforcesOffsetCheck` and `atomicCompletion` were typed as the literal `true`,
+so a store could not declare anything else and the checks that refuse a store
+reporting `false` could never run. Both widen to `boolean`, and
+`partial-content/conformance` goes from 15 write-side checks to 28, exercising
+the behavior behind them rather than the declaration: that a stale write leaves
+the durable offset AND the bytes alone, that a failed completion publishes
+nothing at the destination key, that completion publishes exactly what was
+appended, that an abort spares an object already published, that a store
+which stops mid-body says so (a short append, a torn body, an abort mid-read),
+and that a request ceiling stops a streaming body. `swept-resource-is-not-resurrected`
+holds a sweeping store to the reaped-upload rule under "Security": an append
+whose body was in flight when the sweep ran must not write the resource back.
+
+`runConformanceCheck`, `tallyConformance` and `ConformanceAssert` are exported,
+so a store author can add backend-specific checks to a run and score them with
+the built-in ones. A check that makes no assertion fails rather than passes.
+
+Several of those have to look at what was actually published, so
+`ConformanceOptions` gains `readObject?: (key) => Uint8Array | undefined`, which
+may also return a promise.
+**Without it they are reported SKIPPED with the reason, never passed.** An
+obligation nothing could observe has gone unverified rather than been met, and
+a harness that scored it as a pass would be worth less than the flag it
+replaced, because it would look like proof.
+
+### Appends answer 204, or 200 on completion
+
+`201 Created` is the status for creating the upload resource, which still
+answers 201 with `Location`. A 201 carrying no `Location` asserts that the
+request created what the target URI names, which an append to an existing
+resource did not.
+
+### Smaller protocol corrections
+
+- A completing append that declares a content size now fixes and records the
+  representation's total, which was derived at creation and nowhere else.
+- The completion hook is not re-delivered once a delivery has resolved, so a
+  repeated bodiless request cannot drive unbounded awaited callbacks.
+- A reported store error is withheld under the caller's `auditKey` (a
+  `ProjectedError`, described under "Security"). `redactErrorText` is exported
+  from the package root for a custom store's error sink; it covers the storage
+  key as well as the token, and reaches an error's own properties and its
+  `cause` chain.
+- `reservedKeyGuard` takes a list of prefixes as well as one.
+- A request body the store never took is cancelled rather than abandoned.
+- Whether offset retrieval and cancellation refuse upload-state header fields
+  is a per-version fact in the wire table, so the newest revision no longer
+  inherits a restriction it does not impose.
+- Interop 3, 5 and 6 answer an inconsistent length with the registered problem
+  type's title, `inconsistent length values for upload`, as plain text; the
+  body read `inconsistent upload length indicators`.
+- `createTusHandler` refuses at construction a `maxAgeSeconds` whose deadline
+  falls past the year 9999: `Upload-Expires` is an IMF-fixdate (RFC 9110
+  Section 5.6.7) with a four-digit year, and the header read a five-digit year
+  or `Invalid Date` instead.
+- The tus `PATCH` gate and the IETF append gate read `Content-Type` with
+  `parseMediaType` (RFC 9110 Section 8.3.1). tus now refuses a comma list or
+  an off-grammar value that 4.0.0 admitted, and the IETF gate accepts
+  `application/partial-upload` with parameters, which 4.0.0 refused.
+- A tus `HEAD` that heals an upload stalled at offset equal to its length
+  (it publishes the upload) runs under the `authorize` hook with
+  `operation: "append"`, so a caller admitted only to probe receives the
+  hook's append refusal.
+
+### `Upload-Limit` counted to one deadline
+
+`max-age` is derived from one deadline, the one recorded at creation, on every answer about a resource: the whole seconds left,
+rounded down. A creation whose body streamed has already spent part of it. A
+probe rounded the elapsed time down instead, so it could promise up to a
+second the resource did not have, and a limit rejection about an existing
+upload stated the configured lifetime, moving forward the deadline its client
+already held. The `probed` orchestrator outcome drops
+`remainingLifetimeSeconds` for the `expiresAt` it already carried, and a
+`limit-violation` outcome about an existing resource carries `expiresAt` as
+well. A creation that completed the upload carries no `Upload-Limit`: nothing
+is left to append. `createUploadHandler` refuses at construction a policy
+bound longer than 15 digits, the most an RFC 8941 integer has: a parser
+refuses the whole field on a longer one, which cost the client every limit,
+not only that one.
+
+### A completing upload response names what it published
+
+`Repr-Digest` and `ETag` now ride the response that reports an upload
+complete, on both dialects and on both completing paths. A store configured to
+hash the published representation computed the digest, the orchestrator carried
+it, and both dialects dropped it, while the CORS exposure list advertised
+`Repr-Digest` as readable: a list naming a header nothing sent.
+
+That list is now honest in both directions. `ETag` is exposed, because it is
+not a CORS-safelisted response header and emitting it unexposed would be the
+same defect one field over. `Upload-Checksum` is removed from the tus list: the
+extension defines it as a request header and no response carries it. **A
+deployment that copies that list into its CORS configuration should update the
+string.**
+
+The idempotent replay of an already-complete request deliberately carries
+neither header, because that answer is synthesized from durable facts and holds
+no representation to describe. It is an omission rather than a claim.
+
+### Adapter bookkeeping is written conditionally
+
+A store's own metadata record is the only place an upload's invalidation
+lives, and a holder whose lock was stolen while its body streamed used to write
+that record back from a snapshot taken before the new holder's changes, which
+could clear the flag and resurrect a terminally dead upload. The four adapters
+that keep such a record now pin every write to the version they read: `If-Match`
+on the S3 sidecar `PutObject` (`If-None-Match: *` at creation), `onlyIf` on the
+R2 manifest, `ifMatch` on the Azure info blob's metadata, `ifGenerationMatch`
+on the GCS bookkeeping object (`0` at creation). A refused S3, GCS or Azure
+write re-reads, merges with the terminal flags one-way, and retries, failing
+after three refused attempts; a refused R2 write is answered with the winner's durable
+offset, as every stale writer is. The data writes that can collide are fenced
+too, and the completions that can be misattributed are recorded; both are
+described under "Security".
+
+The Azure record grows by the accepted-block ledger and the completion seal
+fields, and the filesystem adapter keeps each fact in its own file under one
+directory per upload; neither changes a public type. A persisted S3
+sidecar field of the wrong shape (`length`, `partSize`, `invalidated`,
+`completed`, `metadata`) is damaged bookkeeping (see "Security") rather than
+read as absent and written back. Two changes are breaking for an upload in
+flight: the Azure block-id scheme, so **an Azure upload in flight across the
+upgrade reads as invalidated** and must restart, and the filesystem layout
+(see "Changed (breaking)"), so a 4.x filesystem upload in flight answers 404
+and must restart.
+
+`s3UploadStore` gains `sidecarCas` (default `true`). An S3-compatible backend
+that answers `NotImplemented` to the precondition fails the operation naming the
+option rather than degrading in place; pass `false` for such a backend, accepting
+that its sidecar writes are protected by the re-read and the monotonic flags
+alone.
+
+Some S3-compatible backends accept the precondition headers and ignore them,
+which no single write reveals. Before its first conditional write the store
+therefore creates a canary object under `uploadPrefix` with `If-None-Match: *`
+twice, deletes it, and trusts the backend only when the second create answered
+`412`. The verdict is kept for the store's lifetime; a probe that fails for
+another reason decides nothing and is asked again. A backend that accepted both
+creates fails the first upload with an error naming `sidecarCas: false`, as
+one answering `NotImplemented` does. The canary is shaped like a tail no
+sidecar names, so the sweep reclaims one a failed delete left behind.
+
+`s3UploadStore` also gains `publishCas` (default `true`), which makes the
+multipart commit conditional on the destination state the completion sealed. A
+canary probe fails the first completion on a backend that ignores the
+condition, with an error naming `publishCas: false`.
+
+### A size the backend did not report is never counted
+
+A backend reply that lacks a size, or carries one that is not a decimal count,
+now fails the call. `azureUploadStore` counted a block listed without a size as
+zero bytes and `gcsUploadStore` did the same for a chunk object, which handed a
+resuming client an offset short of the bytes it had made durable; `gcsStore`
+read an unparseable object size by its leading digits.
+
+A completed Azure or GCS upload records its size, a deferred length included.
+The state of a completed upload whose published object was later deleted is
+answered from that record; with the length deferred it used to be answered
+with an offset of zero. A completed record written without the size fails that
+read instead, as does an fs sidecar marked complete without one.
+
+`azureUploadStore` records the empty accepted-block ledger at creation, so the
+ledger tells an upload that accepted nothing from one whose bytes were lost. A
+deferred-length upload whose staged blocks were lost under a blob that lists no
+blocks is invalidated; it used to read as a completed empty upload, and a
+completion retry committed an empty blob over the one at the key.
+
+### Read side
+
+- The served body is held to the committed `Content-Length`. A stream body
+  that closes short of it, or produces bytes past it, errors the response (a
+  reset the client sees as a failed transfer) and reports the transfer as
+  `completed: false` with the bytes actually delivered; a byte body whose
+  length disagrees with the store's `contentLength` is refused with 502
+  before headers commit. Both route to `onError` with `operation: "get"`.
+  Until now a backend that ended a body early was delivered as a truncated
+  200 or 206 that a client could not tell from a complete one, and the
+  transfer was logged as completed. The multipart path already held each part
+  to its span; single-range and full responses now do the same. Byte bodies
+  with no transfer hook keep the static-body fast path; every stream body is
+  counted.
+- `ETagSource` uses `ObjectMetadata`'s field names (`etag`, `contentLength`,
+  `lastModified`), so `generateETag(await store.headObject(key))` is a
+  supported call. The retired names throw a `TypeError` naming their
+  replacement rather than reading as absent, which would have served no
+  validator at all. `etag` decides the validator; `digest` is never read.
+- `toObjectBody` narrows a `Buffer`, a bare `Uint8Array` or a
+  `ReadableStream<Uint8Array>` to the `ObjectBody` a store returns, copying a
+  `SharedArrayBuffer`-backed view, so a store reading with `readFile` returns
+  `toObjectBody(await readFile(path))` without a cast. `ObjectBody` and
+  `ObjectBodySource` are exported. The narrow, `ArrayBuffer`-backed type stays
+  in return position, where it is what makes a body assignable to
+  `new Response(...)` under the DOM lib.
+- Media types added for HLS playlists, WebVTT, SubRip, source maps and YAML.
+- `onTiming` is called once per served body, with the figures its
+  `Server-Timing` header carries. A single-range or full read that was
+  refused afterwards (the object changed under it, or the store returned
+  bounds or a byte count the response cannot carry) reported its timing
+  anyway, so a re-validated request was counted twice and a 502 reported a
+  timing no response carried.
+
+### Node
+
+`partial-content/node` gains `toWebRequest`, `sendResponse` and `nodeHandler`,
+so the upload dialects run on `http.createServer` without a hand-written
+bridge. Bodies stream with socket-level backpressure, and `Expect:
+100-continue` is surfaced rather than answered, because whether a body is worth
+receiving is an authorization decision the bridge cannot make. HTTP/2 request
+objects are out of scope.
+
+A request that had already closed before it was converted, or whose socket
+closes without the request emitting its own `close`, aborts the converted
+request's signal, and a body pull on such a request fails rather than waiting
+on a stream nothing will feed. An external signal is unlinked when the
+request's own life ends, including an answered request whose body never
+arrived complete, so a long-lived caller signal does not accumulate listeners.
+
+`readStallTimeoutMs` bounds the time the sender leaves a read outstanding: it
+is armed when the reader asks for a chunk and cleared when one arrives, so it
+measures the sender, never the consumer. A store that takes a minute between
+reads is not a stalled client, and a body nobody reads arms nothing at all,
+which is what keeps a timer from outliving the request that owns it.
+
+Cancelling a request body drains and discards it rather than destroying the
+connection, so a handler that stops reading can still answer. That is what lets
+an upload refused for crossing a bound reach the client as the status it
+deserves instead of a reset, which a resumable client cannot tell from a
+network fault and would retry forever. There is deliberately no byte ceiling on
+that drain: a ceiling reintroduces the reset for exactly the large bodies most
+likely to be refused, and how long a sender may keep pushing a body nobody
+reads is already `server.requestTimeout`'s job.
+
+An absolute-form request target never overrides a configured `origin`. The
+option exists to avoid trusting a client-sent header, and a request target is
+equally client-sent, so only its path and query are taken.
+
+`toWebRequest` refuses a request target the URL parser would rewrite: a leading
+`//`, a dot segment (spelled `.`, `..` or with `%2e`), a backslash, or an
+absolute form whose path is such a target. A rewritten path would route to a
+resource other than the one the client named, and a client-chosen path is what
+`key()` and `resolveToken` read. It throws a `TypeError`, and `nodeHandler`
+answers it `400` and reports it to `onError`.
+
+### Packaging
+
+The `prepare` script is gone, so installing from the git repository no longer
+builds `dist/`. Install from the registry, or run `npm run build` after a git
+install.
+
+### Upload responses 4.0.0 sent that were never conformant
+
+Five upload-path corrections, prepared as a 4.0.1 patch that was never
+published. Four of them change a response 4.0.0 sent, and each of those four
+replaces an answer that was never conformant: a deployment depending on the old
+behavior was depending on the server reporting something untrue.
+
+- **An append that carries content to an upload the server has already
+  finished is refused `400` rather than acknowledged.** The engine decided the
+  case on the offset alone, so a request whose bytes had nowhere to go, the
+  total being fixed at completion, was answered as though they had been
+  stored. It now carries the registered `inconsistent-upload-length` problem
+  type on the revisions that define one.
+- **A completing append that declares no content size no longer publishes
+  without reading its body.** A request with `Upload-Complete` set, arriving at
+  the end of an upload that had reached its length but not yet been published,
+  took a fast path that completed the resource and returned success while the
+  body was never read, written or cancelled. Chunked requests are the ones that
+  declare no size, so the answer a client received depended on whether it sent
+  `Content-Length`. Content presence is now judged one way everywhere: a
+  request carrying content is bounded at zero further bytes and refused by that
+  bound, which is where every other over-append is already decided.
+- **A `409` on a mismatched offset reports the upload as incomplete.** It
+  echoed the resource's own completeness, so a conflict against a finished
+  upload said `Upload-Complete: ?1`. The specification makes the false value
+  mandatory there, and a client reads it to tell a conflict it can resume at
+  the offset beside it from a representation that failed to process, which it
+  cannot. A recoverable conflict was reading as terminal.
+- **`Upload-Limit` states the remaining lifetime and the effective bounds.**
+  `max-age` is defined as the lifetime left counted from the response and was
+  emitting the configured total, so a resource an hour into a one-hour lifetime
+  still advertised the full hour. The field is also built from the bounds
+  actually in force, including a limit the storage backend imposes, which were
+  previously omitted from every response including the `413` that exists to
+  tell a client what size to retry with.
+- **A storage error raised while another request preempts an append is
+  reported, not swallowed.** Preemption is ordinary here, since reading an
+  upload's offset asks an in-flight append to yield, and the classification
+  asked whether that had happened rather than what the store had raised. An
+  append refused for crossing a bound, or for writing at an offset the resource
+  had moved past, could be reported as an interruption and answered with an
+  offset the client could not resume from.
+
+### Changed (breaking)
+
+Each is walked, with before and after code, in `docs/UPGRADING.md`.
+
+- **One `auditKey` shape on both upload dialects**:
+  `({ request, uploadToken }) => string | undefined`. The tus handler took
+  `(uploadToken) => string` and the IETF handler `(request) => string |
+  undefined`. The callback is asked first without a token on a creation, and
+  again with the one the store minted.
+- **`policy.maxSize` is required** on `createUploadHandler` and
+  `createTusHandler`; `Infinity` states that the endpoint has no size ceiling.
+  An omission is a `TypeError` at construction.
+- **`key()` runs after the policy accepts, before anything is allocated**, and
+  may be async. It returns a string, `{ key, metadata? }` (the metadata recorded
+  in place of the client's), or a `Response` that refuses the creation as-is.
+  `UploadCreation` and `TusCreation` carry the effective `policy`, and the tus
+  one the `declaredLength`. Both dialects gain `authorize`, called for probe,
+  append and cancel under the upload's lock with the stored key and metadata,
+  where per-upload checks belong. On the orchestrator,
+  `CreateUploadRequest.key` is a thunk and an outcome may be `refused`.
+- **Upload state reports `status`** (`"incomplete" | "complete" |
+  "invalidated"`) in place of `isComplete` and `isInvalidated`. The persisted
+  bookkeeping is unchanged.
+- **Completion digests are keyed by algorithm.** `expectedDigest` becomes
+  `expectedDigests: { "sha-256": value }`; `digestOnComplete` is
+  `readonly UploadDigestAlgorithm[] | false` (was `"sha256" | false`); the
+  orchestrator's `canVerifyDigest` becomes `verifiedDigests`.
+  `UploadDigestMismatchError` gains `algorithm`. The memory and filesystem
+  stores verify `sha-512` as well as `sha-256`. A `Repr-Digest` member whose
+  value is not the length its algorithm produces is ignored.
+- **The Redis locker names resources by digest on one channel.** The key is the
+  prefix plus the SHA-256 of the token in hex, and a preempt request is that
+  digest published on one `<prefix>preempt` channel that a single subscription
+  per locker routes, instead of one channel and one subscriber connection per
+  acquisition. Lock and channel names differ from 4.0.0's: drain in-flight
+  uploads before switching a fleet over.
+- **`createSignedUrl` distinguishes declining from failing.** `{ ok: false }`
+  (with an optional `code` of `"no-credential"` or `"unsupported"`, and the
+  underlying `cause`) means the store cannot sign and the response streams the
+  bytes, unreported. A throw is a real failure, reported with operation
+  `"sign"` and answered `502`, or `499` after the client aborted. 4.0.0 answered
+  a decline `502`. The signer receives the request's `signal` and is called at
+  most once. `s3Store` throws a signing failure and declines only when the
+  presigner cannot be loaded (`unsupported`); `azureStore` without a shared-key
+  credential and `gcsStore` without a `client_email` decline (`no-credential`).
+- **`ParsedContentRange.totalSize` is `undefined`** for `bytes a-b/*` (it was
+  `-1`).
+- **`EvaluatedWrite.status` admits `428`** (RFC 6585 Section 3). The package's
+  own evaluation still produces `412`.
+- **`ETagSource` takes extra metadata fields.** Only `etag`, `contentLength` and
+  `lastModified` feed the derived validator, so a custom store may carry more
+  on its metadata; `generateETag` refuses a retired name only as an own property
+  with its replacement absent.
+- **A multipart response is bounded at 8 ranges and 8 backend reads** (see
+  "Security"): a request with more than 8 coalesced ranges is answered with the
+  full `200` until `maxRanges` and `maxBackendReads` are raised, and an
+  invalid `maxRanges` is a `TypeError` at construction.
+- **`lookupMime` returns no `js`, `mjs`, `css` or `wasm` type** unless called as
+  `lookupMime(name, { webAssets: true })`. A static asset server passes the
+  option; an upload server leaves it off, so a stored script is served as an
+  attachment of no particular type.
+- **Timing options are validated.** `graceMs` outside 0 to 2147483647 and
+  `lockTimeoutMs` outside 1 to 2147483647 (NaN, negative, fractional or
+  oversized) throw a `TypeError` at construction, where a timer would have
+  fired at once or never.
+- **The fs stores validate their options.** `fsStore` and `fsUploadStore`
+  throw one `TypeError` for a missing or relative `root`, and the `fsStore`
+  cache's `ttlMs`, `maxEntries` and `maxBytes` throw for `NaN`, an infinity or
+  a negative number, each of which had silently disabled the bound it named.
+- **A known length past 10,000 parts of 5 GiB is a `RangeError`** at
+  `createUpload` on S3 and R2, and a deferred-length upload that reaches part
+  10,001 gets a non-fatal `413` (`UploadAppendBoundError`; fatal on R2 in
+  4.0.0).
+- **tus checksum configuration is checked.** `createTusHandler` throws a
+  `TypeError` when `checksum.algorithms` has no `sha1` (tus 1.0 requires every
+  server offering the extension to support it), when an entry is not a header
+  token or repeats another ignoring case, and, as two separate messages, when
+  neither `checksum.maxBufferBytes` nor `policy.maxAppendSize` bounds the
+  verification buffer.
+- **A content-bearing chunked append to a completed upload is refused**
+  (`400`, `inconsistent-upload-length`, both dialects). For a request with no
+  declared size the orchestrator reads the body as far as its first byte; a
+  byte means the refusal, none means the idempotent replay. Interop 9 had
+  answered such a request `200` with the completion while cancelling its body
+  unread.
+- **The CORS exposure lists come from their own dialect.**
+  `TUS_EXPOSED_HEADERS` is exported only from `partial-content/tus` and
+  `UPLOAD_EXPOSED_HEADERS` only from `partial-content/upload`; each was also
+  re-exported from the other subpath. A lock acquire now passes `timeoutMs` and
+  `auditKey` as possibly-undefined fields, which a custom `UploadLocker` that
+  tells absent from `undefined` can see, and a few tus refusal texts are
+  shorter.
+- **A reaped append surfaces the failed discard.** When the resource is reaped
+  while an append streams, the append removes what it wrote and fails with
+  `UploadNotFoundError`; a removal that failed now throws in place of that
+  error (reported through `onError`, answered as a server error), where it was
+  swallowed and left an orphan nothing would reclaim.
+- **Closed literal unions may gain members.** `ServeErrorContext.operation`,
+  the `ServeAuditEvent` method and status, `TransferEvent.status`,
+  `RangeResponseHeaders.status`, `EvaluatedWrite.status`, the `createSignedUrl`
+  `code`, the upload event, status and reject-reason unions and
+  `FatalBoundReason` each say so in their documentation: a `switch` over one
+  needs a `default` branch.
+- **`CompleteUploadOptions.expectedLength` is required.** A custom store seals
+  its completion at that length, refuses every later append, and refuses a
+  mismatch by throwing `UploadOffsetConflictError` carrying the length it
+  holds (see "Security").
+- **`UploadLock.lease` is required.** It is an `AbortSignal` that fires, with
+  reason `UPLOAD_LEASE_LOST`, when the lock is lost. A 4.x custom locker has
+  no `lease`, so every completion throws where the orchestrator tests
+  `lock.lease.aborted`.
+- **The filesystem upload layout is one directory per upload.** 4.x flat files
+  are only swept by age, so a 4.x filesystem upload in flight across the
+  upgrade answers 404 and must restart. `fsUploadStore` needs hard links and
+  one volume for the workspace and every key.
+- **The IETF dialect reports its own failures to `onError` with operation
+  `"handler"`**; 4.0.0 sent `"handle"`.
+- **The Azure discard writes nothing at the key by default**
+  (`discardStaged: "age-out"`). Abort and sweep leave staged blocks to Azure's
+  seven-day collection; `"commit-empty"` reclaims them at once (see
+  "Security" for its costs).
+
+### Changed
+
+- A future `Last-Modified` is clamped to the response time (RFC 9110 Section
+  8.8.2.1) and a date with no zone is read as UTC. One entity-tag form is
+  emitted and compared: an unquoted value, or one with a character outside the
+  `etagc` grammar, is requoted (Section 8.8.3).
+- A `Content-Disposition` filename is never a dot segment, and is capped at 255
+  UTF-8 bytes, keeping a short extension.
+- Under an `auditKey`, a precompressed variant's audit events report the
+  identity key together with `variantKey` and `contentEncoding`; `variantKey`
+  is withheld under an `auditKey`.
+- `ObjectMetadata.contentType` is informational: never sent as `Content-Type`,
+  it reaches `onServe` and `onTransfer` as `storedContentType`.
+- `serveObject` uses `FixedLengthStream` where the runtime has one, so
+  `Content-Length` survives on Cloudflare Workers.
+- A store failure after the client aborted is answered `499` and not reported.
+- A `405`, `412` or `416` carries the deny headers every other refusal carries.
+
+### Added
+
+- `UploadPolicy.digestPolicy`: `"advisory"` (the default) ignores a
+  `Repr-Digest` (RFC 9530) asserted only in algorithms the store cannot verify,
+  and the upload publishes unverified, as it did; `"require-verifiable"`
+  refuses such a request with `400` before anything is allocated or written
+  (`UploadDigestUnverifiableError`, code `UPLOAD_DIGEST_UNVERIFIABLE`, guard
+  `isUploadDigestUnverifiableError`, outcome kind `digest-unverifiable`, audit
+  reason `digest-unverifiable`). A mixed assertion keeps its verifiable
+  algorithms; a request with no assertion is unaffected. Being a policy field,
+  a per-request resolver can set it per tenant. `createTusHandler` throws a
+  `TypeError` at construction when it is set, because tus verifies
+  `Upload-Checksum` itself. `UploadRejectReason` and `UploadOutcome` each gain a
+  member, under the policy that those unions may gain members in a minor release.
+- `fsUploadStore`, `s3UploadStore`, `r2UploadStore`, `gcsUploadStore` and
+  `azureUploadStore` return a `PrefixedUploadStore`, which adds
+  `readonly uploadPrefix`, so `s3Store({ reservedPrefix: uploads.uploadPrefix })`
+  keeps a read store and its write store in step; both defaults come from one
+  constant.
+- Upload errors carry a stable `code` (`UPLOAD_NOT_FOUND`,
+  `UPLOAD_OFFSET_CONFLICT`, `UPLOAD_APPEND_BOUND`, `UPLOAD_OVERRUN`,
+  `UPLOAD_DIGEST_MISMATCH`, `UPLOAD_LOCK_TIMEOUT`); `isUploadNotFoundError`,
+  `isUploadDigestMismatchError` and `isUploadLockTimeoutError` are type guards
+  like their siblings. They match by `name`, not `instanceof`, so a custom
+  store can throw an equivalently-named error without importing the class;
+  the narrowing trusts such an error to carry the class's fields.
+  `UPLOAD_STORE_CONTRACT_VERSION` is exported.
+- `UploadDestinationConflictError` (code `UPLOAD_DESTINATION_CONFLICT`, guard
+  `isUploadDestinationConflictError`), raised when a completion finds the key
+  changed under its sealed plan. The orchestrator answers it with the
+  `destination-conflict` outcome and the `append-rejected` reason of the same
+  name. `UPLOAD_LEASE_LOST` is the reason `UploadLock.lease` aborts with.
+  `UploadStateReadOptions.repair: false` marks a read from a caller that holds
+  no lock, which a store must not let write. The orchestrator takes
+  `redactErrors`, and `CreateUploadRequest` takes `admitBody`. `uploadExpiry`
+  resolves a resource's deadline, and `CreateUploadOptions.expiresAt` and
+  `StoredUploadState.expiresAt` carry it through the store.
+- Audit events `appended` (`atOffset`, `bytes`, `interrupted`) and
+  `lock-contended`; the reject reason `digest-mismatch`; `UploadRejectReason`
+  and `ServeErrorContext` are exported.
+- The IETF handler serves interop 10 (draft-13 and draft-14); the default `interopVersions`
+  are `[3, 5, 6, 9, 10]`. draft-13 reads a `2xx` as "the whole request content
+  was processed", so under 10 a creation or append whose body was interrupted
+  answers `409` with the durable `Upload-Offset`, and a creation keeps its
+  `Location`, the only way back to that prefix. The interop 9 creation response
+  carries `Upload-Limit` when limits exist.
+- `onResumptionSupported` fires when the resource is allocated, before the
+  creation body is read, with the interim response's `headers` (the version
+  echo, `Location`, and `Upload-Limit` where the version announces limits). On
+  the orchestrator, `CreateUploadRequest.onAllocated(uploadToken)` runs under
+  the lock; a throw is reported with operation `allocated-hook` and the
+  creation proceeds. Both fire for a creation that fails
+  after allocating.
+- `policy` accepts a resolver, `(request) => policy | Promise<policy>`. Each
+  request is judged under, and advertises (`Upload-Limit`; `Tus-Max-Size`,
+  expiry, `Upload-Expires` and the checksum buffer bound on tus), the policy it
+  resolves. A resolved policy is validated like a static one: an invalid answer
+  is a `500` reported to `onError` as a `TypeError`. The policy that
+  creates an upload fixes its deadline, which the store records
+  (`CreateUploadOptions.expiresAt`); later requests judge expiry by that
+  instant (`uploadExpiry`), so a request resolving another policy cannot move
+  it. The orchestrator gains
+  `effectivePolicy()` and a per-request `policy`.
+- A write store may implement `claimUpload()`, returning an `UploadClaim` with
+  an `epoch`. The orchestrator claims under the lock before a request that is
+  about to write and passes the epoch to `appendChunk`, `completeUpload` and
+  `abortUpload`; a store refuses a superseded epoch with
+  `UploadOffsetConflictError`. Optional, and the contract version is unchanged;
+  no built-in adapter mints claims.
+- `AppendChunkOptions.releaseBody` cancels the unread request body even when
+  the store has locked the stream. It is idempotent, never rejects, does
+  nothing once the body is read, and a read after it fails instead of ending
+  clean. The orchestrator calls it once `appendChunk` returns or throws, and
+  every built-in store calls it on each refusal.
+- `metadataLimits` on the tus handler (`maxBytes`, `maxPairs`).
+- `maxBackendReads` on `serveObject`; `symlinks` on `fsStore`.
+- `partial-content/conformance` checks that a token does not contain its key
+  (`token-is-unguessable`), and refuses percent-encoded, base64 and plain
+  spellings of it.
+- `dist/sbom.cdx.json`, a CycloneDX software bill of materials, ships in the
+  tarball. `docs/API.md` carries regions generated from the source, checked by
+  `npm run check:api-docs` before a publish.
+
+### Fixed
+
+- A probe of a complete upload re-delivers a completion hook delivery that
+  failed. While the hook throws, the probe answers `500` (IETF) or `502` (tus)
+  so the client probes again; a delivery that resolved is not repeated within
+  the process, and across processes the hook is at-least-once and must be
+  idempotent on `uploadToken`. 4.0.0 re-delivered only on a repeated completing
+  request.
+- A request that preempts an append answers within milliseconds, not after the
+  lock timeout, when the holder's client stopped sending; the interrupted
+  append reports its durable offset. This holds on every store adapter, and the
+  yielding wrapper errors rather than closes, so no truncated object is
+  published.
+- `memoryUploadStore` re-checks the claimed offset when it commits.
+- A stated completion (`Upload-Complete: ?1`) whose body ends cleanly short of
+  the known length answers `400` `inconsistent-upload-length` and leaves the
+  bytes resumable, stating the durable `Upload-Offset` so the client resumes
+  without a probe; tus still infers completion.
+- A tus `HEAD` no longer reports `offset == length` after a failed completion
+  heal, which stopped the client with the object unpublished: a failed publish
+  answers its own status (5xx or `423`, bodiless on `HEAD`), `offset == length`
+  is reported only once the store says complete, and a creation whose heal
+  fails carries the resource's `Location`.
+- A cancel discards the upload even when the state read fails, so an
+  unreadable upload, or one whose multipart upload is gone, can be deleted.
+- The pre-append state read and the completion take a derived signal, so the
+  grace window can fire on them.
+- The ceiling rejection's `durableOffset` is rendered by both dialects.
+- S3: abort keeps the state when the sidecar read fails; the sweep reclaims
+  orphan multipart uploads under `multipartSweepPrefix` (paging
+  `ListMultipartUploads`); a newer holder's tail is never deleted, and a stale
+  caller gets `UploadOffsetConflictError` at the tail; a known length grows the
+  part size so it fits 10,000 parts, and the size is persisted at
+  `createUpload`, so every process cuts the same ranges (a record from before
+  that falls back to `minPartSize`; 4.0.0 always cut at `minPartSize`);
+  entity tags are compared without `W/`, quotes or case; a part that lands on
+  a reaped upload raises `UploadNotFoundError`.
+- S3 appends no longer rewrite the sidecar. Idleness comes from the newest part
+  or tail, the tail is read beside `ListParts`, a deferred-length write is
+  pinned to the ETag already held, and the sweep spares an upload whose newest
+  part is younger than the cutoff. An append that does not complete costs
+  `5 + N` requests: three for the orchestrator's state read (sidecar `GET`,
+  `ListParts`, tail `GET`), `N` `UploadPart`, one conditional tail park, empty
+  when nothing is left over, and one sidecar `GET` once the bytes are durable,
+  which tests the completion seal, so an append working from a stale state read
+  fails at the park's `If-Match` with `UploadOffsetConflictError` carrying the
+  true offset. The store honours a handed-over snapshot once.
+- S3 and R2 each attribute a lost publish by their own publication id: S3 by
+  the object's metadata, R2 by its `customMetadata`.
+- Every adapter's append cancels the request body on each refusal before
+  reading it. GCS and Azure fail an append whose record read fails with anything but
+  not-found. `gcsUploadStore` fails rather than read an object size it cannot
+  parse as `0`, its not-found error keeps the underlying cause, and a corrupt
+  upload record fails closed as `UploadNotFoundError`.
+- R2: abort and sweep swallow only a multipart upload that is gone, and
+  `createUpload` aborts the multipart upload when the manifest write fails.
+- A multipart boundary outside the token alphabet is quoted;
+  `parseAcceptEncoding` reads `x-gzip` as `gzip` (RFC 9110 Section 8.4.1.3); a
+  multi-range request that coalesces to one range is a plain `206`; custom
+  metadata carrying `size`, `mtime` or `hash` no longer rejects `HEAD`,
+  conditional or `Range` requests.
+- A declined `createSignedUrl` streams and is not reported.
+- `ResumableWriteStore.createUpload` documents that the token must be opaque
+  and unguessable, as `checkResumableWriteStore` now checks; the 4.0.0 text
+  suggested encoding the key in it.
+- The conformance check decodes percent-escape runs as UTF-8, leniently, so a
+  malformed escape cannot hide an encoded key.
+- The `checksums` option documents that the AWS SDK sends a CRC32 checksum by
+  default while `requestChecksumCalculation` is `"WHEN_SUPPORTED"`; construct
+  the client with `"WHEN_REQUIRED"` for a backend that rejects checksum
+  parameters.
+
 ## 4.0.0 (2026-09-01)
 
 Four security fixes, upload-path correctness, conformance harnesses for read and
@@ -191,11 +1306,27 @@ unaffected by all four.
   the append landed, which is a different fact. Interop 9 is the revision that
   changes the answer, and it is served too, so a consumer that wants the
   completion replayed asks for interop 9 rather than losing the behavior. The
-  engine reaches this case only when the claimed offset IS the durable offset,
-  so both answers concern the same request, a retry of a completion whose
-  response the client never received. Breaking for a client that treated the
-  `200` as confirmation on an older version; it now sees the status its own
-  revision defines.
+  engine reaches this case only when the claimed offset IS the durable offset
+  and the request carries no content, so both answers concern the same request,
+  a retry of a completion whose response the client never received. Breaking
+  for a client that treated the `200` as confirmation on an older version; it
+  now sees the status its own revision defines.
+- **An append that CARRIES CONTENT to an already-complete upload is refused
+  `400` on every version**, with the registered `inconsistent-upload-length`
+  problem type where the revision defines one (interop 9), and `400`
+  "inconsistent upload length" under tus. It was answered as an idempotent
+  retry, which acknowledged a request whose content was never read and never
+  stored. An upload's total is fixed at completion and the offset may never
+  exceed it, so those bytes have nowhere to land, and only a request carrying
+  none of them can be the retry of a completion that draft-12 Section 4.4.2
+  permits a server to answer by replaying the final response. A declared
+  `Content-Length` decides whether content is present; an append that declares
+  no size falls back to whether a body arrived at all. Durable state is
+  untouched by the refusal, so a client that re-probes still reads the
+  completed upload. Breaking for a client that resent its final chunk at the
+  END offset instead of at the offset that chunk began at; the correct retry
+  claims the chunk's own offset and is answered by the conflict that carries
+  the durable one.
 - **`StoredUploadState` carries `key`.** Every store now reports the storage
   key its upload publishes to, which every backend already persists in order
   to publish at all. Without it there was no supported way to learn which

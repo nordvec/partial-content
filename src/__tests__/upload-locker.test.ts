@@ -11,7 +11,9 @@ const tick = () => new Promise<void>((r) => setTimeout(r, 0));
 /** Count how many times a lock's preempt signal fires (the event is one-shot). */
 function preemptCounter(signal: AbortSignal): () => number {
     let n = 0;
-    signal.addEventListener("abort", () => { n += 1; });
+    signal.addEventListener("abort", () => {
+        n += 1;
+    });
     return () => n;
 }
 
@@ -79,8 +81,14 @@ describe("memoryUploadLocker", () => {
         const order: string[] = [];
 
         const held = await locker.acquire("t");
-        const w1 = locker.acquire("t").then((l) => { order.push("w1"); return l; });
-        const w2 = locker.acquire("t").then((l) => { order.push("w2"); return l; });
+        const w1 = locker.acquire("t").then((l) => {
+            order.push("w1");
+            return l;
+        });
+        const w2 = locker.acquire("t").then((l) => {
+            order.push("w2");
+            return l;
+        });
 
         held.release();
         const l1 = await w1;
@@ -106,7 +114,9 @@ describe("memoryUploadLocker", () => {
             throw new Error("should have timed out");
         } catch (err) {
             expect(err).toBeInstanceOf(UploadLockTimeoutError);
-            expect(isUploadLockTimeoutError(err)).toBe(true);
+            if (!isUploadLockTimeoutError(err)) throw new Error("matcher refused the timeout");
+            // The matcher is a type predicate: the field reads with no cast.
+            expect(err.uploadToken).toBe("t");
             expect(Date.now() - started).toBeGreaterThanOrEqual(25);
         }
     });
@@ -207,7 +217,12 @@ describe("memoryUploadLocker", () => {
         const locker = memoryUploadLocker();
         const held = await locker.acquire("t");
         let rejected = false;
-        const waiting = locker.acquire("t").then((l) => l, () => { rejected = true; });
+        const waiting = locker.acquire("t").then(
+            (l) => l,
+            () => {
+                rejected = true;
+            },
+        );
         await new Promise((r) => setTimeout(r, 60));
         expect(rejected).toBe(false);
         held.release();
@@ -257,6 +272,9 @@ describe("acquire deadline configuration", () => {
 
     test("a nonsensical factory deadline is refused at construction", () => {
         expect(() => memoryUploadLocker({ acquireTimeoutMs: 0 })).toThrow(TypeError);
-        expect(() => memoryUploadLocker({ acquireTimeoutMs: -1 })).toThrow(/positive safe integer/);
+        expect(() => memoryUploadLocker({ acquireTimeoutMs: -1 })).toThrow(
+            /acquireTimeoutMs must be an integer from 1/,
+        );
+        expect(() => memoryUploadLocker({ acquireTimeoutMs: 2 ** 31 })).toThrow(/acquireTimeoutMs must be an integer/);
     });
 });

@@ -18,15 +18,16 @@ import {
     evaluateConditionalWrite,
     fromNodeHeaders,
     generateETag,
+    parseContentRange,
+    MAX_RANGES_DEFAULT,
 } from "../index";
+import type { ETagSource, EvaluatedWrite, ObjectMetadata } from "../index";
 
 // ─── Shared Test Helper ─────────────────────────────────────────────────────
 
 /** Create a minimal Headers-like object for testing. */
 function mockHeaders(h: Record<string, string>): { get(name: string): string | null } {
-    const lower = Object.fromEntries(
-        Object.entries(h).map(([k, v]) => [k.toLowerCase(), v]),
-    );
+    const lower = Object.fromEntries(Object.entries(h).map(([k, v]) => [k.toLowerCase(), v]));
     return { get: (name: string) => lower[name.toLowerCase()] ?? null };
 }
 
@@ -35,7 +36,7 @@ function mockHeaders(h: Record<string, string>): { get(name: string): string | n
 describe("parseRangeHeader", () => {
     const TOTAL = 10_000; // 10KB file
 
-    // ── Valid ranges ────────────────────────────────────────────────────
+    // ── Valid ranges ────────────────────────────────────────────────────────
 
     test("parses standard range: bytes=0-499", () => {
         const r = parseRangeHeader("bytes=0-499", TOTAL);
@@ -83,7 +84,7 @@ describe("parseRangeHeader", () => {
         expect(r).toEqual({ start: 0, end: 100 });
     });
 
-    // ── Returns null (not a range request, degrade to 200) ──────────────
+    // ── Returns null (not a range request, degrade to 200) ──────────────────
 
     test("returns null for missing header", () => {
         expect(parseRangeHeader(null, TOTAL)).toBeNull();
@@ -120,9 +121,9 @@ describe("parseRangeHeader", () => {
         expect(r).toBeNull();
     });
 
-    test("returns \"unsatisfiable\" for zero-length suffix", () => {
+    test('returns "unsatisfiable" for zero-length suffix', () => {
         // bytes=-0 is valid Range syntax but requests zero bytes,
-        // which is unsatisfiable per RFC 7233
+        // which is unsatisfiable per RFC 9110 Section 14.1.1
         expect(parseRangeHeader("bytes=-0", TOTAL)).toBe("unsatisfiable");
     });
 
@@ -134,7 +135,7 @@ describe("parseRangeHeader", () => {
         expect(parseRangeHeader("bytes=0-0", -1)).toBeNull();
     });
 
-    // ── Strict parsePos (rejects non-pure-digit strings) ─────────────
+    // ── Strict parsePos (rejects non-pure-digit strings) ────────────────────
 
     test("rejects float start: bytes=1.5-500", () => {
         expect(parseRangeHeader("bytes=1.5-500", TOTAL)).toBeNull();
@@ -154,7 +155,7 @@ describe("parseRangeHeader", () => {
         expect(parseRangeHeader("bytes=-5-100", TOTAL)).toBeNull();
     });
 
-    // ── Returns "unsatisfiable" (valid syntax, out of bounds -> 416) ────
+    // ── Returns "unsatisfiable" (valid syntax, out of bounds -> 416) ────────
 
     test('returns "unsatisfiable" when start >= totalSize', () => {
         expect(parseRangeHeader("bytes=10000-", TOTAL)).toBe("unsatisfiable");
@@ -292,8 +293,11 @@ describe("buildRangeResponseHeaders", () => {
     test("throws RangeError for NaN totalSize", () => {
         expect(() =>
             buildRangeResponseHeaders({
-                totalSize: NaN, range: null, contentType: "text/plain",
-                etag: undefined, lastModified: undefined,
+                totalSize: NaN,
+                range: null,
+                contentType: "text/plain",
+                etag: undefined,
+                lastModified: undefined,
             }),
         ).toThrow(RangeError);
     });
@@ -301,16 +305,22 @@ describe("buildRangeResponseHeaders", () => {
     test("throws RangeError for negative totalSize", () => {
         expect(() =>
             buildRangeResponseHeaders({
-                totalSize: -1, range: null, contentType: undefined,
-                etag: undefined, lastModified: undefined,
+                totalSize: -1,
+                range: null,
+                contentType: undefined,
+                etag: undefined,
+                lastModified: undefined,
             }),
         ).toThrow("totalSize must be a non-negative safe integer");
     });
 
     test("accepts zero totalSize", () => {
         const { status, headers } = buildRangeResponseHeaders({
-            totalSize: 0, range: null, contentType: "text/plain",
-            etag: undefined, lastModified: undefined,
+            totalSize: 0,
+            range: null,
+            contentType: "text/plain",
+            etag: undefined,
+            lastModified: undefined,
         });
         expect(status).toBe(200);
         expect(headers["Content-Length"]).toBe("0");
@@ -318,13 +328,14 @@ describe("buildRangeResponseHeaders", () => {
 
     test("emits Content-Range with '*' for an unknown total (bytes a-b/*)", () => {
         // A streaming origin that does not know its full length answers
-        // `bytes a-b/*` (RFC 7233 Section 4.2). We must repeat `*` honestly,
+        // `bytes a-b/*` (RFC 9110 Section 14.4). We must repeat `*` honestly,
         // never fabricate a total. Content-Length is still the range span.
         const { status, headers } = buildRangeResponseHeaders({
             totalSize: undefined,
             range: { start: 0, end: 9 },
             contentType: "application/octet-stream",
-            etag: undefined, lastModified: undefined,
+            etag: undefined,
+            lastModified: undefined,
         });
         expect(status).toBe(206);
         expect(headers["Content-Range"]).toBe("bytes 0-9/*");
@@ -336,16 +347,23 @@ describe("buildRangeResponseHeaders", () => {
         // here is an adapter bug, not a valid streaming case.
         expect(() =>
             buildRangeResponseHeaders({
-                totalSize: undefined, range: null, contentType: "text/plain",
-                etag: undefined, lastModified: undefined,
+                totalSize: undefined,
+                range: null,
+                contentType: "text/plain",
+                etag: undefined,
+                lastModified: undefined,
             }),
         ).toThrow("a full (non-range) response requires a known totalSize");
     });
 
     test("emits Repr-Digest and Content-Digest on 200 when digest provided", () => {
         const { headers } = buildRangeResponseHeaders({
-            totalSize: 1000, range: null, contentType: "application/pdf",
-            etag: undefined, lastModified: undefined, digest: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
+            totalSize: 1000,
+            range: null,
+            contentType: "application/pdf",
+            etag: undefined,
+            lastModified: undefined,
+            digest: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
         });
         expect(headers["Repr-Digest"]).toBe("sha-256=:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=:");
         expect(headers["Content-Digest"]).toBe("sha-256=:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=:");
@@ -353,9 +371,12 @@ describe("buildRangeResponseHeaders", () => {
 
     test("emits Repr-Digest but omits Content-Digest on 206", () => {
         const { headers } = buildRangeResponseHeaders({
-            totalSize: 1000, range: { start: 0, end: 499 },
+            totalSize: 1000,
+            range: { start: 0, end: 499 },
             contentType: "application/pdf",
-            etag: undefined, lastModified: undefined, digest: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
+            etag: undefined,
+            lastModified: undefined,
+            digest: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
         });
         expect(headers["Repr-Digest"]).toBe("sha-256=:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=:");
         expect(headers["Content-Digest"]).toBeUndefined();
@@ -363,8 +384,11 @@ describe("buildRangeResponseHeaders", () => {
 
     test("omits digest headers when no digest provided", () => {
         const { headers } = buildRangeResponseHeaders({
-            totalSize: 1000, range: null, contentType: "application/pdf",
-            etag: undefined, lastModified: undefined,
+            totalSize: 1000,
+            range: null,
+            contentType: "application/pdf",
+            etag: undefined,
+            lastModified: undefined,
         });
         expect(headers["Repr-Digest"]).toBeUndefined();
         expect(headers["Content-Digest"]).toBeUndefined();
@@ -372,8 +396,11 @@ describe("buildRangeResponseHeaders", () => {
 
     test("emits Cache-Control on 200 when cacheControl provided", () => {
         const { headers } = buildRangeResponseHeaders({
-            totalSize: 1000, range: null, contentType: "application/pdf",
-            etag: undefined, lastModified: undefined,
+            totalSize: 1000,
+            range: null,
+            contentType: "application/pdf",
+            etag: undefined,
+            lastModified: undefined,
             cacheControl: "private, max-age=3600",
         });
         expect(headers["Cache-Control"]).toBe("private, max-age=3600");
@@ -381,9 +408,11 @@ describe("buildRangeResponseHeaders", () => {
 
     test("emits Cache-Control on 206 when cacheControl provided", () => {
         const { headers } = buildRangeResponseHeaders({
-            totalSize: 1000, range: { start: 0, end: 499 },
+            totalSize: 1000,
+            range: { start: 0, end: 499 },
             contentType: "application/pdf",
-            etag: undefined, lastModified: undefined,
+            etag: undefined,
+            lastModified: undefined,
             cacheControl: "private, no-cache",
         });
         expect(headers["Cache-Control"]).toBe("private, no-cache");
@@ -391,8 +420,11 @@ describe("buildRangeResponseHeaders", () => {
 
     test("omits Cache-Control when not provided", () => {
         const { headers } = buildRangeResponseHeaders({
-            totalSize: 1000, range: null, contentType: "application/pdf",
-            etag: undefined, lastModified: undefined,
+            totalSize: 1000,
+            range: null,
+            contentType: "application/pdf",
+            etag: undefined,
+            lastModified: undefined,
         });
         expect(headers["Cache-Control"]).toBeUndefined();
     });
@@ -450,7 +482,7 @@ describe("build412Headers", () => {
     });
 });
 
-// ── isConditionalFresh (RFC 7232) ───────────────────────────────────────────
+// ── isConditionalFresh (RFC 9110 Sections 13.1.2, 13.1.3) ───────────────────
 
 describe("isConditionalFresh", () => {
     test("returns false when no conditional headers", () => {
@@ -458,81 +490,35 @@ describe("isConditionalFresh", () => {
     });
 
     test("If-None-Match: matching ETag -> fresh (304)", () => {
-        expect(
-            isConditionalFresh(
-                mockHeaders({ "If-None-Match": '"abc123"' }),
-                '"abc123"',
-                undefined,
-            ),
-        ).toBe(true);
+        expect(isConditionalFresh(mockHeaders({ "If-None-Match": '"abc123"' }), '"abc123"', undefined)).toBe(true);
     });
 
     test("If-None-Match: mismatching ETag -> not fresh", () => {
-        expect(
-            isConditionalFresh(
-                mockHeaders({ "If-None-Match": '"old"' }),
-                '"new"',
-                undefined,
-            ),
-        ).toBe(false);
+        expect(isConditionalFresh(mockHeaders({ "If-None-Match": '"old"' }), '"new"', undefined)).toBe(false);
     });
 
     test("If-None-Match: wildcard * -> fresh", () => {
-        expect(
-            isConditionalFresh(
-                mockHeaders({ "If-None-Match": "*" }),
-                '"anything"',
-                undefined,
-            ),
-        ).toBe(true);
+        expect(isConditionalFresh(mockHeaders({ "If-None-Match": "*" }), '"anything"', undefined)).toBe(true);
     });
 
     test("If-None-Match: multi-value list with match -> fresh", () => {
-        expect(
-            isConditionalFresh(
-                mockHeaders({ "If-None-Match": '"aaa", "bbb", "ccc"' }),
-                '"bbb"',
-                undefined,
-            ),
-        ).toBe(true);
+        expect(isConditionalFresh(mockHeaders({ "If-None-Match": '"aaa", "bbb", "ccc"' }), '"bbb"', undefined)).toBe(
+            true,
+        );
     });
 
     test("If-None-Match: multi-value list without match -> not fresh", () => {
-        expect(
-            isConditionalFresh(
-                mockHeaders({ "If-None-Match": '"aaa", "bbb"' }),
-                '"ccc"',
-                undefined,
-            ),
-        ).toBe(false);
+        expect(isConditionalFresh(mockHeaders({ "If-None-Match": '"aaa", "bbb"' }), '"ccc"', undefined)).toBe(false);
     });
 
     test("If-None-Match: weak ETag comparison strips W/ prefix", () => {
-        expect(
-            isConditionalFresh(
-                mockHeaders({ "If-None-Match": 'W/"abc"' }),
-                '"abc"',
-                undefined,
-            ),
-        ).toBe(true);
+        expect(isConditionalFresh(mockHeaders({ "If-None-Match": 'W/"abc"' }), '"abc"', undefined)).toBe(true);
 
-        expect(
-            isConditionalFresh(
-                mockHeaders({ "If-None-Match": '"abc"' }),
-                'W/"abc"',
-                undefined,
-            ),
-        ).toBe(true);
+        expect(isConditionalFresh(mockHeaders({ "If-None-Match": '"abc"' }), 'W/"abc"', undefined)).toBe(true);
     });
 
     test("If-None-Match: returns false when server has no ETag", () => {
-        expect(
-            isConditionalFresh(
-                mockHeaders({ "If-None-Match": '"abc"' }),
-                undefined,
-                undefined,
-            ),
-        ).toBe(false);
+        expect(isConditionalFresh(mockHeaders({ "If-None-Match": '"abc"' }), undefined, undefined)).toBe(false);
     });
 
     test("If-Modified-Since: not modified -> fresh", () => {
@@ -635,19 +621,31 @@ describe("isConditionalFresh", () => {
             // Would roll to Mar 3, which is < Mar 5, so a rolled date would
             // spuriously PASS the precondition; ignoring it must return false.
             expect(
-                isPreconditionFailure(mockHeaders({ "If-Unmodified-Since": "Fri, 31 Feb 2025 12:00:00 GMT" }), undefined, LM),
+                isPreconditionFailure(
+                    mockHeaders({ "If-Unmodified-Since": "Fri, 31 Feb 2025 12:00:00 GMT" }),
+                    undefined,
+                    LM,
+                ),
             ).toBe(false);
         });
 
         test("If-Unmodified-Since: RFC 850 impossible day -> ignored (no 412)", () => {
             expect(
-                isPreconditionFailure(mockHeaders({ "If-Unmodified-Since": "Friday, 31-Feb-25 12:00:00 GMT" }), undefined, LM),
+                isPreconditionFailure(
+                    mockHeaders({ "If-Unmodified-Since": "Friday, 31-Feb-25 12:00:00 GMT" }),
+                    undefined,
+                    LM,
+                ),
             ).toBe(false);
         });
 
         test("If-Unmodified-Since: asctime impossible day -> ignored (no 412)", () => {
             expect(
-                isPreconditionFailure(mockHeaders({ "If-Unmodified-Since": "Fri Feb 30 12:00:00 2025" }), undefined, LM),
+                isPreconditionFailure(
+                    mockHeaders({ "If-Unmodified-Since": "Fri Feb 30 12:00:00 2025" }),
+                    undefined,
+                    LM,
+                ),
             ).toBe(false);
         });
 
@@ -660,17 +658,29 @@ describe("isConditionalFresh", () => {
         test("out-of-range time component -> ignored", () => {
             // Second 99 rolls the minute; the date must be rejected instead.
             expect(
-                isPreconditionFailure(mockHeaders({ "If-Unmodified-Since": "Sun, 05 Mar 2025 12:00:99 GMT" }), undefined, LM),
+                isPreconditionFailure(
+                    mockHeaders({ "If-Unmodified-Since": "Sun, 05 Mar 2025 12:00:99 GMT" }),
+                    undefined,
+                    LM,
+                ),
             ).toBe(false);
         });
 
         test("a genuinely valid date on the same paths still evaluates", () => {
             // Guard against over-rejection: a real "30 Jan" must still work.
             expect(
-                isPreconditionFailure(mockHeaders({ "If-Unmodified-Since": "Thu, 30 Jan 2025 12:00:00 GMT" }), undefined, LM),
+                isPreconditionFailure(
+                    mockHeaders({ "If-Unmodified-Since": "Thu, 30 Jan 2025 12:00:00 GMT" }),
+                    undefined,
+                    LM,
+                ),
             ).toBe(true); // Mar 5 > Jan 30 -> modified after -> precondition fails
             expect(
-                isConditionalFresh(mockHeaders({ "If-Modified-Since": "Wed, 05 Mar 2025 12:00:00 GMT" }), undefined, LM),
+                isConditionalFresh(
+                    mockHeaders({ "If-Modified-Since": "Wed, 05 Mar 2025 12:00:00 GMT" }),
+                    undefined,
+                    LM,
+                ),
             ).toBe(true); // not modified since -> 304
         });
     });
@@ -724,13 +734,7 @@ describe("isConditionalFresh", () => {
     // programmatic revalidation. Verified live against Node/undici.
 
     test("Cache-Control: no-cache without conditional headers -> not a conditional request", () => {
-        expect(
-            isConditionalFresh(
-                mockHeaders({ "Cache-Control": "no-cache" }),
-                undefined,
-                undefined,
-            ),
-        ).toBe(false);
+        expect(isConditionalFresh(mockHeaders({ "Cache-Control": "no-cache" }), undefined, undefined)).toBe(false);
     });
 
     test("Cache-Control: no-cache does NOT defeat a matching If-None-Match (undici revalidation)", () => {
@@ -785,216 +789,121 @@ describe("isConditionalFresh", () => {
         ).toBe(false);
     });
 
-    // ── Quote-aware ETag parsing ────────────────────────────────────────
+    // ── Quote-aware ETag parsing ────────────────────────────────────────────
 
     test("If-None-Match: ETag containing comma is parsed correctly", () => {
-        // RFC 7232 Section 2.3: commas (%x2C) are valid etagc characters.
+        // RFC 9110 Section 8.8.3: commas (%x2C) are valid etagc characters.
         // A naive .split(",") would split "ver,1" into ["\"ver", "1\""].
-        expect(
-            isConditionalFresh(
-                mockHeaders({ "If-None-Match": '"ver,1"' }),
-                '"ver,1"',
-                undefined,
-            ),
-        ).toBe(true);
+        expect(isConditionalFresh(mockHeaders({ "If-None-Match": '"ver,1"' }), '"ver,1"', undefined)).toBe(true);
     });
 
     test("If-None-Match: multiple ETags with commas inside values", () => {
-        expect(
-            isConditionalFresh(
-                mockHeaders({ "If-None-Match": '"a,b", "c,d", "e,f"' }),
-                '"c,d"',
-                undefined,
-            ),
-        ).toBe(true);
+        expect(isConditionalFresh(mockHeaders({ "If-None-Match": '"a,b", "c,d", "e,f"' }), '"c,d"', undefined)).toBe(
+            true,
+        );
     });
 
     test("If-None-Match: comma-containing ETag does not match different value", () => {
-        expect(
-            isConditionalFresh(
-                mockHeaders({ "If-None-Match": '"a,b"' }),
-                '"a"',
-                undefined,
-            ),
-        ).toBe(false);
+        expect(isConditionalFresh(mockHeaders({ "If-None-Match": '"a,b"' }), '"a"', undefined)).toBe(false);
     });
 
     test("If-None-Match: weak ETag with comma inside value", () => {
-        expect(
-            isConditionalFresh(
-                mockHeaders({ "If-None-Match": 'W/"x,y"' }),
-                '"x,y"',
-                undefined,
-            ),
-        ).toBe(true);
+        expect(isConditionalFresh(mockHeaders({ "If-None-Match": 'W/"x,y"' }), '"x,y"', undefined)).toBe(true);
     });
 
-    // ── etagc ABNF character validation (RFC 9110 Section 8.8.3) ────
+    // ── etagc ABNF character validation (RFC 9110 Section 8.8.3) ────────────
 
     test("If-None-Match: rejects ETag with control character (null byte)", () => {
         // etagc does not include 0x00. An ETag like "\0bad" is malformed.
         expect(
-            isConditionalFresh(
-                mockHeaders({ "If-None-Match": '"' + "\x00bad" + '"' }),
-                '"\x00bad"',
-                undefined,
-            ),
+            isConditionalFresh(mockHeaders({ "If-None-Match": '"' + "\x00bad" + '"' }), '"\x00bad"', undefined),
         ).toBe(false); // malformed ETag is rejected, so no match -> not fresh
     });
 
     test("If-None-Match: rejects ETag with space (0x20)", () => {
         // 0x20 (space) is NOT a valid etagc. Valid range starts at 0x21.
-        expect(
-            isConditionalFresh(
-                mockHeaders({ "If-None-Match": '"has space"' }),
-                '"has space"',
-                undefined,
-            ),
-        ).toBe(false);
+        expect(isConditionalFresh(mockHeaders({ "If-None-Match": '"has space"' }), '"has space"', undefined)).toBe(
+            false,
+        );
     });
 
     test("If-None-Match: rejects ETag with DEL (0x7F)", () => {
         // 0x7F (DEL) is excluded from etagc.
         expect(
-            isConditionalFresh(
-                mockHeaders({ "If-None-Match": '"del' + "\x7F" + '"' }),
-                '"del\x7F"',
-                undefined,
-            ),
+            isConditionalFresh(mockHeaders({ "If-None-Match": '"del' + "\x7F" + '"' }), '"del\x7F"', undefined),
         ).toBe(false);
     });
 
     test("If-None-Match: accepts ETag with high-byte obs-text (>= 0x80)", () => {
         // obs-text (0x80-0xFF) is valid in etagc. Common with non-ASCII hashes.
-        expect(
-            isConditionalFresh(
-                mockHeaders({ "If-None-Match": '"abc\x80\xFF"' }),
-                '"abc\x80\xFF"',
-                undefined,
-            ),
-        ).toBe(true);
+        expect(isConditionalFresh(mockHeaders({ "If-None-Match": '"abc\x80\xFF"' }), '"abc\x80\xFF"', undefined)).toBe(
+            true,
+        );
     });
 
     test("If-None-Match: accepts ETag with exclamation mark (0x21)", () => {
         // 0x21 is the first valid etagc character.
-        expect(
-            isConditionalFresh(
-                mockHeaders({ "If-None-Match": '"!ok"' }),
-                '"!ok"',
-                undefined,
-            ),
-        ).toBe(true);
+        expect(isConditionalFresh(mockHeaders({ "If-None-Match": '"!ok"' }), '"!ok"', undefined)).toBe(true);
     });
 
     test("If-None-Match: malformed ETag in list does not prevent matching valid ones", () => {
         // If one ETag in the list has invalid chars, the others should still match.
-        expect(
-            isConditionalFresh(
-                mockHeaders({ "If-None-Match": '"bad\x00one", "good"' }),
-                '"good"',
-                undefined,
-            ),
-        ).toBe(true);
+        expect(isConditionalFresh(mockHeaders({ "If-None-Match": '"bad\x00one", "good"' }), '"good"', undefined)).toBe(
+            true,
+        );
     });
 });
 
-// ── isPreconditionFailure (RFC 7232 Section 3.1 + 3.4) ─────────────────────
+// ── isPreconditionFailure (RFC 9110 Sections 13.1.1 + 13.1.4) ───────────────
 
 describe("isPreconditionFailure", () => {
-
-    // ── No precondition headers ───────────────────────────────────────────
+    // ── No precondition headers ─────────────────────────────────────────────
 
     test("returns false when no precondition headers", () => {
         expect(isPreconditionFailure(mockHeaders({}), '"abc"', undefined)).toBe(false);
     });
 
-    // ── If-Match (RFC 7232 Section 3.1) ───────────────────────────────
+    // ── If-Match (RFC 9110 Section 13.1.1) ──────────────────────────────────
 
     test("If-Match: wildcard * -> no failure (always matches)", () => {
-        expect(
-            isPreconditionFailure(
-                mockHeaders({ "If-Match": "*" }),
-                '"abc"',
-                undefined,
-            ),
-        ).toBe(false);
+        expect(isPreconditionFailure(mockHeaders({ "If-Match": "*" }), '"abc"', undefined)).toBe(false);
     });
 
     test("If-Match: matching ETag -> no failure", () => {
-        expect(
-            isPreconditionFailure(
-                mockHeaders({ "If-Match": '"abc"' }),
-                '"abc"',
-                undefined,
-            ),
-        ).toBe(false);
+        expect(isPreconditionFailure(mockHeaders({ "If-Match": '"abc"' }), '"abc"', undefined)).toBe(false);
     });
 
     test("If-Match: mismatching ETag -> failure (412)", () => {
-        expect(
-            isPreconditionFailure(
-                mockHeaders({ "If-Match": '"abc"' }),
-                '"xyz"',
-                undefined,
-            ),
-        ).toBe(true);
+        expect(isPreconditionFailure(mockHeaders({ "If-Match": '"abc"' }), '"xyz"', undefined)).toBe(true);
     });
 
     test("If-Match: no server ETag -> failure (cannot confirm match)", () => {
-        expect(
-            isPreconditionFailure(
-                mockHeaders({ "If-Match": '"abc"' }),
-                undefined,
-                undefined,
-            ),
-        ).toBe(true);
+        expect(isPreconditionFailure(mockHeaders({ "If-Match": '"abc"' }), undefined, undefined)).toBe(true);
     });
 
     test("If-Match: multi-value list with match -> no failure", () => {
-        expect(
-            isPreconditionFailure(
-                mockHeaders({ "If-Match": '"aaa", "bbb", "ccc"' }),
-                '"bbb"',
-                undefined,
-            ),
-        ).toBe(false);
+        expect(isPreconditionFailure(mockHeaders({ "If-Match": '"aaa", "bbb", "ccc"' }), '"bbb"', undefined)).toBe(
+            false,
+        );
     });
 
     test("If-Match: multi-value list without match -> failure", () => {
-        expect(
-            isPreconditionFailure(
-                mockHeaders({ "If-Match": '"aaa", "bbb"' }),
-                '"ccc"',
-                undefined,
-            ),
-        ).toBe(true);
+        expect(isPreconditionFailure(mockHeaders({ "If-Match": '"aaa", "bbb"' }), '"ccc"', undefined)).toBe(true);
     });
 
     test("If-Match: W/ client ETag does not match strong server ETag (strict strong comparison)", () => {
         // RFC 9110 Section 13.1.1: If-Match uses STRONG comparison.
         // A weak client ETag W/"abc" MUST NOT match strong server "abc"
         // because weak validators only assert semantic equivalence, not byte equality.
-        expect(
-            isPreconditionFailure(
-                mockHeaders({ "If-Match": 'W/"abc"' }),
-                '"abc"',
-                undefined,
-            ),
-        ).toBe(true); // Precondition fails: weak cannot match under strong comparison
+        expect(isPreconditionFailure(mockHeaders({ "If-Match": 'W/"abc"' }), '"abc"', undefined)).toBe(true); // Precondition fails: weak cannot match under strong comparison
     });
 
     test("If-Match: weak server ETag cannot satisfy strong comparison", () => {
         // If the server only has a weak ETag, it cannot satisfy If-Match at all.
-        expect(
-            isPreconditionFailure(
-                mockHeaders({ "If-Match": '"abc"' }),
-                'W/"abc"',
-                undefined,
-            ),
-        ).toBe(true); // Precondition fails: server's weak ETag cannot satisfy strong comparison
+        expect(isPreconditionFailure(mockHeaders({ "If-Match": '"abc"' }), 'W/"abc"', undefined)).toBe(true); // Precondition fails: server's weak ETag cannot satisfy strong comparison
     });
 
-    // ── If-Unmodified-Since (RFC 7232 Section 3.4) ───────────────────
+    // ── If-Unmodified-Since (RFC 9110 Section 13.1.4) ───────────────────────
 
     test("If-Unmodified-Since: unmodified -> no failure", () => {
         expect(
@@ -1052,7 +961,7 @@ describe("isPreconditionFailure", () => {
         ).toBe(false);
     });
 
-    // ── Precedence: If-Match over If-Unmodified-Since ────────────────
+    // ── Precedence: If-Match over If-Unmodified-Since ───────────────────────
 
     test("If-Match takes precedence over If-Unmodified-Since", () => {
         // ETag matches (no failure), but date says modified (would be failure)
@@ -1084,30 +993,18 @@ describe("isPreconditionFailure", () => {
         ).toBe(true);
     });
 
-    // ── Quote-aware ETag parsing for If-Match ────────────────────────
+    // ── Quote-aware ETag parsing for If-Match ───────────────────────────────
 
     test("If-Match: ETag containing comma is parsed correctly", () => {
-        expect(
-            isPreconditionFailure(
-                mockHeaders({ "If-Match": '"ver,1"' }),
-                '"ver,1"',
-                undefined,
-            ),
-        ).toBe(false);
+        expect(isPreconditionFailure(mockHeaders({ "If-Match": '"ver,1"' }), '"ver,1"', undefined)).toBe(false);
     });
 
     test("If-Match: multi ETags with commas inside values", () => {
-        expect(
-            isPreconditionFailure(
-                mockHeaders({ "If-Match": '"a,b", "c,d"' }),
-                '"c,d"',
-                undefined,
-            ),
-        ).toBe(false);
+        expect(isPreconditionFailure(mockHeaders({ "If-Match": '"a,b", "c,d"' }), '"c,d"', undefined)).toBe(false);
     });
 });
 
-// ── isRangeFresh (RFC 7233 Section 3.2) ─────────────────────────────────────
+// ── isRangeFresh (RFC 9110 Section 13.1.5) ──────────────────────────────────
 
 describe("isRangeFresh", () => {
     test("returns true when no If-Range header (always honor range)", () => {
@@ -1115,53 +1012,23 @@ describe("isRangeFresh", () => {
     });
 
     test("If-Range ETag matches -> range is fresh (honor it)", () => {
-        expect(
-            isRangeFresh(
-                mockHeaders({ "If-Range": '"abc123"' }),
-                '"abc123"',
-                undefined,
-            ),
-        ).toBe(true);
+        expect(isRangeFresh(mockHeaders({ "If-Range": '"abc123"' }), '"abc123"', undefined)).toBe(true);
     });
 
     test("If-Range ETag mismatch -> range is stale (ignore it)", () => {
-        expect(
-            isRangeFresh(
-                mockHeaders({ "If-Range": '"old-etag"' }),
-                '"new-etag"',
-                undefined,
-            ),
-        ).toBe(false);
+        expect(isRangeFresh(mockHeaders({ "If-Range": '"old-etag"' }), '"new-etag"', undefined)).toBe(false);
     });
 
     test("If-Range ETag with no server ETag -> stale", () => {
-        expect(
-            isRangeFresh(
-                mockHeaders({ "If-Range": '"abc"' }),
-                undefined,
-                undefined,
-            ),
-        ).toBe(false);
+        expect(isRangeFresh(mockHeaders({ "If-Range": '"abc"' }), undefined, undefined)).toBe(false);
     });
 
-    test("If-Range weak ETag: rejected per RFC 7233 Section 3.2 (strong comparison required)", () => {
-        // RFC 7233 Section 3.2 requires strong comparison for If-Range.
+    test("If-Range weak ETag: rejected per RFC 9110 Section 13.1.5 (strong comparison required)", () => {
+        // RFC 9110 Section 13.1.5 requires strong comparison for If-Range.
         // Weak validators on either side -> ignore range, serve full 200.
-        expect(
-            isRangeFresh(
-                mockHeaders({ "If-Range": 'W/"abc"' }),
-                '"abc"',
-                undefined,
-            ),
-        ).toBe(false);
+        expect(isRangeFresh(mockHeaders({ "If-Range": 'W/"abc"' }), '"abc"', undefined)).toBe(false);
 
-        expect(
-            isRangeFresh(
-                mockHeaders({ "If-Range": '"abc"' }),
-                'W/"abc"',
-                undefined,
-            ),
-        ).toBe(false);
+        expect(isRangeFresh(mockHeaders({ "If-Range": '"abc"' }), 'W/"abc"', undefined)).toBe(false);
     });
 
     test("If-Range date: older Last-Modified -> stale (RFC 9110 requires exact match)", () => {
@@ -1199,26 +1066,16 @@ describe("isRangeFresh", () => {
     });
 
     test("If-Range date: no server Last-Modified -> stale", () => {
-        expect(
-            isRangeFresh(
-                mockHeaders({ "If-Range": "Sat, 28 Jun 2025 12:00:00 GMT" }),
-                undefined,
-                undefined,
-            ),
-        ).toBe(false);
+        expect(isRangeFresh(mockHeaders({ "If-Range": "Sat, 28 Jun 2025 12:00:00 GMT" }), undefined, undefined)).toBe(
+            false,
+        );
     });
 
     test("If-Range: empty string -> treated as absent (honor range)", () => {
         // Empty string from mockHeaders.get() returns "" which is falsy,
         // but our mockHeaders returns null for missing keys. This tests
         // the case where a proxy strips the value but preserves the header.
-        expect(
-            isRangeFresh(
-                mockHeaders({ "If-Range": "" }),
-                '"abc"',
-                undefined,
-            ),
-        ).toBe(true);
+        expect(isRangeFresh(mockHeaders({ "If-Range": "" }), '"abc"', undefined)).toBe(true);
     });
 
     test("If-Range unparseable date -> stale (cannot validate, return full resource)", () => {
@@ -1232,19 +1089,15 @@ describe("isRangeFresh", () => {
     });
 });
 
-// ── build304Headers (RFC 7232 Section 4.1) ──────────────────────────────────
+// ── build304Headers (RFC 9110 Section 15.4.5) ───────────────────────────────
 
 describe("build304Headers", () => {
-    test("returns 304 status with ETag, omits Last-Modified when both present (RFC 7232 4.1)", () => {
-        const { status, headers } = build304Headers(
-            '"abc123"',
-            "Sat, 28 Jun 2025 12:00:00 GMT",
-            "private, no-cache",
-        );
+    test("returns 304 status with ETag, omits Last-Modified when both present (RFC 9110 Section 15.4.5)", () => {
+        const { status, headers } = build304Headers('"abc123"', "Sat, 28 Jun 2025 12:00:00 GMT", "private, no-cache");
 
         expect(status).toBe(304);
         expect(headers["ETag"]).toBe('"abc123"');
-        // RFC 7232 Section 4.1: "Last-Modified might be useful if the response
+        // RFC 9110 Section 15.4.5: "Last-Modified might be useful if the response
         // does not have an ETag field" -- when ETag IS present, Last-Modified
         // is redundant and SHOULD NOT be included.
         expect(headers["Last-Modified"]).toBeUndefined();
@@ -1252,11 +1105,7 @@ describe("build304Headers", () => {
     });
 
     test("includes Last-Modified when no ETag is present", () => {
-        const { status, headers } = build304Headers(
-            undefined,
-            "Sat, 28 Jun 2025 12:00:00 GMT",
-            "private, no-cache",
-        );
+        const { status, headers } = build304Headers(undefined, "Sat, 28 Jun 2025 12:00:00 GMT", "private, no-cache");
 
         expect(status).toBe(304);
         expect(headers["ETag"]).toBeUndefined();
@@ -1291,14 +1140,14 @@ describe("build304Headers", () => {
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Additional edge-case test vectors covering:
-//   - RFC 7232 conditional GET edge cases (malformed lists, whitespace, precedence)
-//   - RFC 7233 range parsing edge cases (boundary values, malformed input)
+//   - RFC 9110 Section 13 conditional GET edge cases (malformed lists, whitespace, precedence)
+//   - RFC 9110 Section 14.1 range parsing edge cases (boundary values, malformed input)
 //   - Integration-level conditional + range interactions
 // ═══════════════════════════════════════════════════════════════════════════
 
-// ── parseRangeHeader: RFC 7233 edge cases ───────────────────────────────────
+// ── parseRangeHeader: RFC 9110 Section 14.1 edge cases ──────────────────────
 
-describe("parseRangeHeader (RFC 7233 edge cases)", () => {
+describe("parseRangeHeader (RFC 9110 Section 14.1 edge cases)", () => {
     const TOTAL = 200;
 
     test("returns null for empty value after bytes=", () => {
@@ -1345,7 +1194,7 @@ describe("parseRangeHeader (RFC 7233 edge cases)", () => {
         expect(parseRangeHeader("bytes= - ", TOTAL)).toBeNull();
     });
 
-    test("returns \"unsatisfiable\" for zero suffix: bytes=-0", () => {
+    test('returns "unsatisfiable" for zero suffix: bytes=-0', () => {
         // bytes=-0 requests zero bytes from the end, which is unsatisfiable
         expect(parseRangeHeader("bytes=-0", 200)).toBe("unsatisfiable");
     });
@@ -1384,54 +1233,31 @@ describe("parseRangeHeader (RFC 7233 edge cases)", () => {
     });
 });
 
-// ── isConditionalFresh: RFC 7232 edge cases ────────────────────────────────
+// ── isConditionalFresh: RFC 9110 Section 13.1 edge cases ────────────────────
 
-describe("isConditionalFresh (RFC 7232 edge cases)", () => {
-
+describe("isConditionalFresh (RFC 9110 Section 13.1 edge cases)", () => {
     test("If-None-Match: tab-separated list matches", () => {
         // fresh test: '"bar",\t"foo"' with etag "foo" -> fresh
-        expect(
-            isConditionalFresh(
-                mockHeaders({ "If-None-Match": '"bar",\t"foo"' }),
-                '"foo"',
-                undefined,
-            ),
-        ).toBe(true);
+        expect(isConditionalFresh(mockHeaders({ "If-None-Match": '"bar",\t"foo"' }), '"foo"', undefined)).toBe(true);
     });
 
     test("If-None-Match: list with spaces and empty entries", () => {
         // Sparse list: ' "foo",, "bar" ,' with none matching -> 412 path
         // For freshness: this list should be parseable
-        expect(
-            isConditionalFresh(
-                mockHeaders({ "If-None-Match": ' "foo",, "bar" ,' }),
-                '"bar"',
-                undefined,
-            ),
-        ).toBe(true);
+        expect(isConditionalFresh(mockHeaders({ "If-None-Match": ' "foo",, "bar" ,' }), '"bar"', undefined)).toBe(true);
     });
 
     test("If-None-Match: list with spaces and empty entries, no match", () => {
-        expect(
-            isConditionalFresh(
-                mockHeaders({ "If-None-Match": ' "foo",, "bar" ,' }),
-                '"baz"',
-                undefined,
-            ),
-        ).toBe(false);
+        expect(isConditionalFresh(mockHeaders({ "If-None-Match": ' "foo",, "bar" ,' }), '"baz"', undefined)).toBe(
+            false,
+        );
     });
 
     test("If-None-Match: wildcard * with no server ETag -> fresh", () => {
         // RFC 9110 Section 8.8.3: wildcard "*" validates resource existence,
         // independent of ETag presence. If the server has any representation
         // at all, the wildcard matches. Checked before the !etag guard.
-        expect(
-            isConditionalFresh(
-                mockHeaders({ "If-None-Match": "*" }),
-                undefined,
-                undefined,
-            ),
-        ).toBe(true);
+        expect(isConditionalFresh(mockHeaders({ "If-None-Match": "*" }), undefined, undefined)).toBe(true);
     });
 
     test("If-Modified-Since: invalid server Last-Modified -> stale", () => {
@@ -1525,29 +1351,16 @@ describe("isConditionalFresh (RFC 7232 edge cases)", () => {
     });
 });
 
-// ── isPreconditionFailure: RFC 7232 edge cases ─────────────────────────────
+// ── isPreconditionFailure: RFC 9110 Section 13.1 edge cases ─────────────────
 
-describe("isPreconditionFailure (RFC 7232 edge cases)", () => {
-
-    test("If-Match: sparse list with empty entries ' \"foo\",, \"bar\" ,' -> failure when none match", () => {
+describe("isPreconditionFailure (RFC 9110 Section 13.1 edge cases)", () => {
+    test('If-Match: sparse list with empty entries \' "foo",, "bar" ,\' -> failure when none match', () => {
         // Sparse comma-separated list with empty entries
-        expect(
-            isPreconditionFailure(
-                mockHeaders({ "If-Match": ' "foo",, "bar" ,' }),
-                '"baz"',
-                undefined,
-            ),
-        ).toBe(true);
+        expect(isPreconditionFailure(mockHeaders({ "If-Match": ' "foo",, "bar" ,' }), '"baz"', undefined)).toBe(true);
     });
 
     test("If-Match: sparse list with match -> no failure", () => {
-        expect(
-            isPreconditionFailure(
-                mockHeaders({ "If-Match": ' "foo",, "bar" ,' }),
-                '"bar"',
-                undefined,
-            ),
-        ).toBe(false);
+        expect(isPreconditionFailure(mockHeaders({ "If-Match": ' "foo",, "bar" ,' }), '"bar"', undefined)).toBe(false);
     });
 
     test("If-Match: multi-value list with extra entry matching -> no failure", () => {
@@ -1589,113 +1402,59 @@ describe("isPreconditionFailure (RFC 7232 edge cases)", () => {
         // Both dates unparseable: isNaN check catches both, falls through.
         // RFC 9110 Section 13.1.4: unparseable dates are ignored.
         expect(
-            isPreconditionFailure(
-                mockHeaders({ "If-Unmodified-Since": "garbage" }),
-                undefined,
-                "also-garbage",
-            ),
+            isPreconditionFailure(mockHeaders({ "If-Unmodified-Since": "garbage" }), undefined, "also-garbage"),
         ).toBe(false);
     });
 
     test("If-Match with tabs in list -> parsed correctly", () => {
-        expect(
-            isPreconditionFailure(
-                mockHeaders({ "If-Match": '"aaa",\t"bbb"' }),
-                '"bbb"',
-                undefined,
-            ),
-        ).toBe(false);
+        expect(isPreconditionFailure(mockHeaders({ "If-Match": '"aaa",\t"bbb"' }), '"bbb"', undefined)).toBe(false);
     });
 
     test("If-Match with W/ on both sides -> failure (weak ETags cannot satisfy strong comparison)", () => {
         // RFC 9110 Section 13.1.1: both sides weak = no match under strong comparison.
-        expect(
-            isPreconditionFailure(
-                mockHeaders({ "If-Match": 'W/"abc"' }),
-                'W/"abc"',
-                undefined,
-            ),
-        ).toBe(true); // Precondition fails: weak on both sides, strong comparison required
+        expect(isPreconditionFailure(mockHeaders({ "If-Match": 'W/"abc"' }), 'W/"abc"', undefined)).toBe(true); // Precondition fails: weak on both sides, strong comparison required
     });
 });
 
-// ── isRangeFresh: RFC 7233 Section 3.2 edge cases ──────────────────────────
+// ── isRangeFresh: RFC 9110 Section 13.1.5 edge cases ────────────────────────
 
-describe("isRangeFresh (RFC 7233 edge cases)", () => {
-
+describe("isRangeFresh (RFC 9110 Section 13.1.5 edge cases)", () => {
     test("If-Range with mutated ETag (one char changed) -> stale", () => {
         // Mutated first character of ETag value should not match
-        expect(
-            isRangeFresh(
-                mockHeaders({ "If-Range": '"0abc123"' }),
-                '"abc123"',
-                undefined,
-            ),
-        ).toBe(false);
+        expect(isRangeFresh(mockHeaders({ "If-Range": '"0abc123"' }), '"abc123"', undefined)).toBe(false);
     });
 
     test("If-Range with date earlier than Last-Modified -> stale", () => {
         // Client cached 20 seconds before the resource was last modified
         const lastMod = "Sun, 29 Jun 2025 12:00:00 GMT";
         const earlier = new Date(Date.parse(lastMod) - 20000).toUTCString();
-        expect(
-            isRangeFresh(
-                mockHeaders({ "If-Range": earlier }),
-                undefined,
-                lastMod,
-            ),
-        ).toBe(false);
+        expect(isRangeFresh(mockHeaders({ "If-Range": earlier }), undefined, lastMod)).toBe(false);
     });
 
     test("If-Range with invalid value 'foo' -> stale (serve full resource)", () => {
         // Invalid If-Range value (not an ETag, not a date) -> ignore range
-        expect(
-            isRangeFresh(
-                mockHeaders({ "If-Range": "foo" }),
-                '"abc"',
-                "Sat, 28 Jun 2025 12:00:00 GMT",
-            ),
-        ).toBe(false);
+        expect(isRangeFresh(mockHeaders({ "If-Range": "foo" }), '"abc"', "Sat, 28 Jun 2025 12:00:00 GMT")).toBe(false);
     });
 
-    test("If-Range with W/ on client, strong on server -> stale (RFC 7233 strong comparison)", () => {
-        // RFC 7233 Section 3.2: weak validator on If-Range -> ignore range, serve full.
-        expect(
-            isRangeFresh(
-                mockHeaders({ "If-Range": 'W/"abc"' }),
-                '"abc"',
-                undefined,
-            ),
-        ).toBe(false);
+    test("If-Range with W/ on client, strong on server -> stale (RFC 9110 Section 13.1.5 strong comparison)", () => {
+        // RFC 9110 Section 13.1.5: weak validator on If-Range -> ignore range, serve full.
+        expect(isRangeFresh(mockHeaders({ "If-Range": 'W/"abc"' }), '"abc"', undefined)).toBe(false);
     });
 
-    test("If-Range with strong on client, W/ on server -> stale (RFC 7233 strong comparison)", () => {
-        // RFC 7233 Section 3.2: weak server ETag -> cannot honor range safely.
-        expect(
-            isRangeFresh(
-                mockHeaders({ "If-Range": '"abc"' }),
-                'W/"abc"',
-                undefined,
-            ),
-        ).toBe(false);
+    test("If-Range with strong on client, W/ on server -> stale (RFC 9110 Section 13.1.5 strong comparison)", () => {
+        // RFC 9110 Section 13.1.5: weak server ETag -> cannot honor range safely.
+        expect(isRangeFresh(mockHeaders({ "If-Range": '"abc"' }), 'W/"abc"', undefined)).toBe(false);
     });
 
-    test("If-Range with W/ on both -> stale (RFC 7233 strong comparison)", () => {
+    test("If-Range with W/ on both -> stale (RFC 9110 Section 13.1.5 strong comparison)", () => {
         // Both weak -> definitely cannot honor range.
-        expect(
-            isRangeFresh(
-                mockHeaders({ "If-Range": 'W/"abc"' }),
-                'W/"abc"',
-                undefined,
-            ),
-        ).toBe(false);
+        expect(isRangeFresh(mockHeaders({ "If-Range": 'W/"abc"' }), 'W/"abc"', undefined)).toBe(false);
     });
 });
 
-// ── RFC 7232 Section 6: Full evaluation chain ordering ──────────────────────
+// ── RFC 9110 Section 13.2.2: Full evaluation chain ordering ─────────────────
 
-describe("RFC 7232 Section 6: evaluation chain ordering", () => {
-
+describe("RFC 9110 Section 13.2.2: evaluation chain ordering", () => {
     test("412 must be evaluated before 304: If-Match fails even when If-None-Match would match", () => {
         // The route checks isPreconditionFailure BEFORE isConditionalFresh.
         // If both headers are present and If-Match fails, 412 takes priority.
@@ -1752,51 +1511,29 @@ describe("RFC 7232 Section 6: evaluation chain ordering", () => {
     });
 });
 
-// ── parseETagList: internal helper validated through public API ──────────────
+// ── parseETagList: internal helper validated through public API ─────────────
 
 describe("ETag list parsing edge cases (via public API)", () => {
-
     test("empty ETag list -> no match", () => {
-        expect(
-            isConditionalFresh(
-                mockHeaders({ "If-None-Match": "" }),
-                '"abc"',
-                undefined,
-            ),
-        ).toBe(false);
+        expect(isConditionalFresh(mockHeaders({ "If-None-Match": "" }), '"abc"', undefined)).toBe(false);
     });
 
     test("only commas -> no match", () => {
-        expect(
-            isConditionalFresh(
-                mockHeaders({ "If-None-Match": ",,," }),
-                '"abc"',
-                undefined,
-            ),
-        ).toBe(false);
+        expect(isConditionalFresh(mockHeaders({ "If-None-Match": ",,," }), '"abc"', undefined)).toBe(false);
     });
 
     test("malformed ETag (no quotes) -> no match", () => {
         // parseETagList skips entries that don't start with a quote
-        expect(
-            isConditionalFresh(
-                mockHeaders({ "If-None-Match": "abc" }),
-                '"abc"',
-                undefined,
-            ),
-        ).toBe(false);
+        expect(isConditionalFresh(mockHeaders({ "If-None-Match": "abc" }), '"abc"', undefined)).toBe(false);
     });
 
-    test("unclosed quote -> still captured as ETag", () => {
-        // parseETagList scans to end of string if no closing quote
-        // The tag includes everything from start to end
-        expect(
-            isConditionalFresh(
-                mockHeaders({ "If-None-Match": '"abc' }),
-                '"abc',
-                undefined,
-            ),
-        ).toBe(true);
+    test("unclosed quote on the server tag -> compared in its emitted, closed form", () => {
+        // The server tag is normalized to '"abc"' before compare, the same
+        // form a response emits, so the client's echo of it matches.
+        expect(isConditionalFresh(mockHeaders({ "If-None-Match": '"abc"' }), '"abc', undefined)).toBe(true);
+        // parseETagList scans an unclosed client entry to end of string, so
+        // '"abc' stays distinct from the closed tag.
+        expect(isConditionalFresh(mockHeaders({ "If-None-Match": '"abc' }), '"abc', undefined)).toBe(false);
     });
 
     test("mixed valid and malformed entries", () => {
@@ -1811,48 +1548,25 @@ describe("ETag list parsing edge cases (via public API)", () => {
     });
 
     test("ETag with special characters inside quotes", () => {
-        // RFC 7232 etagc allows 0x21, 0x23-0x7E, 0x80+
+        // RFC 9110 Section 8.8.3 etagc allows 0x21, 0x23-0x7E, 0x80+
         expect(
-            isConditionalFresh(
-                mockHeaders({ "If-None-Match": '"abc!@#$%^&*()"' }),
-                '"abc!@#$%^&*()"',
-                undefined,
-            ),
+            isConditionalFresh(mockHeaders({ "If-None-Match": '"abc!@#$%^&*()"' }), '"abc!@#$%^&*()"', undefined),
         ).toBe(true);
     });
 
     test("W/ prefix on malformed entry (no quote after W/) -> skipped", () => {
-        expect(
-            isConditionalFresh(
-                mockHeaders({ "If-None-Match": 'W/abc, "valid"' }),
-                '"valid"',
-                undefined,
-            ),
-        ).toBe(true);
+        expect(isConditionalFresh(mockHeaders({ "If-None-Match": 'W/abc, "valid"' }), '"valid"', undefined)).toBe(true);
     });
 
     test("If-Match: empty list -> no failure (empty header treated as absent)", () => {
         // An empty If-Match header value is falsy in JS, so it's treated
         // as absent (no precondition to evaluate). This matches HTTP semantics:
         // an empty field-value is not a valid If-Match precondition.
-        expect(
-            isPreconditionFailure(
-                mockHeaders({ "If-Match": "" }),
-                '"abc"',
-                undefined,
-            ),
-        ).toBe(false);
-
+        expect(isPreconditionFailure(mockHeaders({ "If-Match": "" }), '"abc"', undefined)).toBe(false);
     });
 
     test("If-Match: only commas -> failure (no valid entries)", () => {
-        expect(
-            isPreconditionFailure(
-                mockHeaders({ "If-Match": ",,," }),
-                '"abc"',
-                undefined,
-            ),
-        ).toBe(true);
+        expect(isPreconditionFailure(mockHeaders({ "If-Match": ",,," }), '"abc"', undefined)).toBe(true);
     });
 });
 
@@ -1868,8 +1582,7 @@ describe("ETag list parsing edge cases (via public API)", () => {
 // ═══════════════════════════════════════════════════════════════════════════
 
 describe("RFC 9110 coverage completion", () => {
-
-    // ── §8.8.3.2: Strong vs Weak Comparison (Table 3) ────────────────────
+    // ── §8.8.3.2: Strong vs Weak Comparison (Table 3) ───────────────────────
 
     test("§8.8.3.2: If-Match correctly rejects W/ (strict strong comparison per Table 3)", () => {
         // RFC 9110 Table 3: W/"1" vs "1" under strong comparison is NO MATCH.
@@ -1886,31 +1599,19 @@ describe("RFC 9110 coverage completion", () => {
         ).toBe(true); // Correct: weak server ETag fails strong comparison
     });
 
-    // ── §8.8.3: Empty-String ETag ────────────────────────────────────────
+    // ── §8.8.3: Empty-String ETag ───────────────────────────────────────────
 
     test('§8.8.3: empty-string ETag "" matches correctly in If-None-Match', () => {
         // Per ABNF: entity-tag = [ weak ] opaque-tag; opaque-tag = DQUOTE *etagc DQUOTE
         // An empty etagc sequence is valid, so "" is a valid ETag.
-        expect(
-            isConditionalFresh(
-                mockHeaders({ "If-None-Match": '""' }),
-                '""',
-                undefined,
-            ),
-        ).toBe(true);
+        expect(isConditionalFresh(mockHeaders({ "If-None-Match": '""' }), '""', undefined)).toBe(true);
     });
 
     test('§8.8.3: empty-string ETag "" matches in If-Match', () => {
-        expect(
-            isPreconditionFailure(
-                mockHeaders({ "If-Match": '""' }),
-                '""',
-                undefined,
-            ),
-        ).toBe(false);
+        expect(isPreconditionFailure(mockHeaders({ "If-Match": '""' }), '""', undefined)).toBe(false);
     });
 
-    // ── §13.1.1: If-Match Wildcard with No Server ETag ───────────────────
+    // ── §13.1.1: If-Match Wildcard with No Server ETag ──────────────────────
 
     test("§13.1.1: If-Match * with no server ETag -> failure when exists is unknown", () => {
         // RFC 9110 §13.1.1: "the condition is true if the origin server has
@@ -1939,7 +1640,7 @@ describe("RFC 9110 coverage completion", () => {
         ).toBe(false);
     });
 
-    // ── §13.1.3: If-Modified-Since Ignored When If-None-Match Present ────
+    // ── §13.1.3: If-Modified-Since Ignored When If-None-Match Present ───────
 
     test("§13.1.3: INM mismatch + IMS fresh -> stale (INM fully supersedes IMS)", () => {
         // RFC 9110 §13.1.3: "A recipient MUST ignore If-Modified-Since if
@@ -1958,7 +1659,7 @@ describe("RFC 9110 coverage completion", () => {
         ).toBe(false); // INM mismatch -> stale, IMS completely ignored
     });
 
-    // ── §13.1.5: If-Range Date Requires Exact Match ──────────────────────
+    // ── §13.1.5: If-Range Date Requires Exact Match ─────────────────────────
 
     test("§13.1.5: If-Range date requires exact match (not <=)", () => {
         // RFC 9110 §13.1.5: "Note that this comparison by exact match,
@@ -1990,7 +1691,7 @@ describe("RFC 9110 coverage completion", () => {
         ).toBe(true);
     });
 
-    // ── §14.1.2: Zero-Length Representation ──────────────────────────────
+    // ── §14.1.2: Zero-Length Representation ─────────────────────────────────
 
     test("§14.1.2: bytes=0-0 on zero-length file returns null (not a range request)", () => {
         // RFC 9110 §14.1.2: "When a selected representation has zero length,
@@ -2009,7 +1710,7 @@ describe("RFC 9110 coverage completion", () => {
         expect(parseRangeHeader("bytes=-1", 0)).toBeNull();
     });
 
-    // ── §5.6.7: Obsolete Date Format Acceptance ─────────────────────────
+    // ── §5.6.7: Obsolete Date Format Acceptance ─────────────────────────────
 
     test("§5.6.7: asctime date format parsed for If-Modified-Since", () => {
         // RFC 9110 §5.6.7: "A recipient that parses a timestamp value in an
@@ -2020,13 +1721,7 @@ describe("RFC 9110 coverage completion", () => {
 
         // If-Modified-Since with asctime: resource modified in 2024,
         // client says "not modified since 1994" -> resource IS modified -> not fresh
-        expect(
-            isConditionalFresh(
-                mockHeaders({ "If-Modified-Since": asctime }),
-                undefined,
-                imfFixdate,
-            ),
-        ).toBe(false);
+        expect(isConditionalFresh(mockHeaders({ "If-Modified-Since": asctime }), undefined, imfFixdate)).toBe(false);
     });
 
     test("§5.6.7: RFC 850 date format parsed for If-Modified-Since", () => {
@@ -2034,13 +1729,7 @@ describe("RFC 9110 coverage completion", () => {
         const rfc850 = "Sunday, 06-Nov-94 08:49:37 GMT";
         const imfFixdate = "Mon, 01 Jan 2024 00:00:00 GMT";
 
-        expect(
-            isConditionalFresh(
-                mockHeaders({ "If-Modified-Since": rfc850 }),
-                undefined,
-                imfFixdate,
-            ),
-        ).toBe(false);
+        expect(isConditionalFresh(mockHeaders({ "If-Modified-Since": rfc850 }), undefined, imfFixdate)).toBe(false);
     });
 });
 
@@ -2055,43 +1744,27 @@ describe("sub-second timestamp precision", () => {
     // comparison must also floor the server's timestamp to avoid permanent
     // false-stale results.
 
-    const isoWithMs = "2025-06-29T12:00:00.500Z";  // .500 sub-second
-    const clientEcho = "Sun, 29 Jun 2025 12:00:00 GMT";  // floored by client
+    const isoWithMs = "2025-06-29T12:00:00.500Z"; // .500 sub-second
+    const clientEcho = "Sun, 29 Jun 2025 12:00:00 GMT"; // floored by client
 
     test("isConditionalFresh: ISO-8601 with milliseconds matches floored client date", () => {
         // Without the fix: Date.parse(.500) = 1751..500 <= Date.parse(.000) = 1751..000 -> false (WRONG)
         // With the fix: floor(500) = 0 <= floor(0) = 0 -> true (correct 304)
-        expect(
-            isConditionalFresh(
-                mockHeaders({ "If-Modified-Since": clientEcho }),
-                undefined,
-                isoWithMs,
-            ),
-        ).toBe(true);
+        expect(isConditionalFresh(mockHeaders({ "If-Modified-Since": clientEcho }), undefined, isoWithMs)).toBe(true);
     });
 
     test("isPreconditionFailure: ISO-8601 with milliseconds does not spuriously fail", () => {
         // Without the fix: .500 > .000 -> true (spurious 412)
         // With the fix: 0 > 0 -> false (correct, no failure)
-        expect(
-            isPreconditionFailure(
-                mockHeaders({ "If-Unmodified-Since": clientEcho }),
-                undefined,
-                isoWithMs,
-            ),
-        ).toBe(false);
+        expect(isPreconditionFailure(mockHeaders({ "If-Unmodified-Since": clientEcho }), undefined, isoWithMs)).toBe(
+            false,
+        );
     });
 
     test("isRangeFresh: ISO-8601 with milliseconds does not break If-Range date validation", () => {
         // Without the fix: .500 <= .000 -> false (range rejected, full download)
         // With the fix: 0 <= 0 -> true (range honored, seeking works)
-        expect(
-            isRangeFresh(
-                mockHeaders({ "If-Range": clientEcho }),
-                undefined,
-                isoWithMs,
-            ),
-        ).toBe(true);
+        expect(isRangeFresh(mockHeaders({ "If-Range": clientEcho }), undefined, isoWithMs)).toBe(true);
     });
 });
 
@@ -2106,53 +1779,38 @@ describe("evaluateConditionalRequest", () => {
     };
 
     test("returns 200 with full content when no conditional headers", () => {
-        const result = evaluateConditionalRequest(
-            mockHeaders({}),
-            meta,
-        );
+        const result = evaluateConditionalRequest(mockHeaders({}), meta);
         expect(result.status).toBe(200);
         expect(result.range).toBeNull();
         expect(result.headers["Content-Length"]).toBe("10000");
     });
 
     test("returns 304 when ETag matches via If-None-Match", () => {
-        const result = evaluateConditionalRequest(
-            mockHeaders({ "if-none-match": '"abc123"' }),
-            meta,
-        );
+        const result = evaluateConditionalRequest(mockHeaders({ "if-none-match": '"abc123"' }), meta);
         expect(result.status).toBe(304);
         expect(result.range).toBeNull();
     });
 
     test("returns 412 when ETag does not match via If-Match", () => {
-        const result = evaluateConditionalRequest(
-            mockHeaders({ "if-match": '"wrong"' }),
-            meta,
-        );
+        const result = evaluateConditionalRequest(mockHeaders({ "if-match": '"wrong"' }), meta);
         expect(result.status).toBe(412);
         expect(result.range).toBeNull();
     });
 
     test("returns 206 with valid range", () => {
-        const result = evaluateConditionalRequest(
-            mockHeaders({ "range": "bytes=0-999" }),
-            meta,
-        );
+        const result = evaluateConditionalRequest(mockHeaders({ range: "bytes=0-999" }), meta);
         expect(result.status).toBe(206);
         expect(result.range).toEqual({ start: 0, end: 999 });
         expect(result.headers["Content-Range"]).toBe("bytes 0-999/10000");
     });
 
     test("returns 416 when range is unsatisfiable", () => {
-        const result = evaluateConditionalRequest(
-            mockHeaders({ "range": "bytes=99999-" }),
-            meta,
-        );
+        const result = evaluateConditionalRequest(mockHeaders({ range: "bytes=99999-" }), meta);
         expect(result.status).toBe(416);
         expect(result.range).toBeNull();
     });
 
-    test("412 takes precedence over 304 (RFC 7232 Section 6 order)", () => {
+    test("412 takes precedence over 304 (RFC 9110 Section 13.2.2 order)", () => {
         const result = evaluateConditionalRequest(
             mockHeaders({
                 "if-match": '"wrong"',
@@ -2167,7 +1825,7 @@ describe("evaluateConditionalRequest", () => {
         const result = evaluateConditionalRequest(
             mockHeaders({
                 "if-none-match": '"abc123"',
-                "range": "bytes=0-999",
+                range: "bytes=0-999",
             }),
             meta,
         );
@@ -2179,7 +1837,7 @@ describe("evaluateConditionalRequest", () => {
         const result = evaluateConditionalRequest(
             mockHeaders({
                 "if-range": '"stale-etag"',
-                "range": "bytes=0-999",
+                range: "bytes=0-999",
             }),
             meta,
         );
@@ -2193,36 +1851,30 @@ describe("evaluateConditionalRequest", () => {
 
 describe("evaluateConditionalRequest header values", () => {
     test("normalizes ISO-8601 lastModified to IMF-fixdate in 200 headers", () => {
-        const result = evaluateConditionalRequest(
-            mockHeaders({}),
-            {
-                totalSize: 100,
-                contentType: "text/plain",
-                etag: '"abc"',
-                lastModified: "2025-06-28T12:00:00.000Z", // ISO input
-            },
-        );
+        const result = evaluateConditionalRequest(mockHeaders({}), {
+            totalSize: 100,
+            contentType: "text/plain",
+            etag: '"abc"',
+            lastModified: "2025-06-28T12:00:00.000Z", // ISO input
+        });
         expect(result.status).toBe(200);
         expect(result.headers["Last-Modified"]).toBe("Sat, 28 Jun 2025 12:00:00 GMT");
     });
 
     test("normalizes ISO-8601 lastModified to IMF-fixdate in 206 headers", () => {
-        const result = evaluateConditionalRequest(
-            mockHeaders({ "range": "bytes=0-9" }),
-            {
-                totalSize: 100,
-                contentType: "text/plain",
-                etag: '"abc"',
-                lastModified: "2025-06-28T12:00:00.000Z",
-            },
-        );
+        const result = evaluateConditionalRequest(mockHeaders({ range: "bytes=0-9" }), {
+            totalSize: 100,
+            contentType: "text/plain",
+            etag: '"abc"',
+            lastModified: "2025-06-28T12:00:00.000Z",
+        });
         expect(result.status).toBe(206);
         expect(result.headers["Last-Modified"]).toBe("Sat, 28 Jun 2025 12:00:00 GMT");
     });
 
     test("normalizes ISO-8601 lastModified to IMF-fixdate in 304 headers", () => {
         // ETag is absent so Last-Modified is emitted as the cache-update hint.
-        // (When ETag is present, Last-Modified is omitted per RFC 7232 Section 4.1.)
+        // (When ETag is present, Last-Modified is omitted per RFC 9110 Section 15.4.5.)
         const result = evaluateConditionalRequest(
             mockHeaders({ "if-modified-since": "Sat, 28 Jun 2025 12:00:00 GMT" }),
             {
@@ -2236,13 +1888,10 @@ describe("evaluateConditionalRequest header values", () => {
     });
 
     test("strips sub-second precision from ISO-8601 lastModified", () => {
-        const result = evaluateConditionalRequest(
-            mockHeaders({}),
-            {
-                totalSize: 100,
-                lastModified: "2025-06-28T12:00:00.999Z", // sub-second
-            },
-        );
+        const result = evaluateConditionalRequest(mockHeaders({}), {
+            totalSize: 100,
+            lastModified: "2025-06-28T12:00:00.999Z", // sub-second
+        });
         // toUTCString floors to whole seconds
         expect(result.headers["Last-Modified"]).toBe("Sat, 28 Jun 2025 12:00:00 GMT");
     });
@@ -2250,13 +1899,10 @@ describe("evaluateConditionalRequest header values", () => {
     test("strips CRLF from unparseable lastModified fallback", () => {
         // Regression test: orchestrator must strip CRLF like the standalone builders.
         // An attacker-controlled unparseable date with CRLF should not inject headers.
-        const result = evaluateConditionalRequest(
-            mockHeaders({}),
-            {
-                totalSize: 100,
-                lastModified: "bad-date\r\nX-Injected: evil",
-            },
-        );
+        const result = evaluateConditionalRequest(mockHeaders({}), {
+            totalSize: 100,
+            lastModified: "bad-date\r\nX-Injected: evil",
+        });
         expect(result.status).toBe(200);
         // CRLF must be stripped; the raw fallback is used for unparseable dates
         expect(result.headers["Last-Modified"]).toBe("bad-dateX-Injected: evil");
@@ -2269,16 +1915,13 @@ describe("evaluateConditionalRequest header values", () => {
         // Node writeHead / undici Headers throw on any control byte, not just
         // CRLF (\x01, \x0B, \x7F...). Surviving sanitization would turn a
         // poisoned backend value into a runtime crash instead of a response.
-        const result = evaluateConditionalRequest(
-            mockHeaders({}),
-            {
-                totalSize: 100,
-                contentType: "text/\x01plain\x7F; charset=utf-8",
-                etag: '"abc\x0Bdef"',
-                lastModified: "bad\x0Cdate",
-                digest: "hash\x00value",
-            },
-        );
+        const result = evaluateConditionalRequest(mockHeaders({}), {
+            totalSize: 100,
+            contentType: "text/\x01plain\x7F; charset=utf-8",
+            etag: '"abc\x0Bdef"',
+            lastModified: "bad\x0Cdate",
+            digest: "hash\x00value",
+        });
         expect(result.status).toBe(200);
         expect(result.headers["Content-Type"]).toBe("text/plain; charset=utf-8");
         expect(result.headers["ETag"]).toBe('"abcdef"');
@@ -2292,23 +1935,17 @@ describe("evaluateConditionalRequest header values", () => {
 
     test("passes IMF-fixdate through unchanged", () => {
         const imf = "Sat, 28 Jun 2025 12:00:00 GMT";
-        const result = evaluateConditionalRequest(
-            mockHeaders({}),
-            {
-                totalSize: 100,
-                lastModified: imf,
-            },
-        );
+        const result = evaluateConditionalRequest(mockHeaders({}), {
+            totalSize: 100,
+            lastModified: imf,
+        });
         expect(result.headers["Last-Modified"]).toBe(imf);
     });
 
     test("omits Last-Modified when not provided", () => {
-        const result = evaluateConditionalRequest(
-            mockHeaders({}),
-            {
-                totalSize: 100,
-            },
-        );
+        const result = evaluateConditionalRequest(mockHeaders({}), {
+            totalSize: 100,
+        });
         expect(result.headers["Last-Modified"]).toBeUndefined();
     });
 });
@@ -2317,115 +1954,88 @@ describe("evaluateConditionalRequest header values", () => {
 
 describe("evaluateConditionalRequest Repr-Digest", () => {
     test("emits Repr-Digest on 200 when digest is provided", () => {
-        const result = evaluateConditionalRequest(
-            mockHeaders({}),
-            {
-                totalSize: 1000,
-                digest: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
-            },
-        );
+        const result = evaluateConditionalRequest(mockHeaders({}), {
+            totalSize: 1000,
+            digest: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
+        });
         expect(result.status).toBe(200);
         expect(result.headers["Repr-Digest"]).toBe("sha-256=:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=:");
     });
 
     test("emits Repr-Digest on 206 (stable across ranges)", () => {
-        const result = evaluateConditionalRequest(
-            mockHeaders({ range: "bytes=0-99" }),
-            {
-                totalSize: 1000,
-                digest: "LPJNul+wow4m6DsqxbninhsWHlwfp0JecwQzYpOLmCQ=",
-            },
-        );
+        const result = evaluateConditionalRequest(mockHeaders({ range: "bytes=0-99" }), {
+            totalSize: 1000,
+            digest: "LPJNul+wow4m6DsqxbninhsWHlwfp0JecwQzYpOLmCQ=",
+        });
         expect(result.status).toBe(206);
         // Repr-Digest covers the full representation, not the range
         expect(result.headers["Repr-Digest"]).toBe("sha-256=:LPJNul+wow4m6DsqxbninhsWHlwfp0JecwQzYpOLmCQ=:");
     });
 
     test("omits Repr-Digest when not provided", () => {
-        const result = evaluateConditionalRequest(
-            mockHeaders({}),
-            {
-                totalSize: 1000,
-            },
-        );
+        const result = evaluateConditionalRequest(mockHeaders({}), {
+            totalSize: 1000,
+        });
         expect(result.headers["Repr-Digest"]).toBeUndefined();
     });
 
     test("omits Repr-Digest on 304 (no body)", () => {
-        const result = evaluateConditionalRequest(
-            mockHeaders({ "if-none-match": '"abc"' }),
-            {
-                totalSize: 1000,
-                etag: '"abc"',
-                digest: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
-            },
-        );
+        const result = evaluateConditionalRequest(mockHeaders({ "if-none-match": '"abc"' }), {
+            totalSize: 1000,
+            etag: '"abc"',
+            digest: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
+        });
         expect(result.status).toBe(304);
         expect(result.headers["Repr-Digest"]).toBeUndefined();
     });
 
     test("omits Repr-Digest on 412 (no body)", () => {
-        const result = evaluateConditionalRequest(
-            mockHeaders({ "if-match": '"wrong"' }),
-            {
-                totalSize: 1000,
-                etag: '"right"',
-                digest: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
-            },
-        );
+        const result = evaluateConditionalRequest(mockHeaders({ "if-match": '"wrong"' }), {
+            totalSize: 1000,
+            etag: '"right"',
+            digest: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
+        });
         expect(result.status).toBe(412);
         expect(result.headers["Repr-Digest"]).toBeUndefined();
     });
 
-    // ── Content-Digest (RFC 9530 Section 2) ─────────────────────────
+    // ── Content-Digest (RFC 9530 Section 2) ─────────────────────────────────
 
     test("emits Content-Digest on 200 (equals Repr-Digest when content = full representation)", () => {
-        const result = evaluateConditionalRequest(
-            mockHeaders({}),
-            {
-                totalSize: 1000,
-                digest: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
-            },
-        );
+        const result = evaluateConditionalRequest(mockHeaders({}), {
+            totalSize: 1000,
+            digest: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
+        });
         expect(result.status).toBe(200);
         expect(result.headers["Content-Digest"]).toBe("sha-256=:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=:");
         expect(result.headers["Content-Digest"]).toBe(result.headers["Repr-Digest"]);
     });
 
     test("omits Content-Digest on 206 (range-slice hash would require I/O)", () => {
-        const result = evaluateConditionalRequest(
-            mockHeaders({ range: "bytes=0-99" }),
-            {
-                totalSize: 1000,
-                digest: "LPJNul+wow4m6DsqxbninhsWHlwfp0JecwQzYpOLmCQ=",
-            },
-        );
+        const result = evaluateConditionalRequest(mockHeaders({ range: "bytes=0-99" }), {
+            totalSize: 1000,
+            digest: "LPJNul+wow4m6DsqxbninhsWHlwfp0JecwQzYpOLmCQ=",
+        });
         expect(result.status).toBe(206);
         expect(result.headers["Repr-Digest"]).toBe("sha-256=:LPJNul+wow4m6DsqxbninhsWHlwfp0JecwQzYpOLmCQ=:");
         expect(result.headers["Content-Digest"]).toBeUndefined();
     });
 
-    // ── Want-Repr-Digest (RFC 9530 Section 4) ───────────────────────
+    // ── Want-Repr-Digest (RFC 9530 Section 4) ───────────────────────────────
 
     test("emits digest when Want-Repr-Digest includes sha-256", () => {
-        const result = evaluateConditionalRequest(
-            mockHeaders({ "want-repr-digest": "sha-256=5, sha-512=3" }),
-            {
-                totalSize: 1000,
-                digest: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
-            },
-        );
+        const result = evaluateConditionalRequest(mockHeaders({ "want-repr-digest": "sha-256=5, sha-512=3" }), {
+            totalSize: 1000,
+            digest: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
+        });
         expect(result.headers["Repr-Digest"]).toBe("sha-256=:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=:");
     });
 
     test("omits Repr-Digest when Want-Repr-Digest excludes sha-256; Content-Digest keeps its own default", () => {
-        const result = evaluateConditionalRequest(
-            mockHeaders({ "want-repr-digest": "sha-512=5" }),
-            {
-                totalSize: 1000,
-                digest: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
-            },
-        );
+        const result = evaluateConditionalRequest(mockHeaders({ "want-repr-digest": "sha-512=5" }), {
+            totalSize: 1000,
+            digest: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
+        });
         expect(result.headers["Repr-Digest"]).toBeUndefined();
         // No Want-Content-Digest was sent, and an absent field expresses no
         // preference (unsolicited digests are permitted), so the full-200
@@ -2435,24 +2045,18 @@ describe("evaluateConditionalRequest Repr-Digest", () => {
     });
 
     test("omits digest when Want-Repr-Digest sets sha-256 weight to 0", () => {
-        const result = evaluateConditionalRequest(
-            mockHeaders({ "want-repr-digest": "sha-256=0" }),
-            {
-                totalSize: 1000,
-                digest: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
-            },
-        );
+        const result = evaluateConditionalRequest(mockHeaders({ "want-repr-digest": "sha-256=0" }), {
+            totalSize: 1000,
+            digest: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
+        });
         expect(result.headers["Repr-Digest"]).toBeUndefined();
     });
 
     test("emits digest when no Want-* header is present (unsolicited allowed)", () => {
-        const result = evaluateConditionalRequest(
-            mockHeaders({}),
-            {
-                totalSize: 1000,
-                digest: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
-            },
-        );
+        const result = evaluateConditionalRequest(mockHeaders({}), {
+            totalSize: 1000,
+            digest: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
+        });
         expect(result.headers["Repr-Digest"]).toBe("sha-256=:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=:");
     });
 
@@ -2460,25 +2064,19 @@ describe("evaluateConditionalRequest Repr-Digest", () => {
         // Each Want-* field expresses a preference for its corresponding
         // response field (RFC 9530 Section 4): declining Content-Digest must
         // not suppress Repr-Digest.
-        const result = evaluateConditionalRequest(
-            mockHeaders({ "want-content-digest": "sha-512=5" }),
-            {
-                totalSize: 1000,
-                digest: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
-            },
-        );
+        const result = evaluateConditionalRequest(mockHeaders({ "want-content-digest": "sha-512=5" }), {
+            totalSize: 1000,
+            digest: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
+        });
         expect(result.headers["Repr-Digest"]).toBe("sha-256=:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=:");
         expect(result.headers["Content-Digest"]).toBeUndefined();
     });
 
     test("Want-Content-Digest: sha-256=0 suppresses Content-Digest on a full 200", () => {
-        const result = evaluateConditionalRequest(
-            mockHeaders({ "want-content-digest": "sha-256=0" }),
-            {
-                totalSize: 1000,
-                digest: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
-            },
-        );
+        const result = evaluateConditionalRequest(mockHeaders({ "want-content-digest": "sha-256=0" }), {
+            totalSize: 1000,
+            digest: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
+        });
         expect(result.headers["Repr-Digest"]).toBe("sha-256=:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=:");
         expect(result.headers["Content-Digest"]).toBeUndefined();
     });
@@ -2528,24 +2126,24 @@ describe("evaluateConditionalRequest Repr-Digest", () => {
     });
 
     test("duplicate Want-Repr-Digest keys: the LAST occurrence wins (RFC 8941 3.2)", () => {
-        const suppressed = evaluateConditionalRequest(
-            mockHeaders({ "want-repr-digest": "sha-256=5, sha-256=0" }),
-            { totalSize: 1000, digest: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=" },
-        );
+        const suppressed = evaluateConditionalRequest(mockHeaders({ "want-repr-digest": "sha-256=5, sha-256=0" }), {
+            totalSize: 1000,
+            digest: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
+        });
         expect(suppressed.headers["Repr-Digest"]).toBeUndefined();
 
-        const wanted = evaluateConditionalRequest(
-            mockHeaders({ "want-repr-digest": "sha-256=0, sha-256=5" }),
-            { totalSize: 1000, digest: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=" },
-        );
+        const wanted = evaluateConditionalRequest(mockHeaders({ "want-repr-digest": "sha-256=0, sha-256=5" }), {
+            totalSize: 1000,
+            digest: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
+        });
         expect(wanted.headers["Repr-Digest"]).toBe("sha-256=:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=:");
     });
 
     test("bare sha-256 key with Structured Fields parameters still counts as wanted", () => {
-        const result = evaluateConditionalRequest(
-            mockHeaders({ "want-repr-digest": "sha-256;x=1" }),
-            { totalSize: 1000, digest: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=" },
-        );
+        const result = evaluateConditionalRequest(mockHeaders({ "want-repr-digest": "sha-256;x=1" }), {
+            totalSize: 1000,
+            digest: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
+        });
         expect(result.headers["Repr-Digest"]).toBe("sha-256=:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=:");
     });
 
@@ -2577,39 +2175,30 @@ describe("evaluateConditionalRequest Repr-Digest", () => {
 
     test("does not match sha-256-v2 algorithm name (false positive guard)", () => {
         // A hypothetical future algorithm "sha-256-v2" must NOT match "sha-256"
-        const result = evaluateConditionalRequest(
-            mockHeaders({ "want-repr-digest": "sha-256-v2=5" }),
-            {
-                totalSize: 1000,
-                digest: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
-            },
-        );
+        const result = evaluateConditionalRequest(mockHeaders({ "want-repr-digest": "sha-256-v2=5" }), {
+            totalSize: 1000,
+            digest: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
+        });
         // Client wants an algorithm we don't support
         expect(result.headers["Repr-Digest"]).toBeUndefined();
     });
 
     test("emits Cache-Control on 200 response", () => {
-        const result = evaluateConditionalRequest(
-            mockHeaders({}),
-            {
-                totalSize: 1000,
-                contentType: "application/pdf",
-                cacheControl: "private, max-age=3600",
-            },
-        );
+        const result = evaluateConditionalRequest(mockHeaders({}), {
+            totalSize: 1000,
+            contentType: "application/pdf",
+            cacheControl: "private, max-age=3600",
+        });
         expect(result.status).toBe(200);
         expect(result.headers["Cache-Control"]).toBe("private, max-age=3600");
     });
 
     test("emits Cache-Control on 206 response", () => {
-        const result = evaluateConditionalRequest(
-            mockHeaders({ range: "bytes=0-499" }),
-            {
-                totalSize: 1000,
-                contentType: "application/pdf",
-                cacheControl: "private, no-cache",
-            },
-        );
+        const result = evaluateConditionalRequest(mockHeaders({ range: "bytes=0-499" }), {
+            totalSize: 1000,
+            contentType: "application/pdf",
+            cacheControl: "private, no-cache",
+        });
         expect(result.status).toBe(206);
         expect(result.headers["Cache-Control"]).toBe("private, no-cache");
     });
@@ -2673,30 +2262,26 @@ describe("fromNodeHeaders", () => {
 // case below guards that.
 
 describe("generateETag - strength matrix", () => {
-    test("hash present -> STRONG validator", () => {
-        expect(generateETag({ hash: "abc123" })).toBe('"abc123"');
+    test("etag present -> STRONG validator", () => {
+        expect(generateETag({ etag: "abc123" })).toBe('"abc123"');
     });
 
-    test("hash takes precedence over size+mtime (digest is byte-exact)", () => {
-        expect(
-            generateETag({ hash: "abc123", size: 1000, mtime: 0 }),
-        ).toBe('"abc123"');
+    test("etag takes precedence over contentLength+lastModified", () => {
+        expect(generateETag({ etag: "abc123", contentLength: 1000, lastModified: 0 })).toBe('"abc123"');
     });
 
-    test("no hash, size + mtime -> WEAK validator (RFC 9110 Section 8.8.1)", () => {
-        // size 1000 = 0x3e8, mtime 1_000_000ms -> floor(1000s) = 0x3e8
-        expect(
-            generateETag({ size: 1000, mtime: 1_000_000 }),
-        ).toBe('W/"3e8-3e8"');
+    test("no etag, contentLength + lastModified -> WEAK validator (RFC 9110 Section 8.8.1)", () => {
+        // size 1000 = 0x3e8, lastModified 1_000_000ms -> floor(1000s) = 0x3e8
+        expect(generateETag({ contentLength: 1000, lastModified: 1_000_000 })).toBe('W/"3e8-3e8"');
     });
 
-    test("no hash, size only (no mtime) -> undefined", () => {
-        // size alone cannot detect modification -> refuse to emit.
-        expect(generateETag({ size: 1000 })).toBeUndefined();
+    test("no etag, contentLength only (no lastModified) -> undefined", () => {
+        // A byte count alone cannot detect modification -> refuse to emit.
+        expect(generateETag({ contentLength: 1000 })).toBeUndefined();
     });
 
-    test("no hash, mtime only (no size) -> undefined", () => {
-        expect(generateETag({ mtime: 1_000_000 })).toBeUndefined();
+    test("no etag, lastModified only (no contentLength) -> undefined", () => {
+        expect(generateETag({ lastModified: 1_000_000 })).toBeUndefined();
     });
 
     test("empty source -> undefined", () => {
@@ -2704,71 +2289,158 @@ describe("generateETag - strength matrix", () => {
     });
 });
 
-describe("generateETag - hash normalization", () => {
-    test("strips storage-supplied surrounding quotes, re-wraps once", () => {
-        // S3 returns the ETag already quoted. Must not double-quote.
-        expect(generateETag({ hash: '"abc123"' })).toBe('"abc123"');
+/**
+ * Call the way a JavaScript consumer does, with no compile-time shape check.
+ * The cast IS the subject under test: it stands in for the caller TypeScript
+ * never saw, which is the only caller that can reach the runtime guard.
+ */
+function fromUncheckedCaller(source: Record<string, unknown>): string | undefined {
+    return generateETag(source as ETagSource);
+}
+
+// The field names are ObjectMetadata's, so a store's HEAD result is a valid
+// argument as-is. `digest` rides along on that object and must never divert
+// the strength decision: an RFC 9530 digest is not the backend's version
+// identifier, and reading it in place of `etag` would serve a weak
+// W/"<size>-<mtime>" for a store that has a strong validator, refusing
+// If-Range resumes and 412-ing every If-Match write with no error anywhere.
+describe("generateETag - ObjectMetadata is a valid source", () => {
+    test("a whole HEAD result yields the strong validator from etag", () => {
+        const meta: ObjectMetadata = {
+            contentLength: 1000,
+            etag: '"abc123"',
+            lastModified: "2025-06-28T12:00:00.000Z",
+            digest: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
+            pin: "generation-42",
+        };
+        expect(generateETag(meta)).toBe('"abc123"');
     });
 
-    test("unquoted backend hash is wrapped", () => {
-        expect(generateETag({ hash: "abc123" })).toBe('"abc123"');
+    test("digest never substitutes for a missing etag", () => {
+        const meta: ObjectMetadata = {
+            contentLength: 1000,
+            lastModified: new Date(1_000_000).toISOString(),
+            digest: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
+        };
+        expect(generateETag(meta)).toBe('W/"3e8-3e8"');
+    });
+
+    test("digest alone is not a validator", () => {
+        expect(
+            fromUncheckedCaller({
+                digest: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
+            }),
+        ).toBeUndefined();
+    });
+});
+
+// Every retired name reads as absent here, so the answer would be a weak
+// validator, or none, for a store that has a strong one. That is a
+// cache-correctness failure with no error: it refuses If-Range resumes and
+// 412s every If-Match write. Throwing turns it into a stack trace.
+describe("generateETag - retired field names are refused", () => {
+    test.each([
+        ["hash", "etag"],
+        ["size", "contentLength"],
+        ["mtime", "lastModified"],
+    ])("%s throws and names %s", (retired, current) => {
+        expect(() => fromUncheckedCaller({ [retired]: "x" })).toThrow(new RegExp(`"${retired}".*"${current}"`));
+    });
+
+    test("a retired name is refused even alongside valid fields", () => {
+        // The dangerous shape: enough valid metadata to answer plausibly,
+        // so a silent answer would look correct.
+        expect(() =>
+            fromUncheckedCaller({
+                hash: "abc123",
+                contentLength: 1000,
+                lastModified: 1_000_000,
+            }),
+        ).toThrow(TypeError);
+    });
+
+    test("an explicitly undefined retired name still throws", () => {
+        // `{ hash: undefined }` is a caller who believes the field exists.
+        expect(() => fromUncheckedCaller({ hash: undefined })).toThrow(TypeError);
+    });
+
+    test("a non-object source is refused rather than read as empty", () => {
+        expect(() => generateETag(undefined as unknown as ETagSource)).toThrow(TypeError);
+        expect(() => generateETag(null as unknown as ETagSource)).toThrow(TypeError);
+    });
+
+    test("a TypeScript caller is stopped by the compiler first", () => {
+        // The directive is the assertion: typecheck:tests fails if this call
+        // ever starts compiling, which would mean the type surface accepts a
+        // name generateETag does not read.
+        // @ts-expect-error `hash` is not a field of ETagSource.
+        expect(() => generateETag({ hash: "abc123" })).toThrow(TypeError);
+    });
+});
+
+describe("generateETag - etag normalization", () => {
+    test("strips storage-supplied surrounding quotes, re-wraps once", () => {
+        // S3 returns the ETag already quoted. Must not double-quote.
+        expect(generateETag({ etag: '"abc123"' })).toBe('"abc123"');
+    });
+
+    test("unquoted backend etag is wrapped", () => {
+        expect(generateETag({ etag: "abc123" })).toBe('"abc123"');
     });
 
     test("multipart S3 ETag (hash-partcount) is a valid strong validator", () => {
         // "<md5>-<n>" is still byte-exact for that object; format verbatim.
-        expect(generateETag({ hash: '"d41d8cd98f00b204e9800998ecf8427e-7"' }))
-            .toBe('"d41d8cd98f00b204e9800998ecf8427e-7"');
+        expect(generateETag({ etag: '"d41d8cd98f00b204e9800998ecf8427e-7"' })).toBe(
+            '"d41d8cd98f00b204e9800998ecf8427e-7"',
+        );
     });
 
-    test("backend-marked weak hash STAYS weak (no silent upgrade to strong)", () => {
-        expect(generateETag({ hash: 'W/"abc123"' })).toBe('W/"abc123"');
+    test("backend-marked weak etag STAYS weak (no silent upgrade to strong)", () => {
+        expect(generateETag({ etag: 'W/"abc123"' })).toBe('W/"abc123"');
     });
 
-    test("hash that is empty after cleaning falls through to size+mtime", () => {
-        expect(generateETag({ hash: '""', size: 1000, mtime: 1_000_000 }))
-            .toBe('W/"3e8-3e8"');
+    test("etag that is empty after cleaning falls through to size+mtime", () => {
+        expect(generateETag({ etag: '""', contentLength: 1000, lastModified: 1_000_000 })).toBe('W/"3e8-3e8"');
     });
 
-    test("whitespace-only hash falls through, not a bare quote pair", () => {
-        expect(generateETag({ hash: "   " })).toBeUndefined();
+    test("whitespace-only etag falls through, not a bare quote pair", () => {
+        expect(generateETag({ etag: "   " })).toBeUndefined();
     });
 
     test("interior DQUOTE is stripped so the emitted ETag is well-formed etagc", () => {
-        // A backend hash with an embedded quote must not emit `"abc"def"`,
+        // A backend etag with an embedded quote must not emit `"abc"def"`,
         // which a cache parses as etag `"abc"` + trailing garbage, silently
         // defeating revalidation. RFC 9110 8.8.3 etagc excludes DQUOTE.
-        const etag = generateETag({ hash: 'abc"def' });
+        const etag = generateETag({ etag: 'abc"def' });
         expect(etag).toBe('"abcdef"');
         // Exactly two quotes: the anchoring pair, none in the body.
         expect((etag!.match(/"/g) ?? []).length).toBe(2);
     });
 
     test("control bytes and DEL are stripped from the ETag body", () => {
-        expect(generateETag({ hash: "abc\x00\x7Fdef" })).toBe('"abcdef"');
+        expect(generateETag({ etag: "abc\x00\x7Fdef" })).toBe('"abcdef"');
     });
 });
 
-describe("generateETag - mtime input types", () => {
+describe("generateETag - lastModified input types", () => {
     test("accepts Date", () => {
-        expect(generateETag({ size: 16, mtime: new Date(2_000_000) }))
-            .toBe('W/"10-7d0"'); // 16=0x10, floor(2000s)=0x7d0
+        expect(generateETag({ contentLength: 16, lastModified: new Date(2_000_000) })).toBe('W/"10-7d0"'); // 16=0x10, floor(2000s)=0x7d0
     });
 
     test("accepts epoch-ms number", () => {
-        expect(generateETag({ size: 16, mtime: 2_000_000 })).toBe('W/"10-7d0"');
+        expect(generateETag({ contentLength: 16, lastModified: 2_000_000 })).toBe('W/"10-7d0"');
     });
 
     test("accepts Date.parse()-able string (ISO)", () => {
         const ms = Date.parse("2025-06-28T12:00:00.000Z");
         const expected = `W/"10-${Math.floor(ms / 1000).toString(16)}"`;
-        expect(generateETag({ size: 16, mtime: "2025-06-28T12:00:00.000Z" }))
-            .toBe(expected);
+        expect(generateETag({ contentLength: 16, lastModified: "2025-06-28T12:00:00.000Z" })).toBe(expected);
     });
 
-    test("unparseable mtime WITH size -> undefined, NOT a size-only ETag", () => {
+    test("unparseable lastModified WITH contentLength -> undefined, NOT a size-only ETag", () => {
         // The trap: a validator that floors to size and ignores a broken date
         // would 304 on changed content. Refuse instead.
-        expect(generateETag({ size: 1000, mtime: "not-a-date" })).toBeUndefined();
+        expect(generateETag({ contentLength: 1000, lastModified: "not-a-date" })).toBeUndefined();
     });
 });
 
@@ -2776,17 +2448,17 @@ describe("generateETag - sub-second consistency (matches Last-Modified flooring)
     test("millisecond jitter does not churn the weak validator", () => {
         // Both floor to the same whole second -> identical ETag. Prevents the
         // emitted Last-Modified (sec resolution) and the ETag from disagreeing.
-        const a = generateETag({ size: 500, mtime: "2025-06-28T12:00:00.100Z" });
-        const b = generateETag({ size: 500, mtime: "2025-06-28T12:00:00.900Z" });
+        const a = generateETag({ contentLength: 500, lastModified: "2025-06-28T12:00:00.100Z" });
+        const b = generateETag({ contentLength: 500, lastModified: "2025-06-28T12:00:00.900Z" });
         expect(a).toBe(b);
     });
 
-    test("empty file (size 0) is valid, not treated as missing", () => {
-        expect(generateETag({ size: 0, mtime: 1_000_000 })).toBe('W/"0-3e8"');
+    test("empty file (contentLength 0) is valid, not treated as missing", () => {
+        expect(generateETag({ contentLength: 0, lastModified: 1_000_000 })).toBe('W/"0-3e8"');
     });
 
-    test("negative size -> undefined (defensive; size is a byte count)", () => {
-        expect(generateETag({ size: -1, mtime: 1_000_000 })).toBeUndefined();
+    test("negative contentLength -> undefined (defensive; it is a byte count)", () => {
+        expect(generateETag({ contentLength: -1, lastModified: 1_000_000 })).toBeUndefined();
     });
 });
 
@@ -2807,18 +2479,12 @@ describe("evaluateConditionalWrite - OCC (If-Match)", () => {
     });
 
     test("If-Match: matching ETag -> proceed (safe to overwrite)", () => {
-        const result = evaluateConditionalWrite(
-            mockHeaders({ "If-Match": '"v1"' }),
-            { etag: '"v1"' },
-        );
+        const result = evaluateConditionalWrite(mockHeaders({ "If-Match": '"v1"' }), { etag: '"v1"' });
         expect(result.proceed).toBe(true);
     });
 
     test("If-Match: mismatching ETag -> 412 (concurrent edit detected)", () => {
-        const result = evaluateConditionalWrite(
-            mockHeaders({ "If-Match": '"v1"' }),
-            { etag: '"v2"' },
-        );
+        const result = evaluateConditionalWrite(mockHeaders({ "If-Match": '"v1"' }), { etag: '"v2"' });
         expect(result.proceed).toBe(false);
         if (!result.proceed) {
             expect(result.status).toBe(412);
@@ -2830,28 +2496,19 @@ describe("evaluateConditionalWrite - OCC (If-Match)", () => {
     });
 
     test("If-Match: no server ETag -> 412 (cannot confirm match)", () => {
-        const result = evaluateConditionalWrite(
-            mockHeaders({ "If-Match": '"v1"' }),
-            {},
-        );
+        const result = evaluateConditionalWrite(mockHeaders({ "If-Match": '"v1"' }), {});
         expect(result.proceed).toBe(false);
     });
 
     test("If-Match: wildcard * -> proceed (resource exists)", () => {
-        const result = evaluateConditionalWrite(
-            mockHeaders({ "If-Match": "*" }),
-            { etag: '"v1"' },
-        );
+        const result = evaluateConditionalWrite(mockHeaders({ "If-Match": "*" }), { etag: '"v1"' });
         expect(result.proceed).toBe(true);
     });
 
     test("If-Match: W/ client ETag fails strong comparison (write-side)", () => {
         // RFC 9110 Section 13.1.1: If-Match requires strong comparison.
         // A weak ETag from the client cannot satisfy the precondition.
-        const result = evaluateConditionalWrite(
-            mockHeaders({ "If-Match": 'W/"v1"' }),
-            { etag: '"v1"' },
-        );
+        const result = evaluateConditionalWrite(mockHeaders({ "If-Match": 'W/"v1"' }), { etag: '"v1"' });
         expect(result.proceed).toBe(false); // Weak cannot match under strong comparison
     });
 });
@@ -2887,10 +2544,7 @@ describe("evaluateConditionalWrite - If-Unmodified-Since", () => {
 
 describe("evaluateConditionalWrite - If-None-Match (write semantics: 412, NOT 304)", () => {
     test("If-None-Match: * with existing resource -> 412 (resource already exists)", () => {
-        const result = evaluateConditionalWrite(
-            mockHeaders({ "If-None-Match": "*" }),
-            { etag: '"v1"' },
-        );
+        const result = evaluateConditionalWrite(mockHeaders({ "If-None-Match": "*" }), { etag: '"v1"' });
         expect(result.proceed).toBe(false);
         if (!result.proceed) {
             expect(result.status).toBe(412);
@@ -2898,48 +2552,33 @@ describe("evaluateConditionalWrite - If-None-Match (write semantics: 412, NOT 30
     });
 
     test("If-None-Match: * with non-existing resource -> proceed (safe to create)", () => {
-        const result = evaluateConditionalWrite(
-            mockHeaders({ "If-None-Match": "*" }),
-            { exists: false },
-        );
+        const result = evaluateConditionalWrite(mockHeaders({ "If-None-Match": "*" }), { exists: false });
         expect(result.proceed).toBe(true);
     });
 
     test("If-None-Match: * infers existence from etag when exists is omitted", () => {
         // Has etag -> exists -> 412
-        const withEtag = evaluateConditionalWrite(
-            mockHeaders({ "If-None-Match": "*" }),
-            { etag: '"v1"' },
-        );
+        const withEtag = evaluateConditionalWrite(mockHeaders({ "If-None-Match": "*" }), { etag: '"v1"' });
         expect(withEtag.proceed).toBe(false);
     });
 
     test("If-None-Match: * with no etag and no exists -> throws (fail closed)", () => {
         // When existence is genuinely unknowable, the library throws
         // rather than guessing and potentially overwriting a resource.
-        expect(() =>
-            evaluateConditionalWrite(
-                mockHeaders({ "If-None-Match": "*" }),
-                {},
-            ),
-        ).toThrow("requires a known existence state");
+        expect(() => evaluateConditionalWrite(mockHeaders({ "If-None-Match": "*" }), {})).toThrow(
+            "requires a known existence state",
+        );
     });
 
     test("If-None-Match: * with exists=true overrides missing etag", () => {
         // Resource exists but has no etag (e.g., filesystem) -> still 412
-        const result = evaluateConditionalWrite(
-            mockHeaders({ "If-None-Match": "*" }),
-            { exists: true },
-        );
+        const result = evaluateConditionalWrite(mockHeaders({ "If-None-Match": "*" }), { exists: true });
         expect(result.proceed).toBe(false);
     });
 
     test("If-None-Match: * with exists=false overrides present etag", () => {
         // Edge case: exists explicitly false but etag provided -> trust exists
-        const result = evaluateConditionalWrite(
-            mockHeaders({ "If-None-Match": "*" }),
-            { etag: '"v1"', exists: false },
-        );
+        const result = evaluateConditionalWrite(mockHeaders({ "If-None-Match": "*" }), { etag: '"v1"', exists: false });
         expect(result.proceed).toBe(true);
     });
 
@@ -2947,10 +2586,7 @@ describe("evaluateConditionalWrite - If-None-Match (write semantics: 412, NOT 30
         // This is THE critical difference from the read path.
         // isConditionalFresh would return true (304). The write path
         // MUST return 412 instead.
-        const result = evaluateConditionalWrite(
-            mockHeaders({ "If-None-Match": '"v1"' }),
-            { etag: '"v1"' },
-        );
+        const result = evaluateConditionalWrite(mockHeaders({ "If-None-Match": '"v1"' }), { etag: '"v1"' });
         expect(result.proceed).toBe(false);
         if (!result.proceed) {
             expect(result.status).toBe(412);
@@ -2958,43 +2594,28 @@ describe("evaluateConditionalWrite - If-None-Match (write semantics: 412, NOT 30
     });
 
     test("If-None-Match: mismatching ETag -> proceed", () => {
-        const result = evaluateConditionalWrite(
-            mockHeaders({ "If-None-Match": '"v1"' }),
-            { etag: '"v2"' },
-        );
+        const result = evaluateConditionalWrite(mockHeaders({ "If-None-Match": '"v1"' }), { etag: '"v2"' });
         expect(result.proceed).toBe(true);
     });
 
     test("If-None-Match: ETag list with one match -> 412", () => {
-        const result = evaluateConditionalWrite(
-            mockHeaders({ "If-None-Match": '"v1", "v2", "v3"' }),
-            { etag: '"v2"' },
-        );
+        const result = evaluateConditionalWrite(mockHeaders({ "If-None-Match": '"v1", "v2", "v3"' }), { etag: '"v2"' });
         expect(result.proceed).toBe(false);
     });
 
     test("If-None-Match: ETag list with no match -> proceed", () => {
-        const result = evaluateConditionalWrite(
-            mockHeaders({ "If-None-Match": '"v1", "v2"' }),
-            { etag: '"v3"' },
-        );
+        const result = evaluateConditionalWrite(mockHeaders({ "If-None-Match": '"v1", "v2"' }), { etag: '"v3"' });
         expect(result.proceed).toBe(true);
     });
 
     test("If-None-Match: W/ comparison for write-side matching", () => {
-        const result = evaluateConditionalWrite(
-            mockHeaders({ "If-None-Match": 'W/"v1"' }),
-            { etag: '"v1"' },
-        );
+        const result = evaluateConditionalWrite(mockHeaders({ "If-None-Match": 'W/"v1"' }), { etag: '"v1"' });
         expect(result.proceed).toBe(false);
     });
 
     test("If-None-Match: no server etag, specific ETag -> proceed", () => {
         // No server etag means we can't match -> proceed
-        const result = evaluateConditionalWrite(
-            mockHeaders({ "If-None-Match": '"v1"' }),
-            {},
-        );
+        const result = evaluateConditionalWrite(mockHeaders({ "If-None-Match": '"v1"' }), {});
         expect(result.proceed).toBe(true);
     });
 });
@@ -3041,13 +2662,10 @@ describe("evaluateConditionalWrite - evaluation order", () => {
     });
 
     test("discriminated union narrows correctly on proceed=false", () => {
-        const result = evaluateConditionalWrite(
-            mockHeaders({ "If-Match": '"wrong"' }),
-            { etag: '"v1"' },
-        );
+        const result = evaluateConditionalWrite(mockHeaders({ "If-Match": '"wrong"' }), { etag: '"v1"' });
         if (!result.proceed) {
-            // TypeScript should narrow to { proceed: false, status: 412, headers }
-            const s: 412 = result.status;
+            // TypeScript should narrow to { proceed: false, status: 412 | 428, headers }
+            const s: 412 | 428 = result.status;
             const h: Record<string, string> = result.headers;
             expect(s).toBe(412);
             expect(h).toBeDefined();
@@ -3150,6 +2768,31 @@ describe("evaluateConditionalRequest - totalSize validation", () => {
 
 // ─── Multiple Ranges (parseRanges) ──────────────────────────────────────────
 
+describe("range-spec classification order (RFC 9110 Section 14.1.1)", () => {
+    // Malformed and invalid specs are ignorable syntax; only a well-formed,
+    // valid int-range whose first-pos is past the end is unsatisfiable.
+    test.each(["bytes=20-abc", "bytes=20-5", "bytes=20-19x"])(
+        "%s on a 10-byte object is ignored, not 416",
+        (header) => {
+            expect(parseRangeHeader(header, 10)).toBeNull();
+            expect(parseRanges(header, 10)).toBeNull();
+        },
+    );
+
+    test("one malformed element voids the whole header, whatever its neighbours", () => {
+        expect(parseRanges("bytes=20-abc,0-1", 10)).toBeNull();
+        expect(parseRanges("bytes=0-1,20-5", 10)).toBeNull();
+        expect(parseRanges("bytes=20-5,30-40", 10)).toBeNull();
+    });
+
+    test("a valid first-pos past the end stays unsatisfiable", () => {
+        expect(parseRangeHeader("bytes=20-30", 10)).toBe("unsatisfiable");
+        expect(parseRangeHeader("bytes=20-", 10)).toBe("unsatisfiable");
+        expect(parseRanges("bytes=20-30,40-50", 10)).toBe("unsatisfiable");
+        expect(parseRanges("bytes=20-30,0-1", 10)).toEqual({ ranges: [{ start: 0, end: 1 }] });
+    });
+});
+
 describe("parseRanges", () => {
     test("single range returns a one-element set", () => {
         const r = parseRanges("bytes=0-9", 100);
@@ -3158,7 +2801,12 @@ describe("parseRanges", () => {
 
     test("disjoint ranges are returned in REQUEST order (RFC 9110 15.3.7.2 SHOULD)", () => {
         const r = parseRanges("bytes=500-509,0-9", 1000);
-        expect(r).toEqual({ ranges: [{ start: 500, end: 509 }, { start: 0, end: 9 }] });
+        expect(r).toEqual({
+            ranges: [
+                { start: 500, end: 509 },
+                { start: 0, end: 9 },
+            ],
+        });
     });
 
     test("overlapping ranges are coalesced", () => {
@@ -3179,17 +2827,25 @@ describe("parseRanges", () => {
     });
 
     test("a gap of exactly the 80-byte overhead is bridged; 81 is not", () => {
-        expect(parseRanges("bytes=0-9,90-99", 1000))
-            .toEqual({ ranges: [{ start: 0, end: 99 }] });
-        expect(parseRanges("bytes=0-9,91-99", 1000))
-            .toEqual({ ranges: [{ start: 0, end: 9 }, { start: 91, end: 99 }] });
+        expect(parseRanges("bytes=0-9,90-99", 1000)).toEqual({ ranges: [{ start: 0, end: 99 }] });
+        expect(parseRanges("bytes=0-9,91-99", 1000)).toEqual({
+            ranges: [
+                { start: 0, end: 9 },
+                { start: 91, end: 99 },
+            ],
+        });
     });
 
     test("a coalesced part inherits its earliest contributor's request position", () => {
         // 500-509 appears first; 0-9 and 80-89 (later specs) merge into 0-89,
         // whose position is that of 0-9 (second spec) -> after 500-509.
         const r = parseRanges("bytes=500-509,0-9,80-89", 1000);
-        expect(r).toEqual({ ranges: [{ start: 500, end: 509 }, { start: 0, end: 89 }] });
+        expect(r).toEqual({
+            ranges: [
+                { start: 500, end: 509 },
+                { start: 0, end: 89 },
+            ],
+        });
     });
 
     test("all-unsatisfiable ranges yield 416", () => {
@@ -3207,7 +2863,12 @@ describe("parseRanges", () => {
 
     test("empty list elements are skipped per the RFC list rule", () => {
         const r = parseRanges("bytes=0-9,,200-209", 1000);
-        expect(r).toEqual({ ranges: [{ start: 0, end: 9 }, { start: 200, end: 209 }] });
+        expect(r).toEqual({
+            ranges: [
+                { start: 0, end: 9 },
+                { start: 200, end: 209 },
+            ],
+        });
     });
 
     test("amplification: more coalesced parts than maxRanges degrades to 200", () => {
@@ -3220,15 +2881,13 @@ describe("parseRanges", () => {
         // 0-9 + 10-19 merge into 0-19, the entire 20-byte object: served as a
         // plain single 206 (no multipart framing), never degraded to 200 --
         // consistent with how parseRangeHeader treats "bytes=0-".
-        expect(parseRanges("bytes=0-9,10-19", 20))
-            .toEqual({ ranges: [{ start: 0, end: 19 }] });
+        expect(parseRanges("bytes=0-9,10-19", 20)).toEqual({ ranges: [{ start: 0, end: 19 }] });
     });
 
     test("a single satisfiable range behaves exactly like parseRangeHeader", () => {
         // Trailing comma routes "bytes=0-" through the multi-range parser;
         // it must still yield the same open-ended seek, not degrade to 200.
-        expect(parseRanges("bytes=0-,", 100))
-            .toEqual({ ranges: [{ start: 0, end: 99 }] });
+        expect(parseRanges("bytes=0-,", 100)).toEqual({ ranges: [{ start: 0, end: 99 }] });
     });
 
     test("non-bytes unit is ignored (serve 200)", () => {
@@ -3291,9 +2950,15 @@ describe("multipart/byteranges builders", () => {
 
     test("top-level headers are multipart/byteranges with an EXACT Content-Length", () => {
         const boundary = "BXYZ";
-        const ranges = [{ start: 0, end: 4 }, { start: 10, end: 14 }];
+        const ranges = [
+            { start: 0, end: 4 },
+            { start: 10, end: 14 },
+        ];
         const { status, headers, contentLength } = buildMultipartHeaders({
-            boundary, ranges, totalSize: 100, contentType: "text/plain",
+            boundary,
+            ranges,
+            totalSize: 100,
+            contentType: "text/plain",
             etag: '"v1"',
         });
 
@@ -3317,8 +2982,11 @@ describe("multipart/byteranges builders", () => {
 
     test("Repr-Digest is emitted but Content-Digest is not (partial response)", () => {
         const { headers } = buildMultipartHeaders({
-            boundary: "B", ranges: [{ start: 0, end: 4 }], totalSize: 100,
-            contentType: "application/pdf", digest: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
+            boundary: "B",
+            ranges: [{ start: 0, end: 4 }],
+            totalSize: 100,
+            contentType: "application/pdf",
+            digest: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
         });
         expect(headers["Repr-Digest"]).toBe("sha-256=:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=:");
         expect(headers["Content-Digest"]).toBeUndefined();
@@ -3328,48 +2996,83 @@ describe("multipart/byteranges builders", () => {
     // The precomputed Content-Length arithmetic assumes a non-negative safe
     // integer; a corrupt size must throw, never silently emit a wrong length.
     test("throws RangeError for NaN totalSize", () => {
-        expect(() => buildMultipartHeaders({
-            boundary: "B", ranges: [{ start: 0, end: 4 }], totalSize: NaN, contentType: "text/plain",
-        })).toThrow(RangeError);
+        expect(() =>
+            buildMultipartHeaders({
+                boundary: "B",
+                ranges: [{ start: 0, end: 4 }],
+                totalSize: NaN,
+                contentType: "text/plain",
+            }),
+        ).toThrow(RangeError);
     });
 
     test("throws RangeError for fractional totalSize", () => {
-        expect(() => buildMultipartHeaders({
-            boundary: "B", ranges: [{ start: 0, end: 4 }], totalSize: 100.5, contentType: "text/plain",
-        })).toThrow(RangeError);
+        expect(() =>
+            buildMultipartHeaders({
+                boundary: "B",
+                ranges: [{ start: 0, end: 4 }],
+                totalSize: 100.5,
+                contentType: "text/plain",
+            }),
+        ).toThrow(RangeError);
     });
 
     test("throws RangeError for negative totalSize", () => {
-        expect(() => buildMultipartHeaders({
-            boundary: "B", ranges: [{ start: 0, end: 4 }], totalSize: -1, contentType: "text/plain",
-        })).toThrow(RangeError);
+        expect(() =>
+            buildMultipartHeaders({
+                boundary: "B",
+                ranges: [{ start: 0, end: 4 }],
+                totalSize: -1,
+                contentType: "text/plain",
+            }),
+        ).toThrow(RangeError);
     });
 
     // ── range-bounds guard (parity with buildRangeResponseHeaders) ──────────
     // A part whose bounds the range parser could never produce must throw
     // rather than serialize an invalid Content-Range into the framing.
     test("throws RangeError for a part end at/past totalSize", () => {
-        expect(() => buildMultipartHeaders({
-            boundary: "B", ranges: [{ start: 0, end: 999 }], totalSize: 500, contentType: "text/plain",
-        })).toThrow(RangeError);
+        expect(() =>
+            buildMultipartHeaders({
+                boundary: "B",
+                ranges: [{ start: 0, end: 999 }],
+                totalSize: 500,
+                contentType: "text/plain",
+            }),
+        ).toThrow(RangeError);
     });
 
     test("throws RangeError for inverted and negative part bounds", () => {
-        expect(() => buildMultipartHeaders({
-            boundary: "B", ranges: [{ start: 10, end: 4 }], totalSize: 100, contentType: "text/plain",
-        })).toThrow(RangeError);
-        expect(() => buildMultipartHeaders({
-            boundary: "B", ranges: [{ start: -1, end: 4 }], totalSize: 100, contentType: "text/plain",
-        })).toThrow(RangeError);
+        expect(() =>
+            buildMultipartHeaders({
+                boundary: "B",
+                ranges: [{ start: 10, end: 4 }],
+                totalSize: 100,
+                contentType: "text/plain",
+            }),
+        ).toThrow(RangeError);
+        expect(() =>
+            buildMultipartHeaders({
+                boundary: "B",
+                ranges: [{ start: -1, end: 4 }],
+                totalSize: 100,
+                contentType: "text/plain",
+            }),
+        ).toThrow(RangeError);
     });
 
     test("throws RangeError when the OPEN_ENDED sentinel reaches the framing", () => {
-        expect(() => buildMultipartHeaders({
-            boundary: "B", ranges: [{ start: 0, end: OPEN_ENDED }], totalSize: 100, contentType: "text/plain",
-        })).toThrow(RangeError);
+        expect(() =>
+            buildMultipartHeaders({
+                boundary: "B",
+                ranges: [{ start: 0, end: OPEN_ENDED }],
+                totalSize: 100,
+                contentType: "text/plain",
+            }),
+        ).toThrow(RangeError);
     });
 
-    // ── boundary guard ───────────────────────────────────────────────────────
+    // ── boundary guard ──────────────────────────────────────────────────────
     // The boundary lands in the Content-Type header AND the body framing the
     // Content-Length was computed against, so an invalid token throws instead
     // of being silently sanitized into a desynced value.
@@ -3445,7 +3148,9 @@ describe("builder input validation (grammar-invalid Content-Range prevention)", 
             buildRangeResponseHeaders({
                 totalSize: undefined,
                 range: { start: 0, end: OPEN_ENDED },
-                contentType: undefined, etag: undefined, lastModified: undefined,
+                contentType: undefined,
+                etag: undefined,
+                lastModified: undefined,
             }),
         ).toThrow(RangeError);
     });
@@ -3455,7 +3160,9 @@ describe("builder input validation (grammar-invalid Content-Range prevention)", 
             buildRangeResponseHeaders({
                 totalSize: 100,
                 range: { start: 0, end: 100 },
-                contentType: undefined, etag: undefined, lastModified: undefined,
+                contentType: undefined,
+                etag: undefined,
+                lastModified: undefined,
             }),
         ).toThrow(RangeError);
     });
@@ -3465,14 +3172,18 @@ describe("builder input validation (grammar-invalid Content-Range prevention)", 
             buildRangeResponseHeaders({
                 totalSize: 100,
                 range: { start: 10, end: 5 },
-                contentType: undefined, etag: undefined, lastModified: undefined,
+                contentType: undefined,
+                etag: undefined,
+                lastModified: undefined,
             }),
         ).toThrow(RangeError);
         expect(() =>
             buildRangeResponseHeaders({
                 totalSize: 100,
                 range: { start: -1, end: 5 },
-                contentType: undefined, etag: undefined, lastModified: undefined,
+                contentType: undefined,
+                etag: undefined,
+                lastModified: undefined,
             }),
         ).toThrow(RangeError);
     });
@@ -3496,7 +3207,10 @@ describe("buildMultipartHeaders top-level metadata", () => {
     test("normalizes ISO Last-Modified to IMF-fixdate and emits Cache-Control", () => {
         const { headers } = buildMultipartHeaders({
             boundary: "B",
-            ranges: [{ start: 0, end: 4 }, { start: 100, end: 104 }],
+            ranges: [
+                { start: 0, end: 4 },
+                { start: 100, end: 104 },
+            ],
             totalSize: 200,
             contentType: "application/pdf",
             lastModified: "2025-06-28T12:00:00.500Z",
@@ -3518,5 +3232,242 @@ describe("generateMultipartBoundary fallback (no crypto.randomUUID)", () => {
         } finally {
             Object.defineProperty(globalThis.crypto, "randomUUID", { value: original, configurable: true });
         }
+    });
+});
+
+// ── Custom store metadata carrying the retired names ───────────────────────
+
+describe("generateETag - a retired name next to its replacement", () => {
+    test("custom metadata with size and mtime beside contentLength and lastModified is read", () => {
+        // A custom store's HEAD result is passed whole; extra fields of its own
+        // that happen to share a retired name must not refuse the call when the
+        // field generateETag actually reads is present.
+        expect(
+            fromUncheckedCaller({ contentLength: 1000, lastModified: 1_000_000, size: 1000, mtime: 1_000_000 }),
+        ).toBe('W/"3e8-3e8"');
+    });
+
+    test("hash beside etag is read as the etag", () => {
+        expect(fromUncheckedCaller({ etag: '"v1"', hash: "abc", contentLength: 1 })).toBe('"v1"');
+    });
+
+    test("an inherited retired name is not an argument the caller wrote", () => {
+        const proto = { hash: "abc" };
+        const meta = Object.assign(Object.create(proto) as Record<string, unknown>, { contentLength: 1 });
+        expect(() => fromUncheckedCaller(meta)).not.toThrow();
+    });
+
+    test("a retired name whose replacement is absent still throws", () => {
+        expect(() => fromUncheckedCaller({ contentLength: 1, hash: "abc" })).toThrow(TypeError);
+    });
+});
+
+// ── Last-Modified is never later than the response (RFC 9110 8.8.2.1) ───────
+
+describe("a future Last-Modified is clamped to now", () => {
+    const NOW = new Date("2025-06-28T12:00:00.000Z");
+    const NOW_HTTP = "Sat, 28 Jun 2025 12:00:00 GMT";
+    const FUTURE = "2025-06-28T13:00:00.000Z";
+
+    function atNow<T>(fn: () => T): T {
+        setSystemTime(NOW);
+        try {
+            return fn();
+        } finally {
+            setSystemTime();
+        }
+    }
+
+    test("evaluateConditionalRequest emits now, not the future date", () => {
+        const res = atNow(() => evaluateConditionalRequest(mockHeaders({}), { totalSize: 5, lastModified: FUTURE }));
+        expect(res.headers["Last-Modified"]).toBe(NOW_HTTP);
+    });
+
+    test("buildRangeResponseHeaders, build304Headers and buildMultipartHeaders clamp too", () => {
+        atNow(() => {
+            const full = buildRangeResponseHeaders({
+                totalSize: 5,
+                range: null,
+                contentType: undefined,
+                etag: undefined,
+                lastModified: FUTURE,
+            });
+            expect(full.headers["Last-Modified"]).toBe(NOW_HTTP);
+            expect(build304Headers(undefined, FUTURE).headers["Last-Modified"]).toBe(NOW_HTTP);
+            const multi = buildMultipartHeaders({
+                boundary: "B",
+                ranges: [
+                    { start: 0, end: 0 },
+                    { start: 3, end: 4 },
+                ],
+                totalSize: 5,
+                contentType: undefined,
+                lastModified: FUTURE,
+            });
+            expect(multi.headers["Last-Modified"]).toBe(NOW_HTTP);
+        });
+    });
+
+    test("If-Modified-Since echoing the clamped value revalidates to 304", () => {
+        const res = atNow(() =>
+            evaluateConditionalRequest(mockHeaders({ "if-modified-since": NOW_HTTP }), {
+                totalSize: 5,
+                lastModified: FUTURE,
+            }),
+        );
+        expect(res.status).toBe(304);
+    });
+
+    test("If-Unmodified-Since at the clamped value does not fail the precondition", () => {
+        const res = atNow(() =>
+            evaluateConditionalRequest(mockHeaders({ "if-unmodified-since": NOW_HTTP }), {
+                totalSize: 5,
+                lastModified: FUTURE,
+            }),
+        );
+        expect(res.status).toBe(200);
+    });
+
+    test("a past Last-Modified is emitted unchanged", () => {
+        const res = atNow(() =>
+            evaluateConditionalRequest(mockHeaders({}), { totalSize: 5, lastModified: "2025-06-28T11:00:00.000Z" }),
+        );
+        expect(res.headers["Last-Modified"]).toBe("Sat, 28 Jun 2025 11:00:00 GMT");
+    });
+});
+
+// ── A zoneless ISO timestamp is UTC ─────────────────────────────────────────
+
+describe("a zoneless ISO lastModified is read as UTC", () => {
+    function inZone<T>(tz: string, fn: () => T): T {
+        const prev = process.env.TZ;
+        process.env.TZ = tz;
+        try {
+            return fn();
+        } finally {
+            if (prev === undefined) delete process.env.TZ;
+            else process.env.TZ = prev;
+        }
+    }
+
+    test("Last-Modified does not shift with the server's zone", () => {
+        for (const tz of ["America/New_York", "Asia/Tokyo"]) {
+            const res = inZone(tz, () =>
+                evaluateConditionalRequest(mockHeaders({}), { totalSize: 5, lastModified: "2025-06-29T12:00:00" }),
+            );
+            expect(res.headers["Last-Modified"]).toBe("Sun, 29 Jun 2025 12:00:00 GMT");
+        }
+    });
+
+    test("a space-separated date-time is UTC as well", () => {
+        const res = inZone("America/New_York", () =>
+            evaluateConditionalRequest(mockHeaders({}), { totalSize: 5, lastModified: "2025-06-29 12:00:00" }),
+        );
+        expect(res.headers["Last-Modified"]).toBe("Sun, 29 Jun 2025 12:00:00 GMT");
+    });
+
+    test("the weak ETag agrees with the explicit-UTC spelling", () => {
+        const zoneless = inZone("America/New_York", () =>
+            generateETag({ contentLength: 5, lastModified: "2025-06-29T12:00:00" }),
+        );
+        expect(zoneless).toBe(generateETag({ contentLength: 5, lastModified: "2025-06-29T12:00:00Z" }));
+    });
+});
+
+// ── One normalized entity-tag for emit and compare (RFC 9110 8.8.3) ─────────
+
+describe("the emitted ETag is the compared ETag", () => {
+    test("an unquoted store etag is emitted quoted and matches its quoted echo", () => {
+        const fresh = evaluateConditionalRequest(mockHeaders({}), { totalSize: 5, etag: "abc" });
+        expect(fresh.headers["ETag"]).toBe('"abc"');
+        const revalidated = evaluateConditionalRequest(mockHeaders({ "if-none-match": '"abc"' }), {
+            totalSize: 5,
+            etag: "abc",
+        });
+        expect(revalidated.status).toBe(304);
+        expect(revalidated.headers["ETag"]).toBe('"abc"');
+    });
+
+    test("an etag with bytes outside etagc is compared in its sanitized form", () => {
+        const etag = '"a\u0001b"';
+        expect(evaluateConditionalRequest(mockHeaders({}), { totalSize: 5, etag }).headers["ETag"]).toBe('"ab"');
+        expect(
+            evaluateConditionalRequest(mockHeaders({ "if-none-match": '"ab"' }), { totalSize: 5, etag }).status,
+        ).toBe(304);
+        expect(evaluateConditionalRequest(mockHeaders({ "if-match": '"ab"' }), { totalSize: 5, etag }).status).toBe(
+            200,
+        );
+    });
+
+    test("the predicates and builders normalize the same way", () => {
+        expect(isPreconditionFailure(mockHeaders({ "if-match": '"abc"' }), "abc", undefined)).toBe(false);
+        expect(isConditionalFresh(mockHeaders({ "if-none-match": '"abc"' }), "abc", undefined)).toBe(true);
+        expect(isRangeFresh(mockHeaders({ "if-range": '"abc"' }), "abc", undefined)).toBe(true);
+        expect(build304Headers("abc", undefined).headers["ETag"]).toBe('"abc"');
+        expect(
+            buildRangeResponseHeaders({
+                totalSize: 5,
+                range: null,
+                contentType: undefined,
+                etag: "W/abc",
+                lastModified: undefined,
+            }).headers["ETag"],
+        ).toBe('W/"abc"');
+        expect(evaluateConditionalWrite(mockHeaders({ "if-match": '"abc"' }), { etag: "abc" })).toEqual({
+            proceed: true,
+        });
+    });
+});
+
+// ── Hand-supplied multipart boundaries ──────────────────────────────────────
+
+describe("a hand-supplied boundary outside token is quoted in Content-Type", () => {
+    const base = { ranges: [{ start: 0, end: 0 }], totalSize: 5, contentType: undefined };
+
+    test.each(["a:b", "a b", "x=y", "(z)", "p/q", "w?v", "c,d"])("%s is quoted", (boundary) => {
+        expect(buildMultipartHeaders({ ...base, boundary }).headers["Content-Type"]).toBe(
+            `multipart/byteranges; boundary="${boundary}"`,
+        );
+    });
+
+    test("a token boundary stays bare", () => {
+        expect(buildMultipartHeaders({ ...base, boundary: "abc'+_.-9" }).headers["Content-Type"]).toBe(
+            "multipart/byteranges; boundary=abc'+_.-9",
+        );
+    });
+});
+
+// ── Range-count cap ─────────────────────────────────────────────────────────
+
+describe("the multi-range cap", () => {
+    // Nine parts, each farther apart than the coalescing gap.
+    const nine = `bytes=${Array.from({ length: 9 }, (_, i) => `${i * 200}-${i * 200}`).join(",")}`;
+    const eight = `bytes=${Array.from({ length: 8 }, (_, i) => `${i * 200}-${i * 200}`).join(",")}`;
+
+    test("defaults to 8 distinct parts", () => {
+        expect(MAX_RANGES_DEFAULT).toBe(8);
+        expect(parseRanges(nine, 10_000)).toBeNull();
+        expect(parseRanges(eight, 10_000)).not.toBeNull();
+    });
+
+    test("a NaN cap fails closed to the full response", () => {
+        expect(parseRanges(nine, 10_000, Number.NaN)).toBeNull();
+    });
+});
+
+// ── Content-Range with an unknown total ─────────────────────────────────────
+
+describe("parseContentRange unknown total", () => {
+    test("`*` is reported as an undefined totalSize", () => {
+        expect(parseContentRange("bytes 0-4/*")).toEqual({ start: 0, end: 4, totalSize: undefined });
+    });
+});
+
+// ── Write-side statuses ─────────────────────────────────────────────────────
+
+describe("EvaluatedWrite status", () => {
+    test("admits 428 Precondition Required (RFC 6585 Section 3)", () => {
+        const required: EvaluatedWrite = { proceed: false, status: 428, headers: {} };
+        expect(required.proceed).toBe(false);
     });
 });

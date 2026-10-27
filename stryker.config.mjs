@@ -1,5 +1,5 @@
 /**
- * Mutation-testing config for @nordvec/partial-content.
+ * Mutation-testing config for partial-content.
  *
  * Bun has no native StrykerJS test-runner plugin, so we drive the real suite
  * through the `command` runner (`bun test`). That means no per-test coverage
@@ -45,10 +45,10 @@ export default {
     reporters: ["clear-text", "json"],
     jsonReporter: { fileName: "reports/mutation/partial-content.json" },
 
-    // Incremental locally (fast re-runs while iterating); disabled in CI where
-    // the checkout is fresh and a full, deterministic evaluation is wanted.
-    incremental: process.env.STRYKER_INCREMENTAL !== "false",
-    incrementalFile: "reports/mutation/stryker-incremental.json",
+    // Never incremental: the command runner reports one test with no file, so
+    // Stryker cannot see a test change and reuses every earlier result after
+    // one, which is exactly the run that iterates on survivors.
+    incremental: false,
     tempDirName: ".stryker-tmp",
     cleanTempDir: true,
 

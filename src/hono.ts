@@ -24,6 +24,7 @@
 
 import { serveObject as serveObjectWeb, type ServeObjectOptions, type ServeContext } from "./web.ts";
 import type { ObjectStore } from "./index.ts";
+import { projectError } from "./object-store.ts";
 
 // Re-export for convenience
 export type { ServeObjectOptions, ServeContext } from "./web.ts";
@@ -41,12 +42,12 @@ export type { ObjectStore } from "./index.ts";
  * published package.
  */
 interface HonoContext {
-  req: {
-    raw: Request;
-    param: (name: string) => string;
-    header: (name: string) => string | undefined;
-    method: string;
-  };
+    req: {
+        raw: Request;
+        param: (name: string) => string;
+        header: (name: string) => string | undefined;
+        method: string;
+    };
 }
 
 /** Hono handler return type. */
@@ -55,36 +56,36 @@ type HonoResponse = Response | Promise<Response>;
 // ─── Options ────────────────────────────────────────────────────────────────
 
 export interface HonoServeOptions extends ServeObjectOptions {
-  /**
-   * Extract the storage key from the Hono context.
-   *
-   * @example
-   * ```ts
-   * key: (c) => c.req.param("key")
-   * key: (c) => c.req.param("path")
-   * ```
-   */
-  key: (c: HonoContext) => string | Promise<string>;
+    /**
+     * Extract the storage key from the Hono context.
+     *
+     * @example
+     * ```ts
+     * key: (c) => c.req.param("key")
+     * key: (c) => c.req.param("path")
+     * ```
+     */
+    key: (c: HonoContext) => string | Promise<string>;
 
-  /**
-   * Extract the MIME type from the Hono context.
-   * When omitted, defaults to "application/octet-stream".
-   */
-  mime?: (c: HonoContext) => string | undefined;
+    /**
+     * Extract the MIME type from the Hono context.
+     * When omitted, defaults to "application/octet-stream".
+     */
+    mime?: (c: HonoContext) => string | undefined;
 
-  /**
-   * Extract the filename from the Hono context (for Content-Disposition).
-   * When omitted, no filename is set.
-   */
-  filename?: (c: HonoContext) => string | undefined;
+    /**
+     * Extract the filename from the Hono context (for Content-Disposition).
+     * When omitted, no filename is set.
+     */
+    filename?: (c: HonoContext) => string | undefined;
 
-  /**
-   * Extract an audit-safe identifier reported as `key` in every
-   * `onServe`/`onTransfer`/`onError` event instead of the storage key
-   * (which commonly embeds a filename -- personal data that must stay out
-   * of log records). The store still reads by the real key.
-   */
-  auditKey?: (c: HonoContext) => string | undefined;
+    /**
+     * Extract an audit-safe identifier reported as `key` in every
+     * `onServe`/`onTransfer`/`onError` event instead of the storage key
+     * (which commonly embeds a filename -- personal data that must stay out
+     * of log records). The store still reads by the real key.
+     */
+    auditKey?: (c: HonoContext) => string | undefined;
 }
 
 // ─── Factory ────────────────────────────────────────────────────────────────
@@ -111,40 +112,38 @@ export interface HonoServeOptions extends ServeObjectOptions {
  * }));
  * ```
  */
-export function serveObject(
-  store: ObjectStore,
-  opts: HonoServeOptions,
-): (c: HonoContext) => HonoResponse {
-  const { key: keyFn, mime: mimeFn, filename: filenameFn, auditKey: auditKeyFn, ...serveOpts } = opts;
-  const handler = serveObjectWeb(store, serveOpts);
+export function serveObject(store: ObjectStore, opts: HonoServeOptions): (c: HonoContext) => HonoResponse {
+    const { key: keyFn, mime: mimeFn, filename: filenameFn, auditKey: auditKeyFn, ...serveOpts } = opts;
+    const handler = serveObjectWeb(store, serveOpts);
 
-  return async function honoHandler(c: HonoContext): Promise<Response> {
-    let ctx: ServeContext;
-    try {
-      ctx = {
-        key: await keyFn(c),
-        mime: mimeFn?.(c),
-        filename: filenameFn?.(c),
-        auditKey: auditKeyFn?.(c),
-      };
-    } catch (err) {
-      // A throwing extractor is consumer code failing: surface it to the
-      // consumer's telemetry (the response body stays generic), with the
-      // same error-hygiene headers every other error response carries.
-      // `onError` reports the `context` operation on every adapter, so a
-      // consumer's telemetry does not depend on which one they mounted.
-      serveOpts.onError?.(err, { key: "", operation: "context" });
-      return new Response("Internal Server Error", {
-        status: 500,
-        headers: {
-          "Content-Type": "text/plain; charset=utf-8",
-          "X-Content-Type-Options": "nosniff",
-          "Cache-Control": "no-store",
-          "Content-Security-Policy": "default-src 'none'",
-        },
-      });
-    }
+    return async function honoHandler(c: HonoContext): Promise<Response> {
+        let ctx: ServeContext;
+        try {
+            ctx = {
+                key: await keyFn(c),
+                mime: mimeFn?.(c),
+                filename: filenameFn?.(c),
+                auditKey: auditKeyFn?.(c),
+            };
+        } catch (err) {
+            // A throwing extractor is consumer code failing: surface it to the
+            // consumer's telemetry (the response body stays generic), with the
+            // same error-hygiene headers every other error response carries.
+            // `onError` reports the `context` operation on every adapter, so a
+            // consumer's telemetry does not depend on which one they mounted.
+            // Under an auditKey it is the projection: the raw error may name the key.
+            serveOpts.onError?.(auditKeyFn ? projectError(err, "context") : err, { key: "", operation: "context" });
+            return new Response("Internal Server Error", {
+                status: 500,
+                headers: {
+                    "Content-Type": "text/plain; charset=utf-8",
+                    "Content-Security-Policy": "default-src 'none'",
+                    "X-Content-Type-Options": "nosniff",
+                    "Cache-Control": "no-store",
+                },
+            });
+        }
 
-    return handler(c.req.raw, ctx);
-  };
+        return handler(c.req.raw, ctx);
+    };
 }

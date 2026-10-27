@@ -1,6 +1,14 @@
 import { describe, test, expect } from "bun:test";
-import { serveObject, serveObjectRaw, type ServeAuditEvent, type TransferEvent } from "../web";
-import { OPEN_ENDED, ObjectNotFoundError, StoreUnavailableError } from "../index";
+import {
+    serveObject,
+    serveObjectRaw,
+    type ServeAuditEvent,
+    type ServeErrorContext,
+    type ServeObjectOptions,
+    type TransferEvent,
+} from "../web";
+import { OPEN_ENDED, ObjectNotFoundError, StoreUnavailableError, isInlineSafeMediaType } from "../index";
+import { lookupMime } from "../mime";
 import type { ObjectStore, ObjectMetadata, ObjectStream, ParsedRange } from "../index";
 import { memoryStore as kvStore } from "../memory";
 
@@ -33,7 +41,10 @@ interface MemoryStoreOpts {
     digest?: string;
     /** Override the served range the GET result reports (TOCTOU tests). */
     rangeOverride?: { start: number; end: number } | null;
-    /** Throw this error from headObject/getObject. */
+    /**
+     * Reject headObject/getObject with this value, verbatim: classification is
+     * duck-typed, so the fixtures hand it strings, plain objects and null.
+     */
     error?: unknown;
     /** Record calls for assertions. */
     calls?: string[];
@@ -67,7 +78,8 @@ function memoryStore(opts: MemoryStoreOpts = {}): ObjectStore {
 
         async headObject(key: string): Promise<ObjectMetadata> {
             opts.calls?.push(`head:${key}`);
-            if (opts.error) throw opts.error;
+            // oxlint-disable-next-line typescript/only-throw-error -- the fixture value is rethrown as given (see `error`)
+            if ("error" in opts) throw opts.error;
             return {
                 contentLength: data.length,
                 etag: opts.etag,
@@ -79,14 +91,16 @@ function memoryStore(opts: MemoryStoreOpts = {}): ObjectStore {
         async getObject(key: string, getOpts?: { range?: ParsedRange; ifMatch?: string }): Promise<ObjectStream> {
             const range = getOpts?.range;
             opts.calls?.push(`get:${key}:${range ? `${range.start}-${range.end}` : "full"}`);
-            if (opts.error) throw opts.error;
+            // oxlint-disable-next-line typescript/only-throw-error -- the fixture value is rethrown as given (see `error`)
+            if ("error" in opts) throw opts.error;
 
             const slice = range ? data.slice(range.start, range.end + 1) : data;
-            const served = opts.rangeOverride !== undefined
-                ? (opts.rangeOverride ?? undefined)
-                : range
-                    ? { start: range.start, end: range.end }
-                    : undefined;
+            const served =
+                opts.rangeOverride !== undefined
+                    ? (opts.rangeOverride ?? undefined)
+                    : range
+                      ? { start: range.start, end: range.end }
+                      : undefined;
 
             return {
                 body: streamOf(slice),
@@ -259,11 +273,14 @@ describe("serveObject: range requests", () => {
         let cancelled = false;
         const stream = streamOf(bytesOf("0123456789"));
         const origCancel = stream.cancel.bind(stream);
-        stream.cancel = (reason?: unknown) => { cancelled = true; return origCancel(reason); };
+        stream.cancel = (reason?: unknown) => {
+            cancelled = true;
+            return origCancel(reason);
+        };
         const store = memoryStore({ etag: ETAG });
         store.getObject = async () => ({
             body: stream,
-            contentLength: 10,           // 10 bytes...
+            contentLength: 10, // 10 bytes...
             totalSize: 20,
             range: { start: 0, end: 4 }, // ...but the span is 5
             etag: ETAG,
@@ -281,12 +298,15 @@ describe("serveObject: range requests", () => {
         let cancelled = false;
         const stream = streamOf(bytesOf("0123456789"));
         const origCancel = stream.cancel.bind(stream);
-        stream.cancel = (reason?: unknown) => { cancelled = true; return origCancel(reason); };
+        stream.cancel = (reason?: unknown) => {
+            cancelled = true;
+            return origCancel(reason);
+        };
         const store = memoryStore({ etag: ETAG });
         store.getObject = async () => ({
             body: stream,
-            contentLength: 10,   // body is 10 bytes...
-            totalSize: 20,       // ...but the full size is advertised as 20
+            contentLength: 10, // body is 10 bytes...
+            totalSize: 20, // ...but the full size is advertised as 20
             etag: ETAG,
         });
         const handler = serveObject(store);
@@ -296,21 +316,43 @@ describe("serveObject: range requests", () => {
         expect(cancelled).toBe(true);
     });
 
+    test("a byte body shorter than its own claimed count fails loudly with 502, on a 200 and on a single range", async () => {
+        // The claimed count agrees with the span, so only the body's REAL
+        // length gives it away. A stream settles its count as it drains; a
+        // byte body is written whole after the Content-Length is committed,
+        // so a short one is a truncated response the client cannot tell from
+        // a complete one. The multipart path checked this per part; the two
+        // hot paths did not.
+        const store = memoryStore({ etag: ETAG });
+        store.getObject = async (_key, opts) =>
+            opts?.range
+                ? { body: new Uint8Array(3), contentLength: 5, totalSize: 20, range: { start: 0, end: 4 }, etag: ETAG }
+                : { body: new Uint8Array(10), contentLength: 20, totalSize: 20, etag: ETAG };
+        const errors: unknown[] = [];
+        let served = 0;
+        const handler = serveObject(store, {
+            onError: (err) => errors.push(err),
+            onServe: () => {
+                served++;
+            },
+        });
+
+        expect((await handler(req(), { key: KEY })).status).toBe(502);
+        expect((await handler(req({ Range: "bytes=0-4" }), { key: KEY })).status).toBe(502);
+        expect(errors).toHaveLength(2);
+        expect(String(errors[0])).toContain("body=10");
+        expect(served).toBe(0);
+    });
+
     test("If-Range with matching strong ETag honors the range", async () => {
         const handler = serveObject(memoryStore({ etag: ETAG }));
-        const res = await handler(
-            req({ Range: "bytes=0-9", "If-Range": ETAG }),
-            { key: KEY },
-        );
+        const res = await handler(req({ Range: "bytes=0-9", "If-Range": ETAG }), { key: KEY });
         expect(res.status).toBe(206);
     });
 
     test("If-Range with stale ETag ignores the range and serves 200", async () => {
         const handler = serveObject(memoryStore({ etag: ETAG }));
-        const res = await handler(
-            req({ Range: "bytes=0-9", "If-Range": '"old-version"' }),
-            { key: KEY },
-        );
+        const res = await handler(req({ Range: "bytes=0-9", "If-Range": '"old-version"' }), { key: KEY });
         expect(res.status).toBe(200);
         expect(await res.text()).toBe("0123456789abcdefghij");
     });
@@ -336,10 +378,7 @@ describe("serveObject: conditional requests", () => {
 
     test("If-Modified-Since not-modified returns 304", async () => {
         const handler = serveObject(memoryStore({ lastModified: LAST_MODIFIED }));
-        const res = await handler(
-            req({ "If-Modified-Since": "Sun, 29 Jun 2025 12:00:00 GMT" }),
-            { key: KEY },
-        );
+        const res = await handler(req({ "If-Modified-Since": "Sun, 29 Jun 2025 12:00:00 GMT" }), { key: KEY });
         expect(res.status).toBe(304);
     });
 });
@@ -403,10 +442,9 @@ describe("serveObject: error handling", () => {
 
     test("store failure returns 502 with truthful Content-Length and fires onError", async () => {
         const errors: Array<{ key: string; operation: string }> = [];
-        const handler = serveObject(
-            memoryStore({ error: new Error("connection refused") }),
-            { onError: (_err, ctx) => errors.push(ctx) },
-        );
+        const handler = serveObject(memoryStore({ error: new Error("connection refused") }), {
+            onError: (_err, ctx) => errors.push(ctx),
+        });
         const res = await handler(req(), { key: KEY });
 
         expect(res.status).toBe(502);
@@ -453,7 +491,9 @@ describe("serveObject: supportsRange=false degradation", () => {
         const store: ObjectStore = {
             supportsRange: false,
             headObject: async () => ({ contentLength: 1 }),
-            getObject: async () => { throw new Error("unreachable"); },
+            getObject: async () => {
+                throw new Error("unreachable");
+            },
             createSignedUrl: async () => ({ ok: true, url: "https://cdn.example/signed" }),
         };
         const handler = serveObject(store);
@@ -468,7 +508,9 @@ describe("serveObject: supportsRange=false degradation", () => {
         const store: ObjectStore = {
             supportsRange: false,
             headObject: async () => ({ contentLength: 1 }),
-            getObject: async () => { throw new Error("unreachable"); },
+            getObject: async () => {
+                throw new Error("unreachable");
+            },
             createSignedUrl: async () => ({ ok: true, url: "https://cdn/x\r\nSet-Cookie: evil=1" }),
         };
         const handler = serveObject(store);
@@ -484,7 +526,9 @@ describe("serveObject: supportsRange=false degradation", () => {
         const store: ObjectStore = {
             supportsRange: false,
             headObject: async () => ({ contentLength: 1 }),
-            getObject: async () => { throw new Error("unreachable"); },
+            getObject: async () => {
+                throw new Error("unreachable");
+            },
         };
         const handler = serveObject(store);
         const res = await handler(req(), { key: KEY });
@@ -498,7 +542,9 @@ describe("serveObject: supportsRange=false degradation", () => {
         return {
             supportsRange: false,
             headObject: async () => ({ contentLength: 20, etag: '"v1"' }),
-            getObject: async () => { throw new Error("unreachable"); },
+            getObject: async () => {
+                throw new Error("unreachable");
+            },
             createSignedUrl: async (_key, opts) => {
                 signedCalls.push(opts);
                 return { ok: true, url: "https://cdn.example/signed" };
@@ -565,8 +611,12 @@ describe("serveObject: audit and headers", () => {
 
         expect(events).toHaveLength(1);
         expect(events[0]).toMatchObject({
-            key: KEY, status: 206, mime: "video/mp4",
-            bytesServed: 5, rangeStart: 5, rangeEnd: 9,
+            key: KEY,
+            status: 206,
+            mime: "video/mp4",
+            bytesServed: 5,
+            rangeStart: 5,
+            rangeEnd: 9,
         });
     });
 
@@ -592,7 +642,9 @@ describe("serveObject: audit and headers", () => {
     test("ctx.auditKey substitutes the key in onError events too", async () => {
         const errorKeys: string[] = [];
         const store = memoryStore({ etag: ETAG });
-        store.headObject = async () => { throw new Error("backend down"); };
+        store.headObject = async () => {
+            throw new Error("backend down");
+        };
         const handler = serveObject(store, {
             onError: (_err, ctx) => errorKeys.push(ctx.key),
         });
@@ -605,13 +657,90 @@ describe("serveObject: audit and headers", () => {
     test("a throwing hook reports the auditKey, not the storage key, through onError", async () => {
         const errorKeys: string[] = [];
         const handler = serveObject(memoryStore({ etag: ETAG }), {
-            onServe: () => { throw new Error("audit sink down"); },
+            onServe: () => {
+                throw new Error("audit sink down");
+            },
             onError: (_err, ctx) => errorKeys.push(ctx.key),
         });
         const res = await handler(req(), { key: KEY, auditKey: "doc-42" });
 
         expect(res.status).toBe(200);
         expect(errorKeys).toEqual(["doc-42"]);
+    });
+
+    test("with ctx.auditKey onError receives an allow-listed projection, never the raw error", async () => {
+        // The error travels to the same sink as the context, and the key can sit
+        // anywhere in it: the message, an own property, a request descriptor in
+        // a cause, in any encoding. Only fields that cannot carry it pass.
+        const seen: unknown[] = [];
+        const store = memoryStore({ etag: ETAG });
+        const backend = Object.assign(new Error(`HEAD /bucket/${encodeURIComponent(KEY)}: 503`), {
+            code: "SlowDown",
+            request: { path: KEY },
+        });
+        store.headObject = async () => {
+            throw new StoreUnavailableError(KEY, { cause: backend });
+        };
+        const handler = serveObject(store, {
+            onError: (err) => seen.push(err),
+        });
+        const res = await handler(req({ "If-None-Match": ETAG }), { key: KEY, auditKey: "doc-42" });
+
+        expect(res.status).toBe(503);
+        expect(seen).toEqual([
+            {
+                name: "StoreUnavailableError",
+                status: 503,
+                operation: "head",
+                cause: { name: "Error", code: "SlowDown" },
+            },
+        ]);
+        expect(JSON.stringify(seen)).not.toContain(encodeURIComponent(KEY));
+    });
+
+    test("the projection keeps only well-typed fields and bounds a cause cycle", async () => {
+        const seen: unknown[] = [];
+        const store = memoryStore({ etag: ETAG });
+        const looped = Object.assign(new Error("x"), { name: 42, code: { k: KEY }, status: "503" });
+        (looped as { cause?: unknown }).cause = looped;
+        store.headObject = async () => {
+            throw looped;
+        };
+        const handler = serveObject(store, { onError: (err) => seen.push(err) });
+        await handler(req({ "If-None-Match": ETAG }), { key: KEY, auditKey: "doc-42" });
+
+        let depth = 0;
+        for (let p = seen[0] as { name?: unknown; cause?: unknown } | undefined; p; p = p.cause as typeof p) {
+            expect(Object.keys(p).every((k) => ["name", "operation", "cause"].includes(k))).toBe(true);
+            expect(p.name).toBe("Error");
+            depth++;
+        }
+        expect(depth).toBeLessThan(12);
+        expect(JSON.stringify(seen)).not.toContain(KEY);
+    });
+
+    test("a thrown non-object projects to its type name", async () => {
+        const seen: unknown[] = [];
+        const store = memoryStore({ etag: ETAG });
+        store.headObject = async () => {
+            // oxlint-disable-next-line typescript/only-throw-error -- a thrown non-object is the subject of this test
+            throw `string naming ${KEY}`;
+        };
+        const handler = serveObject(store, { onError: (err) => seen.push(err) });
+        await handler(req({ "If-None-Match": ETAG }), { key: KEY, auditKey: "doc-42" });
+        expect(seen).toEqual([{ name: "string", operation: "head" }]);
+    });
+
+    test("without ctx.auditKey the error reaches onError untouched", async () => {
+        const seen: unknown[] = [];
+        const store = memoryStore({ etag: ETAG });
+        const thrown = new Error(`backend down for ${KEY}`);
+        store.headObject = async () => {
+            throw thrown;
+        };
+        const handler = serveObject(store, { onError: (err) => seen.push(err) });
+        await handler(req({ "If-None-Match": ETAG }), { key: KEY });
+        expect(seen[0]).toBe(thrown);
     });
 
     test("onServe fires with bytesServed 0 on 304", async () => {
@@ -686,30 +815,23 @@ describe("serveObject: audit and headers", () => {
     test("Want-Repr-Digest: sha-256=0 suppresses the digest (RFC 9530 Section 4)", async () => {
         const digest = "MV9b23bQeMQ7isAGTkoBZGErH853yGk0W/yUx1iU7dM=";
         const handler = serveObject(memoryStore({ etag: ETAG, digest }));
-        const res = await handler(
-            req({ "Want-Repr-Digest": "sha-256=0" }),
-            { key: KEY },
-        );
+        const res = await handler(req({ "Want-Repr-Digest": "sha-256=0" }), { key: KEY });
         expect(res.headers.get("Repr-Digest")).toBeNull();
     });
 
     test("Want-Repr-Digest listing only unsupported algorithms suppresses the digest", async () => {
         const digest = "MV9b23bQeMQ7isAGTkoBZGErH853yGk0W/yUx1iU7dM=";
         const handler = serveObject(memoryStore({ etag: ETAG, digest }));
-        const res = await handler(
-            req({ "Want-Repr-Digest": "sha-512=5" }),
-            { key: KEY },
-        );
+        const res = await handler(req({ "Want-Repr-Digest": "sha-512=5" }), { key: KEY });
         expect(res.headers.get("Repr-Digest")).toBeNull();
     });
 
     test("declined Repr-Digest does not suppress a wanted Content-Digest (independent Want-* fields)", async () => {
         const digest = "MV9b23bQeMQ7isAGTkoBZGErH853yGk0W/yUx1iU7dM=";
         const handler = serveObject(memoryStore({ etag: ETAG, digest }));
-        const res = await handler(
-            req({ "Want-Repr-Digest": "sha-256=0", "Want-Content-Digest": "sha-256=5" }),
-            { key: KEY },
-        );
+        const res = await handler(req({ "Want-Repr-Digest": "sha-256=0", "Want-Content-Digest": "sha-256=5" }), {
+            key: KEY,
+        });
         expect(res.status).toBe(200);
         expect(res.headers.get("Repr-Digest")).toBeNull();
         expect(res.headers.get("Content-Digest")).toBe(`sha-256=:${digest}:`);
@@ -843,7 +965,9 @@ describe("serveObject: audit and headers", () => {
         const store: ObjectStore = {
             supportsRange: false,
             headObject: async () => ({ contentLength: 1 }),
-            getObject: async () => { throw new Error("unreachable"); },
+            getObject: async () => {
+                throw new Error("unreachable");
+            },
             createSignedUrl: async () => ({ ok: true, url: "https://cdn.example/signed" }),
         };
         const handler = serveObject(store, { onServe: (e) => events.push(e) });
@@ -882,8 +1006,12 @@ describe("serveObject: never-throw contract (Path C)", () => {
         const failures: Array<{ key: string; operation: string }> = [];
         const store = memoryStore({ etag: ETAG });
         const handler = serveObject(store, {
-            onServe: () => { throw new Error("audit sink is down"); },
-            onError: (_err, ctx) => { failures.push(ctx); },
+            onServe: () => {
+                throw new Error("audit sink is down");
+            },
+            onError: (_err, ctx) => {
+                failures.push(ctx);
+            },
         });
         const res = await handler(req(), { key: KEY });
 
@@ -914,8 +1042,9 @@ describe("serveObject: never-throw contract (Path C)", () => {
         const errors: { op: string }[] = [];
         const store = memoryStore({ etag: ETAG });
         (store as { supportsRange: boolean }).supportsRange = false;
-        (store as unknown as { createSignedUrl: unknown }).createSignedUrl =
-            async () => { throw new Error("provider exploded"); };
+        (store as unknown as { createSignedUrl: unknown }).createSignedUrl = async () => {
+            throw new Error("provider exploded");
+        };
         const handler = serveObject(store, {
             onError: (_err, ctx) => errors.push({ op: ctx.operation }),
         });
@@ -926,18 +1055,20 @@ describe("serveObject: never-throw contract (Path C)", () => {
         expect(errors).toEqual([{ op: "sign" }]);
     });
 
-    test("supportsRange: false with a declining createSignedUrl returns a reported 502", async () => {
+    test("supportsRange: false with a declining createSignedUrl streams the body itself", async () => {
         const errors: unknown[] = [];
         const store = memoryStore({ etag: ETAG });
         (store as { supportsRange: boolean }).supportsRange = false;
-        (store as unknown as { createSignedUrl: unknown }).createSignedUrl =
-            async () => ({ ok: false as const, error: "bucket policy denies presign" });
+        (store as unknown as { createSignedUrl: unknown }).createSignedUrl = async () => ({
+            ok: false as const,
+            error: "bucket policy denies presign",
+        });
         const handler = serveObject(store, { onError: (err) => errors.push(err) });
         const res = await handler(req(), { key: KEY });
 
-        expect(res.status).toBe(502);
-        expect(errors).toHaveLength(1);
-        expect(String(errors[0])).toContain("bucket policy denies presign");
+        expect(res.status).toBe(200);
+        expect(await res.text()).toBe("0123456789abcdefghij");
+        expect(errors).toEqual([]);
     });
 });
 
@@ -1005,8 +1136,12 @@ describe("plain-range fast path (authoritative-range stores)", () => {
             const store: ObjectStore = {
                 supportsRange: true,
                 authoritativeRange: true,
-                async headObject(): Promise<ObjectMetadata> { return { contentLength: 20, etag: '"v"' }; },
-                async getObject(): Promise<ObjectStream> { throw err; },
+                async headObject(): Promise<ObjectMetadata> {
+                    return { contentLength: 20, etag: '"v"' };
+                },
+                async getObject(): Promise<ObjectStream> {
+                    throw err;
+                },
             };
             const handler = serveObject(store, { onError: (_e, ctx) => reported.push(ctx) });
             const res = await handler(req({ Range: "bytes=0-4" }), { key: KEY });
@@ -1068,10 +1203,7 @@ describe("plain-range fast path (authoritative-range stores)", () => {
     test("conditional range requests still take the validating HEAD path", async () => {
         const calls: string[] = [];
         const handler = serveObject(authoritativeStore(calls));
-        const res = await handler(
-            req({ Range: "bytes=5-9", "If-None-Match": '"auth-v1"' }),
-            { key: KEY },
-        );
+        const res = await handler(req({ Range: "bytes=5-9", "If-None-Match": '"auth-v1"' }), { key: KEY });
 
         expect(res.status).toBe(304);
         expect(calls).toEqual([`head:${KEY}`]);
@@ -1123,8 +1255,12 @@ describe("plain-range fast path (authoritative-range stores)", () => {
         const store: ObjectStore = {
             supportsRange: true,
             authoritativeRange: true,
-            headObject: async () => { throw new Error("backend down"); },
-            getObject: async () => { throw new Error("backend down"); },
+            headObject: async () => {
+                throw new Error("backend down");
+            },
+            getObject: async () => {
+                throw new Error("backend down");
+            },
         };
         const handler = serveObject(store, { onError: (_e, ctx) => errors.push(ctx) });
         const res = await handler(req({ Range: "bytes=0-9" }), { key: KEY });
@@ -1164,43 +1300,62 @@ describe("plain-range fast path (authoritative-range stores)", () => {
     });
 });
 
+/**
+ * Store whose GET streams `chunks` but claims `claimed` bytes throughout;
+ * `onCancel` observes the source being released. A truthful claim is the
+ * chunks' total.
+ */
+function claimingStore(chunks: string[], claimed: number, onCancel?: () => void): ObjectStore {
+    const parts = chunks.map(bytesOf);
+    return {
+        supportsRange: true,
+        async headObject(): Promise<ObjectMetadata> {
+            return { contentLength: claimed, etag: ETAG };
+        },
+        async getObject(): Promise<ObjectStream> {
+            let i = 0;
+            const body = new ReadableStream<Uint8Array<ArrayBuffer>>({
+                pull(controller) {
+                    if (i < parts.length) controller.enqueue(parts[i++]!);
+                    else controller.close();
+                },
+                cancel() {
+                    onCancel?.();
+                },
+            });
+            return { body, contentLength: claimed, totalSize: claimed, etag: ETAG };
+        },
+    };
+}
+
+/** Store whose GET returns `content` as a byte body (no stream) claiming `claimed` bytes. */
+function claimingByteStore(content: string, claimed: number): ObjectStore {
+    const data = bytesOf(content);
+    return {
+        supportsRange: true,
+        async headObject(): Promise<ObjectMetadata> {
+            return { contentLength: claimed, etag: ETAG };
+        },
+        async getObject(): Promise<ObjectStream> {
+            return { body: data, contentLength: claimed, totalSize: claimed, etag: ETAG };
+        },
+    };
+}
+
 // ─── Transfer-completion metering (onTransfer) ──────────────────────────────
 
 describe("transfer-completion (onTransfer)", () => {
     /** Store whose body streams several discrete chunks (to interrupt mid-way). */
     function multiChunkStore(chunks: string[]): ObjectStore {
-        const parts = chunks.map(bytesOf);
-        const total = parts.reduce((n, p) => n + p.byteLength, 0);
-        return {
-            supportsRange: true,
-            async headObject(): Promise<ObjectMetadata> {
-                return { contentLength: total, etag: ETAG };
-            },
-            async getObject(): Promise<ObjectStream> {
-                let i = 0;
-                const body = new ReadableStream<Uint8Array<ArrayBuffer>>({
-                    pull(controller) {
-                        if (i < parts.length) controller.enqueue(parts[i++]!);
-                        else controller.close();
-                    },
-                });
-                return { body, contentLength: total, totalSize: total, etag: ETAG };
-            },
-        };
+        return claimingStore(
+            chunks,
+            chunks.map(bytesOf).reduce((n, p) => n + p.byteLength, 0),
+        );
     }
 
     /** Store whose GET returns a byte body (Uint8Array), not a stream. */
     function byteStore(content: string): ObjectStore {
-        const data = bytesOf(content);
-        return {
-            supportsRange: true,
-            async headObject(): Promise<ObjectMetadata> {
-                return { contentLength: data.length, etag: ETAG };
-            },
-            async getObject(): Promise<ObjectStream> {
-                return { body: data, contentLength: data.length, totalSize: data.length, etag: ETAG };
-            },
-        };
+        return claimingByteStore(content, bytesOf(content).length);
     }
 
     test("reports the full byte count and completed=true on a drained body", async () => {
@@ -1211,8 +1366,12 @@ describe("transfer-completion (onTransfer)", () => {
         expect(await res.text()).toBe("0123456789abcdefghij"); // drains fully
         expect(events).toHaveLength(1);
         expect(events[0]).toMatchObject({
-            key: KEY, method: "GET", status: 200,
-            bytesExpected: 20, bytesTransferred: 20, completed: true,
+            key: KEY,
+            method: "GET",
+            status: 200,
+            bytesExpected: 20,
+            bytesTransferred: 20,
+            completed: true,
         });
     });
 
@@ -1245,8 +1404,12 @@ describe("transfer-completion (onTransfer)", () => {
         expect(res.status).toBe(206);
         expect(await res.text()).toBe("56789");
         expect(events[0]).toMatchObject({
-            status: 206, bytesExpected: 5, bytesTransferred: 5, completed: true,
-            rangeStart: 5, rangeEnd: 9,
+            status: 206,
+            bytesExpected: 5,
+            bytesTransferred: 5,
+            completed: true,
+            rangeStart: 5,
+            rangeEnd: 9,
         });
     });
 
@@ -1265,8 +1428,20 @@ describe("transfer-completion (onTransfer)", () => {
         expect(parts.body).toBeInstanceOf(Uint8Array);
     });
 
+    test("with onTransfer an empty byte body completes with zero bytes", async () => {
+        const events: TransferEvent[] = [];
+        const handler = serveObject(byteStore(""), { onTransfer: (e) => events.push(e) });
+        const res = await handler(req(), { key: KEY });
+        expect(await res.text()).toBe("");
+        expect(events).toMatchObject([{ bytesTransferred: 0, completed: true }]);
+    });
+
     test("with onTransfer a byte body is wrapped in a counting stream", async () => {
-        const raw = serveObjectRaw(byteStore("hello"), { onTransfer: () => { /* noop */ } });
+        const raw = serveObjectRaw(byteStore("hello"), {
+            onTransfer: () => {
+                /* noop */
+            },
+        });
         const parts = await raw(req(), { key: KEY });
         expect(parts.body).toBeInstanceOf(ReadableStream);
     });
@@ -1274,13 +1449,120 @@ describe("transfer-completion (onTransfer)", () => {
     test("a throwing onTransfer routes to onError (operation 'audit') without corrupting the transfer", async () => {
         const failures: Array<{ key: string; operation: string }> = [];
         const handler = serveObject(byteStore("hello"), {
-            onTransfer: () => { throw new Error("meter sink is down"); },
-            onError: (_err, ctx) => { failures.push(ctx); },
+            onTransfer: () => {
+                throw new Error("meter sink is down");
+            },
+            onError: (_err, ctx) => {
+                failures.push(ctx);
+            },
         });
         const res = await handler(req(), { key: KEY });
 
         expect(await res.text()).toBe("hello"); // transfer completes cleanly
         expect(failures).toEqual([{ key: KEY, operation: "audit" }]);
+    });
+});
+
+// ─── The body is held to the committed Content-Length ───────────────────────
+
+describe("the body is held to the committed Content-Length", () => {
+    /** Drains `res`, returning the bytes delivered before the body errored. */
+    async function drainUntilError(res: Response): Promise<{ delivered: string; error: unknown }> {
+        const reader = res.body!.getReader();
+        let delivered = "";
+        try {
+            for (;;) {
+                const { done, value } = await reader.read();
+                if (done) return { delivered, error: undefined };
+                delivered += new TextDecoder().decode(value);
+            }
+        } catch (error) {
+            return { delivered, error };
+        }
+    }
+
+    test("a stream that closes short of the committed length errors the body, never a complete-looking 200", async () => {
+        const events: TransferEvent[] = [];
+        const failures: Array<{ key: string; operation: string }> = [];
+        const handler = serveObject(claimingStore(["aaaa", "bbbb"], 12), {
+            onTransfer: (e) => events.push(e),
+            onError: (_err, ctx) => failures.push(ctx),
+        });
+        const res = await handler(req(), { key: KEY });
+
+        expect(res.status).toBe(200);
+        expect(res.headers.get("Content-Length")).toBe("12");
+        const { delivered, error } = await drainUntilError(res);
+        expect(delivered).toBe("aaaabbbb");
+        expect(String(error)).toMatch(/closed short of the committed length/);
+        expect(events).toEqual([expect.objectContaining({ bytesExpected: 12, bytesTransferred: 8, completed: false })]);
+        expect(failures).toEqual([{ key: KEY, operation: "get" }]);
+    });
+
+    test("the bound holds without a transfer hook", async () => {
+        const handler = serveObject(claimingStore(["aaaa"], 12));
+        const res = await handler(req(), { key: KEY });
+
+        expect(res.status).toBe(200);
+        const { error } = await drainUntilError(res);
+        expect(String(error)).toMatch(/closed short/);
+    });
+
+    test("a stream that runs past the committed length is cut at the last committed byte", async () => {
+        const events: TransferEvent[] = [];
+        let sourceCancelled = false;
+        // A fourth chunk keeps the source open past the overrun, so the release is observable.
+        const store = claimingStore(["aaaa", "bbbb", "cccc", "dddd"], 8, () => {
+            sourceCancelled = true;
+        });
+        const handler = serveObject(store, { onTransfer: (e) => events.push(e) });
+        const res = await handler(req(), { key: KEY });
+
+        expect(res.headers.get("Content-Length")).toBe("8");
+        const { delivered, error } = await drainUntilError(res);
+        expect(delivered).toBe("aaaabbbb");
+        expect(String(error)).toMatch(/ran past the committed length/);
+        expect(events).toEqual([expect.objectContaining({ bytesExpected: 8, bytesTransferred: 12, completed: false })]);
+        // The backend resource is released, not left open behind an errored body.
+        expect(sourceCancelled).toBe(true);
+    });
+
+    test("a 206 is held to its span the same way", async () => {
+        const store = claimingStore(["ab"], 5);
+        store.getObject = async () => ({
+            body: streamOf(bytesOf("ab")),
+            contentLength: 5,
+            totalSize: 20,
+            range: { start: 0, end: 4 },
+            etag: ETAG,
+        });
+        const handler = serveObject(store);
+        const res = await handler(req({ Range: "bytes=0-4" }), { key: KEY });
+
+        expect(res.status).toBe(206);
+        const { delivered, error } = await drainUntilError(res);
+        expect(delivered).toBe("ab");
+        expect(String(error)).toMatch(/closed short/);
+    });
+
+    test("a byte body shorter than its claim is refused with 502 before headers commit", async () => {
+        const failures: Array<{ key: string; operation: string }> = [];
+        const handler = serveObject(claimingByteStore("hello", 12), {
+            onError: (_err, ctx) => failures.push(ctx),
+        });
+        const res = await handler(req(), { key: KEY });
+
+        expect(res.status).toBe(502);
+        expect(failures).toEqual([{ key: KEY, operation: "get" }]);
+    });
+
+    test("a body that delivers exactly the committed length completes cleanly", async () => {
+        const events: TransferEvent[] = [];
+        const handler = serveObject(claimingStore(["aaaa", "bbbb"], 8), { onTransfer: (e) => events.push(e) });
+        const res = await handler(req(), { key: KEY });
+
+        expect(await res.text()).toBe("aaaabbbb");
+        expect(events).toEqual([expect.objectContaining({ bytesTransferred: 8, completed: true })]);
     });
 });
 
@@ -1347,10 +1629,9 @@ describe("multi-range serving (multipart/byteranges)", () => {
         expect(wanted.status).toBe(206);
         expect(wanted.headers.get("Repr-Digest")).toBe(`sha-256=:${digest}:`);
 
-        const suppressed = await handler(
-            req({ Range: "bytes=0-4,10-14", "Want-Repr-Digest": "sha-256=0" }),
-            { key: KEY },
-        );
+        const suppressed = await handler(req({ Range: "bytes=0-4,10-14", "Want-Repr-Digest": "sha-256=0" }), {
+            key: KEY,
+        });
         expect(suppressed.status).toBe(206);
         expect(suppressed.headers.get("Repr-Digest")).toBeNull();
     });
@@ -1395,19 +1676,13 @@ describe("multi-range serving (multipart/byteranges)", () => {
 
     test("conditionals still win: If-None-Match on a multi-range yields 304", async () => {
         const handler = serveObject(memoryStore({ etag: ETAG }));
-        const res = await handler(
-            req({ Range: "bytes=0-4,10-14", "If-None-Match": ETAG }),
-            { key: KEY },
-        );
+        const res = await handler(req({ Range: "bytes=0-4,10-14", "If-None-Match": ETAG }), { key: KEY });
         expect(res.status).toBe(304);
     });
 
     test("stale If-Range on a multi-range serves the full 200", async () => {
         const handler = serveObject(memoryStore({ etag: ETAG, lastModified: LAST_MODIFIED }));
-        const res = await handler(
-            req({ Range: "bytes=0-4,10-14", "If-Range": '"stale-etag"' }),
-            { key: KEY },
-        );
+        const res = await handler(req({ Range: "bytes=0-4,10-14", "If-Range": '"stale-etag"' }), { key: KEY });
         expect(res.status).toBe(200);
         expect(await res.text()).toBe("0123456789abcdefghij");
     });
@@ -1427,8 +1702,8 @@ describe("multi-range serving (multipart/byteranges)", () => {
             async getObject(_key: string, getOpts?: { range?: ParsedRange }): Promise<ObjectStream> {
                 const range = getOpts?.range;
                 return {
-                    body: streamOf(data),        // full body...
-                    contentLength: data.length,  // ...but claims the range span
+                    body: streamOf(data), // full body...
+                    contentLength: data.length, // ...but claims the range span
                     totalSize: data.length,
                     range: range ? { start: range.start, end: range.end } : undefined,
                 };
@@ -1462,10 +1737,21 @@ describe("multi-range serving (multipart/byteranges)", () => {
                 const range = getOpts!.range!;
                 const slice = data.subarray(range.start, range.end + 1);
                 const body = new ReadableStream<Uint8Array<ArrayBuffer>>({
-                    start(c) { c.enqueue(slice); c.close(); },
-                    cancel() { firstCancelled = true; },
+                    start(c) {
+                        c.enqueue(slice);
+                        c.close();
+                    },
+                    cancel() {
+                        firstCancelled = true;
+                    },
                 });
-                return { body, contentLength: slice.length, totalSize: data.length, range: { start: range.start, end: range.end }, etag: ETAG };
+                return {
+                    body,
+                    contentLength: slice.length,
+                    totalSize: data.length,
+                    range: { start: range.start, end: range.end },
+                    etag: ETAG,
+                };
             },
         };
         const handler = serveObject(store);
@@ -1494,7 +1780,13 @@ describe("multi-range serving (multipart/byteranges)", () => {
                 const range = getOpts!.range!;
                 const slice = data.subarray(range.start, range.end + 1);
                 const etag = call++ === 0 ? ETAG : '"overwritten-same-size"';
-                return { body: streamOf(slice), contentLength: slice.length, totalSize: data.length, range: { start: range.start, end: range.end }, etag };
+                return {
+                    body: streamOf(slice),
+                    contentLength: slice.length,
+                    totalSize: data.length,
+                    range: { start: range.start, end: range.end },
+                    etag,
+                };
             },
         };
         const handler = serveObject(store);
@@ -1503,7 +1795,11 @@ describe("multi-range serving (multipart/byteranges)", () => {
         expect(res.status).toBe(206);
         // ...but draining must fail loudly rather than deliver spliced bytes.
         let streamError = false;
-        try { await res.arrayBuffer(); } catch { streamError = true; }
+        try {
+            await res.arrayBuffer();
+        } catch {
+            streamError = true;
+        }
         expect(streamError).toBe(true);
     });
 
@@ -1515,8 +1811,10 @@ describe("multi-range serving (multipart/byteranges)", () => {
         const buf = await res.arrayBuffer();
         expect(events).toHaveLength(1);
         expect(events[0]).toMatchObject({
-            status: 206, completed: true,
-            bytesExpected: buf.byteLength, bytesTransferred: buf.byteLength,
+            status: 206,
+            completed: true,
+            bytesExpected: buf.byteLength,
+            bytesTransferred: buf.byteLength,
         });
     });
 });
@@ -1628,10 +1926,7 @@ describe("HEAD-to-GET validator drift guard (non-pinning stores)", () => {
         const headCalls = { n: 0 };
         const handler = serveObject(driftingStore(headCalls));
         // Client validated against v1; object is v2 by the time GET runs.
-        const res = await handler(
-            req({ Range: "bytes=0-9", "If-Range": '"v1"' }),
-            { key: KEY },
-        );
+        const res = await handler(req({ Range: "bytes=0-9", "If-Range": '"v1"' }), { key: KEY });
 
         // First attempt: If-Range fresh vs HEAD(v1) -> range honored -> GET
         // returns v2 validators -> drift detected -> ONE re-validation.
@@ -1640,6 +1935,39 @@ describe("HEAD-to-GET validator drift guard (non-pinning stores)", () => {
         expect(res.status).toBe(200);
         expect(await res.text()).toBe("XXXXXXXXXXXXXXXXXXXX");
         expect(res.headers.get("ETag")).toBe('"v2"');
+    });
+
+    test("a re-validated request reports its timing once, for the attempt that served", async () => {
+        // The first attempt's GET is read, then refused as drifted: it never
+        // becomes a response, so it must not reach onTiming either.
+        const timings: { storeMs: number; evaluateMs: number; totalMs: number }[] = [];
+        const handler = serveObject(driftingStore({ n: 0 }), { timing: true, onTiming: (t) => timings.push(t) });
+        const res = await handler(req({ Range: "bytes=0-9", "If-Range": '"v1"' }), { key: KEY });
+
+        expect(res.status).toBe(200);
+        expect(timings).toHaveLength(1);
+        expect(res.headers.get("Server-Timing")).toBe(
+            `store;dur=${timings[0]!.storeMs.toFixed(1)},eval;dur=${timings[0]!.evaluateMs.toFixed(1)}`,
+        );
+    });
+
+    test("a store result refused as a 502 reports no timing", async () => {
+        const timings: unknown[] = [];
+        const store = memoryStore({ etag: ETAG });
+        // end >= totalSize: bounds a correct backend can never produce.
+        store.getObject = async () => ({
+            body: bytesOf("0123456789"),
+            contentLength: 10,
+            totalSize: 20,
+            range: { start: 15, end: 25 },
+            etag: ETAG,
+        });
+        const handler = serveObject(store, { timing: true, onTiming: (t) => timings.push(t) });
+        const res = await handler(req({ Range: "bytes=0-9" }), { key: KEY });
+
+        expect(res.status).toBe(502);
+        expect(res.headers.get("Server-Timing")).toBeNull();
+        expect(timings).toHaveLength(0);
     });
 });
 
@@ -1655,7 +1983,11 @@ describe("precompressed variant negotiation", () => {
             "data.json.gz": { body: "g".repeat(20), etag: '"gz-v1"', lastModified: "Mon, 01 Jan 2024 00:00:00 GMT" },
         };
         if (!overrides.omitBr) {
-            objects["data.json.br"] = { body: "b".repeat(10), etag: '"br-v1"', lastModified: "Mon, 01 Jan 2024 00:00:00 GMT" };
+            objects["data.json.br"] = {
+                body: "b".repeat(10),
+                etag: '"br-v1"',
+                lastModified: "Mon, 01 Jan 2024 00:00:00 GMT",
+            };
         }
         return kvStore({ objects });
     }
@@ -1714,13 +2046,16 @@ describe("precompressed variant negotiation", () => {
         const base = tripleStore();
         const probing: ObjectStore = {
             ...base,
-            headObject: async (key, o) => { heads.push(key); return base.headObject(key, o); },
+            headObject: async (key, o) => {
+                heads.push(key);
+                return base.headObject(key, o);
+            },
         };
         const handler = serveObject(probing, { precompressed: true });
-        const res = await handler(
-            req({ "Accept-Encoding": "br", Range: "bytes=0-3" }),
-            { key: "data.json", mime: "application/pdf" },
-        );
+        const res = await handler(req({ "Accept-Encoding": "br", Range: "bytes=0-3" }), {
+            key: "data.json",
+            mime: "application/pdf",
+        });
 
         expect(res.status).toBe(206);
         expect(res.headers.get("Vary")).toBeNull();
@@ -1754,15 +2089,11 @@ describe("precompressed variant negotiation", () => {
     test("revalidation is per-representation: variant ETag 304s, identity ETag misses", async () => {
         const handler = serveObject(tripleStore(), { precompressed: true });
 
-        const hit = await handler(
-            req({ "Accept-Encoding": "br", "If-None-Match": '"br-v1"' }), CTX,
-        );
+        const hit = await handler(req({ "Accept-Encoding": "br", "If-None-Match": '"br-v1"' }), CTX);
         expect(hit.status).toBe(304);
         expect(hit.headers.get("Vary")).toBe("Accept-Encoding");
 
-        const miss = await handler(
-            req({ "Accept-Encoding": "br", "If-None-Match": '"id-v1"' }), CTX,
-        );
+        const miss = await handler(req({ "Accept-Encoding": "br", "If-None-Match": '"id-v1"' }), CTX);
         expect(miss.status).toBe(200);
         expect(await miss.text()).toBe("b".repeat(10));
     });
@@ -1781,9 +2112,7 @@ describe("precompressed variant negotiation", () => {
     test("multi-range requests serve the identity representation", async () => {
         const handler = serveObject(tripleStore(), { precompressed: true });
         // Gap under the coalescing threshold: collapses to one identity 206.
-        const res = await handler(
-            req({ "Accept-Encoding": "br", Range: "bytes=0-1,20-21" }), CTX,
-        );
+        const res = await handler(req({ "Accept-Encoding": "br", Range: "bytes=0-1,20-21" }), CTX);
 
         expect(res.status).toBe(206);
         expect(res.headers.get("Content-Encoding")).toBeNull();
@@ -1827,9 +2156,11 @@ describe("precompressed variant negotiation", () => {
     });
 
     test("unknown coding in the option throws at setup", () => {
-        expect(() => serveObject(tripleStore(), {
-            precompressed: ["deflate" as never],
-        })).toThrow(TypeError);
+        expect(() =>
+            serveObject(tripleStore(), {
+                precompressed: ["deflate" as never],
+            }),
+        ).toThrow(TypeError);
     });
 });
 
@@ -1959,8 +2290,9 @@ describe("accessControlExposeHeaders", () => {
             accessControlExposeHeaders: true,
         });
         const ok = await handler(req(), { key: KEY });
-        expect(ok.headers.get("Access-Control-Expose-Headers"))
-            .toBe("Accept-Ranges, Content-Range, Content-Encoding, ETag, Content-Disposition, Repr-Digest, Content-Digest, Server-Timing");
+        expect(ok.headers.get("Access-Control-Expose-Headers")).toBe(
+            "Accept-Ranges, Content-Range, Content-Encoding, ETag, Content-Disposition, Repr-Digest, Content-Digest, Server-Timing",
+        );
 
         const head = await handler(req({}, "HEAD"), { key: KEY });
         expect(head.headers.get("Access-Control-Expose-Headers")).toContain("Accept-Ranges");
@@ -2115,6 +2447,9 @@ describe("charset enforcement across the textual MIME taxonomy", () => {
         "application/atom+xml",
         "application/javascript",
         "application/ecmascript",
+        // HLS playlists are UTF-8 text (RFC 8216 Section 4) under an
+        // `application/` type, so the text/* prefix does not reach them.
+        "application/vnd.apple.mpegurl",
     ];
     for (const mime of textual) {
         test(`${mime} gets charset=utf-8`, async () => {
@@ -2128,6 +2463,22 @@ describe("charset enforcement across the textual MIME taxonomy", () => {
         const handler = serveObject(memoryStore({ etag: ETAG }));
         const res = await handler(req(), { key: KEY, mime: "font/woff2" });
         expect(res.headers.get("Content-Type")).toBe("font/woff2");
+    });
+
+    test("an HLS playlist is served nosniff and as an attachment", async () => {
+        // A playlist names sibling URIs. Rendered from the serving origin it
+        // drives same-origin fetches, so it must reach the client with the
+        // type it was given and without a document disposition.
+        const handler = serveObject(memoryStore({ etag: ETAG }));
+        const res = await handler(req(), {
+            key: KEY,
+            mime: lookupMime("stream/index.m3u8"),
+            filename: "index.m3u8",
+        });
+        expect(res.headers.get("Content-Type")).toBe("application/vnd.apple.mpegurl; charset=utf-8");
+        expect(res.headers.get("X-Content-Type-Options")).toBe("nosniff");
+        expect(res.headers.get("Content-Disposition")).toStartWith("attachment");
+        expect(isInlineSafeMediaType("application/vnd.apple.mpegurl")).toBe(false);
     });
 });
 
@@ -2176,16 +2527,9 @@ describe("store error taxonomy (status- and name-based classification)", () => {
     });
 
     test("a thrown null is an opaque 502", async () => {
-        // Bypass the fixture (null is falsy in its throw gate): a store whose
-        // rejection VALUE is null must not crash `in`-based classification.
-        const base = memoryStore({ etag: ETAG });
-        const store: ObjectStore = {
-            ...base,
-            headObject: async () => { throw null; },
-            getObject: async () => { throw null; },
-        };
-        const handler = serveObject(store);
-        const res = await handler(req(), { key: KEY });
+        // A store whose rejection VALUE is null must not crash `in`-based
+        // classification.
+        const res = await serveWithError(null);
         expect(res.status).toBe(502);
     });
 
@@ -2198,7 +2542,9 @@ describe("store error taxonomy (status- and name-based classification)", () => {
         const base = memoryStore({ etag: ETAG });
         const store: ObjectStore = {
             ...base,
-            getObject: async () => { throw new Error("read failed"); },
+            getObject: async () => {
+                throw new Error("read failed");
+            },
         };
         const handler = serveObject(store);
         const res = await handler(req(), { key: KEY });
@@ -2209,7 +2555,12 @@ describe("store error taxonomy (status- and name-based classification)", () => {
 describe("abort classification (client disconnect vs backend failure)", () => {
     function getThrowingStore(err: unknown): ObjectStore {
         const base = memoryStore({ etag: ETAG, content: "0123456789abcdefghij".repeat(10) });
-        return { ...base, getObject: async () => { throw err; } };
+        return {
+            ...base,
+            getObject: async () => {
+                throw err;
+            },
+        };
     }
 
     test("an Error named AbortError is a client disconnect: bodyless 499", async () => {
@@ -2224,10 +2575,9 @@ describe("abort classification (client disconnect vs backend failure)", () => {
 
     test("a non-abort DOMException is a backend failure, reported to onError", async () => {
         const reported: Array<{ key: string; operation: string }> = [];
-        const handler = serveObject(
-            getThrowingStore(new DOMException("timed out", "TimeoutError")),
-            { onError: (_e, ctx) => reported.push(ctx) },
-        );
+        const handler = serveObject(getThrowingStore(new DOMException("timed out", "TimeoutError")), {
+            onError: (_e, ctx) => reported.push(ctx),
+        });
         const res = await handler(req(), { key: KEY });
 
         expect(res.status).toBe(502);
@@ -2250,7 +2600,9 @@ describe("abort classification (client disconnect vs backend failure)", () => {
 describe("audit hooks never break the never-throw contract without onError", () => {
     test("a throwing onServe with no onError leaves the response intact", async () => {
         const handler = serveObject(memoryStore({ etag: ETAG }), {
-            onServe: () => { throw new Error("audit sink down"); },
+            onServe: () => {
+                throw new Error("audit sink down");
+            },
         });
         const res = await handler(req(), { key: KEY });
         expect(res.status).toBe(200);
@@ -2259,7 +2611,9 @@ describe("audit hooks never break the never-throw contract without onError", () 
 
     test("a throwing onTransfer with no onError leaves the body intact", async () => {
         const handler = serveObject(memoryStore({ etag: ETAG }), {
-            onTransfer: () => { throw new Error("metrics sink down"); },
+            onTransfer: () => {
+                throw new Error("metrics sink down");
+            },
         });
         const res = await handler(req(), { key: KEY });
         expect(await res.text()).toBe("0123456789abcdefghij");
@@ -2271,14 +2625,16 @@ describe("signed-url provider failures (offload path telemetry)", () => {
         const base = memoryStore({ etag: ETAG });
         const store: ObjectStore = {
             ...base,
-            createSignedUrl: async () => { throw new Error("STS outage"); },
+            createSignedUrl: async () => {
+                throw new Error("STS outage");
+            },
         };
         const handler = serveObject(store, { preferSignedUrl: () => true });
         const res = await handler(req(), { key: KEY });
         expect(res.status).toBe(502);
     });
 
-    test("a declining provider reports full onError context", async () => {
+    test("a declining provider falls back to streaming without an onError report", async () => {
         const reported: Array<{ key: string; operation: string }> = [];
         const base = memoryStore({ etag: ETAG });
         const store: ObjectStore = {
@@ -2290,16 +2646,39 @@ describe("signed-url provider failures (offload path telemetry)", () => {
             onError: (_e, ctx) => reported.push(ctx),
         });
         const res = await handler(req(), { key: KEY });
-        expect(res.status).toBe(502);
-        expect(reported).toEqual([{ key: KEY, operation: "sign" }]);
+        expect(res.status).toBe(200);
+        expect(reported).toEqual([]);
+    });
+
+    test("a provider that declined is asked once per request, however many offload points follow", async () => {
+        // A range-incapable store reaches the immediate offload, then the
+        // preferSignedUrl one: the second must not re-ask or re-report.
+        let asked = 0;
+        const reported: string[] = [];
+        const base = memoryStore({ etag: ETAG });
+        const store: ObjectStore = {
+            ...base,
+            supportsRange: false,
+            createSignedUrl: async () => {
+                asked++;
+                return { ok: false as const, error: "no signing credential" };
+            },
+        };
+        const handler = serveObject(store, {
+            preferSignedUrl: () => true,
+            onError: (_e, ctx) => reported.push(ctx.operation),
+        });
+        const res = await handler(req(), { key: KEY });
+        expect(res.status).toBe(200);
+        expect(await res.text()).toBe("0123456789abcdefghij");
+        expect(asked).toBe(1);
+        // A decline is an answer, not a failure: nothing to report.
+        expect(reported).toEqual([]);
     });
 });
 
 describe("served-range byte-accounting guard (hostile stores)", () => {
-    async function serveHostileRange(
-        rangeOverride: { start: number; end: number },
-        rangeHeader = "bytes=0-4",
-    ) {
+    async function serveHostileRange(rangeOverride: { start: number; end: number }, rangeHeader = "bytes=0-4") {
         const reported: Array<{ key: string; operation: string }> = [];
         const handler = serveObject(memoryStore({ etag: ETAG, rangeOverride }), {
             onError: (_e, ctx) => reported.push(ctx),
@@ -2344,11 +2723,15 @@ describe("served-range byte-accounting guard (hostile stores)", () => {
         const data = bytesOf("0123456789");
         const store: ObjectStore = {
             supportsRange: true,
-            async headObject() { return { contentLength: 10, etag: '"u1"' }; },
+            async headObject() {
+                return { contentLength: 10, etag: '"u1"' };
+            },
             async getObject() {
                 return {
-                    body: streamOf(data), contentLength: 10,
-                    totalSize: undefined, etag: '"u1"',
+                    body: streamOf(data),
+                    contentLength: 10,
+                    totalSize: undefined,
+                    etag: '"u1"',
                 };
             },
         };
@@ -2478,7 +2861,9 @@ describe("weak/strong validator comparability in the drift guard", () => {
                 const range = getOpts?.range;
                 const slice = range ? data.slice(range.start, range.end + 1) : data;
                 return {
-                    body: streamOf(slice), contentLength: slice.length, totalSize: 20,
+                    body: streamOf(slice),
+                    contentLength: slice.length,
+                    totalSize: 20,
                     range: range ? { start: range.start, end: range.end } : undefined,
                     etag: '"v1"',
                 };
@@ -2511,7 +2896,9 @@ describe("multipart per-part representation coherence", () => {
                 const range = requireRange(getOpts);
                 const slice = data.slice(range.start, range.end + 1);
                 return {
-                    body: streamOf(slice), contentLength: slice.length, totalSize: data.length,
+                    body: streamOf(slice),
+                    contentLength: slice.length,
+                    totalSize: data.length,
                     range: { start: range.start, end: range.end },
                     ...partMeta(call),
                 };
@@ -2520,8 +2907,7 @@ describe("multipart per-part representation coherence", () => {
     }
 
     test("one-sided ETag absence falls back to Last-Modified agreement: serves", async () => {
-        const store = perPartStore((call) =>
-            call <= 1 ? { etag: '"p1"', lastModified: LM } : { lastModified: LM });
+        const store = perPartStore((call) => (call <= 1 ? { etag: '"p1"', lastModified: LM } : { lastModified: LM }));
         const handler = serveObject(store);
         const res = await handler(req({ Range: "bytes=0-4,150-154" }), { key: KEY });
 
@@ -2533,7 +2919,8 @@ describe("multipart per-part representation coherence", () => {
 
     test("Last-Modified disagreement between parts (no ETags) errors the stream, never splices", async () => {
         const store = perPartStore((call) =>
-            call <= 1 ? { lastModified: LM } : { lastModified: "Tue, 02 Jan 2024 00:00:00 GMT" });
+            call <= 1 ? { lastModified: LM } : { lastModified: "Tue, 02 Jan 2024 00:00:00 GMT" },
+        );
         const handler = serveObject(store);
         const res = await handler(req({ Range: "bytes=0-4,150-154" }), { key: KEY });
         // Lazy parts settle after the 206 commits: the divergence surfaces as
@@ -2567,7 +2954,9 @@ describe("multipart byte-body length verification", () => {
                 // Claim the correct span but hand over truncated bytes.
                 const body = shortWhen(range) ? slice.slice(0, span - 1) : slice;
                 return {
-                    body, contentLength: span, totalSize: data.length,
+                    body,
+                    contentLength: span,
+                    totalSize: data.length,
                     range: { start: range.start, end: range.end },
                     etag: '"mb-v1"',
                 };
@@ -2588,5 +2977,577 @@ describe("multipart byte-body length verification", () => {
         const res = await handler(req({ Range: "bytes=0-4,150-154" }), { key: KEY });
         expect(res.status).toBe(206);
         await expect(res.arrayBuffer()).rejects.toThrow();
+    });
+
+    test("a LATER byte part longer than its span is withheld whole, never framed", async () => {
+        const data = bytesOf(BIG);
+        const store: ObjectStore = {
+            supportsRange: true,
+            async headObject(): Promise<ObjectMetadata> {
+                return { contentLength: data.length, etag: '"mb-v1"' };
+            },
+            async getObject(_key, getOpts?: { range?: ParsedRange }): Promise<ObjectStream> {
+                const range = requireRange(getOpts);
+                const span = range.end - range.start + 1;
+                const end = range.start === 150 ? range.end + 12 : range.end + 1;
+                return {
+                    body: data.slice(range.start, end),
+                    contentLength: span,
+                    totalSize: data.length,
+                    range: { start: range.start, end: range.end },
+                    etag: '"mb-v1"',
+                };
+            },
+        };
+        const res = await serveObject(store)(req({ Range: "bytes=0-4,150-154" }), { key: KEY });
+        expect(res.status).toBe(206);
+        const reader = res.body!.getReader();
+        let seen = "";
+        await expect(
+            (async () => {
+                for (;;) {
+                    const { done, value } = await reader.read();
+                    if (done) return;
+                    seen += new TextDecoder().decode(value);
+                }
+            })(),
+        ).rejects.toThrow();
+        expect(seen).not.toContain(BIG.slice(150, 155));
+    });
+
+    test("a LATER part whose stream over-runs its span is cut at the crossing chunk, never framed", async () => {
+        // The bytes past the span belong to whatever the source became under the
+        // read. They must not reach the wire inside a well-formed part before the
+        // error: the crossing chunk is withheld, so the client sees at most the
+        // in-span bytes of the part and then a failed transfer.
+        const data = bytesOf(BIG);
+        const store: ObjectStore = {
+            supportsRange: true,
+            async headObject(): Promise<ObjectMetadata> {
+                return { contentLength: data.length, etag: '"mb-v1"' };
+            },
+            async getObject(_key, getOpts?: { range?: ParsedRange }): Promise<ObjectStream> {
+                const range = requireRange(getOpts);
+                const span = range.end - range.start + 1;
+                const slice = data.slice(range.start, range.end + 1);
+                const overrun = range.start === 150;
+                const chunks = overrun ? [slice, bytesOf("LEAKED-TAIL")] : [slice];
+                let i = 0;
+                const body = new ReadableStream<Uint8Array<ArrayBuffer>>({
+                    pull(controller) {
+                        if (i < chunks.length) controller.enqueue(chunks[i++]!);
+                        else controller.close();
+                    },
+                });
+                return {
+                    body,
+                    contentLength: span,
+                    totalSize: data.length,
+                    range: { start: range.start, end: range.end },
+                    etag: '"mb-v1"',
+                };
+            },
+        };
+        const errors: unknown[] = [];
+        const handler = serveObject(store, { onError: (err) => errors.push(err) });
+        const res = await handler(req({ Range: "bytes=0-4,150-154" }), { key: KEY });
+        if (res.status !== 206) throw new Error(String(errors[0]));
+        const reader = res.body!.getReader();
+        const seen: Uint8Array[] = [];
+        let failed = false;
+        try {
+            for (;;) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                seen.push(value);
+            }
+        } catch {
+            failed = true;
+        }
+        expect(failed).toBe(true);
+        expect(Buffer.concat(seen).toString("latin1")).not.toContain("LEAKED");
+    });
+});
+
+// ─── Custom store metadata reaches generateETag as the three ETag fields ────
+
+describe("custom store metadata carrying extra fields", () => {
+    /** A store whose HEAD result carries fields of its own beside the contract's. */
+    function extraFieldStore(): ObjectStore {
+        const base = memoryStore({ lastModified: LAST_MODIFIED });
+        return {
+            ...base,
+            async headObject(key: string, o?: { signal?: AbortSignal }): Promise<ObjectMetadata> {
+                const meta = await base.headObject(key, o);
+                return Object.assign(meta, { size: 20, mtime: 1_751_112_000_000, hash: "sha1-of-something" });
+            },
+        };
+    }
+
+    test("HEAD, a conditional GET and a Range GET are served", async () => {
+        const handler = serveObject(extraFieldStore());
+        const head = await handler(req({}, "HEAD"), { key: KEY });
+        expect(head.status).toBe(200);
+        const etag = head.headers.get("ETag");
+        expect(etag).toStartWith('W/"14-');
+
+        const revalidated = await handler(req({ "If-None-Match": etag! }), { key: KEY });
+        expect(revalidated.status).toBe(304);
+
+        const ranged = await handler(
+            req({ Range: "bytes=0-4", "If-Modified-Since": "Fri, 27 Jun 2025 00:00:00 GMT" }),
+            {
+                key: KEY,
+            },
+        );
+        expect(ranged.status).toBe(206);
+        expect(await ranged.text()).toBe("01234");
+    });
+
+    test("a throwing metadata read is reported to onError and answered 502", async () => {
+        const reported: Array<{ key: string; operation: string }> = [];
+        const base = memoryStore({ etag: ETAG });
+        const store: ObjectStore = {
+            ...base,
+            async headObject(): Promise<ObjectMetadata> {
+                return {
+                    contentLength: 20,
+                    get etag(): string {
+                        throw new Error("lazy metadata field failed");
+                    },
+                };
+            },
+        };
+        const handler = serveObject(store, { onError: (_e, ctx) => reported.push(ctx) });
+        const res = await handler(req({}, "HEAD"), { key: KEY });
+        expect(res.status).toBe(502);
+        expect(reported).toEqual([{ key: KEY, operation: "head" }]);
+    });
+});
+
+// ─── Inline active content is sandboxed ─────────────────────────────────────
+
+describe("inline active content gets a sandbox CSP", () => {
+    test.each([
+        "application/rss+xml",
+        "application/atom+xml",
+        "application/xslt+xml",
+        "text/xsl",
+        "image/svg+xml; charset=utf-8",
+        "Application/MathML+XML",
+    ])("%s", async (mime) => {
+        const handler = serveObject(memoryStore({ etag: ETAG }), { disposition: "inline" });
+        const res = await handler(req(), { key: KEY, mime });
+        expect(res.headers.get("Content-Security-Policy")).toBe("sandbox");
+    });
+
+    test("a non-XML inline type is not sandboxed", async () => {
+        const handler = serveObject(memoryStore({ etag: ETAG }), { disposition: "inline" });
+        const res = await handler(req(), { key: KEY, mime: "image/png" });
+        expect(res.headers.get("Content-Security-Policy")).toBeNull();
+    });
+});
+
+// ─── maxRanges is validated where it is configured ──────────────────────────
+
+describe("maxRanges validation", () => {
+    test.each([0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 2 ** 53])("%p throws a TypeError", (maxRanges) => {
+        expect(() => serveObject(memoryStore(), { maxRanges })).toThrow(TypeError);
+    });
+
+    test("a string is refused too", () => {
+        expect(() => serveObject(memoryStore(), { maxRanges: "8" as unknown as number })).toThrow(TypeError);
+    });
+
+    test("1 is accepted and degrades multi-range to a full 200", async () => {
+        const handler = serveObject(memoryStore({ etag: ETAG, content: "x".repeat(1000) }), { maxRanges: 1 });
+        const res = await handler(req({ Range: "bytes=0-1,500-501" }), { key: KEY });
+        expect(res.status).toBe(200);
+    });
+});
+
+// ─── Fixed-length bodies where the runtime offers FixedLengthStream ─────────
+
+describe("FixedLengthStream is used when the runtime provides it", () => {
+    async function withStub<T>(fn: (lengths: number[]) => Promise<T>): Promise<T> {
+        const lengths: number[] = [];
+        class StubFixedLengthStream extends TransformStream<Uint8Array, Uint8Array> {
+            constructor(length: number) {
+                super();
+                lengths.push(length);
+            }
+        }
+        const g = globalThis as { FixedLengthStream?: unknown };
+        g.FixedLengthStream = StubFixedLengthStream;
+        try {
+            return await fn(lengths);
+        } finally {
+            delete g.FixedLengthStream;
+        }
+    }
+
+    test("a streamed 200 body is fixed to its Content-Length", async () => {
+        await withStub(async (lengths) => {
+            const res = await serveObject(memoryStore({ etag: ETAG }))(req(), { key: KEY });
+            expect(await res.text()).toBe("0123456789abcdefghij");
+            expect(lengths).toEqual([20]);
+        });
+    });
+
+    test("a multipart body is fixed to the multipart Content-Length", async () => {
+        await withStub(async (lengths) => {
+            const store = memoryStore({ etag: ETAG, content: "x".repeat(1000) });
+            const res = await serveObject(store)(req({ Range: "bytes=0-1,500-501" }), { key: KEY });
+            expect(res.status).toBe(206);
+            expect(res.headers.get("Content-Type")).toStartWith("multipart/byteranges");
+            await res.arrayBuffer();
+            expect(lengths).toEqual([Number(res.headers.get("Content-Length"))]);
+        });
+    });
+
+    test("without the global the body is not wrapped", async () => {
+        expect((globalThis as { FixedLengthStream?: unknown }).FixedLengthStream).toBeUndefined();
+        const res = await serveObject(memoryStore({ etag: ETAG }))(req(), { key: KEY });
+        expect(await res.text()).toBe("0123456789abcdefghij");
+    });
+});
+
+// ─── A store error after the client went away is a client abort ─────────────
+
+describe("an error after the request signal aborted", () => {
+    function abortingStore(ac: AbortController): ObjectStore {
+        return {
+            supportsRange: true,
+            async headObject(): Promise<ObjectMetadata> {
+                ac.abort();
+                throw new Error("socket closed");
+            },
+            async getObject(): Promise<ObjectStream> {
+                ac.abort();
+                throw new TypeError("terminated");
+            },
+        };
+    }
+
+    test.each([
+        ["HEAD path", { "If-None-Match": ETAG }],
+        ["GET path", {}],
+    ])("%s answers 499 without onError", async (_name, headers) => {
+        const ac = new AbortController();
+        const errors: unknown[] = [];
+        const handler = serveObjectRaw(abortingStore(ac), { onError: (e) => errors.push(e) });
+        const res = await handler({ method: "GET", headers: new Headers(headers), signal: ac.signal }, { key: KEY });
+        expect(res.status).toBe(499);
+        expect(errors).toEqual([]);
+    });
+});
+
+// ─── Audit events name the identity, and the variant beside it ──────────────
+
+describe("audit events for a precompressed variant", () => {
+    const objects = {
+        "a.txt": { body: "plain text body", etag: '"id"' },
+        "a.txt.br": { body: "br-bytes", etag: '"br"' },
+    };
+
+    test("key is the identity key; variantKey and contentEncoding name the variant", async () => {
+        const served: ServeAuditEvent[] = [];
+        const transferred: TransferEvent[] = [];
+        const handler = serveObject(kvStore({ objects }), {
+            precompressed: true,
+            onServe: (e) => served.push(e),
+            onTransfer: (e) => transferred.push(e),
+        });
+        const res = await handler(req({ "Accept-Encoding": "br" }), { key: "a.txt", mime: "text/plain" });
+        expect(res.headers.get("Content-Encoding")).toBe("br");
+        await res.text();
+        expect(served).toHaveLength(1);
+        expect(served[0]).toMatchObject({ key: "a.txt", variantKey: "a.txt.br", contentEncoding: "br" });
+        expect(transferred.at(-1)).toMatchObject({ key: "a.txt", variantKey: "a.txt.br", contentEncoding: "br" });
+    });
+
+    test("with an auditKey the variant's storage key is not reported", async () => {
+        const served: ServeAuditEvent[] = [];
+        const handler = serveObject(kvStore({ objects }), { precompressed: true, onServe: (e) => served.push(e) });
+        const res = await handler(req({ "Accept-Encoding": "br", "If-None-Match": '"br"' }), {
+            key: "a.txt",
+            mime: "text/plain",
+            auditKey: "doc-17",
+        });
+        expect(res.status).toBe(304);
+        expect(served).toEqual([
+            expect.objectContaining({ key: "doc-17", contentEncoding: "br", status: 304 }) as ServeAuditEvent,
+        ]);
+        expect(served[0]!.variantKey).toBeUndefined();
+    });
+
+    test("an identity response carries neither field", async () => {
+        const served: ServeAuditEvent[] = [];
+        const handler = serveObject(kvStore({ objects }), { precompressed: true, onServe: (e) => served.push(e) });
+        await (await handler(req(), { key: "a.txt", mime: "text/plain" })).text();
+        expect(served[0]!.key).toBe("a.txt");
+        expect(served[0]!.variantKey).toBeUndefined();
+        expect(served[0]!.contentEncoding).toBeUndefined();
+    });
+});
+
+// ─── Signed-URL outcomes ────────────────────────────────────────────────────
+
+describe("createSignedUrl outcomes", () => {
+    type SignOpts = Parameters<NonNullable<ObjectStore["createSignedUrl"]>>[1];
+
+    function signingStore(sign: (key: string, o: SignOpts) => ReturnType<NonNullable<ObjectStore["createSignedUrl"]>>) {
+        return { ...memoryStore({ etag: ETAG }), createSignedUrl: sign } satisfies ObjectStore;
+    }
+
+    test("ok: true redirects, and the request signal reaches the signer", async () => {
+        const ac = new AbortController();
+        let seen: AbortSignal | undefined;
+        const store = signingStore(async (_k, o) => {
+            seen = o.signal;
+            return { ok: true, url: "https://signed.example/obj" };
+        });
+        const res = await serveObjectRaw(store, { preferSignedUrl: () => true })(
+            { method: "GET", headers: new Headers(), signal: ac.signal },
+            { key: KEY },
+        );
+        expect(res.status).toBe(302);
+        expect(res.headers["Location"]).toBe("https://signed.example/obj");
+        expect(seen).toBe(ac.signal);
+    });
+
+    test("ok: false under preferSignedUrl streams the bytes and reports nothing", async () => {
+        const errors: unknown[] = [];
+        const store = signingStore(async () => ({ ok: false, error: "no signing credential", cause: new Error("x") }));
+        const res = await serveObject(store, { preferSignedUrl: () => true, onError: (e) => errors.push(e) })(req(), {
+            key: KEY,
+        });
+        expect(res.status).toBe(200);
+        expect(await res.text()).toBe("0123456789abcdefghij");
+        expect(errors).toEqual([]);
+    });
+
+    test.each(["no-credential", "unsupported"] as const)(
+        "a decline may say why with code %p, and still streams",
+        async (code) => {
+            const decline: Extract<Awaited<ReturnType<NonNullable<ObjectStore["createSignedUrl"]>>>, { ok: false }> = {
+                ok: false,
+                error: "declined",
+                code,
+            };
+            const store = signingStore(async () => decline);
+            const res = await serveObject(store, { preferSignedUrl: () => true })(req(), { key: KEY });
+            expect(res.status).toBe(200);
+            expect(await res.text()).toBe("0123456789abcdefghij");
+        },
+    );
+
+    test("ok: false on a range-incapable store streams the full body", async () => {
+        const store = { ...signingStore(async () => ({ ok: false, error: "declined" })), supportsRange: false };
+        const res = await serveObject(store)(req({ Range: "bytes=0-4" }), { key: KEY });
+        expect(res.status).toBe(200);
+        expect(res.headers.get("Accept-Ranges")).toBe("none");
+        expect(await res.text()).toBe("0123456789abcdefghij");
+    });
+
+    test("a throw is a reported backend failure", async () => {
+        const reported: Array<{ key: string; operation: string }> = [];
+        const store = signingStore(async () => {
+            throw new Error("signer exploded");
+        });
+        const res = await serveObject(store, { preferSignedUrl: () => true, onError: (_e, c) => reported.push(c) })(
+            req(),
+            { key: KEY },
+        );
+        expect(res.status).toBe(502);
+        expect(reported).toEqual([{ key: KEY, operation: "sign" }]);
+    });
+
+    test("a throw after the client aborted is a client abort", async () => {
+        const ac = new AbortController();
+        const errors: unknown[] = [];
+        const store = signingStore(async () => {
+            ac.abort();
+            throw new Error("fetch failed");
+        });
+        const res = await serveObjectRaw(store, { preferSignedUrl: () => true, onError: (e) => errors.push(e) })(
+            { method: "GET", headers: new Headers(), signal: ac.signal },
+            { key: KEY },
+        );
+        expect(res.status).toBe(499);
+        expect(errors).toEqual([]);
+    });
+});
+
+// ─── Stored content type is informational ───────────────────────────────────
+
+describe("ObjectMetadata.contentType", () => {
+    test("is reported to onServe and never used as the served type", async () => {
+        const served: ServeAuditEvent[] = [];
+        const base = memoryStore({ etag: ETAG });
+        const store: ObjectStore = {
+            ...base,
+            async headObject(key: string, o?: { signal?: AbortSignal }): Promise<ObjectMetadata> {
+                return { ...(await base.headObject(key, o)), contentType: "text/html" };
+            },
+        };
+        const res = await serveObject(store, { onServe: (e) => served.push(e) })(req({}, "HEAD"), { key: KEY });
+        expect(res.headers.get("Content-Type")).toBe("application/octet-stream");
+        expect(served[0]!.storedContentType).toBe("text/html");
+    });
+});
+
+// ─── Named error context ────────────────────────────────────────────────────
+
+describe("ServeErrorContext", () => {
+    test("is the onError context type", () => {
+        const contexts: ServeErrorContext[] = [];
+        const opts: ServeObjectOptions = { onError: (_e, ctx) => contexts.push(ctx) };
+        opts.onError?.(new Error("x"), { key: KEY, operation: "sign" });
+        expect(contexts).toEqual([{ key: KEY, operation: "sign" }]);
+    });
+});
+
+// ─── Multipart backend reads ────────────────────────────────────────────────
+
+describe("multipart backend reads are bounded", () => {
+    /** Content where every byte names its own offset modulo 62. */
+    const ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    const contentOf = (n: number): string => Array.from({ length: n }, (_, i) => ALPHABET[i % 62]).join("");
+
+    /** memoryStore whose stream bodies arrive in `chunk`-byte pieces, counting reads. */
+    function chunkedStore(content: string, chunk: number, gets: string[]): ObjectStore {
+        const inner = memoryStore({ etag: ETAG, content });
+        return {
+            ...inner,
+            async getObject(key, getOpts) {
+                const r = getOpts?.range;
+                gets.push(r ? `${r.start}-${r.end}` : "full");
+                const res = await inner.getObject(key, getOpts);
+                const bytes = new Uint8Array(await new Response(res.body).arrayBuffer());
+                return {
+                    ...res,
+                    body: new ReadableStream<Uint8Array<ArrayBuffer>>({
+                        start(controller) {
+                            for (let i = 0; i < bytes.length; i += chunk) controller.enqueue(bytes.slice(i, i + chunk));
+                            controller.close();
+                        },
+                    }),
+                };
+            },
+        };
+    }
+
+    /** The bodies of a multipart/byteranges response, in order. */
+    async function partBodies(res: Response): Promise<string[]> {
+        const boundary = /boundary=([^;]+)/.exec(res.headers.get("Content-Type") ?? "")![1]!;
+        const text = await res.text();
+        return text
+            .split(`--${boundary}`)
+            .slice(1, -1)
+            .map((p) => p.slice(p.indexOf("\r\n\r\n") + 4, -2));
+    }
+
+    test("50 disjoint ascending ranges cost one ranged read", async () => {
+        const content = contentOf(10_000);
+        const gets: string[] = [];
+        const ranges = Array.from({ length: 50 }, (_, i) => [i * 150, i * 150 + 9] as const);
+        const handler = serveObject(chunkedStore(content, 7, gets), { maxRanges: 50 });
+        const res = await handler(req({ Range: `bytes=${ranges.map(([a, b]) => `${a}-${b}`).join(",")}` }), {
+            key: KEY,
+        });
+        expect(res.status).toBe(206);
+        const bodies = await partBodies(res);
+        expect(gets).toEqual([`0-${49 * 150 + 9}`]);
+        expect(bodies).toEqual(ranges.map(([a, b]) => content.slice(a, b + 1)));
+    });
+
+    test("a byte-body store is sliced the same way", async () => {
+        const content = contentOf(2000);
+        const gets: string[] = [];
+        const inner = memoryStore({ etag: ETAG, content });
+        const store: ObjectStore = {
+            ...inner,
+            async getObject(key, getOpts) {
+                gets.push("get");
+                const res = await inner.getObject(key, getOpts);
+                return { ...res, body: new Uint8Array(await new Response(res.body).arrayBuffer()) };
+            },
+        };
+        const res = await serveObject(store, { maxBackendReads: 1 })(req({ Range: "bytes=10-19,500-509,1200-1209" }), {
+            key: KEY,
+        });
+        expect(await partBodies(res)).toEqual([
+            content.slice(10, 20),
+            content.slice(500, 510),
+            content.slice(1200, 1210),
+        ]);
+        expect(gets).toHaveLength(1);
+    });
+
+    test("parts in descending request order share the read too, framed in request order", async () => {
+        const content = contentOf(10_000);
+        const gets: string[] = [];
+        const spec = Array.from({ length: 50 }, (_, i) => `${(49 - i) * 150}-${(49 - i) * 150 + 9}`).join(",");
+        const res = await serveObject(chunkedStore(content, 7, gets), { maxRanges: 50 })(
+            req({ Range: `bytes=${spec}` }),
+            {
+                key: KEY,
+            },
+        );
+        expect(res.status).toBe(206);
+        expect(await partBodies(res)).toEqual(
+            Array.from({ length: 50 }, (_, i) => content.slice((49 - i) * 150, (49 - i) * 150 + 10)),
+        );
+        expect(gets).toEqual([`0-${49 * 150 + 9}`]);
+    });
+
+    test("within maxBackendReads each part streams from its own read", async () => {
+        const size = 4 * 1_048_576;
+        const content = contentOf(size);
+        const gets: string[] = [];
+        const res = await serveObject(chunkedStore(content, 65_536, gets))(
+            req({ Range: `bytes=0-9,${size / 2}-${size / 2 + 9},${size - 10}-${size - 1}` }),
+            { key: KEY },
+        );
+        expect(await partBodies(res)).toEqual([
+            content.slice(0, 10),
+            content.slice(size / 2, size / 2 + 10),
+            content.slice(size - 10),
+        ]);
+        expect(gets).toEqual(["0-9", `${size / 2}-${size / 2 + 9}`, `${size - 10}-${size - 1}`]);
+    });
+
+    test("past maxBackendReads, a span over the buffer bound degrades to a full 200", async () => {
+        const size = 4 * 1_048_576;
+        const gets: string[] = [];
+        const res = await serveObject(chunkedStore(contentOf(size), 65_536, gets), { maxBackendReads: 2 })(
+            req({ Range: `bytes=0-9,${size / 2}-${size / 2 + 9},${size - 10}-${size - 1}` }),
+            { key: KEY },
+        );
+        expect(res.status).toBe(200);
+        await res.arrayBuffer();
+        expect(gets).toEqual(["full"]);
+    });
+
+    test("a shared read that ends early is caught before headers commit: 502, never short parts", async () => {
+        const content = contentOf(1000);
+        const inner = memoryStore({ etag: ETAG, content });
+        const store: ObjectStore = {
+            ...inner,
+            async getObject(key, getOpts) {
+                const res = await inner.getObject(key, getOpts);
+                const bytes = new Uint8Array(await new Response(res.body).arrayBuffer());
+                return { ...res, body: streamOf(bytes.slice(0, 300)) };
+            },
+        };
+        const res = await serveObject(store, { maxBackendReads: 2 })(req({ Range: "bytes=0-9,200-209,500-509" }), {
+            key: KEY,
+        });
+        expect(res.status).toBe(502);
+    });
+
+    test.each([0, 1.5, Number.NaN])("maxBackendReads %p throws a TypeError", (maxBackendReads) => {
+        expect(() => serveObject(memoryStore(), { maxBackendReads })).toThrow(TypeError);
     });
 });

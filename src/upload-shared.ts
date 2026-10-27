@@ -8,43 +8,79 @@
  * @packageDocumentation
  */
 
+import { isSha256Base64, sanitizeHeaderValue } from "./kernel.ts";
+
 export {
-  UploadNotFoundError,
-  UploadOffsetConflictError,
-  UploadAppendBoundError,
-  UploadOverrunError,
-  UploadDigestMismatchError,
-  isUploadNotFoundError,
-  isUploadOffsetConflictError,
-  isUploadAppendBoundError,
-  isUploadOverrunError,
-  isUploadDigestMismatchError,
+    UploadNotFoundError,
+    UploadOffsetConflictError,
+    UploadDestinationConflictError,
+    UploadAppendBoundError,
+    UploadOverrunError,
+    UploadDigestMismatchError,
+    UploadDigestUnverifiableError,
+    isUploadNotFoundError,
+    isUploadOffsetConflictError,
+    isUploadDestinationConflictError,
+    isUploadAppendBoundError,
+    isUploadOverrunError,
+    isUploadDigestMismatchError,
+    isUploadDigestUnverifiableError,
+    UPLOAD_STORE_CONTRACT_VERSION,
 } from "./upload-store.ts";
 export type {
-  ResumableWriteStore,
-  StoredUploadState,
-  CreateUploadOptions,
-  AppendChunkOptions,
-  CompleteUploadOptions,
-  CompletedUpload,
+    UploadErrorCode,
+    UploadDigestAlgorithm,
+    UploadDigests,
+    ResumableWriteStore,
+    SweepingWriteStore,
+    PrefixedUploadStore,
+    StoredUploadState,
+    UploadStateReadOptions,
+    UploadStateSnapshot,
+    CreateUploadOptions,
+    AppendChunkOptions,
+    AppendChunkResult,
+    UploadSweepCutoff,
+    CompleteUploadOptions,
+    CompletedUpload,
+    UploadClaim,
 } from "./upload-store.ts";
 export {
-  memoryUploadLocker,
-  UploadLockTimeoutError,
-  isUploadLockTimeoutError,
-  UPLOAD_PREEMPTED,
+    memoryUploadLocker,
+    UploadLockTimeoutError,
+    isUploadLockTimeoutError,
+    UPLOAD_PREEMPTED,
+    UPLOAD_LEASE_LOST,
 } from "./upload-locker.ts";
 export type { UploadLocker, UploadLock, AcquireOptions } from "./upload-locker.ts";
+export type { ProjectedError } from "./object-store.ts";
 export { createUploadOrchestrator } from "./upload-orchestrator.ts";
 export type {
-  UploadOrchestrator,
-  UploadOrchestratorOptions,
-  UploadOutcome,
-  UploadResourceEvent,
-  CreateUploadRequest,
-  AppendUploadRequest,
+    UploadOrchestrator,
+    UploadOrchestratorOptions,
+    UploadOutcome,
+    UploadResourceEvent,
+    CreateUploadRequest,
+    AppendUploadRequest,
+    UploadAuditKey,
+    UploadAuditKeyContext,
+    UploadKeyResolution,
+    UploadKeyResult,
+    UploadAuthorize,
+    UploadAuthorizeContext,
+    UploadAuthorizeTarget,
+    UploadAuthorizer,
+    UploadOperation,
+    UploadPolicyResolver,
+    UploadResourceOptions,
 } from "./upload-orchestrator.ts";
-export type { UploadPolicy, UploadAuditEvent, FatalBoundReason } from "./upload-engine.ts";
+export type {
+    UploadPolicy,
+    UploadAuditEvent,
+    UploadRejectReason,
+    FatalBoundReason,
+    UploadStatus,
+} from "./upload-engine.ts";
 
 /**
  * Hardening headers on every dialect error response (4xx/5xx): no MIME
@@ -53,58 +89,59 @@ export type { UploadPolicy, UploadAuditEvent, FatalBoundReason } from "./upload-
  * change to the security posture cannot land in one dialect and not the other.
  */
 export const UPLOAD_ERROR_HEADERS: Readonly<Record<string, string>> = Object.freeze({
-  "X-Content-Type-Options": "nosniff",
-  "Cache-Control": "no-store",
-  "Content-Security-Policy": "default-src 'none'",
+    "X-Content-Type-Options": "nosniff",
+    "Cache-Control": "no-store",
+    "Content-Security-Policy": "default-src 'none'",
 });
 
 /**
- * Every response header a cross-origin browser upload must be allowed to READ,
- * for an `Access-Control-Expose-Headers` value. This package does not ship CORS
- * middleware (the caller owns their CORS policy), but a resumable upload breaks
- * in non-obvious ways when the list is incomplete: expose `Location` but forget
- * `Upload-Offset` and a client cannot resume; forget `Upload-Expires` and it
- * cannot renew before expiry. Deriving the list by hand is exactly the step
- * that silently drops one header, so both dialects publish theirs here.
- *
- * Spread into your CORS layer:
- * ```typescript
- * "Access-Control-Expose-Headers": TUS_EXPOSED_HEADERS.join(", ")
- * ```
- *
- * The union covers both dialects and the checksum extension; a handler that
- * enables neither simply exposes a couple of headers it never sends, which is
- * harmless. Request-header allow-lists (`Access-Control-Allow-Headers`) are the
- * mirror image and remain the caller's to assemble from the same protocol
- * surface.
+ * Representation metadata for the object a completing upload just published,
+ * as it appears on the completion outcome.
  */
-export const TUS_EXPOSED_HEADERS: readonly string[] = Object.freeze([
-  "Location",
-  "Tus-Resumable",
-  "Tus-Version",
-  "Tus-Extension",
-  "Tus-Max-Size",
-  "Tus-Checksum-Algorithm",
-  "Upload-Offset",
-  "Upload-Length",
-  "Upload-Defer-Length",
-  "Upload-Metadata",
-  "Upload-Expires",
-  "Upload-Checksum",
-]);
+export interface PublishedRepresentation {
+    /** Raw base64 SHA-256 of the published bytes, when the store reported one. */
+    digest?: string;
+    /** Validator of the published object, when the backend reported one. */
+    etag?: string;
+}
 
 /**
- * The {@link TUS_EXPOSED_HEADERS} equivalent for the IETF resumable-uploads
- * dialect (`partial-content/upload`): the response headers a cross-origin
- * client must be allowed to read across every supported interop version.
+ * The response headers that describe the object a completing upload just
+ * published: RFC 9530 `Repr-Digest` for the digest, RFC 9110 `ETag` for the
+ * validator. Both dialects build them here so the response that says "your
+ * upload landed" describes the same representation the read side will serve,
+ * with the same values.
+ *
+ * Both fields are omitted when the outcome carries nothing for them, which is
+ * the case for every non-completing append and for a store that neither
+ * computes a digest nor reports a validator. Absence therefore means "not
+ * asserted", never "asserted empty": a client that sent `Repr-Digest` and gets
+ * none back knows its assertion was not verified against stored bytes, which
+ * is the per-object answer to the question a static capability flag can only
+ * answer per-endpoint. The dialects read no such flag for that reason.
+ *
+ * A store-supplied value is untrusted input on a header line and is treated
+ * as one:
+ *
+ * - The digest must be the raw base64 of a 32-byte SHA-256, because that is
+ *   the only thing `sha-256=:...:` may frame (RFC 9530 Section 3 makes the
+ *   member value a Structured Fields Byte Sequence). Anything else emits no
+ *   field at all: framing a malformed value produces a field recipients must
+ *   discard at best, and a false integrity assertion at worst.
+ * - The validator is stripped to RFC 9110 field-value bytes, the same
+ *   treatment the read side gives a backend `ETag`, so the two surfaces
+ *   cannot disagree about the validator of one object. A value left empty by
+ *   that stripping emits no field.
  */
-export const UPLOAD_EXPOSED_HEADERS: readonly string[] = Object.freeze([
-  "Location",
-  "Upload-Offset",
-  "Upload-Length",
-  "Upload-Complete",
-  "Upload-Incomplete",
-  "Upload-Draft-Interop-Version",
-  "Upload-Limit",
-  "Repr-Digest",
-]);
+export function publishedRepresentationHeaders(published: PublishedRepresentation): Record<string, string> {
+    const headers: Record<string, string> = {};
+    if (published.digest !== undefined) {
+        const digest = published.digest.trim();
+        if (isSha256Base64(digest)) headers["Repr-Digest"] = `sha-256=:${digest}:`;
+    }
+    if (published.etag !== undefined) {
+        const etag = sanitizeHeaderValue(published.etag);
+        if (etag.length > 0) headers.ETag = etag;
+    }
+    return headers;
+}

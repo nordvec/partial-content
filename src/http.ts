@@ -26,7 +26,10 @@
  * import { serveObject } from "partial-content/web";
  *
  * const store = httpStore({
- *   url: (key) => `${SUPABASE_URL}/storage/v1/object/documents/${key}`,
+ *   // A key is a path in the origin's namespace, not a URL fragment: each
+ *   // segment is encoded so a key cannot carry a query, a fragment, an
+ *   // authority or a dot segment into the request line.
+ *   url: (key) => `${SUPABASE_URL}/storage/v1/object/documents/${encodeKeyPath(key)}`,
  *   headers: { Authorization: `Bearer ${serviceRoleKey}` },
  * });
  *
@@ -37,17 +40,18 @@
  */
 
 import {
-  ObjectNotFoundError,
-  ObjectChangedError,
-  StoreUnavailableError,
-  resolveServedRange,
-  parseRetryAfterSeconds,
-  isOpenEndedRange,
-  guardStreamLength,
-  type ObjectStore,
-  type ObjectMetadata,
-  type ObjectStream,
-  type ParsedRange,
+    ObjectNotFoundError,
+    ObjectChangedError,
+    StoreUnavailableError,
+    resolveServedRange,
+    parseRetryAfterSeconds,
+    isOpenEndedRange,
+    guardStreamLength,
+    reservedKeyGuard,
+    type ObjectStore,
+    type ObjectMetadata,
+    type ObjectStream,
+    type ParsedRange,
 } from "./index.ts";
 
 // Re-export for convenience
@@ -56,36 +60,101 @@ export { ObjectNotFoundError, ObjectChangedError, StoreUnavailableError };
 // ─── Options ────────────────────────────────────────────────────────────────
 
 export interface HttpStoreOptions {
-  /** Build the absolute URL for a storage key. */
-  url: (key: string) => string | URL;
-  /**
-   * Request headers (e.g. Authorization). A static record, or a function of
-   * the key for per-object credentials.
-   *
-   * `Accept-Encoding`, `Range`, and `If-Match` are reserved: the adapter owns
-   * them for byte-accounting and pinned-read correctness, and any supplied
-   * value is replaced (case-insensitively, so a lowercase `accept-encoding`
-   * cannot merge with the adapter's into a combined header the origin would
-   * honor over the identity requirement).
-   */
-  headers?: Record<string, string> | ((key: string) => Record<string, string>);
-  /**
-   * Fetch implementation. Defaults to the global `fetch`.
-   * Inject for testing or to add retries/instrumentation. This is also the
-   * SSRF hook: when `url()` incorporates untrusted input, supply a fetch
-   * that validates resolved addresses (see SECURITY.md).
-   */
-  fetch?: typeof globalThis.fetch;
-  /**
-   * Redirect policy for origin requests. Defaults to `"error"`: a serving layer
-   * whose `url()` may incorporate untrusted keys must not let a compromised or
-   * misconfigured origin bounce the store to internal endpoints (cloud metadata
-   * IPs) via a 3xx. Object-storage origins answer GET/HEAD with a direct 200, so
-   * the safe default costs nothing there. Set `"follow"` explicitly for origins
-   * that legitimately redirect (some presigned-URL or CDN front-door flows);
-   * pair it with a validating `fetch` (see SECURITY.md) when keys are untrusted.
-   */
-  redirect?: "follow" | "error" | "manual";
+    /** Build the absolute URL for a storage key. */
+    url: (key: string) => string | URL;
+    /**
+     * Request headers (e.g. Authorization). A static record, or a function of
+     * the key for per-object credentials.
+     *
+     * `Accept-Encoding`, `Range`, and `If-Match` are reserved: the adapter owns
+     * them for byte-accounting and pinned-read correctness, and any supplied
+     * value is replaced (case-insensitively, so a lowercase `accept-encoding`
+     * cannot merge with the adapter's into a combined header the origin would
+     * honor over the identity requirement).
+     */
+    headers?: Record<string, string> | ((key: string) => Record<string, string>);
+    /**
+     * Fetch implementation. Defaults to the global `fetch`.
+     * Inject for testing or to add retries/instrumentation. This is also the
+     * SSRF hook: when `url()` incorporates untrusted input, supply a fetch
+     * that validates resolved addresses (see SECURITY.md).
+     */
+    fetch?: typeof globalThis.fetch;
+    /**
+     * Redirect policy for origin requests. Defaults to `"error"`: a serving layer
+     * whose `url()` may incorporate untrusted keys must not let a compromised or
+     * misconfigured origin bounce the store to internal endpoints (cloud metadata
+     * IPs) via a 3xx. Object-storage origins answer GET/HEAD with a direct 200, so
+     * the safe default costs nothing there. Set `"follow"` explicitly for origins
+     * that legitimately redirect (some presigned-URL or CDN front-door flows);
+     * pair it with a validating `fetch` (see SECURITY.md) when keys are untrusted.
+     */
+    redirect?: "follow" | "error" | "manual";
+    /**
+     * Key prefixes this store refuses to serve, because they are where an
+     * upload store sharing the origin keeps its in-flight bytes and the
+     * sidecars naming their destination keys. Keys at or under one answer
+     * {@link ObjectNotFoundError}. The default covers every upload store in
+     * this package, since the origin behind a URL does not say which one it
+     * fronts. Set to `""` when no upload store shares the origin.
+     * @default [".uploads/", ".partial-content-uploads/"]
+     */
+    reservedPrefix?: string | readonly string[];
+}
+
+// ─── Key to path ────────────────────────────────────────────────────────────
+
+/**
+ * Encode a storage key as the path suffix of an origin URL.
+ *
+ * A key is a path in the origin's namespace and a URL is a request line, and
+ * interpolating one into the other unencoded lets the key rewrite the request:
+ * `a?x=1` adds a query, `a#b` a fragment, `../other` walks to a sibling
+ * resource, and an encoded slash the origin decodes reaches a key the
+ * interpolation never named. Each segment is percent-encoded and the
+ * separators are the only literal slashes, so the origin sees exactly the key's
+ * segments in the key's order. An empty segment and the `.` and `..` dot
+ * segments are refused as {@link ObjectNotFoundError}: a URL parser resolves
+ * them before the origin ever sees the path, so no encoding of them names
+ * what the key names.
+ */
+export function encodeKeyPath(key: string): string {
+    const segments = key.split("/");
+    for (const segment of segments) {
+        if (segment === "" || segment === "." || segment === "..") throw new ObjectNotFoundError(key);
+    }
+    return segments.map(encodeURIComponent).join("/");
+}
+
+/**
+ * Every spelling an origin can resolve a key to before the key names anything.
+ *
+ * A key here becomes the path of a URL, and a path is decoded and its dot
+ * segments resolved on the way: `%2Euploads/x` and `a/../.uploads/x` both
+ * arrive at `.uploads/x` though neither carries the reserved prefix as
+ * written. Origins differ on which of the two they do first, so both orders
+ * are covered. {@link encodeKeyPath} leaves none of this reachable, but
+ * `url()` belongs to the consumer, and a key interpolated into one unencoded
+ * is what this set exists for: the reserved namespace has to be unreachable
+ * whichever way that function was written.
+ */
+function originSpellings(key: string): readonly string[] {
+    const decode = (value: string): string => {
+        try {
+            return decodeURIComponent(value);
+        } catch {
+            return value; // not valid percent-encoding: the origin sees it as written
+        }
+    };
+    const resolve = (value: string): string => {
+        try {
+            return new URL(value, "http://spellings.invalid/").pathname.slice(1);
+        } catch {
+            return value;
+        }
+    };
+    const decoded = decode(key);
+    return [key, decoded, resolve(key), resolve(decoded), decode(resolve(key))];
 }
 
 // ─── Factory ────────────────────────────────────────────────────────────────
@@ -94,209 +163,215 @@ export interface HttpStoreOptions {
  * Create an {@link ObjectStore} backed by any range-capable HTTP origin.
  */
 export function httpStore(opts: HttpStoreOptions): ObjectStore {
-  const doFetch = opts.fetch ?? globalThis.fetch;
-  const redirect = opts.redirect ?? "error";
-
-  function requestHeaders(key: string): Headers {
-    const base = typeof opts.headers === "function"
-      ? opts.headers(key)
-      : opts.headers ?? {};
-    // A Headers instance, not a spread record: header names are
-    // case-insensitive on the wire but object keys are not, so a consumer's
-    // lowercase `accept-encoding` would survive a spread alongside ours and
-    // fetch would MERGE the duplicates into e.g. "gzip, identity", silently
-    // authorizing the compressed bodies the identity requirement exists to
-    // prevent. `set()` replaces any spelling of the reserved fields.
-    const headers = new Headers(base);
-    // Byte accounting depends on the origin NOT transparently compressing:
-    // a gzip'd body would break Content-Length/Content-Range math. Server
-    // runtimes (undici, Bun, Deno, Workers) honor this; identity is also
-    // what object-storage origins serve anyway.
-    headers.set("Accept-Encoding", "identity");
-    // Reserved protocol fields: a stale consumer-supplied Range would turn a
-    // full read into an unrequested 206, and a consumer If-Match would fight
-    // the orchestrator's pin. Cleared here; set per request below.
-    headers.delete("Range");
-    headers.delete("If-Match");
-    return headers;
-  }
-
-  return {
-    supportsRange: true,
-    // 206 bounds/total are parsed from the origin's actual Content-Range
-    // (an origin ignoring Range degrades to 200): the orchestrator may skip
-    // the validating HEAD for plain range requests.
-    authoritativeRange: true,
-
-    async headObject(key: string, headOpts?: { signal?: AbortSignal }): Promise<ObjectMetadata> {
-      const response = await doFetch(opts.url(key), {
-        method: "HEAD",
-        headers: requestHeaders(key),
-        signal: headOpts?.signal,
-        redirect,
-      });
-      // HEAD bodies are empty; no need to drain before throwing.
-      if (response.status === 404) throw new ObjectNotFoundError(key);
-      if (isUnavailableStatus(response.status)) {
-        throw new StoreUnavailableError(key, { retryAfterSeconds: parseRetryAfter(response) });
-      }
-      if (!response.ok) {
-        throw new Error(`httpStore HEAD ${key} failed: ${response.status}`);
-      }
-
-      const headEncoding = nonIdentityEncoding(response);
-      if (headEncoding) {
-        throw new Error(
-          `httpStore HEAD ${key}: origin returned Content-Encoding: ${headEncoding}; ` +
-          `Content-Length would report the compressed size, so range serving requires an identity-coded body`,
-        );
-      }
-
-      const contentLength = parseSize(response.headers.get("content-length"));
-      if (contentLength === undefined) {
-        throw new Error(
-          `httpStore HEAD ${key}: origin sent no Content-Length; range serving requires sized responses`,
-        );
-      }
-
-      return {
-        contentLength,
-        etag: response.headers.get("etag") ?? undefined,
-        lastModified: response.headers.get("last-modified") ?? undefined,
-        digest: extractSha256Digest(response.headers.get("repr-digest")),
-      };
-    },
-
-    async getObject(
-      key: string,
-      getOpts?: { range?: ParsedRange; signal?: AbortSignal; ifMatch?: string },
-    ): Promise<ObjectStream> {
-      const { range, signal, ifMatch } = getOpts ?? {};
-      const headers = requestHeaders(key);
-      // Open-ended fast-path ranges carry the OPEN_ENDED sentinel end; emit
-      // the bare `bytes=a-` form rather than a 16-digit last-byte-pos.
-      if (range) {
-        headers.set(
-          "Range",
-          isOpenEndedRange(range)
-            ? `bytes=${range.start}-`
-            : `bytes=${range.start}-${range.end}`,
-        );
-      }
-      // Pin the read to the validated representation. Origins that honor
-      // If-Match (S3, Azure, nginx, another partial-content server) answer
-      // 412 when the object changed; origins that ignore it fall through to
-      // the caller's response-side guard. Weak validators are never sent:
-      // RFC 9110 mandates strong comparison for If-Match, so a `W/` ETag
-      // would be rejected by every compliant origin on every attempt.
-      if (ifMatch && !ifMatch.startsWith("W/")) {
-        headers.set("If-Match", ifMatch);
-      }
-
-      const response = await doFetch(opts.url(key), {
-        method: "GET",
-        headers,
-        signal,
-        redirect,
-      });
-
-      if (response.status === 404) {
-        await drain(response);
-        throw new ObjectNotFoundError(key);
-      }
-      if (response.status === 412) {
-        await drain(response);
-        throw new ObjectChangedError(key);
-      }
-      if (isUnavailableStatus(response.status)) {
-        const retryAfterSeconds = parseRetryAfter(response);
-        await drain(response);
-        throw new StoreUnavailableError(key, { retryAfterSeconds });
-      }
-      if (response.status !== 200 && response.status !== 206) {
-        await drain(response);
-        throw new Error(`httpStore GET ${key} failed: ${response.status}`);
-      }
-
-      // The fetch runtime transparently decodes a compressed body while
-      // Content-Length / Content-Range still describe the encoded bytes, so
-      // every byte count below would be wrong. Refuse rather than stream a
-      // body that disagrees with its own headers.
-      const getEncoding = nonIdentityEncoding(response);
-      if (getEncoding) {
-        await drain(response);
-        throw new Error(
-          `httpStore GET ${key}: origin returned Content-Encoding: ${getEncoding}; ` +
-          `range and length accounting require an identity-coded body`,
-        );
-      }
-
-      const headerLength = parseSize(response.headers.get("content-length"));
-      let served: { start: number; end: number } | undefined;
-      let contentLength: number;
-      let totalSize: number | undefined;
-
-      if (response.status === 206) {
-        // A 206 MUST carry a parseable single-range Content-Range; without
-        // one the body's bounds are unknowable and serving it as anything
-        // would silently truncate or corrupt the client's view.
-        const contentRangeHeader = response.headers.get("content-range");
-        const resolved = contentRangeHeader ? resolveServedRange(contentRangeHeader) : null;
-        if (!resolved) {
-          await drain(response);
-          throw new Error(
-            `httpStore GET ${key}: origin sent 206 with ${contentRangeHeader ? `unparseable Content-Range "${contentRangeHeader}"` : "no Content-Range"}`,
-          );
+    const doFetch = opts.fetch ?? globalThis.fetch;
+    const redirect = opts.redirect ?? "error";
+    const guardSpelling = reservedKeyGuard(opts.reservedPrefix ?? [".uploads/", ".partial-content-uploads/"]);
+    // Reported as the key the caller named: the spellings are how the origin
+    // would read it, not something the caller asked for.
+    const assertReadable = (key: string): void => {
+        for (const spelling of originSpellings(key)) {
+            try {
+                guardSpelling(spelling);
+            } catch {
+                throw new ObjectNotFoundError(key);
+            }
         }
-        served = resolved.served;
-        // Content-Length, or derived from the actual Content-Range when the
-        // origin streams chunked 206s.
-        contentLength = headerLength ?? (resolved.served.end - resolved.served.start + 1);
-        // A proxied origin streaming a generated/transcoded body legitimately
-        // does not know its full length and sends `bytes a-b/*` (the resolver's
-        // `undefined` total). Propagate that so the served response repeats `*`
-        // honestly instead of fabricating a total that would draw a spurious
-        // 416 on a later range past the invented end.
-        totalSize = resolved.totalSize;
-      } else {
-        if (headerLength === undefined) {
-          await drain(response);
-          throw new Error(
-            `httpStore GET ${key}: origin sent no Content-Length; range serving requires sized responses`,
-          );
-        }
-        contentLength = headerLength;
-        totalSize = contentLength;
-      }
+    };
 
-      // A bodyless response that DECLARES bytes would otherwise serve a
-      // clean-looking empty stream under a non-zero committed Content-Length
-      // (truncated but "complete"). No conformant fetch runtime produces
-      // this shape (a 200/206 body is never null); refuse an injected or
-      // broken implementation loudly instead.
-      if (!response.body && contentLength > 0) {
-        throw new Error(
-          `httpStore GET ${key}: origin response has no body but declares ${contentLength} bytes`,
-        );
-      }
+    function requestHeaders(key: string): Headers {
+        const base = typeof opts.headers === "function" ? opts.headers(key) : (opts.headers ?? {});
+        // A Headers instance, not a spread record: header names are
+        // case-insensitive on the wire but object keys are not, so a consumer's
+        // lowercase `accept-encoding` would survive a spread alongside ours and
+        // fetch would MERGE the duplicates into e.g. "gzip, identity", silently
+        // authorizing the compressed bodies the identity requirement exists to
+        // prevent. `set()` replaces any spelling of the reserved fields.
+        const headers = new Headers(base);
+        // Byte accounting depends on the origin NOT transparently compressing:
+        // a gzip'd body would break Content-Length/Content-Range math. Server
+        // runtimes (undici, Bun, Deno, Workers) honor this; identity is also
+        // what object-storage origins serve anyway.
+        headers.set("Accept-Encoding", "identity");
+        // Reserved protocol fields: a stale consumer-supplied Range would turn a
+        // full read into an unrequested 206, and a consumer If-Match would fight
+        // the orchestrator's pin. Cleared here; set per request below.
+        headers.delete("Range");
+        headers.delete("If-Match");
+        return headers;
+    }
 
-      return {
-        // Same truncation guard every other streaming adapter has: an origin
-        // that ends the body cleanly but short of (or past) the Content-Length
-        // it declared must error the stream, not close it looking complete
-        // under the committed byte count.
-        body: response.body
-          ? guardStreamLength(response.body, contentLength)
-          : emptyStream(),
-        contentLength,
-        totalSize,
-        range: served,
-        etag: response.headers.get("etag") ?? undefined,
-        lastModified: response.headers.get("last-modified") ?? undefined,
-        digest: extractSha256Digest(response.headers.get("repr-digest")),
-      };
-    },
-  };
+    return {
+        supportsRange: true,
+        // 206 bounds/total are parsed from the origin's actual Content-Range
+        // (an origin ignoring Range degrades to 200): the orchestrator may skip
+        // the validating HEAD for plain range requests.
+        authoritativeRange: true,
+
+        async headObject(key: string, headOpts?: { signal?: AbortSignal }): Promise<ObjectMetadata> {
+            assertReadable(key);
+            const response = await doFetch(opts.url(key), {
+                method: "HEAD",
+                headers: requestHeaders(key),
+                signal: headOpts?.signal,
+                redirect,
+            });
+            // HEAD bodies are empty; no need to drain before throwing.
+            if (response.status === 404) throw new ObjectNotFoundError(key);
+            if (isUnavailableStatus(response.status)) {
+                throw new StoreUnavailableError(key, { retryAfterSeconds: parseRetryAfter(response) });
+            }
+            if (!response.ok) {
+                throw new Error(`httpStore HEAD failed: ${response.status}`);
+            }
+
+            const headEncoding = nonIdentityEncoding(response);
+            if (headEncoding) {
+                throw new Error(
+                    `httpStore HEAD: origin returned Content-Encoding: ${headEncoding}; ` +
+                        `Content-Length would report the compressed size, so range serving requires an identity-coded body`,
+                );
+            }
+
+            const contentLength = parseSize(response.headers.get("content-length"));
+            if (contentLength === undefined) {
+                throw new Error(
+                    `httpStore HEAD: origin sent no Content-Length; range serving requires sized responses`,
+                );
+            }
+
+            return {
+                contentLength,
+                etag: response.headers.get("etag") ?? undefined,
+                lastModified: response.headers.get("last-modified") ?? undefined,
+                digest: extractSha256Digest(response.headers.get("repr-digest")),
+            };
+        },
+
+        async getObject(
+            key: string,
+            getOpts?: { range?: ParsedRange; signal?: AbortSignal; ifMatch?: string },
+        ): Promise<ObjectStream> {
+            const { range, signal, ifMatch } = getOpts ?? {};
+            assertReadable(key);
+            const headers = requestHeaders(key);
+            // Open-ended fast-path ranges carry the OPEN_ENDED sentinel end; emit
+            // the bare `bytes=a-` form rather than a 16-digit last-byte-pos.
+            if (range) {
+                headers.set(
+                    "Range",
+                    isOpenEndedRange(range) ? `bytes=${range.start}-` : `bytes=${range.start}-${range.end}`,
+                );
+            }
+            // Pin the read to the validated representation. Origins that honor
+            // If-Match (S3, Azure, nginx, another partial-content server) answer
+            // 412 when the object changed; origins that ignore it fall through to
+            // the caller's response-side guard. Weak validators are never sent:
+            // RFC 9110 mandates strong comparison for If-Match, so a `W/` ETag
+            // would be rejected by every compliant origin on every attempt.
+            if (ifMatch && !ifMatch.startsWith("W/")) {
+                headers.set("If-Match", ifMatch);
+            }
+
+            const response = await doFetch(opts.url(key), {
+                method: "GET",
+                headers,
+                signal,
+                redirect,
+            });
+
+            if (response.status === 404) {
+                await drain(response);
+                throw new ObjectNotFoundError(key);
+            }
+            if (response.status === 412) {
+                await drain(response);
+                throw new ObjectChangedError(key);
+            }
+            if (isUnavailableStatus(response.status)) {
+                const retryAfterSeconds = parseRetryAfter(response);
+                await drain(response);
+                throw new StoreUnavailableError(key, { retryAfterSeconds });
+            }
+            if (response.status !== 200 && response.status !== 206) {
+                await drain(response);
+                throw new Error(`httpStore GET failed: ${response.status}`);
+            }
+
+            // The fetch runtime transparently decodes a compressed body while
+            // Content-Length / Content-Range still describe the encoded bytes, so
+            // every byte count below would be wrong. Refuse rather than stream a
+            // body that disagrees with its own headers.
+            const getEncoding = nonIdentityEncoding(response);
+            if (getEncoding) {
+                await drain(response);
+                throw new Error(
+                    `httpStore GET: origin returned Content-Encoding: ${getEncoding}; ` +
+                        `range and length accounting require an identity-coded body`,
+                );
+            }
+
+            const headerLength = parseSize(response.headers.get("content-length"));
+            let served: { start: number; end: number } | undefined;
+            let contentLength: number;
+            let totalSize: number | undefined;
+
+            if (response.status === 206) {
+                // A 206 MUST carry a parseable single-range Content-Range; without
+                // one the body's bounds are unknowable and serving it as anything
+                // would silently truncate or corrupt the client's view.
+                const contentRangeHeader = response.headers.get("content-range");
+                const resolved = contentRangeHeader ? resolveServedRange(contentRangeHeader) : null;
+                if (!resolved) {
+                    await drain(response);
+                    throw new Error(
+                        `httpStore GET: origin sent 206 with ${contentRangeHeader ? `unparseable Content-Range "${contentRangeHeader}"` : "no Content-Range"}`,
+                    );
+                }
+                served = resolved.served;
+                // Content-Length, or derived from the actual Content-Range when the
+                // origin streams chunked 206s.
+                contentLength = headerLength ?? resolved.served.end - resolved.served.start + 1;
+                // A proxied origin streaming a generated/transcoded body legitimately
+                // does not know its full length and sends `bytes a-b/*` (the resolver's
+                // `undefined` total). Propagate that so the served response repeats `*`
+                // honestly instead of fabricating a total that would draw a spurious
+                // 416 on a later range past the invented end.
+                totalSize = resolved.totalSize;
+            } else {
+                if (headerLength === undefined) {
+                    await drain(response);
+                    throw new Error(
+                        `httpStore GET: origin sent no Content-Length; range serving requires sized responses`,
+                    );
+                }
+                contentLength = headerLength;
+                totalSize = contentLength;
+            }
+
+            // A bodyless response that DECLARES bytes would otherwise serve a
+            // clean-looking empty stream under a non-zero committed Content-Length
+            // (truncated but "complete"). No conformant fetch runtime produces
+            // this shape (a 200/206 body is never null); refuse an injected or
+            // broken implementation loudly instead.
+            if (!response.body && contentLength > 0) {
+                throw new Error(`httpStore GET: origin response has no body but declares ${contentLength} bytes`);
+            }
+
+            return {
+                // Same truncation guard every other streaming adapter has: an origin
+                // that ends the body cleanly but short of (or past) the Content-Length
+                // it declared must error the stream, not close it looking complete
+                // under the committed byte count.
+                body: response.body ? guardStreamLength(response.body, contentLength) : emptyStream(),
+                contentLength,
+                totalSize,
+                range: served,
+                etag: response.headers.get("etag") ?? undefined,
+                lastModified: response.headers.get("last-modified") ?? undefined,
+                digest: extractSha256Digest(response.headers.get("repr-digest")),
+            };
+        },
+    };
 }
 
 // ─── Internal Helpers ───────────────────────────────────────────────────────
@@ -309,15 +384,15 @@ export function httpStore(opts: HttpStoreOptions): ObjectStore {
  * which breaks all downstream byte accounting.
  */
 function nonIdentityEncoding(response: Response): string | null {
-  const enc = response.headers.get("content-encoding");
-  return enc && enc.trim().toLowerCase() !== "identity" ? enc : null;
+    const enc = response.headers.get("content-encoding");
+    return enc && enc.trim().toLowerCase() !== "identity" ? enc : null;
 }
 
 /** Parse a Content-Length header into a non-negative integer, or undefined. */
 function parseSize(value: string | null): number | undefined {
-  if (!value || !/^\d+$/.test(value.trim())) return undefined;
-  const n = Number(value.trim());
-  return Number.isSafeInteger(n) ? n : undefined;
+    if (!value || !/^\d+$/.test(value.trim())) return undefined;
+    const n = Number(value.trim());
+    return Number.isSafeInteger(n) ? n : undefined;
 }
 
 /**
@@ -325,7 +400,7 @@ function parseSize(value: string | null): number | undefined {
  * a 503, not a 502): `503 Service Unavailable` and `429 Too Many Requests`.
  */
 function isUnavailableStatus(status: number): boolean {
-  return status === 503 || status === 429;
+    return status === 503 || status === 429;
 }
 
 /**
@@ -334,7 +409,7 @@ function isUnavailableStatus(status: number): boolean {
  * as the non-negative delta from now. Returns undefined when absent/unparseable.
  */
 function parseRetryAfter(response: Response): number | undefined {
-  return parseRetryAfterSeconds(response.headers.get("retry-after"), { allowHttpDate: true });
+    return parseRetryAfterSeconds(response.headers.get("retry-after"), { allowHttpDate: true });
 }
 
 /**
@@ -346,22 +421,21 @@ function parseRetryAfter(response: Response): number | undefined {
  * is attacker-influenced input when proxying arbitrary origins.
  */
 function extractSha256Digest(header: string | null): string | undefined {
-  if (!header) return undefined;
-  const marker = "sha-256=:";
-  const start = header.toLowerCase().indexOf(marker);
-  if (start === -1) return undefined;
-  const from = start + marker.length;
-  let i = from;
-  while (i < header.length && isBase64Char(header.charCodeAt(i))) i++;
-  while (i < header.length && header[i] === "=") i++;
-  if (i === from || header[i] !== ":") return undefined;
-  return header.slice(from, i);
+    if (!header) return undefined;
+    const marker = "sha-256=:";
+    const start = header.toLowerCase().indexOf(marker);
+    if (start === -1) return undefined;
+    const from = start + marker.length;
+    let i = from;
+    while (i < header.length && isBase64Char(header.charCodeAt(i))) i++;
+    while (i < header.length && header[i] === "=") i++;
+    if (i === from || header[i] !== ":") return undefined;
+    return header.slice(from, i);
 }
 
 /** base64 alphabet: A-Z a-z 0-9 + / */
 function isBase64Char(c: number): boolean {
-  return (c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a)
-    || (c >= 0x30 && c <= 0x39) || c === 0x2b || c === 0x2f;
+    return (c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a) || (c >= 0x30 && c <= 0x39) || c === 0x2b || c === 0x2f;
 }
 
 /**
@@ -376,30 +450,30 @@ function isBase64Char(c: number): boolean {
  * the cost; anything larger sacrifices one pooled connection, which is cheap.
  */
 async function drain(response: Response, maxBytes = 64 * 1024): Promise<void> {
-  const body = response.body;
-  if (!body) return;
-  try {
-    const reader = body.getReader();
-    let seen = 0;
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) return;
-      seen += value.byteLength;
-      if (seen > maxBytes) {
-        await reader.cancel();
-        return;
-      }
+    const body = response.body;
+    if (!body) return;
+    try {
+        const reader = body.getReader();
+        let seen = 0;
+        for (;;) {
+            const { done, value } = await reader.read();
+            if (done) return;
+            seen += value.byteLength;
+            if (seen > maxBytes) {
+                await reader.cancel();
+                return;
+            }
+        }
+    } catch {
+        // Body already consumed or connection gone; nothing to release.
     }
-  } catch {
-    // Body already consumed or connection gone; nothing to release.
-  }
 }
 
 /** A closed empty stream for bodyless 200s (zero-byte objects). */
 function emptyStream(): ReadableStream<Uint8Array<ArrayBuffer>> {
-  return new ReadableStream<Uint8Array<ArrayBuffer>>({
-    start(controller) {
-      controller.close();
-    },
-  });
+    return new ReadableStream<Uint8Array<ArrayBuffer>>({
+        start(controller) {
+            controller.close();
+        },
+    });
 }

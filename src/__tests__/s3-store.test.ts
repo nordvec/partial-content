@@ -1,15 +1,10 @@
-import { describe, test, expect, mock, beforeEach } from "bun:test";
+import { describe, test, expect, mock } from "bun:test";
+import { fileURLToPath } from "node:url";
 import { s3Store, s3UploadStore, ObjectChangedError, StoreUnavailableError } from "../s3";
 import { nodeStreamToWeb } from "../object-store";
 import { OPEN_ENDED } from "../index";
 import { asStream } from "./helpers";
-import type { ObjectStore, ObjectStream } from "../index";
 
-/**
- * The streaming half of an {@link ObjectStream} body. This store hands back the
- * SDK's own body, which is always a stream, so a byte body means the adapter
- * stopped streaming and the assertion is measuring the wrong path.
- */
 // ─── Mock S3Client ──────────────────────────────────────────────────────────
 
 /**
@@ -200,9 +195,9 @@ describe("s3Store", () => {
         };
         const store = s3Store({ client, bucket: "documents" });
 
-        await expect(
-            store.getObject("reports/q4.pdf", { ifMatch: '"stale"' }),
-        ).rejects.toBeInstanceOf(ObjectChangedError);
+        await expect(store.getObject("reports/q4.pdf", { ifMatch: '"stale"' })).rejects.toBeInstanceOf(
+            ObjectChangedError,
+        );
     });
 
     test("503 SlowDown on GET maps to StoreUnavailableError (retryable, not 502)", async () => {
@@ -259,7 +254,9 @@ describe("nodeStreamToWeb", () => {
         }
 
         const stream = nodeStreamToWeb(generate(), {
-            destroy: () => { destroyed.called = true; },
+            destroy: () => {
+                destroyed.called = true;
+            },
         });
         const reader = stream.getReader();
 
@@ -286,6 +283,32 @@ describe("nodeStreamToWeb", () => {
         await expect(reader.read()).rejects.toThrow(/expected 10/);
     });
 
+    test("expectedBytes: a chunk that crosses the promised length is withheld and the source destroyed", async () => {
+        let destroyed = false;
+        let pulled = 0;
+        async function* chunks(): AsyncGenerator<Uint8Array> {
+            pulled += 1;
+            yield new Uint8Array([1, 2, 3]);
+            pulled += 1;
+            yield new Uint8Array([4, 5, 6]); // crosses 4
+            pulled += 1;
+            yield new Uint8Array([7]);
+        }
+        const source = Object.assign(chunks(), {
+            destroy: () => {
+                destroyed = true;
+            },
+        });
+        const stream = nodeStreamToWeb(source, { expectedBytes: 4 });
+        const reader = stream.getReader();
+        expect((await reader.read()).value).toEqual(new Uint8Array([1, 2, 3]));
+        // The crossing chunk is refused whole: nothing past the length is enqueued
+        // ahead of the error, and the source is torn down rather than pulled on.
+        await expect(reader.read()).rejects.toThrow(/more than 4 bytes/);
+        expect(destroyed).toBe(true);
+        expect(pulled).toBe(2);
+    });
+
     test("expectedBytes: an exact-length stream closes normally", async () => {
         async function* gen(): AsyncGenerator<Uint8Array> {
             yield new Uint8Array([1, 2, 3, 4, 5]);
@@ -310,7 +333,9 @@ describe("nodeStreamToWeb", () => {
         }
 
         const stream = nodeStreamToWeb(generate(), {
-            destroy: () => { destroyed.called = true; },
+            destroy: () => {
+                destroyed.called = true;
+            },
         });
 
         await stream.cancel("test cancel");
@@ -357,13 +382,24 @@ describe("s3Store: null ContentLength on GET", () => {
         const { client } = createMockS3Client({
             get: {
                 Body: new ReadableStream<Uint8Array>({
-                    start(c) { c.enqueue(new Uint8Array([1, 2, 3])); c.close(); },
+                    start(c) {
+                        c.enqueue(new Uint8Array([1, 2, 3]));
+                        c.close();
+                    },
                 }),
                 ContentLength: undefined,
             },
         });
         const store = s3Store({ client, bucket: "docs" });
-        await expect(store.getObject("file.pdf")).rejects.toThrow(/no ContentLength/);
+        const err: unknown = await store.getObject("Payslip March.pdf").then(
+            () => undefined,
+            (e: unknown) => e,
+        );
+        expect(err).toBeInstanceOf(Error);
+        expect((err as Error).message).toMatch(/no ContentLength/);
+        // The key is commonly a user's filename and the message is free text
+        // a consumer's logs print whole.
+        expect((err as Error).message).not.toContain("Payslip");
     });
 });
 
@@ -387,9 +423,11 @@ describe("s3Store: committed-length guard", () => {
         const store = s3Store({ client: client.client, bucket: "b" });
         const result = await store.getObject("doc");
         const chunks: Uint8Array[] = [];
-        await expect((async () => {
-            for await (const c of asStream(result.body)) chunks.push(c);
-        })()).rejects.toThrow(/expected 10/);
+        await expect(
+            (async () => {
+                for await (const c of asStream(result.body)) chunks.push(c);
+            })(),
+        ).rejects.toThrow(/expected 10/);
     });
 });
 
@@ -401,12 +439,13 @@ describe("s3Store: SDK body shapes", () => {
         const client = createMockS3Client({
             get: {
                 Body: {
-                    transformToWebStream: () => new ReadableStream<Uint8Array>({
-                        start(controller) {
-                            controller.enqueue(bytes);
-                            controller.close();
-                        },
-                    }),
+                    transformToWebStream: () =>
+                        new ReadableStream<Uint8Array>({
+                            start(controller) {
+                                controller.enqueue(bytes);
+                                controller.close();
+                            },
+                        }),
                 } as unknown as ReadableStream<Uint8Array>,
                 ContentLength: 8,
             },
@@ -425,7 +464,9 @@ describe("s3Store: SDK body shapes", () => {
             yield new TextEncoder().encode("node-body");
         }
         const nodeBody = Object.assign(iterate(), {
-            destroy() { destroyed++; },
+            destroy() {
+                destroyed++;
+            },
         });
         const client = createMockS3Client({
             get: {
@@ -511,19 +552,75 @@ describe("s3Store: createSignedUrl", () => {
         expect(seen[0]?.input.ResponseCacheControl).toBe("private, no-cache");
 
         await store.createSignedUrl!("doc.pdf", { expiresInSeconds: 60 });
-        expect("ResponseCacheControl" in (seen[1]?.input ?? {})).toBe(false);
+        // The SDK serializer omits an undefined member from the signed query.
+        expect(seen[1]?.input.ResponseCacheControl).toBeUndefined();
     });
 
-    test("presigner failure returns ok: false with the message (never throws)", async () => {
+    test("a signing failure throws: ok: false is reserved for a store that cannot sign", async () => {
+        // A credential provider that fails means signing was supposed to work.
+        // Answering ok: false would silently turn it into a streamed response.
         mock.module("@aws-sdk/s3-request-presigner", () => ({
-            getSignedUrl: async () => { throw new Error("credentials expired"); },
+            getSignedUrl: async () => {
+                throw new Error("credentials expired");
+            },
         }));
 
         const client = createMockS3Client({});
         const store = s3Store({ client: client.client, bucket: "b" });
-        const result = await store.createSignedUrl!("doc.pdf", { expiresInSeconds: 60 });
 
-        expect(result).toEqual({ ok: false, error: "credentials expired" });
+        await expect(store.createSignedUrl!("doc.pdf", { expiresInSeconds: 60 })).rejects.toThrow(
+            "credentials expired",
+        );
+    });
+
+    test("a presigner that cannot load answers ok: false with the cause, so the caller streams", () => {
+        // This process already holds the presigner, so the absent peer is
+        // reproduced in a fresh one whose loader refuses that module.
+        const script = `
+            Bun.plugin({
+                setup(build) {
+                    build.onLoad({ filter: /s3-request-presigner/ }, () => {
+                        throw new Error("peer not installed");
+                    });
+                },
+            });
+            const { s3Store } = await import(process.env.S3_MODULE);
+            const result = await s3Store({ client: {}, bucket: "b" }).createSignedUrl("doc.pdf", { expiresInSeconds: 60 });
+            console.log(JSON.stringify({ ...result, cause: result.cause?.message }));
+        `;
+        const run = Bun.spawnSync({
+            cmd: [process.execPath, "-e", script],
+            env: { ...process.env, S3_MODULE: fileURLToPath(new URL("../s3.ts", import.meta.url)) },
+        });
+        expect(run.exitCode).toBe(0);
+        const result = JSON.parse(run.stdout.toString().trim()) as Record<string, unknown>;
+        expect(result.ok).toBe(false);
+        expect(result.code).toBe("unsupported");
+        expect(String(result.error)).toMatch(/s3-request-presigner/);
+        expect(result.cause).toBe("peer not installed");
+    });
+
+    test("an aborted signal is honoured before and after signing", async () => {
+        let signed = 0;
+        const controller = new AbortController();
+        mock.module("@aws-sdk/s3-request-presigner", () => ({
+            getSignedUrl: async () => {
+                signed += 1;
+                controller.abort(new Error("caller went away"));
+                return "https://bucket.s3.example/doc?signature=abc";
+            },
+        }));
+
+        const client = createMockS3Client({});
+        const store = s3Store({ client: client.client, bucket: "b" });
+        const signOpts = { expiresInSeconds: 60, signal: controller.signal };
+
+        // Aborted while signing: the URL is not handed out.
+        await expect(store.createSignedUrl!("doc.pdf", signOpts)).rejects.toThrow("caller went away");
+        expect(signed).toBe(1);
+        // Already aborted: signing never starts.
+        await expect(store.createSignedUrl!("doc.pdf", signOpts)).rejects.toThrow("caller went away");
+        expect(signed).toBe(1);
     });
 });
 
@@ -558,17 +655,17 @@ describe("throttle classification by name, with no HTTP status", () => {
                 err.name = name;
                 return err;
             });
-            await expect(store.getObject("reports/q4.pdf"))
-                .rejects.toBeInstanceOf(StoreUnavailableError);
+            await expect(store.getObject("reports/q4.pdf")).rejects.toBeInstanceOf(StoreUnavailableError);
         });
     }
 
     test("a 429 is a throttle beside the 503", async () => {
-        const store = throwingStore(() => Object.assign(new Error("too many requests"), {
-            $metadata: { httpStatusCode: 429 },
-        }));
-        await expect(store.headObject("reports/q4.pdf"))
-            .rejects.toBeInstanceOf(StoreUnavailableError);
+        const store = throwingStore(() =>
+            Object.assign(new Error("too many requests"), {
+                $metadata: { httpStatusCode: 429 },
+            }),
+        );
+        await expect(store.headObject("reports/q4.pdf")).rejects.toBeInstanceOf(StoreUnavailableError);
     });
 
     test("an error that is neither a throttle name nor a throttle status is not one", async () => {
@@ -583,8 +680,7 @@ describe("throttle classification by name, with no HTTP status", () => {
             };
             return err;
         });
-        await expect(store.getObject("reports/q4.pdf"))
-            .rejects.not.toBeInstanceOf(StoreUnavailableError);
+        await expect(store.getObject("reports/q4.pdf")).rejects.not.toBeInstanceOf(StoreUnavailableError);
     });
 
     test("the backend's advised back-off rides along on the throttle", async () => {
@@ -627,8 +723,9 @@ describe("s3 factories refuse a target they cannot address", () => {
     for (const [factory, build] of factories) {
         for (const [label, bad] of badClients) {
             test(`${factory} refuses ${label} as the client`, () => {
-                expect(() => build({ client: bad, bucket: "b" }))
-                    .toThrow(new RegExp(`^${factory}: options\\.client is required`));
+                expect(() => build({ client: bad, bucket: "b" })).toThrow(
+                    new RegExp(`^${factory}: options\\.client is required`),
+                );
             });
         }
 
@@ -638,8 +735,9 @@ describe("s3 factories refuse a target they cannot address", () => {
 
         test(`${factory} refuses a bucket that is not a non-empty string`, () => {
             for (const bad of [undefined, "", 7, null]) {
-                expect(() => build({ client, bucket: bad }))
-                    .toThrow(new RegExp(`^${factory}: options\\.bucket is required`));
+                expect(() => build({ client, bucket: bad })).toThrow(
+                    new RegExp(`^${factory}: options\\.bucket is required`),
+                );
             }
         });
 

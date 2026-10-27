@@ -20,6 +20,39 @@ describe("upload token identity", () => {
         expect(ids.size).toBe(500);
     });
 
+    /** Mint with no `randomUUID`, every random byte set to `fill`. */
+    function mintWithoutRandomUUID(fill: number): string {
+        const crypto = globalThis.crypto;
+        Object.defineProperty(crypto, "randomUUID", { value: undefined, configurable: true });
+        Object.defineProperty(crypto, "getRandomValues", {
+            value: <T extends ArrayBufferView | null>(array: T): T => {
+                if (array instanceof Uint8Array) array.fill(fill);
+                return array;
+            },
+            configurable: true,
+        });
+        try {
+            return newUploadId();
+        } finally {
+            // The own properties shadow the prototype's methods; deleting them
+            // restores the real ones.
+            Reflect.deleteProperty(crypto, "randomUUID");
+            Reflect.deleteProperty(crypto, "getRandomValues");
+        }
+    }
+
+    test("a runtime without randomUUID still mints a version-4 UUID", () => {
+        // The shape is what decodeUploadId accepts, so an id minted in any other
+        // shape is an upload that can never be resumed. The version nibble and
+        // the variant bits are forced whatever the random bytes were.
+        expect(mintWithoutRandomUUID(0xff)).toBe("ffffffff-ffff-4fff-bfff-ffffffffffff");
+        expect(mintWithoutRandomUUID(0x00)).toBe("00000000-0000-4000-8000-000000000000");
+        const id = mintWithoutRandomUUID(0x5a);
+        expect(id).toBe("5a5a5a5a-5a5a-4a5a-9a5a-5a5a5a5a5a5a");
+        expect(decodeUploadId(id)).toBe(id);
+        expect(typeof globalThis.crypto.randomUUID).toBe("function");
+    });
+
     test("anything that is not a minted id is refused", () => {
         for (const forged of [
             "eyJrZXkiOiJ0ZW5hbnRzL2FjbWUvcGF5cm9sbC5jc3YifQ", // a key-bearing payload

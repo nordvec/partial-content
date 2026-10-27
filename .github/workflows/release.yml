@@ -2,21 +2,31 @@ name: release
 
 # Publishes to npm when a version tag is pushed. Publishing happens ONLY here,
 # never from a laptop: `--provenance` attests the exact source commit and
-# workflow, and the prepublishOnly tarball guard blocks stray files.
+# workflow.
+#
+# Three jobs, so the code that runs dependencies never shares a job with a
+# credential: `build` installs, tests, runs the prepublish guards and every
+# runtime smoke against the built `dist/`, and packs the tarball with read-only
+# permissions; `publish` holds only `id-token: write` and publishes that exact
+# tarball with no install and no scripts; `release` holds only
+# `contents: write` and creates the GitHub Release. Actions are pinned by
+# commit SHA and Bun by version.
 on:
   push:
     tags: ["v*"]
 
-permissions:
-  contents: write # create the GitHub Release after a successful publish
-  id-token: write # npm --provenance (Sigstore attestation via OIDC)
+permissions: {}
 
 jobs:
-  publish:
+  build:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Verify tag matches package.json version
         run: |
@@ -26,26 +36,72 @@ jobs:
             exit 1
           fi
 
-      - uses: oven-sh/setup-bun@v2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          bun-version: latest
+          bun-version: 1.4.4
+      # The declared engine floor, so every Node step below runs on what
+      # consumers are promised rather than on the runner's preinstalled Node.
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
       - run: bun install --frozen-lockfile
-      - run: bun test --isolate --timeout 30000
+      - run: bun run test
 
-      - uses: actions/setup-node@v4
+      # The prepublish chain: clean rebuild, doc and export checks, the
+      # changelog version gate and the tarball-content guard. `publish` runs
+      # with --ignore-scripts, so this is where they run.
+      - run: npm run prepublishOnly
+
+      # Every runtime executes the dist/ that is packed below.
+      - name: Smoke on Node 24
+        run: node smoke/smoke.mjs
+      - name: Smoke the Node bridge on Node 24
+        run: node smoke/node-bridge.mjs
+      - name: Smoke on Bun
+        run: bun smoke/smoke.mjs
+      - name: Install Deno
+        run: npm install -g deno@2
+      - name: Smoke on Deno
+        run: deno run --allow-read smoke/smoke.mjs
+
+      - name: Pack
+        run: npm pack --ignore-scripts && mv partial-content-*.tgz package.tgz
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: package
+          path: package.tgz
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      id-token: write # npm --provenance (Sigstore attestation via OIDC)
+    steps:
+      # Provenance names the repository from package.json and the workflow run
+      # from the OIDC token; publishing a tarball needs no source checkout.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: package
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
-
       # Tokenless: npm authenticates via the Trusted Publisher (OIDC) configured
       # on npmjs.com for this repo + workflow. Requires npm >= 11.5 (Node 24
-      # bundles it) and the id-token: write permission above. npm runs
-      # prepublishOnly first: clean rebuild + tarball-content guard.
-      - run: npm publish --provenance --access public
+      # bundles it).
+      - run: npm publish ./package.tgz --provenance --access public --ignore-scripts
 
-      # Only after a successful publish: the GitHub Release for the sidebar,
-      # with notes generated from the commits since the previous tag.
+  release:
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write # create the GitHub Release after a successful publish
+    steps:
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes

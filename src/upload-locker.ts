@@ -22,19 +22,30 @@
 
 /** A held lock. Release exactly once; further calls are no-ops. */
 export interface UploadLock {
-  /**
-   * Aborts the instant a LATER acquirer wants this lock (and, in a
-   * distributed locker, if the holder can no longer prove it still holds the
-   * lease). The holder MUST thread this signal into its long-running store
-   * work (the append write) so it yields at the next safe boundary, flushing
-   * what it has. Because an `AbortSignal` carries latched state (`.aborted`),
-   * a preempt that lands before the holder starts its write is not lost: the
-   * write sees an already-aborted signal and yields at once. Non-cooperation
-   * is then a visible omission (a write that ignores the signal), not a
-   * silent breach of a callback convention.
-   */
-  readonly signal: AbortSignal;
-  release(): void;
+    /**
+     * Aborts the instant a LATER acquirer wants this lock (and, in a
+     * distributed locker, if the holder can no longer prove it still holds the
+     * lease). The holder MUST thread this signal into its long-running store
+     * work (the append write) so it yields at the next safe boundary, flushing
+     * what it has. Because an `AbortSignal` carries latched state (`.aborted`),
+     * a preempt that lands before the holder starts its write is not lost: the
+     * write sees an already-aborted signal and yields at once. Non-cooperation
+     * is then a visible omission (a write that ignores the signal), not a
+     * silent breach of a callback convention.
+     */
+    readonly signal: AbortSignal;
+    /**
+     * Aborts, with reason {@link UPLOAD_LEASE_LOST}, when the locker can no
+     * longer prove this holder still holds the lock: a distributed lease that
+     * lapsed or whose renewal went unanswered. Distinct from `signal`, which
+     * also aborts when a later acquirer merely asks the holder to yield while
+     * the hold is still good. The holder MUST NOT start a new write once this
+     * has aborted (the orchestrator answers contention instead of completing),
+     * and a locker whose holds cannot be lost (the in-process locker) never
+     * aborts it. A lease-lost abort also aborts `signal`.
+     */
+    readonly lease: AbortSignal;
+    release(): void;
 }
 
 /**
@@ -44,134 +55,147 @@ export interface UploadLock {
  * contention, so they share one error.
  */
 export class UploadLockTimeoutError extends Error {
-  readonly uploadToken: string;
-  constructor(uploadToken: string) {
-    super("Upload lock was not acquired in time");
-    this.name = "UploadLockTimeoutError";
-    this.uploadToken = uploadToken;
-  }
+    readonly code = "UPLOAD_LOCK_TIMEOUT" as const;
+    readonly uploadToken: string;
+    constructor(uploadToken: string) {
+        super("Upload lock was not acquired in time");
+        this.name = "UploadLockTimeoutError";
+        this.uploadToken = uploadToken;
+    }
 }
 
-export function isUploadLockTimeoutError(err: unknown): boolean {
-  return err instanceof Error && err.name === "UploadLockTimeoutError";
+/**
+ * Narrows by `name`, not `instanceof`, like the upload-store matchers, so a
+ * custom locker can throw an equivalently-named error without importing the
+ * class (and the narrowing trusts that error to carry `uploadToken`).
+ */
+export function isUploadLockTimeoutError(err: unknown): err is UploadLockTimeoutError {
+    return err instanceof Error && err.name === "UploadLockTimeoutError";
 }
 
 export interface AcquireOptions {
-  /**
-   * How long to wait for a preempted holder to yield before giving up.
-   * A holder that cannot be interrupted (stuck backend write) should surface
-   * as a retryable contention answer, not an indefinite hang.
-   * @default 15000
-   */
-  timeoutMs?: number;
-  /**
-   * A safe identifier that SUBSTITUTES for the upload token wherever this
-   * acquire is reported. The token is the capability: possession of it is the
-   * authorization, so a locker that names it in an error context hands it to
-   * a log sink. A locker cannot invent the substitute, and its own errors are
-   * the only place it would appear, so the caller supplies it here.
-   */
-  auditKey?: string;
+    /**
+     * How long to wait for a preempted holder to yield before giving up.
+     * A holder that cannot be interrupted (stuck backend write) should surface
+     * as a retryable contention answer, not an indefinite hang.
+     * @default 15000
+     */
+    timeoutMs?: number;
+    /**
+     * A safe identifier that SUBSTITUTES for the upload token wherever this
+     * acquire is reported. The token is the capability: possession of it is the
+     * authorization, so a locker that names it in an error context hands it to
+     * a log sink. A locker cannot invent the substitute, and its own errors are
+     * the only place it would appear, so the caller supplies it here.
+     */
+    auditKey?: string;
 }
 
 export interface UploadLocker {
-  /**
-   * Acquire the lock for one upload resource. The returned lock carries a
-   * {@link UploadLock.signal} that aborts when a LATER acquirer wants the
-   * lock; the holder threads it into its store work to yield promptly.
-   */
-  acquire(uploadToken: string, opts?: AcquireOptions): Promise<UploadLock>;
+    /**
+     * Acquire the lock for one upload resource. The returned lock carries a
+     * {@link UploadLock.signal} that aborts when a LATER acquirer wants the
+     * lock; the holder threads it into its store work to yield promptly.
+     */
+    acquire(uploadToken: string, opts?: AcquireOptions): Promise<UploadLock>;
 }
+
+import { MAX_TIMER_MS, intOption } from "./upload-internals.ts";
 
 const DEFAULT_ACQUIRE_TIMEOUT_MS = 15_000;
 
 /** The abort reason on a lock signal, so a preempt is distinguishable from a client disconnect. */
 export const UPLOAD_PREEMPTED = "upload-lock-preempted";
 
+/** The abort reason on {@link UploadLock.lease}: the hold can no longer be proven. */
+export const UPLOAD_LEASE_LOST = "upload-lock-lease-lost";
+
+/** A lease for a hold that cannot be lost: never aborts. */
+const UNLOSABLE_LEASE: AbortSignal = new AbortController().signal;
+
 interface Holder {
-  /**
-   * Aborted when a later acquirer wants the lock. Created at ACQUIRE time and
-   * replaced on each hand-over, so it exists for the holder's full tenure:
-   * there is no window where a preempt has nowhere to land, which is what
-   * lets the holder rely on the signal's latched `.aborted` state instead of
-   * a separate flag.
-   */
-  controller: AbortController;
-  queue: Array<{
-    resolve: (lock: UploadLock) => void;
-    reject: (err: Error) => void;
-    timer: ReturnType<typeof setTimeout>;
-  }>;
+    /**
+     * Aborted when a later acquirer wants the lock. Created at ACQUIRE time and
+     * replaced on each hand-over, so it exists for the holder's full tenure:
+     * there is no window where a preempt has nowhere to land, which is what
+     * lets the holder rely on the signal's latched `.aborted` state instead of
+     * a separate flag.
+     */
+    controller: AbortController;
+    queue: Array<{
+        resolve: (lock: UploadLock) => void;
+        reject: (err: Error) => void;
+        timer: ReturnType<typeof setTimeout>;
+    }>;
 }
 
 /** Single-process in-memory locker (the default). */
 export function memoryUploadLocker(opts?: {
-  /**
-   * How long `acquire` waits for a hand-over before giving up, when the
-   * caller names no deadline of its own.
-   * @default 15000
-   */
-  acquireTimeoutMs?: number;
+    /**
+     * How long `acquire` waits for a hand-over before giving up, when the
+     * caller names no deadline of its own.
+     * @default 15000
+     */
+    acquireTimeoutMs?: number;
 }): UploadLocker {
-  const defaultAcquireTimeoutMs = opts?.acquireTimeoutMs ?? DEFAULT_ACQUIRE_TIMEOUT_MS;
-  if (!Number.isSafeInteger(defaultAcquireTimeoutMs) || defaultAcquireTimeoutMs <= 0) {
-    throw new TypeError(
-      `memoryUploadLocker: acquireTimeoutMs must be a positive safe integer, got ${opts?.acquireTimeoutMs}`,
-    );
-  }
-  const holders = new Map<string, Holder>();
+    // A wait is a timer, so its ceiling is the timer's: a longer one would fire at once.
+    intOption("memoryUploadLocker: acquireTimeoutMs", opts?.acquireTimeoutMs, 1, MAX_TIMER_MS);
+    const defaultAcquireTimeoutMs = opts?.acquireTimeoutMs ?? DEFAULT_ACQUIRE_TIMEOUT_MS;
+    const holders = new Map<string, Holder>();
 
-  function makeLock(token: string, controller: AbortController): UploadLock {
-    let released = false;
-    return {
-      signal: controller.signal,
-      release(): void {
-        if (released) return;
-        released = true;
-        const holder = holders.get(token);
-        if (!holder) return;
-        const next = holder.queue.shift();
-        if (!next) {
-          holders.delete(token);
-          return;
-        }
-        clearTimeout(next.timer);
-        // Hand over to the next waiter with a FRESH signal (the previous
-        // holder's was already aborted). If more waiters remain behind it,
-        // preempt the new holder at once, in FIFO order with the same yield
-        // pressure every holder gets.
-        const nextController = new AbortController();
-        holder.controller = nextController;
-        next.resolve(makeLock(token, nextController));
-        if (holder.queue.length > 0) nextController.abort(UPLOAD_PREEMPTED);
-      },
-    };
-  }
-
-  return {
-    acquire(token, opts): Promise<UploadLock> {
-      const timeoutMs = opts?.timeoutMs ?? defaultAcquireTimeoutMs;
-      const holder = holders.get(token);
-      if (!holder) {
-        const controller = new AbortController();
-        holders.set(token, { controller, queue: [] });
-        return Promise.resolve(makeLock(token, controller));
-      }
-      return new Promise<UploadLock>((resolve, reject) => {
-        const entry = {
-          resolve,
-          reject,
-          timer: setTimeout(() => {
-            const idx = holder.queue.indexOf(entry);
-            if (idx !== -1) holder.queue.splice(idx, 1);
-            reject(new UploadLockTimeoutError(token));
-          }, timeoutMs),
+    function makeLock(token: string, controller: AbortController): UploadLock {
+        let released = false;
+        return {
+            signal: controller.signal,
+            // A hold in this process ends only by release.
+            lease: UNLOSABLE_LEASE,
+            release(): void {
+                if (released) return;
+                released = true;
+                const holder = holders.get(token);
+                if (!holder) return;
+                const next = holder.queue.shift();
+                if (!next) {
+                    holders.delete(token);
+                    return;
+                }
+                clearTimeout(next.timer);
+                // Hand over to the next waiter with a FRESH signal (the previous
+                // holder's was already aborted). If more waiters remain behind it,
+                // preempt the new holder at once, in FIFO order with the same yield
+                // pressure every holder gets.
+                const nextController = new AbortController();
+                holder.controller = nextController;
+                next.resolve(makeLock(token, nextController));
+                if (holder.queue.length > 0) nextController.abort(UPLOAD_PREEMPTED);
+            },
         };
-        holder.queue.push(entry);
-        // Ask the current holder to yield. `abort()` is idempotent, so a
-        // second waiter arriving needs no "already preempted" flag.
-        holder.controller.abort(UPLOAD_PREEMPTED);
-      });
-    },
-  };
+    }
+
+    return {
+        acquire(token, opts): Promise<UploadLock> {
+            const timeoutMs = opts?.timeoutMs ?? defaultAcquireTimeoutMs;
+            const holder = holders.get(token);
+            if (!holder) {
+                const controller = new AbortController();
+                holders.set(token, { controller, queue: [] });
+                return Promise.resolve(makeLock(token, controller));
+            }
+            return new Promise<UploadLock>((resolve, reject) => {
+                const entry = {
+                    resolve,
+                    reject,
+                    timer: setTimeout(() => {
+                        const idx = holder.queue.indexOf(entry);
+                        if (idx !== -1) holder.queue.splice(idx, 1);
+                        reject(new UploadLockTimeoutError(token));
+                    }, timeoutMs),
+                };
+                holder.queue.push(entry);
+                // Ask the current holder to yield. `abort()` is idempotent, so a
+                // second waiter arriving needs no "already preempted" flag.
+                holder.controller.abort(UPLOAD_PREEMPTED);
+            });
+        },
+    };
 }

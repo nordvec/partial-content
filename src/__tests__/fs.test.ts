@@ -1,17 +1,13 @@
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
-import { mkdtemp, rm, writeFile, mkdir, utimes } from "node:fs/promises";
+import { appendFile, mkdtemp, rm, symlink, writeFile, mkdir, utimes } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import { closeSync, openSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { serveObject } from "../web";
 import { fsStore, ObjectNotFoundError } from "../fs";
-import { asStream } from "./helpers";
-import type { ObjectStream } from "../index";
+import { asStream, drain } from "./helpers";
 
-/**
- * The streaming half of an {@link ObjectStream} body. This store serves
- * files above its single-read limit as a stream, so a byte body here means the
- * size boundary moved and the assertion is measuring the wrong path.
- */
 let root: string;
 
 beforeAll(async () => {
@@ -32,13 +28,6 @@ beforeAll(async () => {
 afterAll(async () => {
     await rm(root, { recursive: true, force: true });
 });
-
-async function drain(body: ReadableStream<Uint8Array> | Uint8Array): Promise<string> {
-    if (body instanceof Uint8Array) return Buffer.from(body).toString("utf8");
-    const chunks: Uint8Array[] = [];
-    for await (const chunk of body) chunks.push(chunk);
-    return Buffer.concat(chunks).toString("utf8");
-}
 
 describe("fsStore: headObject", () => {
     test("returns size and HTTP-date Last-Modified", async () => {
@@ -192,9 +181,9 @@ describe("fsStore: getObject", () => {
 
     test("range start beyond EOF throws loudly instead of serving lying bounds", async () => {
         const store = fsStore({ root });
-        await expect(
-            store.getObject("hello.txt", { range: { start: 20, end: 25 } }),
-        ).rejects.toBeInstanceOf(RangeError);
+        await expect(store.getObject("hello.txt", { range: { start: 20, end: 25 } })).rejects.toBeInstanceOf(
+            RangeError,
+        );
     });
 
     test("weak validator distinguishes same-size writes within one second (ns mtime)", async () => {
@@ -254,6 +243,280 @@ describe("fsStore: large transfers (ReadStream path, above the single-read limit
         const result = await store.getObject("limit.bin");
         expect(result.body).toBeInstanceOf(Uint8Array);
         expect(result.contentLength).toBe(128 * 1024);
+    });
+
+    test("a file that grows mid-stream serves exactly the committed length", async () => {
+        // The stream is bounded by the size the pinned fstat reported, which
+        // is the number already committed as Content-Length. An unbounded read
+        // runs to whatever EOF has become by then, and the extra bytes leave
+        // the response longer than its own header: Node answers that with
+        // ERR_HTTP_CONTENT_LENGTH_MISMATCH and a destroyed socket, so the
+        // client gets nothing instead of the correct first N bytes.
+        const key = "growing.bin";
+        const target = join(root, key);
+        await writeFile(target, Buffer.alloc(200 * 1024, 0x63));
+        const store = fsStore({ root });
+        const result = await store.getObject(key);
+        expect(result.contentLength).toBe(200 * 1024);
+
+        await appendFile(target, Buffer.alloc(50 * 1024, 0x64));
+        const body = await drain(result.body);
+
+        expect(body.length).toBe(200 * 1024);
+        // Only the pinned file's filler byte: none of the appended bytes.
+        expect(body.includes("d")).toBe(false);
+        await rm(target, { force: true });
+    });
+});
+
+/**
+ * Lowest unused descriptor number. Node and Bun both hand out the lowest free
+ * slot, on Windows as well as POSIX, so this number rises exactly when
+ * descriptors accumulate and returns to its floor when they are released.
+ * Sampled as a minimum because other test files share this process and open
+ * descriptors of their own; a leak moves the floor, transient neighbours do
+ * not.
+ */
+function lowestFreeDescriptor(probePath: string): number {
+    let lowest = Number.POSITIVE_INFINITY;
+    for (let i = 0; i < 5; i++) {
+        const fd = openSync(probePath, "r");
+        closeSync(fd);
+        if (fd < lowest) lowest = fd;
+    }
+    return lowest;
+}
+
+/** Give the pending best-effort closes a turn to retire before probing. */
+async function settleCloses(): Promise<void> {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+}
+
+/** Descriptors a neighbouring test file may legitimately hold while this one probes. */
+const LEAK_TOLERANCE = 20;
+const SETTLE_ATTEMPTS = 500;
+
+/**
+ * Growth of the lowest free descriptor since `before`, sampled until the
+ * pending closes have retired. Closes complete on the thread pool, so how long
+ * they take depends on machine load; this polls until the growth is within
+ * tolerance and bounds the wait by attempts, not wall-clock. A leaked
+ * descriptor never retires, so a real leak exhausts the attempts and the
+ * returned growth stays above the tolerance.
+ */
+async function descriptorGrowth(probePath: string, before: number): Promise<number> {
+    let growth = lowestFreeDescriptor(probePath) - before;
+    for (let attempt = 0; attempt < SETTLE_ATTEMPTS && growth >= LEAK_TOLERANCE; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        growth = lowestFreeDescriptor(probePath) - before;
+    }
+    return growth;
+}
+
+describe("fsStore: the read path pins one descriptor", () => {
+    const HAMMER = 100;
+    const TOCTOU_REQUESTS = 3000;
+    const TOCTOU_READERS = 32;
+
+    test("sustained range-beyond-EOF traffic leaks no descriptors", async () => {
+        // The read path holds a RAW descriptor, which has no finalizer to
+        // clean up after a missed close, so one descriptor per rejected
+        // request accumulates until the process hits EMFILE. 416 traffic is
+        // the cheapest way for a client to drive that.
+        const store = fsStore({ root });
+        const beyondEof = { range: { start: 20, end: 25 } };
+        for (let i = 0; i < 20; i++) {
+            await expect(store.getObject("hello.txt", beyondEof)).rejects.toBeInstanceOf(RangeError);
+        }
+        await settleCloses();
+        const before = lowestFreeDescriptor(join(root, "hello.txt"));
+
+        for (let i = 0; i < HAMMER; i++) {
+            await expect(store.getObject("hello.txt", beyondEof)).rejects.toBeInstanceOf(RangeError);
+        }
+
+        // A leak is one descriptor per request, so it moves the floor by
+        // HAMMER, which exceeds the tolerance.
+        expect(await descriptorGrowth(join(root, "hello.txt"), before)).toBeLessThan(LEAK_TOLERANCE);
+    });
+
+    test("sustained not-a-file traffic leaks no descriptors", async () => {
+        // A directory opens successfully and is refused only after the stat,
+        // so this is the failure exit that runs with a descriptor already in
+        // hand.
+        const store = fsStore({ root });
+        for (let i = 0; i < 20; i++) {
+            await expect(store.getObject("nested")).rejects.toBeInstanceOf(ObjectNotFoundError);
+        }
+        await settleCloses();
+        const before = lowestFreeDescriptor(join(root, "hello.txt"));
+
+        for (let i = 0; i < HAMMER; i++) {
+            await expect(store.getObject("nested")).rejects.toBeInstanceOf(ObjectNotFoundError);
+        }
+
+        expect(await descriptorGrowth(join(root, "hello.txt"), before)).toBeLessThan(LEAK_TOLERANCE);
+    });
+
+    test("sustained successful small reads leak no descriptors", async () => {
+        // The success exit closes in its own callback rather than a `finally`,
+        // so it is a separate path from the failure exits above and leaks the
+        // same way if it is missed.
+        const store = fsStore({ root });
+        for (let i = 0; i < 20; i++) {
+            expect((await store.getObject("hello.txt")).contentLength).toBe(20);
+        }
+        await settleCloses();
+        const before = lowestFreeDescriptor(join(root, "hello.txt"));
+
+        for (let i = 0; i < HAMMER; i++) {
+            expect((await store.getObject("hello.txt")).contentLength).toBe(20);
+        }
+
+        expect(await descriptorGrowth(join(root, "hello.txt"), before)).toBeLessThan(LEAK_TOLERANCE);
+    });
+
+    test("metadata comes from the descriptor, so a replaced file cannot tear a response", async () => {
+        // The size, validators and bytes of one response must all describe the
+        // file the descriptor was opened on. Statting the PATH instead measures
+        // whatever the name points at by then, and every shape that produces is
+        // asserted below: a Content-Length longer than the pinned file (the read
+        // runs out and reports a shrink), one shorter (a prefix of the wrong
+        // file served as a whole object), and a stat of a name that has since
+        // been unlinked (a bare ENOENT escaping instead of the mapped
+        // not-found the open path produces).
+        //
+        // Unlinking is what makes the two disagree: the descriptor keeps the
+        // inode alive with its own size and bytes while the name is recreated
+        // at a different size. Windows allows this too, so the check is not
+        // POSIX-only.
+        const key = "toctou.bin";
+        const target = join(root, key);
+        const SMALL = { size: 4096, byte: 0x41 };
+        const LARGE = { size: 8192, byte: 0x42 };
+        await writeFile(target, Buffer.alloc(SMALL.size, SMALL.byte));
+
+        let flipping = true;
+        const staged = [join(root, "toctou.staged.0"), join(root, "toctou.staged.1")];
+        // Synchronous flips: the readers below saturate the filesystem thread
+        // pool, and an async flipper queued behind them would flip a handful of
+        // times across the whole run. On the main thread a flip costs nothing
+        // and lands cleanly between two turns of the event loop, which is
+        // exactly where a reader's window sits.
+        const flipper = (async () => {
+            for (let i = 0; flipping; i++) {
+                const shape = i % 2 === 0 ? LARGE : SMALL;
+                const source = staged[i % 2]!;
+                writeFileSync(source, Buffer.alloc(shape.size, shape.byte));
+                // Unlink first (the name must be free before the rename can
+                // take it), then publish the finished file under one syscall,
+                // so a reader sees a whole file or no file, never a half-
+                // written one.
+                rmSync(target, { force: true });
+                renameSync(source, target);
+                await new Promise((resolve) => setImmediate(resolve));
+            }
+        })();
+
+        const store = fsStore({ root });
+        let issued = 0;
+        let served = 0;
+        // Readers run concurrently on purpose. The window a path stat opens is
+        // one turn of the event loop wide, so a single sequential reader almost
+        // always completes between two flips and never straddles one; keeping
+        // many requests in flight means every flip lands inside some reader's
+        // window.
+        const readOnce = async (): Promise<void> => {
+            let result;
+            try {
+                result = await store.getObject(key);
+            } catch (err) {
+                // Losing the race to OPEN is legitimate: the name is briefly
+                // absent while it is recreated, which surfaces as the mapped
+                // not-found or, on Windows, as the delete-pending error the
+                // platform returns there instead. A torn response carries no
+                // errno at all (the short-read guard raises a plain Error), so
+                // this admits the race without admitting the defect.
+                if (!(err instanceof ObjectNotFoundError)) {
+                    expect((err as NodeJS.ErrnoException).code).toMatch(/^(ENOENT|EPERM|EBUSY)$/);
+                }
+                return;
+            }
+            served++;
+            const bytes = result.body;
+            if (!(bytes instanceof Uint8Array)) throw new Error("expected a byte body");
+            // Bounds agree with the bytes actually delivered.
+            expect(bytes.length).toBe(result.contentLength);
+            expect(result.totalSize).toBe(bytes.length);
+            // And the bytes are one whole file, not a prefix of the other:
+            // each shape has its own filler byte and its own length.
+            const shape = bytes.length === SMALL.size ? SMALL : LARGE;
+            expect(bytes.length).toBe(shape.size);
+            expect(bytes.every((b) => b === shape.byte)).toBe(true);
+            // The weak validator encodes the size the descriptor reported.
+            expect(/^W\/"([0-9a-f]+)-/.exec(result.etag!)?.[1]).toBe(shape.size.toString(16));
+        };
+
+        try {
+            await Promise.all(
+                Array.from({ length: TOCTOU_READERS }, async () => {
+                    while (issued < TOCTOU_REQUESTS) {
+                        issued++;
+                        await readOnce();
+                    }
+                }),
+            );
+        } finally {
+            flipping = false;
+            await flipper;
+            await rm(target, { force: true });
+            for (const source of staged) await rm(source, { force: true });
+        }
+        // Guard against the vacuous pass where every request lost the open race
+        // and nothing was ever checked against real bytes.
+        expect(served).toBeGreaterThan(0);
+    });
+
+    test("a throw while the stream is being wrapped leaks no descriptors", async () => {
+        // The descriptor is handed to a ReadStream and then to the web-stream
+        // wrapper, and it belongs to exactly one owner at each point: the raw
+        // number until the ReadStream constructs, the stream afterwards. Only
+        // one of the two steps releasing it means a throw in the other leaves
+        // a descriptor no finalizer will ever collect, and the terminal state
+        // of that is EMFILE for the whole process.
+        //
+        // The wrapper reads the signal by interface (it only subscribes to
+        // "abort"), so a signal whose subscription throws is what drives a
+        // failure into the second step. A real AbortSignal cannot: subscribing
+        // to one is infallible whatever its state.
+        const hostileSignal = {
+            aborted: false,
+            throwIfAborted() {
+                // Not aborted: the read must reach the stream handoff.
+            },
+            addEventListener() {
+                throw new Error("subscription refused");
+            },
+            removeEventListener() {
+                // Never reached; present so the wrapper's detach path is real.
+            },
+        } as unknown as AbortSignal;
+
+        const store = fsStore({ root });
+        // "big.bin" is above the single-read limit, so it takes the streaming
+        // path that owns a descriptor across the handoff.
+        const stream = { signal: hostileSignal };
+        for (let i = 0; i < 20; i++) {
+            await expect(store.getObject("big.bin", stream)).rejects.toThrow("subscription refused");
+        }
+        await settleCloses();
+        const before = lowestFreeDescriptor(join(root, "hello.txt"));
+
+        for (let i = 0; i < HAMMER; i++) {
+            await expect(store.getObject("big.bin", stream)).rejects.toThrow("subscription refused");
+        }
+
+        expect(await descriptorGrowth(join(root, "hello.txt"), before)).toBeLessThan(LEAK_TOLERANCE);
     });
 });
 
@@ -387,7 +650,9 @@ describe("fsStore: opt-in hot-object cache", () => {
             // Even when the range happens to cover the whole object, only
             // FULL (rangeless) reads may populate bodies: the rule is on the
             // read shape, not the byte count.
-            expect(await drain((await store.getObject("r.txt", { range: { start: 0, end: 9 } })).body)).toBe("0123456789");
+            expect(await drain((await store.getObject("r.txt", { range: { start: 0, end: 9 } })).body)).toBe(
+                "0123456789",
+            );
 
             await rm(join(dir, "r.txt"));
             await expect(store.getObject("r.txt")).rejects.toBeInstanceOf(ObjectNotFoundError);
@@ -572,9 +837,9 @@ describe("fsStore: opt-in hot-object cache", () => {
             expect(clamped.contentLength).toBe(6);
             expect(clamped.range).toEqual({ start: 4, end: 9 });
 
-            await expect(
-                store.getObject("c.bin", { range: { start: 10, end: 12 } }),
-            ).rejects.toBeInstanceOf(RangeError);
+            await expect(store.getObject("c.bin", { range: { start: 10, end: 12 } })).rejects.toBeInstanceOf(
+                RangeError,
+            );
         } finally {
             await rm(dir, { recursive: true, force: true });
         }
@@ -661,10 +926,9 @@ describe("fsStore: authoritative-range fast path", () => {
             }) as typeof base.headObject,
         };
         const handler = serveObject(counting);
-        const res = await handler(
-            new Request("http://localhost/f", { headers: { Range: "bytes=5-9" } }),
-            { key: "hello.txt" },
-        );
+        const res = await handler(new Request("http://localhost/f", { headers: { Range: "bytes=5-9" } }), {
+            key: "hello.txt",
+        });
 
         expect(res.status).toBe(206);
         expect(await res.text()).toBe("56789");
@@ -676,10 +940,9 @@ describe("fsStore: authoritative-range fast path", () => {
 
     test("a start beyond EOF falls back to validation and answers a true 416", async () => {
         const handler = serveObject(fsStore({ root }));
-        const res = await handler(
-            new Request("http://localhost/f", { headers: { Range: "bytes=100-200" } }),
-            { key: "hello.txt" },
-        );
+        const res = await handler(new Request("http://localhost/f", { headers: { Range: "bytes=100-200" } }), {
+            key: "hello.txt",
+        });
 
         expect(res.status).toBe(416);
         expect(res.headers.get("Content-Range")).toBe("bytes */20");
@@ -687,13 +950,147 @@ describe("fsStore: authoritative-range fast path", () => {
 
     test("an open-ended range is clamped by the store itself", async () => {
         const handler = serveObject(fsStore({ root }));
-        const res = await handler(
-            new Request("http://localhost/f", { headers: { Range: "bytes=15-" } }),
-            { key: "hello.txt" },
-        );
+        const res = await handler(new Request("http://localhost/f", { headers: { Range: "bytes=15-" } }), {
+            key: "hello.txt",
+        });
 
         expect(res.status).toBe(206);
         expect(await res.text()).toBe("fghij");
         expect(res.headers.get("Content-Range")).toBe("bytes 15-19/20");
+    });
+});
+
+// ─── Links that leave the root ──────────────────────────────────────────────
+
+/**
+ * A directory link: a junction on Windows (no privilege needed), a symlink on
+ * POSIX, where the type argument is ignored.
+ */
+async function linkDir(target: string, path: string): Promise<void> {
+    await symlink(target, path, "junction");
+}
+
+/** A file symlink, or false where the platform refuses one without privilege. */
+async function linkFile(target: string, path: string): Promise<boolean> {
+    try {
+        await symlink(target, path, "file");
+        return true;
+    } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "EPERM") return false;
+        throw err;
+    }
+}
+
+describe("fsStore: symlinks", () => {
+    let base: string;
+    let inside: string;
+    let outside: string;
+
+    beforeAll(async () => {
+        base = await mkdtemp(join(tmpdir(), "pc-fs-links-"));
+        inside = join(base, "root");
+        outside = join(base, "outside");
+        await mkdir(join(inside, "real"), { recursive: true });
+        await mkdir(outside);
+        await writeFile(join(outside, "secret.txt"), "outside the root");
+        await writeFile(join(inside, "real", "doc.txt"), "inside the root");
+        await linkDir(outside, join(inside, "escape"));
+        await linkDir(join(inside, "real"), join(inside, "alias"));
+    });
+
+    afterAll(async () => {
+        await rm(base, { recursive: true, force: true });
+    });
+
+    test("a directory link out of the root is refused by default", async () => {
+        const store = fsStore({ root: inside });
+        await expect(store.getObject("escape/secret.txt")).rejects.toBeInstanceOf(ObjectNotFoundError);
+        await expect(store.headObject("escape/secret.txt")).rejects.toBeInstanceOf(ObjectNotFoundError);
+        const ranged = store.getObject("escape/secret.txt", { range: { start: 0, end: 3 } });
+        await expect(ranged).rejects.toBeInstanceOf(ObjectNotFoundError);
+    });
+
+    test("the refusal holds behind the serving handler and its fast path", async () => {
+        const handler = serveObject(fsStore({ root: inside }));
+        for (const headers of [{}, { Range: "bytes=0-3" }] as Record<string, string>[]) {
+            const res = await handler(new Request("http://localhost/f", { headers }), { key: "escape/secret.txt" });
+            expect(res.status).toBe(404);
+        }
+    });
+
+    test("symlinks: follow serves through the same link", async () => {
+        const store = fsStore({ root: inside, symlinks: "follow" });
+        expect(await drain((await store.getObject("escape/secret.txt")).body)).toBe("outside the root");
+        expect((await store.headObject("escape/secret.txt")).contentLength).toBe(16);
+    });
+
+    test("a link that stays inside the root still serves", async () => {
+        const store = fsStore({ root: inside });
+        expect(await drain((await store.getObject("alias/doc.txt")).body)).toBe("inside the root");
+        expect((await store.headObject("alias/doc.txt")).contentLength).toBe(15);
+    });
+
+    test("a root that is itself reached through a link serves its own files", async () => {
+        const linkedRoot = join(base, "root-link");
+        await linkDir(inside, linkedRoot);
+        const store = fsStore({ root: linkedRoot });
+        expect(await drain((await store.getObject("real/doc.txt")).body)).toBe("inside the root");
+        await expect(store.getObject("escape/secret.txt")).rejects.toBeInstanceOf(ObjectNotFoundError);
+    });
+
+    test("a link inside the root cannot reach the reserved upload workspace", async () => {
+        await mkdir(join(inside, ".uploads"), { recursive: true });
+        await writeFile(join(inside, ".uploads", "abc"), "in-flight bytes");
+        await linkDir(join(inside, ".uploads"), join(inside, "workspace"));
+        const store = fsStore({ root: inside });
+        await expect(store.getObject("workspace/abc")).rejects.toBeInstanceOf(ObjectNotFoundError);
+        await expect(store.headObject("workspace/abc")).rejects.toBeInstanceOf(ObjectNotFoundError);
+    });
+
+    test("a file symlink out of the root is refused by default and served under follow", async () => {
+        if (!(await linkFile(join(outside, "secret.txt"), join(inside, "link.txt")))) return;
+        await expect(fsStore({ root: inside }).getObject("link.txt")).rejects.toBeInstanceOf(ObjectNotFoundError);
+        await expect(fsStore({ root: inside }).headObject("link.txt")).rejects.toBeInstanceOf(ObjectNotFoundError);
+        const follow = fsStore({ root: inside, symlinks: "follow" });
+        expect(await drain((await follow.getObject("link.txt")).body)).toBe("outside the root");
+    });
+
+    test("an unrecognized symlinks value fails closed", async () => {
+        const store = fsStore({ root: inside, symlinks: "allow" as "follow" });
+        await expect(store.getObject("escape/secret.txt")).rejects.toBeInstanceOf(ObjectNotFoundError);
+    });
+});
+
+describe("fsStore: non-regular files", () => {
+    test.skipIf(process.platform === "win32")("a FIFO under the root is refused without blocking", async () => {
+        const dir = await mkdtemp(join(tmpdir(), "pc-fs-fifo-"));
+        try {
+            execFileSync("mkfifo", [join(dir, "pipe")]);
+            for (const symlinks of ["contain", "follow"] as const) {
+                const store = fsStore({ root: dir, symlinks });
+                // Opening a FIFO for reading blocks until a writer appears, so an
+                // open that is not refused never settles and this test times out.
+                await expect(store.getObject("pipe")).rejects.toBeInstanceOf(ObjectNotFoundError);
+                await expect(store.headObject("pipe")).rejects.toBeInstanceOf(ObjectNotFoundError);
+            }
+        } finally {
+            await rm(dir, { recursive: true, force: true });
+        }
+    });
+});
+
+describe("fsStore: cache option validation", () => {
+    for (const option of ["ttlMs", "maxEntries", "maxBytes"] as const) {
+        for (const value of [Number.NaN, Number.POSITIVE_INFINITY, -1]) {
+            test(`cache.${option} = ${value} is refused with a TypeError naming it`, () => {
+                const cache = { ttlMs: 1000, [option]: value };
+                expect(() => fsStore({ root, cache })).toThrow(TypeError);
+                expect(() => fsStore({ root, cache })).toThrow(`cache.${option}`);
+            });
+        }
+    }
+
+    test("zero stays a valid value for every cache option", () => {
+        expect(() => fsStore({ root, cache: { ttlMs: 0, maxEntries: 0, maxBytes: 0 } })).not.toThrow();
     });
 });

@@ -14,18 +14,23 @@ function createMockStore(overrides?: Partial<ObjectStore>): ObjectStore {
             etag: '"abc123"',
             lastModified: "Sat, 28 Jun 2025 12:00:00 GMT",
         })),
-        getObject: mock(async (_key: string, _opts?: { range?: ParsedRange; signal?: AbortSignal; ifMatch?: string }): Promise<ObjectStream> => ({
-            body: new ReadableStream<Uint8Array<ArrayBuffer>>({
-                start(controller) {
-                    controller.enqueue(new Uint8Array([72, 101, 108, 108, 111])); // "Hello"
-                    controller.close();
-                },
+        getObject: mock(
+            async (
+                _key: string,
+                _opts?: { range?: ParsedRange; signal?: AbortSignal; ifMatch?: string },
+            ): Promise<ObjectStream> => ({
+                body: new ReadableStream<Uint8Array<ArrayBuffer>>({
+                    start(controller) {
+                        controller.enqueue(new Uint8Array([72, 101, 108, 108, 111])); // "Hello"
+                        controller.close();
+                    },
+                }),
+                contentLength: 10000,
+                totalSize: 10000,
+                etag: '"abc123"',
+                lastModified: "Sat, 28 Jun 2025 12:00:00 GMT",
             }),
-            contentLength: 10000,
-            totalSize: 10000,
-            etag: '"abc123"',
-            lastModified: "Sat, 28 Jun 2025 12:00:00 GMT",
-        })),
+        ),
         ...overrides,
     };
 }
@@ -68,10 +73,7 @@ describe("serveObject", () => {
         const store = createMockStore();
         const handler = serveObject(store);
 
-        const response = await handler(
-            mockRequest({ "If-None-Match": '"abc123"' }),
-            defaultCtx(),
-        );
+        const response = await handler(mockRequest({ "If-None-Match": '"abc123"' }), defaultCtx());
 
         expect(response.status).toBe(304);
         expect(response.body).toBeNull();
@@ -81,10 +83,7 @@ describe("serveObject", () => {
         const store = createMockStore();
         const handler = serveObject(store);
 
-        const response = await handler(
-            mockRequest({ "If-Match": '"wrong-etag"' }),
-            defaultCtx(),
-        );
+        const response = await handler(mockRequest({ "If-Match": '"wrong-etag"' }), defaultCtx());
 
         expect(response.status).toBe(412);
         expect(response.body).toBeNull();
@@ -111,7 +110,7 @@ describe("serveObject", () => {
         // Range with If-None-Match miss forces Path A (HEAD required)
         const response = await handler(
             mockRequest({
-                "Range": "bytes=0-499",
+                Range: "bytes=0-499",
                 "If-Match": '"abc123"',
             }),
             defaultCtx(),
@@ -144,10 +143,7 @@ describe("serveObject", () => {
         const handler = serveObject(rangeStore);
 
         // Range header with NO conditional headers (no If-Match, no If-None-Match)
-        const response = await handler(
-            mockRequest({ "Range": "bytes=0-499" }),
-            defaultCtx(),
-        );
+        const response = await handler(mockRequest({ Range: "bytes=0-499" }), defaultCtx());
 
         expect(response.status).toBe(206);
         expect(response.headers.get("Content-Range")).toBe("bytes 0-499/10000");
@@ -161,10 +157,7 @@ describe("serveObject", () => {
         const handler = serveObject(store);
 
         // HEAD is derived from the request method (single source of truth).
-        const response = await handler(
-            new Request("http://localhost/stream", { method: "HEAD" }),
-            defaultCtx(),
-        );
+        const response = await handler(new Request("http://localhost/stream", { method: "HEAD" }), defaultCtx());
 
         expect(response.status).toBe(200);
         expect(response.body).toBeNull();
@@ -197,7 +190,7 @@ describe("serveObject", () => {
     test("applies Content-Disposition function per MIME", async () => {
         const store = createMockStore();
         const handler = serveObject(store, {
-            disposition: (mime) => mime === "application/pdf" ? "inline" : "attachment",
+            disposition: (mime) => (mime === "application/pdf" ? "inline" : "attachment"),
         });
 
         const pdfResponse = await handler(mockRequest(), defaultCtx({ mime: "application/pdf" }));
@@ -245,7 +238,9 @@ describe("serveObject", () => {
         const noRangeStore = createMockStore({
             getObject: mock(async (_key: string, _opts?: { range?: ParsedRange }): Promise<ObjectStream> => ({
                 body: new ReadableStream<Uint8Array<ArrayBuffer>>({
-                    start(c) { c.close(); },
+                    start(c) {
+                        c.close();
+                    },
                 }),
                 contentLength: 10000,
                 totalSize: 10000,
@@ -258,7 +253,7 @@ describe("serveObject", () => {
 
         const response = await handler(
             mockRequest({
-                "Range": "bytes=0-499",
+                Range: "bytes=0-499",
                 "If-Match": '"abc123"',
             }),
             defaultCtx(),
@@ -295,10 +290,7 @@ describe("serveObject", () => {
         // A Range request against a store that cannot seek: RFC 9110 14.2
         // lets the server ignore Range, so the client gets the full 200 and
         // an honest Accept-Ranges: none instead of a hard 502.
-        const response = await handler(
-            mockRequest({ Range: "bytes=0-4" }),
-            defaultCtx(),
-        );
+        const response = await handler(mockRequest({ Range: "bytes=0-4" }), defaultCtx());
 
         expect(response.status).toBe(200);
         expect(response.headers.get("Accept-Ranges")).toBe("none");
@@ -312,10 +304,7 @@ describe("serveObject", () => {
         });
         const handler = serveObject(noRangeStore);
 
-        const response = await handler(
-            mockRequest({ "If-None-Match": '"abc123"' }),
-            defaultCtx(),
-        );
+        const response = await handler(mockRequest({ "If-None-Match": '"abc123"' }), defaultCtx());
         expect(response.status).toBe(304);
     });
 
@@ -343,7 +332,7 @@ describe("serveObject", () => {
 
         const response = await handler(
             mockRequest({
-                "Range": "bytes=99999-100000",
+                Range: "bytes=99999-100000",
                 "If-Match": '"abc123"',
             }),
             defaultCtx(),
@@ -357,15 +346,14 @@ describe("serveObject", () => {
 
     test("returns 502 when headObject throws", async () => {
         const failingStore = createMockStore({
-            headObject: mock(async () => { throw new Error("Connection refused"); }),
+            headObject: mock(async () => {
+                throw new Error("Connection refused");
+            }),
         });
         const handler = serveObject(failingStore);
 
         // Request with If-None-Match forces Path A (HEAD required)
-        const response = await handler(
-            mockRequest({ "if-none-match": '"xyz"' }),
-            defaultCtx(),
-        );
+        const response = await handler(mockRequest({ "if-none-match": '"xyz"' }), defaultCtx());
 
         expect(response.status).toBe(502);
         expect(response.headers.get("X-Content-Type-Options")).toBe("nosniff");
@@ -373,7 +361,9 @@ describe("serveObject", () => {
 
     test("returns 502 when getObject throws", async () => {
         const failingStore = createMockStore({
-            getObject: mock(async () => { throw new Error("S3 timeout"); }),
+            getObject: mock(async () => {
+                throw new Error("S3 timeout");
+            }),
         });
         const handler = serveObject(failingStore);
 
@@ -410,18 +400,23 @@ describe("serveObject", () => {
             etag: '"abc123"',
             lastModified: "Sat, 28 Jun 2025 12:00:00 GMT",
         }));
-        const getSpy = mock(async (_key: string, _opts?: { range?: ParsedRange; signal?: AbortSignal; ifMatch?: string }): Promise<ObjectStream> => ({
-            body: new ReadableStream<Uint8Array<ArrayBuffer>>({
-                start(controller) {
-                    controller.enqueue(new Uint8Array([72, 101, 108, 108, 111]));
-                    controller.close();
-                },
+        const getSpy = mock(
+            async (
+                _key: string,
+                _opts?: { range?: ParsedRange; signal?: AbortSignal; ifMatch?: string },
+            ): Promise<ObjectStream> => ({
+                body: new ReadableStream<Uint8Array<ArrayBuffer>>({
+                    start(controller) {
+                        controller.enqueue(new Uint8Array([72, 101, 108, 108, 111]));
+                        controller.close();
+                    },
+                }),
+                contentLength: 10000,
+                totalSize: 10000,
+                etag: '"abc123"',
+                lastModified: "Sat, 28 Jun 2025 12:00:00 GMT",
             }),
-            contentLength: 10000,
-            totalSize: 10000,
-            etag: '"abc123"',
-            lastModified: "Sat, 28 Jun 2025 12:00:00 GMT",
-        }));
+        );
         const spyStore = createMockStore({ headObject: headSpy, getObject: getSpy });
         const handler = serveObject(spyStore);
 
@@ -493,7 +488,9 @@ describe("serveObject", () => {
             status: 404,
         });
         const store = createMockStore({
-            headObject: mock(async () => { throw notFoundError; }),
+            headObject: mock(async () => {
+                throw notFoundError;
+            }),
         });
         const handler = serveObject(store);
 
@@ -508,7 +505,9 @@ describe("serveObject", () => {
     test("returns 502 for generic store errors (not 404)", async () => {
         const genericError = new Error("Connection refused");
         const store = createMockStore({
-            headObject: mock(async () => { throw genericError; }),
+            headObject: mock(async () => {
+                throw genericError;
+            }),
         });
         const handler = serveObject(store);
 
@@ -521,7 +520,9 @@ describe("serveObject", () => {
 
     test("returns 503 + Retry-After for a StoreUnavailableError with a retry hint", async () => {
         const store = createMockStore({
-            headObject: mock(async () => { throw new StoreUnavailableError("reports/q4.pdf", { retryAfterSeconds: 5 }); }),
+            headObject: mock(async () => {
+                throw new StoreUnavailableError("reports/q4.pdf", { retryAfterSeconds: 5 });
+            }),
         });
         const req = mockRequest({ "if-none-match": '"xyz"' });
         const response = await serveObject(store)(req, defaultCtx());
@@ -537,7 +538,9 @@ describe("serveObject", () => {
 
     test("returns 503 WITHOUT Retry-After when the backend gives no hint", async () => {
         const store = createMockStore({
-            getObject: mock(async () => { throw new StoreUnavailableError("reports/q4.pdf"); }),
+            getObject: mock(async () => {
+                throw new StoreUnavailableError("reports/q4.pdf");
+            }),
         });
         const response = await serveObject(store)(mockRequest(), defaultCtx());
 
@@ -547,7 +550,9 @@ describe("serveObject", () => {
 
     test("503 is recognized from a foreign error by its status property (no kernel import)", async () => {
         const store = createMockStore({
-            getObject: mock(async () => { throw Object.assign(new Error("SlowDown"), { status: 503 }); }),
+            getObject: mock(async () => {
+                throw Object.assign(new Error("SlowDown"), { status: 503 });
+            }),
         });
         const response = await serveObject(store)(mockRequest(), defaultCtx());
         expect(response.status).toBe(503);
@@ -555,12 +560,16 @@ describe("serveObject", () => {
 
     test("Retry-After: fractional hint is floored, negative/NaN hint is dropped", async () => {
         const frac = createMockStore({
-            getObject: mock(async () => { throw new StoreUnavailableError("k", { retryAfterSeconds: 2.9 }); }),
+            getObject: mock(async () => {
+                throw new StoreUnavailableError("k", { retryAfterSeconds: 2.9 });
+            }),
         });
         expect((await serveObject(frac)(mockRequest(), defaultCtx())).headers.get("Retry-After")).toBe("2");
 
         const neg = createMockStore({
-            getObject: mock(async () => { throw new StoreUnavailableError("k", { retryAfterSeconds: -5 }); }),
+            getObject: mock(async () => {
+                throw new StoreUnavailableError("k", { retryAfterSeconds: -5 });
+            }),
         });
         const rNeg = await serveObject(neg)(mockRequest(), defaultCtx());
         expect(rNeg.status).toBe(503);
@@ -570,7 +579,9 @@ describe("serveObject", () => {
     test("calls onError callback when store throws", async () => {
         const storeError = new Error("S3 timeout");
         const store = createMockStore({
-            headObject: mock(async () => { throw storeError; }),
+            headObject: mock(async () => {
+                throw storeError;
+            }),
         });
         const errorSpy = mock((_err: unknown, _ctx: { key: string; operation: string }) => {});
         const handler = serveObject(store, { onError: errorSpy });
@@ -586,7 +597,9 @@ describe("serveObject", () => {
     test("calls onError callback on getObject error (Path C)", async () => {
         const storeError = new Error("S3 read timeout");
         const store = createMockStore({
-            getObject: mock(async () => { throw storeError; }),
+            getObject: mock(async () => {
+                throw storeError;
+            }),
         });
         const errorSpy = mock((_err: unknown, _ctx: { key: string; operation: string }) => {});
         const handler = serveObject(store, { onError: errorSpy });
@@ -602,7 +615,9 @@ describe("serveObject", () => {
     test("does not call onError on AbortError", async () => {
         const abortError = new DOMException("Aborted", "AbortError");
         const store = createMockStore({
-            headObject: mock(async () => { throw abortError; }),
+            headObject: mock(async () => {
+                throw abortError;
+            }),
         });
         const errorSpy = mock((_err: unknown, _ctx: { key: string; operation: string }) => {});
         const handler = serveObject(store, { onError: errorSpy });
@@ -624,10 +639,7 @@ describe("serveObject", () => {
         expect(r200.statusText).toBe("OK");
 
         // 304 response
-        const r304 = await handler(
-            mockRequest({ "if-none-match": '"abc123"' }),
-            defaultCtx(),
-        );
+        const r304 = await handler(mockRequest({ "if-none-match": '"abc123"' }), defaultCtx());
         expect(r304.status).toBe(304);
         expect(r304.statusText).toBe("Not Modified");
     });
@@ -654,10 +666,7 @@ describe("serveObject", () => {
         expect(r200.headers.get("X-Content-Type-Options")).toBe("nosniff");
 
         // 206 partial
-        const r206 = await handler(
-            mockRequest({ Range: "bytes=0-99" }),
-            defaultCtx(),
-        );
+        const r206 = await handler(mockRequest({ Range: "bytes=0-99" }), defaultCtx());
         expect(r206.headers.get("X-Content-Type-Options")).toBe("nosniff");
 
         // HEAD
@@ -666,7 +675,9 @@ describe("serveObject", () => {
 
         // 502 error
         const errorStore = createMockStore({
-            headObject: mock(async () => { throw new Error("connection timeout"); }),
+            headObject: mock(async () => {
+                throw new Error("connection timeout");
+            }),
         });
         const errorHandler = serveObject(errorStore);
         const r502 = await errorHandler(mockRequest(), defaultCtx());
@@ -674,7 +685,9 @@ describe("serveObject", () => {
 
         // 404 not found
         const notFoundStore = createMockStore({
-            headObject: mock(async () => { throw Object.assign(new Error("Not Found"), { name: "NotFound" }); }),
+            headObject: mock(async () => {
+                throw Object.assign(new Error("Not Found"), { name: "NotFound" });
+            }),
         });
         const notFoundHandler = serveObject(notFoundStore);
         const r404 = await notFoundHandler(mockRequest(), defaultCtx());
@@ -691,30 +704,33 @@ describe("serveObject", () => {
         expect(r200.headers.get("Content-Security-Policy")).toBeNull();
 
         // 405 Method Not Allowed
-        const r405 = await handler(
-            new Request("http://localhost/stream", { method: "POST" }),
-            defaultCtx(),
-        );
+        const r405 = await handler(new Request("http://localhost/stream", { method: "POST" }), defaultCtx());
         expect(r405.headers.get("Content-Security-Policy")).toBe(CSP);
 
         // 502 error (Path C: getObject)
         const errorStore = createMockStore({
-            getObject: mock(async () => { throw new Error("connection timeout"); }),
+            getObject: mock(async () => {
+                throw new Error("connection timeout");
+            }),
         });
         const r502 = await serveObject(errorStore)(mockRequest(), defaultCtx());
         expect(r502.headers.get("Content-Security-Policy")).toBe(CSP);
 
         // 404 not found (Path C: getObject)
         const notFoundStore = createMockStore({
-            getObject: mock(async () => { throw Object.assign(new Error("Not Found"), { name: "NotFound" }); }),
+            getObject: mock(async () => {
+                throw Object.assign(new Error("Not Found"), { name: "NotFound" });
+            }),
         });
         const r404 = await serveObject(notFoundStore)(mockRequest(), defaultCtx());
         expect(r404.headers.get("Content-Security-Policy")).toBe(CSP);
 
-        // 502 declined signed URL (range-incapable store whose provider says no)
+        // 502 failed signed URL (range-incapable store whose signer throws)
         const noStreamStore = createMockStore({
             supportsRange: false,
-            createSignedUrl: mock(async () => ({ ok: false as const, error: "denied" })),
+            createSignedUrl: mock(async () => {
+                throw new Error("signer failed");
+            }),
         });
         const r502ns = await serveObject(noStreamStore)(mockRequest(), defaultCtx());
         expect(r502ns.status).toBe(502);
@@ -725,22 +741,23 @@ describe("serveObject", () => {
         const handler = serveObject(createMockStore());
 
         // 405 Method Not Allowed
-        const r405 = await handler(
-            new Request("http://localhost/stream", { method: "POST" }),
-            defaultCtx(),
-        );
+        const r405 = await handler(new Request("http://localhost/stream", { method: "POST" }), defaultCtx());
         expect(r405.headers.get("Content-Length")).toBe("0");
 
         // 502 error (Path C calls getObject directly, not headObject)
         const errorStore = createMockStore({
-            getObject: mock(async () => { throw new Error("connection timeout"); }),
+            getObject: mock(async () => {
+                throw new Error("connection timeout");
+            }),
         });
         const r502 = await serveObject(errorStore)(mockRequest(), defaultCtx());
         expect(r502.headers.get("Content-Length")).toBe("21"); // "Storage backend error"
 
         // 404 not found (Path C calls getObject directly)
         const notFoundStore = createMockStore({
-            getObject: mock(async () => { throw Object.assign(new Error("Not Found"), { name: "NotFound" }); }),
+            getObject: mock(async () => {
+                throw Object.assign(new Error("Not Found"), { name: "NotFound" });
+            }),
         });
         const r404 = await serveObject(notFoundStore)(mockRequest(), defaultCtx());
         expect(r404.headers.get("Content-Length")).toBe("9"); // "Not Found"
@@ -760,20 +777,14 @@ describe("serveObject", () => {
         const handler = serveObject(storeWithDigest);
 
         // 200 with conditional (forces Path A through HEAD)
-        const r200 = await handler(
-            mockRequest({ "if-none-match": '"xyz"' }),
-            defaultCtx(),
-        );
+        const r200 = await handler(mockRequest({ "if-none-match": '"xyz"' }), defaultCtx());
         expect(r200.status).toBe(200);
         expect(r200.headers.get("Repr-Digest")).toBe("sha-256=:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=:");
     });
 
     test("RFC 9530 Repr-Digest: not emitted when store has no digest", async () => {
         const handler = serveObject(createMockStore());
-        const response = await handler(
-            mockRequest({ "if-none-match": '"xyz"' }),
-            defaultCtx(),
-        );
+        const response = await handler(mockRequest({ "if-none-match": '"xyz"' }), defaultCtx());
         expect(response.headers.get("Repr-Digest")).toBeNull();
     });
 
@@ -807,10 +818,7 @@ describe("serveObject", () => {
 
     test("Server-Timing emitted when timing is enabled", async () => {
         const handler = serveObject(createMockStore(), { timing: true });
-        const response = await handler(
-            mockRequest({ "if-none-match": '"xyz"' }),
-            defaultCtx(),
-        );
+        const response = await handler(mockRequest({ "if-none-match": '"xyz"' }), defaultCtx());
         const timing = response.headers.get("Server-Timing");
         expect(timing).toBeTruthy();
         expect(timing).toContain("store;dur=");
@@ -829,10 +837,7 @@ describe("serveObject", () => {
             timing: true,
             onTiming: timingSpy,
         });
-        await handler(
-            mockRequest({ "if-none-match": '"xyz"' }),
-            defaultCtx(),
-        );
+        await handler(mockRequest({ "if-none-match": '"xyz"' }), defaultCtx());
         expect(timingSpy).toHaveBeenCalledTimes(1);
         const metrics = timingSpy.mock.calls[0][0];
         expect(metrics.storeMs).toBeGreaterThanOrEqual(0);
@@ -862,14 +867,18 @@ describe("serveObject", () => {
     test("Accept-Ranges: none on error responses", async () => {
         // 404 not found
         const notFoundStore = createMockStore({
-            getObject: mock(async () => { throw Object.assign(new Error("Not Found"), { name: "NotFound" }); }),
+            getObject: mock(async () => {
+                throw Object.assign(new Error("Not Found"), { name: "NotFound" });
+            }),
         });
         const r404 = await serveObject(notFoundStore)(mockRequest(), defaultCtx());
         expect(r404.headers.get("Accept-Ranges")).toBe("none");
 
         // 502 error
         const errorStore = createMockStore({
-            getObject: mock(async () => { throw new Error("timeout"); }),
+            getObject: mock(async () => {
+                throw new Error("timeout");
+            }),
         });
         const r502 = await serveObject(errorStore)(mockRequest(), defaultCtx());
         expect(r502.headers.get("Accept-Ranges")).toBe("none");
@@ -912,10 +921,7 @@ describe("serveObject", () => {
         const handler = serveObject(createMockStore(), {
             onServe: (event) => events.push(event as unknown as Record<string, unknown>),
         });
-        await handler(
-            mockRequest({ "if-none-match": '"abc123"' }),
-            defaultCtx(),
-        );
+        await handler(mockRequest({ "if-none-match": '"abc123"' }), defaultCtx());
         expect(events).toHaveLength(1);
         expect(events[0]!.status).toBe(304);
         expect(events[0]!.bytesServed).toBe(0);
@@ -926,10 +932,7 @@ describe("serveObject", () => {
         const handler = serveObject(createMockStore(), {
             onServe: (event) => events.push(event as unknown as Record<string, unknown>),
         });
-        await handler(
-            new Request("http://localhost/stream", { method: "HEAD" }),
-            defaultCtx(),
-        );
+        await handler(new Request("http://localhost/stream", { method: "HEAD" }), defaultCtx());
         expect(events).toHaveLength(1);
         expect(events[0]!.status).toBe(200);
         expect(events[0]!.method).toBe("HEAD");
@@ -966,8 +969,12 @@ describe("serveObject", () => {
     test("onServe does NOT fire on error responses", async () => {
         const events: Array<Record<string, unknown>> = [];
         const errorStore = createMockStore({
-            headObject: mock(async () => { throw new Error("boom"); }),
-            getObject: mock(async () => { throw new Error("boom"); }),
+            headObject: mock(async () => {
+                throw new Error("boom");
+            }),
+            getObject: mock(async () => {
+                throw new Error("boom");
+            }),
         });
         const handler = serveObject(errorStore, {
             onServe: (event) => events.push(event as unknown as Record<string, unknown>),
@@ -1013,19 +1020,24 @@ describe("serveObject", () => {
 
     test("emits Repr-Digest on Path C when GET response carries digest", async () => {
         const store = createMockStore({
-            getObject: mock(async (_key: string, _opts?: { range?: ParsedRange; signal?: AbortSignal; ifMatch?: string }): Promise<ObjectStream> => ({
-                body: new ReadableStream<Uint8Array<ArrayBuffer>>({
-                    start(controller) {
-                        controller.enqueue(new Uint8Array([1, 2, 3]));
-                        controller.close();
-                    },
+            getObject: mock(
+                async (
+                    _key: string,
+                    _opts?: { range?: ParsedRange; signal?: AbortSignal; ifMatch?: string },
+                ): Promise<ObjectStream> => ({
+                    body: new ReadableStream<Uint8Array<ArrayBuffer>>({
+                        start(controller) {
+                            controller.enqueue(new Uint8Array([1, 2, 3]));
+                            controller.close();
+                        },
+                    }),
+                    contentLength: 3,
+                    totalSize: 3,
+                    etag: '"abc123"',
+                    lastModified: "Sat, 28 Jun 2025 12:00:00 GMT",
+                    digest: "LPJNul+wow4m6DsqxbninhsWHlwfp0JecwQzYpOLmCQ=",
                 }),
-                contentLength: 3,
-                totalSize: 3,
-                etag: '"abc123"',
-                lastModified: "Sat, 28 Jun 2025 12:00:00 GMT",
-                digest: "LPJNul+wow4m6DsqxbninhsWHlwfp0JecwQzYpOLmCQ=",
-            })),
+            ),
         });
         const handler = serveObject(store);
         // Path C: no conditional headers, no range, no HEAD needed
@@ -1039,10 +1051,7 @@ describe("serveObject", () => {
     test("412 response includes Content-Security-Policy", async () => {
         const store = createMockStore();
         const handler = serveObject(store);
-        const res = await handler(
-            mockRequest({ "If-Match": '"wrong-etag"' }),
-            defaultCtx(),
-        );
+        const res = await handler(mockRequest({ "If-Match": '"wrong-etag"' }), defaultCtx());
         expect(res.status).toBe(412);
         expect(res.headers.get("Content-Security-Policy")).toBe("default-src 'none'");
         expect(res.headers.get("X-Content-Type-Options")).toBe("nosniff");
@@ -1054,7 +1063,7 @@ describe("serveObject", () => {
         const res = await handler(
             mockRequest({
                 "If-None-Match": '"no-match"',
-                "Range": "bytes=99999-100000",
+                Range: "bytes=99999-100000",
             }),
             defaultCtx(),
         );

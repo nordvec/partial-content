@@ -1,24 +1,21 @@
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import { createServer, type Server } from "node:http";
-import { httpStore, ObjectNotFoundError, ObjectChangedError, StoreUnavailableError } from "../http";
+import { httpStore, encodeKeyPath, ObjectNotFoundError, ObjectChangedError, StoreUnavailableError } from "../http";
 import { memoryStore } from "../memory";
 import { serveObject } from "../web";
 import { serveObject as serveObjectNode } from "../node";
 import { asStream } from "./helpers";
-import type { ObjectStream } from "../index";
 
-/**
- * The streaming half of an {@link ObjectStream} body. This store proxies an
- * origin response, which is always a stream, so a byte body means the adapter
- * stopped proxying and the assertion is measuring the wrong path.
- */
 // ─── Stub-fetch unit tests ──────────────────────────────────────────────────
 
-function stubFetch(
-    handler: (url: string, init: RequestInit) => Response | Promise<Response>,
-): typeof globalThis.fetch {
+function stubFetch(handler: (url: string, init: RequestInit) => Response | Promise<Response>): typeof globalThis.fetch {
+    // The target's text the way the runtime reads it, so a Request never
+    // records as "[object Request]".
     return (async (input: string | URL | Request, init?: RequestInit) =>
-        handler(String(input), init ?? {})) as typeof globalThis.fetch;
+        handler(
+            typeof input === "string" ? input : input instanceof URL ? input.href : input.url,
+            init ?? {},
+        )) as typeof globalThis.fetch;
 }
 
 function headersOf(init: RequestInit): Record<string, string> {
@@ -27,18 +24,127 @@ function headersOf(init: RequestInit): Record<string, string> {
     return Object.fromEntries(new Headers(init.headers ?? {}).entries());
 }
 
+describe("httpStore: reserved upload bookkeeping", () => {
+    // An origin fronting a bucket an upload store also writes to exposes that
+    // store's in-flight bytes and sidecars through the read path. The http
+    // adapter cannot know which upload store it is, so it refuses every
+    // default prefix before a request is ever built.
+    function counting() {
+        const urls: string[] = [];
+        const store = httpStore({
+            url: (key) => `https://origin.example/${key}`,
+            fetch: stubFetch((url) => {
+                urls.push(url);
+                return new Response("x", { headers: { "Content-Length": "1" } });
+            }),
+        });
+        return { store, urls };
+    }
+
+    /** Every key is refused on both read entry points, with no request built. */
+    async function refusedWithoutRequest(keys: readonly string[]): Promise<void> {
+        const { store, urls } = counting();
+        for (const key of keys) {
+            await expect(store.headObject(key)).rejects.toBeInstanceOf(ObjectNotFoundError);
+            await expect(store.getObject(key)).rejects.toBeInstanceOf(ObjectNotFoundError);
+        }
+        expect(urls).toEqual([]);
+    }
+
+    test("both upload-store defaults are refused on headObject and getObject without a request", async () => {
+        await refusedWithoutRequest([
+            ".uploads/tok",
+            ".uploads/tok.json",
+            ".uploads",
+            ".partial-content-uploads/tok.info",
+        ]);
+    });
+
+    test("a spelling the origin resolves into the reserved namespace is refused without a request", async () => {
+        // `url()` belongs to the consumer, and one that interpolates the key
+        // unencoded hands the origin a path it decodes and resolves before the
+        // key names anything: `%2E` becomes `.` and `..` walks a segment up, so
+        // a literal prefix check alone reads both of these as ordinary keys.
+        await refusedWithoutRequest([
+            "%2Euploads/tok",
+            "%2euploads/tok.info",
+            "docs/../.uploads/tok",
+            ".uploads%2Ftok",
+            "%2E%2E/.uploads/tok",
+            "docs/%2E%2E/.partial-content-uploads/tok",
+        ]);
+    });
+
+    test("an ordinary key that merely carries an encoding is still fetched", async () => {
+        // The guard decides on what the origin would resolve to, not on whether
+        // a key is spelled plainly: a key with a percent-encoded space, or one
+        // whose dot segments resolve inside the published namespace, is ordinary.
+        const { store, urls } = counting();
+        await store.headObject("docs/a%20b.pdf");
+        await store.headObject("docs/2026/../a.pdf");
+        expect(urls).toEqual(["https://origin.example/docs/a%20b.pdf", "https://origin.example/docs/2026/../a.pdf"]);
+    });
+
+    test("a published key is fetched", async () => {
+        const { store, urls } = counting();
+        await store.headObject("docs/a.pdf");
+        expect(urls).toEqual(["https://origin.example/docs/a.pdf"]);
+    });
+
+    test("reservedPrefix takes the consumer's own value, a list, or the empty opt-out", async () => {
+        const own = httpStore({
+            url: (key) => `https://origin.example/${key}`,
+            reservedPrefix: "private/",
+            fetch: stubFetch(() => new Response(null, { headers: { "Content-Length": "1" } })),
+        });
+        await expect(own.headObject("private/x")).rejects.toBeInstanceOf(ObjectNotFoundError);
+        await expect(own.headObject(".uploads/x")).resolves.toBeDefined();
+
+        const none = httpStore({
+            url: (key) => `https://origin.example/${key}`,
+            reservedPrefix: "",
+            fetch: stubFetch(() => new Response(null, { headers: { "Content-Length": "1" } })),
+        });
+        await expect(none.headObject(".uploads/x")).resolves.toBeDefined();
+    });
+});
+
+describe("encodeKeyPath", () => {
+    test("encodes each segment and keeps the separators literal", () => {
+        expect(encodeKeyPath("docs/a b.pdf")).toBe("docs/a%20b.pdf");
+        expect(encodeKeyPath("r\u00e9ports/2026/q1.pdf")).toBe("r%C3%A9ports/2026/q1.pdf");
+    });
+
+    test("a key cannot carry a query, a fragment, an authority or an encoded separator into the request line", () => {
+        expect(encodeKeyPath("a?x=1")).toBe("a%3Fx%3D1");
+        expect(encodeKeyPath("a#frag")).toBe("a%23frag");
+        expect(() => encodeKeyPath("//evil.example/x")).toThrow(ObjectNotFoundError);
+        expect(encodeKeyPath("evil.example:8080/x")).toBe("evil.example%3A8080/x");
+        expect(encodeKeyPath("a%2Fb")).toBe("a%252Fb");
+    });
+
+    test("an empty segment and the dot segments are refused, since a URL parser resolves them", () => {
+        for (const key of ["", "a//b", "/a", "a/", ".", "..", "a/../b", "a/./b", "../a"]) {
+            expect(() => encodeKeyPath(key)).toThrow(ObjectNotFoundError);
+        }
+    });
+});
+
 describe("httpStore: unit (stub fetch)", () => {
     test("headObject maps HEAD response headers to metadata", async () => {
         const store = httpStore({
             url: (key) => `https://origin.example/${key}`,
-            fetch: stubFetch(() => new Response(null, {
-                headers: {
-                    "Content-Length": "1234",
-                    ETag: '"origin-etag"',
-                    "Last-Modified": "Sat, 28 Jun 2025 12:00:00 GMT",
-                    "Repr-Digest": "sha-256=:MV9b23bQeMQ7isAGTkoBZGErH853yGk0W/yUx1iU7dM=:",
-                },
-            })),
+            fetch: stubFetch(
+                () =>
+                    new Response(null, {
+                        headers: {
+                            "Content-Length": "1234",
+                            ETag: '"origin-etag"',
+                            "Last-Modified": "Sat, 28 Jun 2025 12:00:00 GMT",
+                            "Repr-Digest": "sha-256=:MV9b23bQeMQ7isAGTkoBZGErH853yGk0W/yUx1iU7dM=:",
+                        },
+                    }),
+            ),
         });
         const meta = await store.headObject("doc.pdf");
 
@@ -73,7 +179,7 @@ describe("httpStore: unit (stub fetch)", () => {
             // the duplicates ("gzip, identity"), defeating the identity guard.
             headers: {
                 "accept-encoding": "gzip",
-                "range": "bytes=0-0",
+                range: "bytes=0-0",
                 "if-match": '"stale"',
                 Authorization: "Bearer tok",
             },
@@ -101,9 +207,12 @@ describe("httpStore: unit (stub fetch)", () => {
         // "Content-Encoding: IDENTITY" is identity-coded, not compressed.
         const store = httpStore({
             url: (key) => `https://origin.example/${key}`,
-            fetch: stubFetch(() => new Response(null, {
-                headers: { "Content-Length": "5", "Content-Encoding": "IDENTITY" },
-            })),
+            fetch: stubFetch(
+                () =>
+                    new Response(null, {
+                        headers: { "Content-Length": "5", "Content-Encoding": "IDENTITY" },
+                    }),
+            ),
         });
         const meta = await store.headObject("doc.bin");
         expect(meta.contentLength).toBe(5);
@@ -130,9 +239,12 @@ describe("httpStore: unit (stub fetch)", () => {
         const digestOf = async (reprDigest: string) => {
             const store = httpStore({
                 url: (key) => `https://origin.example/${key}`,
-                fetch: stubFetch(() => new Response(null, {
-                    headers: { "Content-Length": "1", "Repr-Digest": reprDigest },
-                })),
+                fetch: stubFetch(
+                    () =>
+                        new Response(null, {
+                            headers: { "Content-Length": "1", "Repr-Digest": reprDigest },
+                        }),
+                ),
             });
             return (await store.headObject("doc.bin")).digest;
         };
@@ -176,10 +288,13 @@ describe("httpStore: unit (stub fetch)", () => {
         });
         const store = httpStore({
             url: (key) => `https://origin.example/${key}`,
-            fetch: stubFetch(() => new Response(body, {
-                status: 503,
-                headers: { "Retry-After": "1" },
-            })),
+            fetch: stubFetch(
+                () =>
+                    new Response(body, {
+                        status: 503,
+                        headers: { "Retry-After": "1" },
+                    }),
+            ),
         });
         await expect(store.getObject("big.bin")).rejects.toBeInstanceOf(StoreUnavailableError);
 
@@ -235,18 +350,24 @@ describe("httpStore: unit (stub fetch)", () => {
         // and GET rather than stream a body that disagrees with its headers.
         const headStore = httpStore({
             url: (key) => `https://origin.example/${key}`,
-            fetch: stubFetch(() => new Response(null, {
-                headers: { "Content-Length": "46", "Content-Encoding": "gzip" },
-            })),
+            fetch: stubFetch(
+                () =>
+                    new Response(null, {
+                        headers: { "Content-Length": "46", "Content-Encoding": "gzip" },
+                    }),
+            ),
         });
         await expect(headStore.headObject("doc.pdf")).rejects.toThrow(/Content-Encoding/);
 
         const getStore = httpStore({
             url: (key) => `https://origin.example/${key}`,
-            fetch: stubFetch(() => new Response("body-longer-than-the-declared-46-bytes-would-be", {
-                status: 200,
-                headers: { "Content-Length": "46", "Content-Encoding": "gzip" },
-            })),
+            fetch: stubFetch(
+                () =>
+                    new Response("body-longer-than-the-declared-46-bytes-would-be", {
+                        status: 200,
+                        headers: { "Content-Length": "46", "Content-Encoding": "gzip" },
+                    }),
+            ),
         });
         await expect(getStore.getObject("doc.pdf")).rejects.toThrow(/Content-Encoding/);
     });
@@ -261,21 +382,30 @@ describe("httpStore: unit (stub fetch)", () => {
         const TOTAL = CHUNK * 64; // 1 MiB if fully read
         const body = new ReadableStream<Uint8Array>({
             pull(controller) {
-                if (pulled >= TOTAL) { controller.close(); return; }
+                if (pulled >= TOTAL) {
+                    controller.close();
+                    return;
+                }
                 pulled += CHUNK;
                 controller.enqueue(new Uint8Array(CHUNK));
             },
-            cancel() { cancelled = true; },
+            cancel() {
+                cancelled = true;
+            },
         });
         const store = httpStore({
             url: (k) => `https://origin.example/${k}`,
-            fetch: stubFetch(() => new Response(body, {
-                status: 206,
-                headers: { "Content-Range": "bytes garbage", "Content-Length": String(TOTAL) },
-            })),
+            fetch: stubFetch(
+                () =>
+                    new Response(body, {
+                        status: 206,
+                        headers: { "Content-Range": "bytes garbage", "Content-Length": String(TOTAL) },
+                    }),
+            ),
         });
-        await expect(store.getObject("big.bin", { range: { start: 0, end: 5 } }))
-            .rejects.toThrow(/unparseable Content-Range/);
+        await expect(store.getObject("big.bin", { range: { start: 0, end: 5 } })).rejects.toThrow(
+            /unparseable Content-Range/,
+        );
         expect(cancelled).toBe(true);
         // Bounded to ~64 KiB + one chunk, never the full 1 MiB.
         expect(pulled).toBeLessThan(200 * 1024);
@@ -284,9 +414,12 @@ describe("httpStore: unit (stub fetch)", () => {
     test("allows an explicit identity Content-Encoding", async () => {
         const store = httpStore({
             url: (key) => `https://origin.example/${key}`,
-            fetch: stubFetch(() => new Response(null, {
-                headers: { "Content-Length": "10", "Content-Encoding": "identity" },
-            })),
+            fetch: stubFetch(
+                () =>
+                    new Response(null, {
+                        headers: { "Content-Length": "10", "Content-Encoding": "identity" },
+                    }),
+            ),
         });
         const meta = await store.headObject("doc.pdf");
         expect(meta.contentLength).toBe(10);
@@ -400,10 +533,13 @@ describe("httpStore: unit (stub fetch)", () => {
         // `undefined` so the served response repeats `*` honestly.
         const store = httpStore({
             url: (key) => `https://origin.example/${key}`,
-            fetch: stubFetch(() => new Response("0123456789", {
-                status: 206,
-                headers: { "Content-Range": "bytes 0-9/*" },
-            })),
+            fetch: stubFetch(
+                () =>
+                    new Response("0123456789", {
+                        status: 206,
+                        headers: { "Content-Range": "bytes 0-9/*" },
+                    }),
+            ),
         });
         const result = await store.getObject("stream.bin", { range: { start: 0, end: 9 } });
 
@@ -515,10 +651,13 @@ describe("httpStore: origin edge cases", () => {
     test("getObject surfaces the origin's Last-Modified onto the stream", async () => {
         const store = httpStore({
             url: (key) => `https://origin.example/${key}`,
-            fetch: stubFetch(() => new Response("data", {
-                status: 200,
-                headers: { "Content-Length": "4", "Last-Modified": "Sat, 28 Jun 2025 12:00:00 GMT" },
-            })),
+            fetch: stubFetch(
+                () =>
+                    new Response("data", {
+                        status: 200,
+                        headers: { "Content-Length": "4", "Last-Modified": "Sat, 28 Jun 2025 12:00:00 GMT" },
+                    }),
+            ),
         });
         const result = await store.getObject("doc.pdf");
         expect(result.lastModified).toBe("Sat, 28 Jun 2025 12:00:00 GMT");
@@ -551,9 +690,12 @@ describe("httpStore: origin edge cases", () => {
         // a base64url-style unpadded digest is still extracted verbatim.
         const store = httpStore({
             url: (key) => `https://origin.example/${key}`,
-            fetch: stubFetch(() => new Response(null, {
-                headers: { "Content-Length": "1", "Repr-Digest": "sha-256=:abcABC0189+/xyz:" },
-            })),
+            fetch: stubFetch(
+                () =>
+                    new Response(null, {
+                        headers: { "Content-Length": "1", "Repr-Digest": "sha-256=:abcABC0189+/xyz:" },
+                    }),
+            ),
         });
         const meta = await store.headObject("doc.pdf");
         expect(meta.digest).toBe("abcABC0189+/xyz");
@@ -597,7 +739,9 @@ beforeAll(async () => {
         }),
         { key: (req) => new URL(req.url!, "http://x").pathname.slice(1) },
     );
-    origin = createServer((req, res) => { void originHandler(req, res); });
+    origin = createServer((req, res) => {
+        void originHandler(req, res);
+    });
     await new Promise<void>((r) => origin.listen(0, r));
     const address = origin.address();
     if (typeof address === "string" || address === null) throw new Error("no port");
@@ -614,10 +758,10 @@ function edgeHandler() {
 
 describe("httpStore: proxy chain over real HTTP", () => {
     test("full GET relays body, size, and validators", async () => {
-        const res = await edgeHandler()(
-            new Request("http://edge/files/hello.txt"),
-            { key: "hello.txt", mime: "text/plain" },
-        );
+        const res = await edgeHandler()(new Request("http://edge/files/hello.txt"), {
+            key: "hello.txt",
+            mime: "text/plain",
+        });
 
         expect(res.status).toBe(200);
         expect(await res.text()).toBe("0123456789abcdefghij");
@@ -647,10 +791,7 @@ describe("httpStore: proxy chain over real HTTP", () => {
     });
 
     test("origin 404 becomes edge 404", async () => {
-        const res = await edgeHandler()(
-            new Request("http://edge/files/missing.txt"),
-            { key: "missing.txt" },
-        );
+        const res = await edgeHandler()(new Request("http://edge/files/missing.txt"), { key: "missing.txt" });
         expect(res.status).toBe(404);
     });
 });
@@ -669,7 +810,9 @@ describe("httpStore: weak-validator origins (fs-style) must still serve", () => 
             }),
             { key: (req) => new URL(req.url!, "http://x").pathname.slice(1) },
         );
-        weakOrigin = createServer((req, res) => { void handler(req, res); });
+        weakOrigin = createServer((req, res) => {
+            void handler(req, res);
+        });
         await new Promise<void>((r) => weakOrigin.listen(0, r));
         const address = weakOrigin.address();
         if (typeof address === "string" || address === null) throw new Error("no port");
@@ -682,10 +825,7 @@ describe("httpStore: weak-validator origins (fs-style) must still serve", () => 
 
     test("range request through the chain returns 206, not 502", async () => {
         const edge = serveObject(httpStore({ url: (key) => `${weakUrl}/${key}` }));
-        const res = await edge(
-            new Request("http://edge/w", { headers: { Range: "bytes=0-3" } }),
-            { key: "w.txt" },
-        );
+        const res = await edge(new Request("http://edge/w", { headers: { Range: "bytes=0-3" } }), { key: "w.txt" });
 
         expect(res.status).toBe(206);
         expect(await res.text()).toBe("weak");
@@ -696,36 +836,45 @@ describe("httpStore: degenerate origin responses", () => {
     test("206 without Content-Range is refused (would silently truncate)", async () => {
         const store = httpStore({
             url: (key) => `https://origin.example/${key}`,
-            fetch: stubFetch(() => new Response("partial", {
-                status: 206,
-                headers: { "Content-Length": "7" },
-            })),
+            fetch: stubFetch(
+                () =>
+                    new Response("partial", {
+                        status: 206,
+                        headers: { "Content-Length": "7" },
+                    }),
+            ),
         });
-        await expect(
-            store.getObject("doc.pdf", { range: { start: 0, end: 6 } }),
-        ).rejects.toThrow(/206 with no Content-Range/);
+        await expect(store.getObject("doc.pdf", { range: { start: 0, end: 6 } })).rejects.toThrow(
+            /206 with no Content-Range/,
+        );
     });
 
     test("206 with unparseable Content-Range is refused", async () => {
         const store = httpStore({
             url: (key) => `https://origin.example/${key}`,
-            fetch: stubFetch(() => new Response("partial", {
-                status: 206,
-                headers: { "Content-Length": "7", "Content-Range": "bytes nonsense" },
-            })),
+            fetch: stubFetch(
+                () =>
+                    new Response("partial", {
+                        status: 206,
+                        headers: { "Content-Length": "7", "Content-Range": "bytes nonsense" },
+                    }),
+            ),
         });
-        await expect(
-            store.getObject("doc.pdf", { range: { start: 0, end: 6 } }),
-        ).rejects.toThrow(/unparseable Content-Range/);
+        await expect(store.getObject("doc.pdf", { range: { start: 0, end: 6 } })).rejects.toThrow(
+            /unparseable Content-Range/,
+        );
     });
 
     test("zero-byte 200 with a null body streams an empty object", async () => {
         const store = httpStore({
             url: (key) => `https://origin.example/${key}`,
-            fetch: stubFetch(() => new Response(null, {
-                status: 200,
-                headers: { "Content-Length": "0" },
-            })),
+            fetch: stubFetch(
+                () =>
+                    new Response(null, {
+                        status: 200,
+                        headers: { "Content-Length": "0" },
+                    }),
+            ),
         });
         const result = await store.getObject("empty.bin");
         const chunks: Uint8Array[] = [];

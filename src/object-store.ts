@@ -19,19 +19,25 @@ import { parseContentRange, type ParsedRange } from "./kernel.ts";
  * use the `status` property to distinguish "object not found" (404)
  * from a transiently unavailable backend (503, {@link StoreUnavailableError})
  * and other store failures (502).
+ *
+ * The message names the failure, never the key: a key is commonly a user's
+ * filename, and a message is free text every log line and error tracker
+ * prints whole. The key rides on {@link ObjectNotFoundError.key}, as it does
+ * on {@link ObjectChangedError} and {@link StoreUnavailableError}, where a
+ * consumer can drop, hash or redact it by name.
  */
 export class ObjectNotFoundError extends Error {
-  /** HTTP status hint for downstream handlers. */
-  readonly status = 404 as const;
-  /** The storage key that was not found. */
-  readonly key: string;
+    /** HTTP status hint for downstream handlers. */
+    readonly status = 404 as const;
+    /** The storage key that was not found. */
+    readonly key: string;
 
-  constructor(key: string, cause?: unknown) {
-    super(`Object not found: ${key}`);
-    this.name = "ObjectNotFoundError";
-    this.key = key;
-    if (cause !== undefined) this.cause = cause;
-  }
+    constructor(key: string, cause?: unknown) {
+        super("Object not found");
+        this.name = "ObjectNotFoundError";
+        this.key = key;
+        if (cause !== undefined) this.cause = cause;
+    }
 }
 
 /**
@@ -49,15 +55,18 @@ export class ObjectNotFoundError extends Error {
  * Refusal is the default rather than an opt-in, because the shared arrangement
  * is the documented one and the safe posture has to be what a consumer gets
  * without knowing to ask for it. Pass `reservedPrefix: ""` to serve the whole
- * namespace when no upload store shares it.
+ * namespace when no upload store shares it. A store that cannot know which
+ * upload store sits behind its location passes every default at once.
  */
-export function reservedKeyGuard(reservedPrefix: string): (key: string) => void {
-  if (reservedPrefix === "") return () => {};
-  const prefix = reservedPrefix.endsWith("/") ? reservedPrefix : `${reservedPrefix}/`;
-  const bare = prefix.slice(0, -1);
-  return (key: string): void => {
-    if (key === bare || key.startsWith(prefix)) throw new ObjectNotFoundError(key);
-  };
+export function reservedKeyGuard(reservedPrefix: string | readonly string[]): (key: string) => void {
+    const prefixes = (typeof reservedPrefix === "string" ? [reservedPrefix] : reservedPrefix)
+        .filter((p) => p !== "")
+        .map((p) => (p.endsWith("/") ? p : `${p}/`));
+    if (prefixes.length === 0) return () => {};
+    const bare = prefixes.map((p) => p.slice(0, -1));
+    return (key: string): void => {
+        if (bare.includes(key) || prefixes.some((p) => key.startsWith(p))) throw new ObjectNotFoundError(key);
+    };
 }
 
 /**
@@ -70,17 +79,17 @@ export function reservedKeyGuard(reservedPrefix: string): (key: string) => void 
  * signal to re-validate the request against the object's new state.
  */
 export class ObjectChangedError extends Error {
-  /** HTTP status hint: the pinned read's precondition failed. */
-  readonly status = 412 as const;
-  /** The storage key whose object changed. */
-  readonly key: string;
+    /** HTTP status hint: the pinned read's precondition failed. */
+    readonly status = 412 as const;
+    /** The storage key whose object changed. */
+    readonly key: string;
 
-  constructor(key: string, cause?: unknown) {
-    super(`Object changed since validation: ${key}`);
-    this.name = "ObjectChangedError";
-    this.key = key;
-    if (cause !== undefined) this.cause = cause;
-  }
+    constructor(key: string, cause?: unknown) {
+        super("Object changed since validation");
+        this.name = "ObjectChangedError";
+        this.key = key;
+        if (cause !== undefined) this.cause = cause;
+    }
 }
 
 /**
@@ -100,30 +109,30 @@ export class ObjectChangedError extends Error {
  * local timeouts) are NOT this: they propagate untouched and map to 502.
  */
 export class StoreUnavailableError extends Error {
-  /** HTTP status hint: the backend is transiently unavailable. */
-  readonly status = 503 as const;
-  /** The storage key whose read failed. */
-  readonly key: string;
-  /**
-   * Suggested back-off in whole seconds, echoed as `Retry-After`. Normalized at
-   * construction: a non-negative finite hint is floored to an integer (a
-   * fractional `2.9` -> `2`), and a NaN/negative/infinite/out-of-safe-range hint
-   * (from a hostile backend header or a buggy third-party classifier) is dropped
-   * entirely. So every consumer -- the web adapter AND anyone reading
-   * `.retryAfterSeconds` directly off the frozen contract -- sees a clean
-   * non-negative integer or `undefined`. Absent means the adapter emits `503`
-   * without a `Retry-After` (RFC 9110 Section 15.6.4 permits its absence).
-   */
-  readonly retryAfterSeconds?: number;
+    /** HTTP status hint: the backend is transiently unavailable. */
+    readonly status = 503 as const;
+    /** The storage key whose read failed. */
+    readonly key: string;
+    /**
+     * Suggested back-off in whole seconds, echoed as `Retry-After`. Normalized at
+     * construction: a non-negative finite hint is floored to an integer (a
+     * fractional `2.9` -> `2`), and a NaN/negative/infinite/out-of-safe-range hint
+     * (from a hostile backend header or a buggy third-party classifier) is dropped
+     * entirely. So every consumer -- the web adapter AND anyone reading
+     * `.retryAfterSeconds` directly off the frozen contract -- sees a clean
+     * non-negative integer or `undefined`. Absent means the adapter emits `503`
+     * without a `Retry-After` (RFC 9110 Section 15.6.4 permits its absence).
+     */
+    readonly retryAfterSeconds?: number;
 
-  constructor(key: string, opts?: { retryAfterSeconds?: number; cause?: unknown }) {
-    super(`Storage backend unavailable: ${key}`);
-    this.name = "StoreUnavailableError";
-    this.key = key;
-    const hint = parseRetryAfterSeconds(opts?.retryAfterSeconds);
-    if (hint !== undefined) this.retryAfterSeconds = hint;
-    if (opts?.cause !== undefined) this.cause = opts.cause;
-  }
+    constructor(key: string, opts?: { retryAfterSeconds?: number; cause?: unknown }) {
+        super("Storage backend unavailable");
+        this.name = "StoreUnavailableError";
+        this.key = key;
+        const hint = parseRetryAfterSeconds(opts?.retryAfterSeconds);
+        if (hint !== undefined) this.retryAfterSeconds = hint;
+        if (opts?.cause !== undefined) this.cause = opts.cause;
+    }
 }
 
 /**
@@ -134,13 +143,171 @@ export class StoreUnavailableError extends Error {
  * check. The name is the stable identity.
  */
 export function isObjectNotFoundError(err: unknown): err is ObjectNotFoundError {
-  return err instanceof Error && err.name === "ObjectNotFoundError";
+    return err instanceof Error && err.name === "ObjectNotFoundError";
 }
 export function isObjectChangedError(err: unknown): err is ObjectChangedError {
-  return err instanceof Error && err.name === "ObjectChangedError";
+    return err instanceof Error && err.name === "ObjectChangedError";
 }
+/**
+ * Replace a sensitive identifier with a safe substitute everywhere it appears
+ * in an error: the message, the stack, every own property whose value is a
+ * string or nests one (an errno `path` or `dest`, a store error's `key`, a
+ * backend client's request descriptor), and the `cause` chain.
+ *
+ * `auditKey` promises an identifier never reaches a log surface, and the
+ * error object is delivered to the same sink as the redacted context. The
+ * package's own error classes name the storage key in their message AND keep
+ * it as an own property, an errno error names the resolved path on `path`
+ * and a rename's on `dest`, and a classified backend failure carries the raw
+ * backend error as `cause`; rewriting the message alone leaves the identifier
+ * one property away.
+ *
+ * A needle is searched for in every spelling a store can produce, not only the
+ * one the caller passed. A key is separated by forward slashes because that is
+ * how a consumer spells it, but a filesystem adapter resolves it through the
+ * platform path module before naming it in an error, so on a backslash
+ * platform the errno `path` and `dest` carry the same key under a separator
+ * the literal search would walk straight past.
+ *
+ * The walk descends into arrays and plain objects, because a backend client's
+ * error commonly holds the failing request under a nested own property and the
+ * whole error reaches the sink; anything with a prototype of its own is left
+ * untouched, since cloning it would not survive as the thing it is. The clone
+ * keeps the prototype and every own property descriptor, so `instanceof`,
+ * `code` and `status` survive; a redacted `cause` is itself a clone of the
+ * same shape. A value carrying none of the needles is returned by identity,
+ * so the common path allocates nothing and an untouched branch is shared
+ * rather than copied. One depth bound covers the cause chain and the nested
+ * walk together, and a cycle terminates at it.
+ *
+ * Absent and empty needles are skipped rather than searched for: a search for
+ * whatever `undefined` stringifies to would substitute into unrelated text.
+ */
+export function redactErrorText(err: unknown, needles: readonly (string | undefined)[], replacement: string): unknown {
+    const active = needles.filter((n): n is string => typeof n === "string" && n.length > 0);
+    if (active.length === 0) return err;
+    const spellings = new Set<string>();
+    for (const n of active) {
+        spellings.add(n);
+        if (n.includes("/")) spellings.add(n.replaceAll("/", "\\"));
+    }
+    return redactDepth(err, [...spellings], replacement, 0);
+}
+
+const REDACT_CAUSE_DEPTH = 8;
+
+/**
+ * The allow-listed form of an error bound for a sink that must not see the
+ * storage key. Only fields that name a failure class pass: a string `name`, a
+ * string or numeric `code`, a numeric `status`, the failed `operation`, and
+ * the `cause` projected the same way. The message, the stack and every other
+ * property stay behind, because the key can sit in any of them in any
+ * spelling (a percent-encoded request path, a resolved filesystem path).
+ */
+export interface ProjectedError {
+    name: string;
+    code?: string | number;
+    status?: number;
+    operation?: string;
+    cause?: ProjectedError;
+}
+
+/**
+ * Project `err` to a {@link ProjectedError}. A thrown non-object projects to
+ * its `typeof`; a cause chain (a cycle included) stops at the redaction depth
+ * bound.
+ */
+export function projectError(err: unknown, operation?: string, depth = 0): ProjectedError {
+    const out: ProjectedError = { name: typeof err };
+    if (typeof err === "object" && err !== null) {
+        const { name, code, status, cause } = err as Record<string, unknown>;
+        out.name = typeof name === "string" ? name : "Error";
+        if (typeof code === "string" || typeof code === "number") out.code = code;
+        if (typeof status === "number") out.status = status;
+        if (cause !== undefined && depth < REDACT_CAUSE_DEPTH) out.cause = projectError(cause, undefined, depth + 1);
+    }
+    if (operation !== undefined) out.operation = operation;
+    return out;
+}
+
+/**
+ * Redact one value of any shape, returning it by identity when nothing in it
+ * carries a needle so an untouched branch is never copied.
+ *
+ * Only a string is rewritten. An array or a plain object is descended into and
+ * rebuilt when a leaf below it changed; an object with a prototype of its own
+ * is returned untouched, because a clone of it would be a plain object wearing
+ * the same properties and no longer the thing the consumer expects to receive.
+ * An `Error` hands back to {@link redactDepth} so a nested error is redacted as
+ * an error rather than as a bag of properties.
+ */
+function redactValue(value: unknown, needles: readonly string[], replacement: string, depth: number): unknown {
+    if (typeof value === "string") {
+        if (!needles.some((n) => value.includes(n))) return value;
+        return needles.reduce((acc, n) => acc.replaceAll(n, replacement), value);
+    }
+    if (value === null || typeof value !== "object" || depth > REDACT_CAUSE_DEPTH) return value;
+    if (value instanceof Error) return redactDepth(value, needles, replacement, depth);
+    if (Array.isArray(value)) {
+        let touched = false;
+        const next = value.map((entry) => {
+            const redacted = redactValue(entry, needles, replacement, depth + 1);
+            if (redacted !== entry) touched = true;
+            return redacted;
+        });
+        return touched ? next : value;
+    }
+    const proto: unknown = Object.getPrototypeOf(value);
+    if (proto !== Object.prototype && proto !== null) return value;
+    let touched = false;
+    const next: Record<string, unknown> = {};
+    for (const [name, entry] of Object.entries(value as Record<string, unknown>)) {
+        const redacted = redactValue(entry, needles, replacement, depth + 1);
+        if (redacted !== entry) touched = true;
+        next[name] = redacted;
+    }
+    return touched ? next : value;
+}
+
+function redactDepth(err: unknown, needles: readonly string[], replacement: string, depth: number): unknown {
+    if (!(err instanceof Error) || depth > REDACT_CAUSE_DEPTH) return err;
+    const descriptors: Record<string, PropertyDescriptor> = Object.getOwnPropertyDescriptors(err);
+    let touched = false;
+    for (const [name, d] of Object.entries(descriptors)) {
+        // `cause` has its own walk below, which reads it off the instance so an
+        // accessor-defined cause is covered too; redacting it here as well would
+        // build one clone and then discard it for another.
+        if (name === "cause" || !("value" in d)) continue;
+        const redacted = redactValue(d.value, needles, replacement, depth + 1);
+        if (redacted !== d.value) {
+            descriptors[name] = { ...d, value: redacted };
+            touched = true;
+        }
+    }
+    // `message` and `stack` are own properties on every engine this package
+    // runs on, but a subclass may define either as an accessor on its
+    // prototype, and `cause` may be one too; all three are read through the
+    // instance so each is covered. Only a string message or stack is rewritten.
+    for (const name of ["message", "stack", "cause"] as const) {
+        if (name !== "cause" && name in descriptors) continue;
+        const value: unknown = err[name];
+        const redacted =
+            name === "cause"
+                ? redactDepth(value, needles, replacement, depth + 1)
+                : typeof value === "string"
+                  ? redactValue(value, needles, replacement, depth + 1)
+                  : value;
+        if (redacted !== value) {
+            descriptors[name] = { value: redacted, writable: true, enumerable: false, configurable: true };
+            touched = true;
+        }
+    }
+    if (!touched) return err;
+    return Object.create(Object.getPrototypeOf(err) as object, descriptors) as Error;
+}
+
 export function isStoreUnavailableError(err: unknown): err is StoreUnavailableError {
-  return err instanceof Error && err.name === "StoreUnavailableError";
+    return err instanceof Error && err.name === "StoreUnavailableError";
 }
 
 /**
@@ -155,27 +322,24 @@ export function isStoreUnavailableError(err: unknown): err is StoreUnavailableEr
  * `delay-seconds = DIGIT+` grammar), plus non-numeric text. A hostile header or
  * a buggy third-party classifier therefore can never emit a malformed header.
  */
-export function parseRetryAfterSeconds(
-  raw: unknown,
-  opts?: { allowHttpDate?: boolean },
-): number | undefined {
-  if (typeof raw === "number") {
-    if (!Number.isFinite(raw) || raw < 0) return undefined;
-    const floored = Math.floor(raw);
-    return Number.isSafeInteger(floored) ? floored : undefined;
-  }
-  if (typeof raw !== "string") return undefined;
-  const trimmed = raw.trim();
-  if (/^\d+$/.test(trimmed)) {
-    const n = Number(trimmed);
-    return Number.isSafeInteger(n) ? n : undefined;
-  }
-  if (opts?.allowHttpDate) {
-    const when = Date.parse(trimmed);
-    if (Number.isNaN(when)) return undefined;
-    return Math.max(0, Math.round((when - Date.now()) / 1000));
-  }
-  return undefined;
+export function parseRetryAfterSeconds(raw: unknown, opts?: { allowHttpDate?: boolean }): number | undefined {
+    if (typeof raw === "number") {
+        if (!Number.isFinite(raw) || raw < 0) return undefined;
+        const floored = Math.floor(raw);
+        return Number.isSafeInteger(floored) ? floored : undefined;
+    }
+    if (typeof raw !== "string") return undefined;
+    const trimmed = raw.trim();
+    if (/^\d+$/.test(trimmed)) {
+        const n = Number(trimmed);
+        return Number.isSafeInteger(n) ? n : undefined;
+    }
+    if (opts?.allowHttpDate) {
+        const when = Date.parse(trimmed);
+        if (Number.isNaN(when)) return undefined;
+        return Math.max(0, Math.round((when - Date.now()) / 1000));
+    }
+    return undefined;
 }
 
 // ─── Error Classification ─────────────────────────────────────────────────────
@@ -187,22 +351,22 @@ export function parseRetryAfterSeconds(
  * so sharing the set costs nothing and keeps the two paths provably symmetric.
  */
 export interface StoreErrorClassifiers {
-  /** The object does not exist (maps to {@link ObjectNotFoundError}, 404). */
-  notFound(err: unknown): boolean;
-  /**
-   * A pinned read's precondition failed (maps to {@link ObjectChangedError},
-   * 412). Omit for backends whose pin is an etag/metadata comparison rather
-   * than a native conditional error (e.g. GCS).
-   */
-  changed?(err: unknown): boolean;
-  /**
-   * Transient throttle/overload (maps to {@link StoreUnavailableError}, 503).
-   * Return `true` for a throttle with no back-off hint, or
-   * `{ retryAfterSeconds }` to surface a backend's `Retry-After` so the 503
-   * echoes it and shared caches back off for the advised interval. Return
-   * `false` when the error is not a throttle.
-   */
-  throttled(err: unknown): boolean | { retryAfterSeconds: number };
+    /** The object does not exist (maps to {@link ObjectNotFoundError}, 404). */
+    notFound(err: unknown): boolean;
+    /**
+     * A pinned read's precondition failed (maps to {@link ObjectChangedError},
+     * 412). Omit for backends whose pin is an etag/metadata comparison rather
+     * than a native conditional error (e.g. GCS).
+     */
+    changed?(err: unknown): boolean;
+    /**
+     * Transient throttle/overload (maps to {@link StoreUnavailableError}, 503).
+     * Return `true` for a throttle with no back-off hint, or
+     * `{ retryAfterSeconds }` to surface a backend's `Retry-After` so the 503
+     * echoes it and shared caches back off for the advised interval. Return
+     * `false` when the error is not a throttle.
+     */
+    throttled(err: unknown): boolean | { retryAfterSeconds: number };
 }
 
 /**
@@ -226,37 +390,37 @@ export interface StoreErrorClassifiers {
  * ```
  */
 export async function classifyStoreRead<T>(
-  key: string,
-  op: () => Promise<T>,
-  classifiers: StoreErrorClassifiers,
+    key: string,
+    op: () => Promise<T>,
+    classifiers: StoreErrorClassifiers,
 ): Promise<T> {
-  try {
-    return await op();
-  } catch (err) {
-    if (classifiers.notFound(err)) throw new ObjectNotFoundError(key, err);
-    if (classifiers.changed?.(err)) throw new ObjectChangedError(key, err);
-    const throttled = classifiers.throttled(err);
-    if (throttled) {
-      throw new StoreUnavailableError(key, {
-        cause: err,
-        // `throttled` may return the backend's advised back-off; a bare `true`
-        // means "throttled, no hint" and emits a 503 without `Retry-After`.
-        retryAfterSeconds: typeof throttled === "object" ? throttled.retryAfterSeconds : undefined,
-      });
+    try {
+        return await op();
+    } catch (err) {
+        if (classifiers.notFound(err)) throw new ObjectNotFoundError(key, err);
+        if (classifiers.changed?.(err)) throw new ObjectChangedError(key, err);
+        const throttled = classifiers.throttled(err);
+        if (throttled) {
+            throw new StoreUnavailableError(key, {
+                cause: err,
+                // `throttled` may return the backend's advised back-off; a bare `true`
+                // means "throttled, no hint" and emits a 503 without `Retry-After`.
+                retryAfterSeconds: typeof throttled === "object" ? throttled.retryAfterSeconds : undefined,
+            });
+        }
+        throw err;
     }
-    throw err;
-  }
 }
 
 // ─── Read Options ───────────────────────────────────────────────────────────
 
 /** Options for `headObject`. */
 export interface HeadObjectOptions {
-  /**
-   * Cancel signal. Pass `req.signal` to cancel the backend request when the
-   * client disconnects.
-   */
-  signal?: AbortSignal;
+    /**
+     * Cancel signal. Pass `req.signal` to cancel the backend request when the
+     * client disconnects.
+     */
+    signal?: AbortSignal;
 }
 
 /**
@@ -272,24 +436,24 @@ export interface HeadObjectOptions {
  * throws {@link ObjectChangedError}.
  */
 export interface GetObjectOptions {
-  /** Validated byte range to stream. Omit for full content. */
-  range?: ParsedRange;
-  /**
-   * Cancel signal. Cancels the backend stream when the client disconnects,
-   * preventing orphaned TCP connections.
-   */
-  signal?: AbortSignal;
-  /** Raw backend ETag the object must still match (strong validators only). */
-  ifMatch?: string;
-  /**
-   * Opaque pin token from a prior `headObject` on the same key
-   * ({@link ObjectMetadata.pin}), passed back verbatim. Adapters that issue
-   * pins use it to stream the exact validated representation without
-   * re-fetching metadata; when the pinned version no longer exists they
-   * throw {@link ObjectChangedError}. Adapters that never issue pins
-   * ignore it.
-   */
-  pin?: string;
+    /** Validated byte range to stream. Omit for full content. */
+    range?: ParsedRange;
+    /**
+     * Cancel signal. Cancels the backend stream when the client disconnects,
+     * preventing orphaned TCP connections.
+     */
+    signal?: AbortSignal;
+    /** Raw backend ETag the object must still match (strong validators only). */
+    ifMatch?: string;
+    /**
+     * Opaque pin token from a prior `headObject` on the same key
+     * ({@link ObjectMetadata.pin}), passed back verbatim. Adapters that issue
+     * pins use it to stream the exact validated representation without
+     * re-fetching metadata; when the pinned version no longer exists they
+     * throw {@link ObjectChangedError}. Adapters that never issue pins
+     * ignore it.
+     */
+    pin?: string;
 }
 
 // ─── Node Stream Conversion ─────────────────────────────────────────────────
@@ -328,85 +492,115 @@ export interface GetObjectOptions {
  *   not a graceful end, so it is unaffected by this check.
  */
 export function nodeStreamToWeb(
-  iterable: AsyncIterable<Uint8Array>,
-  opts?: {
-    destroy?: () => void;
-    signal?: {
-      addEventListener(type: "abort", listener: () => void): void;
-      removeEventListener?(type: "abort", listener: () => void): void;
-    };
-    expectedBytes?: number;
-  },
+    iterable: AsyncIterable<Uint8Array>,
+    opts?: {
+        destroy?: () => void;
+        signal?: {
+            addEventListener(type: "abort", listener: () => void): void;
+            removeEventListener?(type: "abort", listener: () => void): void;
+        };
+        expectedBytes?: number;
+    },
 ): ReadableStream<Uint8Array<ArrayBuffer>> {
-  const { signal, expectedBytes } = opts ?? {};
-  let seen = 0;
-  // Auto-detect the Node-stream destroy capability when the caller doesn't
-  // supply one: every adapter was hand-rolling the same
-  // `typeof stream.destroy === "function"` guard.
-  const nativeDestroy = (iterable as AsyncIterable<Uint8Array> & { destroy?: () => void }).destroy;
-  const destroy = opts?.destroy ?? (
-    typeof nativeDestroy === "function" ? () => nativeDestroy.call(iterable) : undefined
-  );
+    const { signal, expectedBytes } = opts ?? {};
+    let seen = 0;
+    // Auto-detect the Node-stream destroy capability when the caller doesn't
+    // supply one: every adapter was hand-rolling the same
+    // `typeof stream.destroy === "function"` guard.
+    const nativeDestroy = (iterable as AsyncIterable<Uint8Array> & { destroy?: () => void }).destroy;
+    const destroy =
+        opts?.destroy ?? (typeof nativeDestroy === "function" ? () => nativeDestroy.call(iterable) : undefined);
 
-  // Propagate abort signal to the underlying stream. The listener MUST be
-  // removed once the stream settles: a consumer that reuses one long-lived
-  // signal across many getObject calls would otherwise accumulate one
-  // listener (and one retained stream reference) per completed transfer
-  // until the signal is aborted or GC'd.
-  const abortListener = signal && destroy ? destroy : undefined;
-  if (signal && abortListener) signal.addEventListener("abort", abortListener);
-  const detach = () => {
-    if (signal && abortListener) signal.removeEventListener?.("abort", abortListener);
-  };
+    // Propagate abort signal to the underlying stream. The listener MUST be
+    // removed once the stream settles: a consumer that reuses one long-lived
+    // signal across many getObject calls would otherwise accumulate one
+    // listener (and one retained stream reference) per completed transfer
+    // until the signal is aborted or GC'd.
+    const abortListener = signal && destroy ? destroy : undefined;
+    if (signal && abortListener) signal.addEventListener("abort", abortListener);
+    const detach = () => {
+        if (signal && abortListener) signal.removeEventListener?.("abort", abortListener);
+    };
 
-  const iterator = iterable[Symbol.asyncIterator]();
-  return new ReadableStream<Uint8Array<ArrayBuffer>>({
-    async pull(controller) {
-      let result: IteratorResult<Uint8Array>;
-      try {
-        result = await iterator.next();
-      } catch (err) {
-        // Stop backend I/O when iteration fails, then error the web stream.
-        // Without this, a mid-transfer backend failure leaks the socket.
-        detach();
-        destroy?.();
-        throw err;
-      }
-      if (result.done) {
-        detach();
-        // A graceful end that under- or over-ran the promised length means the
-        // source changed under an already-committed Content-Length: fail the
-        // body loudly (a reset the client sees as a failed transfer) rather
-        // than deliver a truncated stream that looks complete.
-        if (expectedBytes !== undefined && seen !== expectedBytes) {
-          destroy?.();
-          controller.error(new Error(
-            `stream delivered ${seen} bytes, expected ${expectedBytes} (source changed mid-read)`,
-          ));
-          return;
+    const iterator = iterable[Symbol.asyncIterator]();
+    return new ReadableStream<Uint8Array<ArrayBuffer>>({
+        async pull(controller) {
+            let result: IteratorResult<Uint8Array>;
+            try {
+                result = await iterator.next();
+            } catch (err) {
+                // Stop backend I/O when iteration fails, then error the web stream.
+                // Without this, a mid-transfer backend failure leaks the socket.
+                detach();
+                destroy?.();
+                throw err;
+            }
+            if (result.done) {
+                detach();
+                // A graceful end that under- or over-ran the promised length means the
+                // source changed under an already-committed Content-Length: fail the
+                // body loudly (a reset the client sees as a failed transfer) rather
+                // than deliver a truncated stream that looks complete.
+                if (expectedBytes !== undefined && seen !== expectedBytes) {
+                    destroy?.();
+                    controller.error(
+                        new Error(
+                            `stream delivered ${seen} bytes, expected ${expectedBytes} (source changed mid-read)`,
+                        ),
+                    );
+                    return;
+                }
+                controller.close();
+            } else {
+                // Node.js streams yield Buffer; ensure Uint8Array for cross-runtime compat.
+                // Node Buffers and adapter chunks are ArrayBuffer-backed, so the narrow
+                // is runtime-safe and lets the web stream advertise a BodyInit-assignable
+                // Uint8Array<ArrayBuffer> (the same narrowing guardStreamLength makes).
+                const raw = result.value instanceof Uint8Array ? result.value : Buffer.from(result.value);
+                const chunk = raw as Uint8Array<ArrayBuffer>;
+                // Withheld on crossing the committed length, as in guardStreamLength:
+                // the overrun never reaches the consumer ahead of the error.
+                if (expectedBytes !== undefined && seen + chunk.byteLength > expectedBytes) {
+                    detach();
+                    destroy?.();
+                    controller.error(
+                        new Error(`stream delivered more than ${expectedBytes} bytes (source changed mid-read)`),
+                    );
+                    return;
+                }
+                seen += chunk.byteLength;
+                controller.enqueue(chunk);
+            }
+        },
+        async cancel(reason) {
+            detach();
+            try {
+                await iterator.return?.(reason);
+            } catch {
+                // Iterator cleanup failed; socket will be GC'd
+            }
+            destroy?.();
+        },
+    });
+}
+
+/**
+ * Hand a body of known length to the runtime as a `FixedLengthStream` where
+ * that global exists (Cloudflare Workers), which is how such a runtime learns
+ * the length of a stream body: without it the body may be sent with chunked
+ * transfer coding instead of the committed Content-Length. Elsewhere the
+ * stream is returned unchanged.
+ */
+export function fixedLength(
+    stream: ReadableStream<Uint8Array>,
+    length: number,
+): ReadableStream<Uint8Array<ArrayBuffer>> {
+    const Fixed = (
+        globalThis as {
+            FixedLengthStream?: new (length: number) => TransformStream<Uint8Array, Uint8Array<ArrayBuffer>>;
         }
-        controller.close();
-      } else {
-        // Node.js streams yield Buffer; ensure Uint8Array for cross-runtime compat.
-        // Node Buffers and adapter chunks are ArrayBuffer-backed, so the narrow
-        // is runtime-safe and lets the web stream advertise a BodyInit-assignable
-        // Uint8Array<ArrayBuffer> (see F5 rationale in guardStreamLength).
-        const raw = result.value instanceof Uint8Array ? result.value : Buffer.from(result.value);
-        const chunk = raw as Uint8Array<ArrayBuffer>;
-        seen += chunk.byteLength;
-        controller.enqueue(chunk);
-      }
-    },
-    async cancel(reason) {
-      detach();
-      try {
-        await iterator.return?.(reason);
-      } catch {
-        // Iterator cleanup failed; socket will be GC'd
-      }
-      destroy?.();
-    },
-  });
+    ).FixedLengthStream;
+    return Fixed ? stream.pipeThrough(new Fixed(length)) : (stream as ReadableStream<Uint8Array<ArrayBuffer>>);
 }
 
 /**
@@ -423,32 +617,100 @@ export function nodeStreamToWeb(
  * Passing `undefined` disables the check and returns the stream unwrapped.
  */
 export function guardStreamLength(
-  stream: ReadableStream<Uint8Array>,
-  expectedBytes: number | undefined,
+    stream: ReadableStream<Uint8Array>,
+    expectedBytes: number | undefined,
 ): ReadableStream<Uint8Array<ArrayBuffer>> {
-  // Return position narrows to <ArrayBuffer> (backend byte chunks are always
-  // ArrayBuffer-backed) so the guarded body stays `new Response(...)`-assignable
-  // under DOM lib; the input stays wide for callers.
-  if (expectedBytes === undefined) return stream as ReadableStream<Uint8Array<ArrayBuffer>>;
-  let seen = 0;
-  return stream.pipeThrough(
-    new TransformStream<Uint8Array, Uint8Array<ArrayBuffer>>({
-      transform(chunk, controller) {
-        seen += chunk.byteLength;
-        controller.enqueue(chunk as Uint8Array<ArrayBuffer>);
-      },
-      flush(controller) {
-        // A short (or long) graceful end means the source diverged from the
-        // committed length: fail the body loudly rather than deliver a
-        // truncated stream that looks complete. Mirrors nodeStreamToWeb.
-        if (seen !== expectedBytes) {
-          controller.error(new Error(
-            `stream delivered ${seen} bytes, expected ${expectedBytes} (source changed mid-read)`,
-          ));
-        }
-      },
-    }),
-  );
+    // Return position narrows to <ArrayBuffer> (backend byte chunks are always
+    // ArrayBuffer-backed) so the guarded body stays `new Response(...)`-assignable
+    // under DOM lib; the input stays wide for callers.
+    if (expectedBytes === undefined) return stream as ReadableStream<Uint8Array<ArrayBuffer>>;
+    let seen = 0;
+    const guarded = stream.pipeThrough(
+        new TransformStream<Uint8Array, Uint8Array<ArrayBuffer>>({
+            transform(chunk, controller) {
+                // A chunk that crosses the committed length is withheld: the bytes
+                // past it belong to a representation the caller did not commit to,
+                // and enqueuing them first would put them on the wire before the
+                // error the flush would raise.
+                if (seen + chunk.byteLength > expectedBytes) {
+                    controller.error(
+                        new Error(`stream delivered more than ${expectedBytes} bytes (source changed mid-read)`),
+                    );
+                    return;
+                }
+                seen += chunk.byteLength;
+                controller.enqueue(chunk as Uint8Array<ArrayBuffer>);
+            },
+            flush(controller) {
+                // A short (or long) graceful end means the source diverged from the
+                // committed length: fail the body loudly rather than deliver a
+                // truncated stream that looks complete. Mirrors nodeStreamToWeb.
+                if (seen !== expectedBytes) {
+                    controller.error(
+                        new Error(
+                            `stream delivered ${seen} bytes, expected ${expectedBytes} (source changed mid-read)`,
+                        ),
+                    );
+                }
+            },
+        }),
+    );
+    // Last, so the body the runtime receives is the fixed-length one.
+    return fixedLength(guarded, expectedBytes);
+}
+
+// ─── Body Narrowing ─────────────────────────────────────────────────────────
+
+/**
+ * The body form {@link ObjectStream.body} carries: `ArrayBuffer`-backed, so a
+ * consumer can hand it straight to `new Response(...)` under `lib: ["DOM"]`,
+ * where `BodyInit` excludes `SharedArrayBuffer`-backed views.
+ */
+export type ObjectBody = ReadableStream<Uint8Array<ArrayBuffer>> | Uint8Array<ArrayBuffer>;
+
+/**
+ * The body forms a store may already be holding, before it commits to the
+ * narrower {@link ObjectBody}. `Buffer` and `ReadableStream<Uint8Array>` both
+ * land here: a `Buffer` is typed over `ArrayBufferLike` wherever the Node
+ * typings in use predate `NonSharedBuffer`, and an SDK that hands back a web
+ * stream types its chunks as bare `Uint8Array`.
+ */
+export type ObjectBodySource = ReadableStream<Uint8Array> | Uint8Array;
+
+/**
+ * Narrow a store's body to the {@link ObjectBody} form the read path serves.
+ *
+ * Wide in, narrow out, the same split {@link guardStreamLength} applies to
+ * streams: a store keeps whatever type its source gave it and the narrowing
+ * is decided here rather than at a cast in each adapter.
+ *
+ * Bytes are narrowed by inspection, so a `SharedArrayBuffer`-backed view is
+ * copied into its own `ArrayBuffer` instead of being relabelled: that view
+ * is the one input `new Response(...)` genuinely rejects, and a relabel would
+ * move the failure from this call to the consumer's response construction.
+ * Streams keep the chunk-level assumption {@link guardStreamLength}
+ * documents, since a per-chunk copy would defeat streaming.
+ *
+ * @example
+ * ```typescript
+ * import { readFile } from "node:fs/promises";
+ * import { toObjectBody } from "partial-content";
+ *
+ * const body = toObjectBody(await readFile("/data/report.pdf"));
+ * ```
+ */
+export function toObjectBody(source: ObjectBodySource): ObjectBody {
+    if (source instanceof Uint8Array) {
+        return isArrayBufferBacked(source) ? source : new Uint8Array(source);
+    }
+    // `undefined` disables the length guard and returns the stream unwrapped,
+    // so this costs nothing beyond the narrowing itself.
+    return guardStreamLength(source, undefined);
+}
+
+/** Whether a view is backed by an `ArrayBuffer` rather than a `SharedArrayBuffer`. */
+function isArrayBufferBacked(view: Uint8Array): view is Uint8Array<ArrayBuffer> {
+    return view.buffer instanceof ArrayBuffer;
 }
 
 // ─── Storage Metadata ───────────────────────────────────────────────────────
@@ -458,37 +720,46 @@ export function guardStreamLength(
  * any body transfer.
  */
 export interface ObjectMetadata {
-  /** Full object size in bytes. */
-  contentLength: number;
-  /** Backend ETag, if any (already quoted or `W/`-prefixed -- pass through `generateETag`). */
-  etag?: string;
-  /** Last-Modified, in whatever format the backend emits (`Date.parse`-able). */
-  lastModified?: string;
-  /**
-   * RFC 9530 SHA-256 digest of the full representation (raw base64, no prefix).
-   *
-   * When provided, the adapter emits `Repr-Digest: sha-256=:<base64>:` on
-   * success responses for end-to-end integrity verification.
-   *
-   * Source it from a backend field that IS a SHA-256 of the object bytes:
-   * S3 `x-amz-checksum-sha256` (checksummed uploads); R2 `checksums.sha256`.
-   * GCS has no native SHA-256 (`x-goog-hash` carries only crc32c and md5,
-   * neither of which may be framed as `sha-256`): store your own hash as
-   * custom object metadata and point `gcsStore`'s `digestMetadataKey` at it.
-   */
-  digest?: string;
-  /**
-   * Opaque adapter token pinning a later `getObject` to this exact
-   * representation. The orchestrator round-trips it verbatim into
-   * {@link GetObjectOptions.pin} without interpreting it.
-   *
-   * Only needed by stores whose version identifier is not the ETag: GCS
-   * encodes its generation (plus the size/validators `getObject` would
-   * otherwise re-fetch), turning the HEAD->GET pair into a single backend
-   * read. ETag-pinning stores (S3, R2, Azure, http) omit it -- `ifMatch`
-   * already carries their pin.
-   */
-  pin?: string;
+    /** Full object size in bytes. */
+    contentLength: number;
+    /** Backend ETag, if any (already quoted or `W/`-prefixed -- pass through `generateETag`). */
+    etag?: string;
+    /** Last-Modified, in whatever format the backend emits (`Date.parse`-able). */
+    lastModified?: string;
+    /**
+     * RFC 9530 SHA-256 digest of the full representation (raw base64, no prefix).
+     *
+     * When provided, the adapter emits `Repr-Digest: sha-256=:<base64>:` on
+     * success responses for end-to-end integrity verification.
+     *
+     * Source it from a backend field that IS a SHA-256 of the object bytes:
+     * S3 `x-amz-checksum-sha256` (checksummed uploads); R2 `checksums.sha256`.
+     * GCS has no native SHA-256 (`x-goog-hash` carries only crc32c and md5,
+     * neither of which may be framed as `sha-256`): store your own hash as
+     * custom object metadata and point `gcsStore`'s `digestMetadataKey` at it.
+     */
+    digest?: string;
+    /**
+     * Opaque adapter token pinning a later `getObject` to this exact
+     * representation. The orchestrator round-trips it verbatim into
+     * {@link GetObjectOptions.pin} without interpreting it.
+     *
+     * Only needed by stores whose version identifier is not the ETag: GCS
+     * encodes its generation (plus the size/validators `getObject` would
+     * otherwise re-fetch), turning the HEAD->GET pair into a single backend
+     * read. ETag-pinning stores (S3, R2, Azure, http) omit it -- `ifMatch`
+     * already carries their pin.
+     */
+    pin?: string;
+    /**
+     * The media type the backend stored with the object, if it keeps one.
+     * Informational only: the serving path never trusts it for
+     * `Content-Type`, because a stored type is usually whatever the uploader
+     * claimed. An omitted `mime` is served from the caller's choice or as
+     * `application/octet-stream`; the value reaches audit events as
+     * `storedContentType`.
+     */
+    contentType?: string;
 }
 
 // ─── Stream Result ──────────────────────────────────────────────────────────
@@ -507,21 +778,21 @@ export interface ObjectMetadata {
  * check `range.start`.
  */
 export interface ServedRange {
-  /** First byte position served (0-based, inclusive). */
-  start: number;
-  /** Last byte position served (inclusive). */
-  end: number;
+    /** First byte position served (0-based, inclusive). */
+    start: number;
+    /** Last byte position served (inclusive). */
+    end: number;
 }
 
 /** Served bounds plus honest total parsed from a backend `Content-Range`. */
 export interface ResolvedContentRange {
-  /** The byte range the backend actually served (inclusive bounds). */
-  served: ServedRange;
-  /**
-   * Full representation size, or `undefined` for the `bytes a-b/*`
-   * unknown-total sentinel (a streaming origin that does not know its length).
-   */
-  totalSize: number | undefined;
+    /** The byte range the backend actually served (inclusive bounds). */
+    served: ServedRange;
+    /**
+     * Full representation size, or `undefined` for the `bytes a-b/*`
+     * unknown-total sentinel (a streaming origin that does not know its length).
+     */
+    totalSize: number | undefined;
 }
 
 /**
@@ -540,12 +811,12 @@ export interface ResolvedContentRange {
  * GCS, R2) construct {@link ServedRange} directly and never call this.
  */
 export function resolveServedRange(contentRange: string): ResolvedContentRange | null {
-  const parsed = parseContentRange(contentRange);
-  if (!parsed) return null;
-  return {
-    served: { start: parsed.start, end: parsed.end },
-    totalSize: parsed.totalSize < 0 ? undefined : parsed.totalSize,
-  };
+    const parsed = parseContentRange(contentRange);
+    if (!parsed) return null;
+    return {
+        served: { start: parsed.start, end: parsed.end },
+        totalSize: parsed.totalSize,
+    };
 }
 
 /**
@@ -557,60 +828,73 @@ export function resolveServedRange(contentRange: string): ResolvedContentRange |
  * (the HEAD->GET TOCTOU window).
  */
 export interface ObjectStream {
-  /**
-   * The body: a `ReadableStream` for streamed transfers, or a plain
-   * `Uint8Array` when the adapter already has the exact bytes in memory
-   * (small files, in-memory stores). Byte bodies let consumers skip stream
-   * machinery entirely -- server adapters write them in a single syscall
-   * and `new Response(bytes)` takes the fetch runtime's static-body fast
-   * path. Return whichever form is natural; never buffer large transfers
-   * just to produce bytes.
-   *
-   * Typed `<ArrayBuffer>`-backed (not the wider `ArrayBufferLike`) so a
-   * consumer can pass it straight to `new Response(...)` under `lib: ["DOM"]`
-   * on TS >= 5.7, where `BodyInit` requires an `ArrayBuffer`-backed view.
-   */
-  body: ReadableStream<Uint8Array<ArrayBuffer>> | Uint8Array<ArrayBuffer>;
-  /** Bytes in THIS response (range length for 206, full size for 200). */
-  contentLength: number;
-  /**
-   * Full object size, independent of any range, or `undefined` when the
-   * backend served a partial response with an unknown total (`bytes a-b/*`,
-   * RFC 7233 Section 4.2) -- a streaming origin that does not know its full
-   * length. Object stores (S3, R2, GCS, Azure) always know their sizes and
-   * set a number; only proxied origins (the http adapter) legitimately leave
-   * it `undefined`. Valid ONLY alongside a `range`: a full response carries a
-   * concrete size in `contentLength`, so `undefined` with no `range` is an
-   * adapter bug (the orchestrator emits 200 and needs the length).
-   */
-  totalSize: number | undefined;
-  /**
-   * The byte range the backend ACTUALLY served (inclusive bounds), or
-   * `undefined` if it served full content.
-   *
-   * This is the source of truth for 206 vs 200: if a range was requested but
-   * `range` is `undefined`, the backend ignored it -- emit 200, never a
-   * lying 206. Adapters that receive a `Content-Range` string from their
-   * backend parse it with {@link parseContentRange} and fail loudly on
-   * garbage; adapters that know the bounds natively (fs, memory, GCS, R2)
-   * construct this directly -- malformed range strings cannot exist in the
-   * contract.
-   */
-  range?: ServedRange;
-  /** ETag as returned by the GET (authoritative for this body). */
-  etag?: string;
-  /** Last-Modified as returned by the GET (authoritative for this body). */
-  lastModified?: string;
-  /**
-   * RFC 9530 SHA-256 digest of the full representation (raw base64, no prefix).
-   *
-   * When provided by the GET response, the adapter can emit `Repr-Digest`
-   * even on Path C (no prior HEAD). This closes the digest gap for
-   * first-visit requests that skip the HEAD round-trip.
-   *
-   * S3: map from `x-amz-checksum-sha256` on GetObject response.
-   */
-  digest?: string;
+    /**
+     * The body: a `ReadableStream` for streamed transfers, or a plain
+     * `Uint8Array` when the adapter already has the exact bytes in memory
+     * (small files, in-memory stores). Byte bodies let consumers skip stream
+     * machinery entirely -- server adapters write them in a single syscall
+     * and `new Response(bytes)` takes the fetch runtime's static-body fast
+     * path. Return whichever form is natural; never buffer large transfers
+     * just to produce bytes.
+     *
+     * Typed `<ArrayBuffer>`-backed (not the wider `ArrayBufferLike`) so a
+     * consumer can pass it straight to `new Response(...)` under `lib: ["DOM"]`
+     * on TS >= 5.7, where `BodyInit` requires an `ArrayBuffer`-backed view.
+     *
+     * A store holding a wider value (a `Buffer<ArrayBufferLike>`, which older
+     * Node typings return from `readFile`) passes it through {@link toObjectBody}, which
+     * is the one place the narrowing is decided.
+     *
+     * **A stream body MUST be read to the end or cancelled.** It can hold an
+     * operating-system resource that only those two paths release: the
+     * filesystem store hands the reader a descriptor it opened, and a stream
+     * neither drained nor cancelled keeps it open for the life of the process,
+     * so a route that abandons bodies exhausts the descriptor table. Nothing
+     * reclaims it later; a garbage collector frees the object, not the handle
+     * underneath it. Every path in this package that stops early cancels, which
+     * is the same obligation stated in code.
+     */
+    body: ObjectBody;
+    /** Bytes in THIS response (range length for 206, full size for 200). */
+    contentLength: number;
+    /**
+     * Full object size, independent of any range, or `undefined` when the
+     * backend served a partial response with an unknown total (`bytes a-b/*`,
+     * RFC 9110 Section 14.4) -- a streaming origin that does not know its full
+     * length. Object stores (S3, R2, GCS, Azure) always know their sizes and
+     * set a number; only proxied origins (the http adapter) legitimately leave
+     * it `undefined`. Valid ONLY alongside a `range`: a full response carries a
+     * concrete size in `contentLength`, so `undefined` with no `range` is an
+     * adapter bug (the orchestrator emits 200 and needs the length).
+     */
+    totalSize: number | undefined;
+    /**
+     * The byte range the backend ACTUALLY served (inclusive bounds), or
+     * `undefined` if it served full content.
+     *
+     * This is the source of truth for 206 vs 200: if a range was requested but
+     * `range` is `undefined`, the backend ignored it -- emit 200, never a
+     * lying 206. Adapters that receive a `Content-Range` string from their
+     * backend parse it with {@link parseContentRange} and fail loudly on
+     * garbage; adapters that know the bounds natively (fs, memory, GCS, R2)
+     * construct this directly -- malformed range strings cannot exist in the
+     * contract.
+     */
+    range?: ServedRange;
+    /** ETag as returned by the GET (authoritative for this body). */
+    etag?: string;
+    /** Last-Modified as returned by the GET (authoritative for this body). */
+    lastModified?: string;
+    /**
+     * RFC 9530 SHA-256 digest of the full representation (raw base64, no prefix).
+     *
+     * When provided by the GET response, the adapter can emit `Repr-Digest`
+     * even on Path C (no prior HEAD). This closes the digest gap for
+     * first-visit requests that skip the HEAD round-trip.
+     *
+     * S3: map from `x-amz-checksum-sha256` on GetObject response.
+     */
+    digest?: string;
 }
 
 // ─── Store Contract ─────────────────────────────────────────────────────────
@@ -639,103 +923,114 @@ export interface ObjectStream {
  * ```
  */
 export interface ObjectStore {
-  /**
-   * Fetch metadata without a body. Used to evaluate conditional requests
-   * (304/412) and If-Range before deciding whether to transfer bytes.
-   *
-   * @param key - Object key within the bucket.
-   * @param opts - Cancellation ({@link HeadObjectOptions}).
-   */
-  headObject(key: string, opts?: HeadObjectOptions): Promise<ObjectMetadata>;
+    /**
+     * Fetch metadata without a body. Used to evaluate conditional requests
+     * (304/412) and If-Range before deciding whether to transfer bytes.
+     *
+     * @param key - Object key within the bucket.
+     * @param opts - Cancellation ({@link HeadObjectOptions}).
+     */
+    headObject(key: string, opts?: HeadObjectOptions): Promise<ObjectMetadata>;
 
-  /**
-   * Stream an object, optionally a byte range.
-   *
-   * The adapter receives a `ParsedRange` in `opts.range` and formats it for
-   * the backend (e.g. `bytes=${start}-${end}`). `range.end` may exceed the
-   * object size (RFC 9110 lets servers clamp a last-byte-pos past EOF, and
-   * the fast range path uses an open end deliberately); adapters clamp it
-   * and report the bounds ACTUALLY served. `range.start` beyond EOF is the
-   * caller's error: local adapters throw a RangeError, remote backends
-   * reject natively. Returns the actual transfer result -- including the
-   * real `Content-Range` -- so the caller can build a truthful 200/206
-   * from a single round-trip.
-   *
-   * @param key - Object key within the bucket.
-   * @param opts - Range, cancellation, and pinning
-   *   ({@link GetObjectOptions}). Stores that cannot pin reads may ignore
-   *   `ifMatch`; the web adapter keeps a response-side guard (actual
-   *   Content-Range + GET validators) for that case.
-   */
-  getObject(key: string, opts?: GetObjectOptions): Promise<ObjectStream>;
+    /**
+     * Stream an object, optionally a byte range.
+     *
+     * The adapter receives a `ParsedRange` in `opts.range` and formats it for
+     * the backend (e.g. `bytes=${start}-${end}`). `range.end` may exceed the
+     * object size (RFC 9110 lets servers clamp a last-byte-pos past EOF, and
+     * the fast range path uses an open end deliberately); adapters clamp it
+     * and report the bounds ACTUALLY served. `range.start` beyond EOF is the
+     * caller's error: local adapters throw a RangeError, remote backends
+     * reject natively. Returns the actual transfer result -- including the
+     * real `Content-Range` -- so the caller can build a truthful 200/206
+     * from a single round-trip.
+     *
+     * @param key - Object key within the bucket.
+     * @param opts - Range, cancellation, and pinning
+     *   ({@link GetObjectOptions}). Stores that cannot pin reads may ignore
+     *   `ifMatch`; the web adapter keeps a response-side guard (actual
+     *   Content-Range + GET validators) for that case.
+     */
+    getObject(key: string, opts?: GetObjectOptions): Promise<ObjectStream>;
 
-  /**
-   * Capability flag. When `false`, the framework adapter degrades gracefully
-   * (e.g. signed-URL redirect) instead of attempting range streaming.
-   * Omit or set `true` for any S3-compatible backend.
-   *
-   * @default true
-   */
-  readonly supportsRange?: boolean;
+    /**
+     * Capability flag. When `false`, the framework adapter degrades gracefully
+     * (e.g. signed-URL redirect) instead of attempting range streaming.
+     * Omit or set `true` for any S3-compatible backend.
+     *
+     * @default true
+     */
+    readonly supportsRange?: boolean;
 
-  /**
-   * Capability flag: this adapter's ranged responses carry bounds and total
-   * size taken from the BACKEND's actual response (`Content-Range`), not
-   * echoed from the request. When `true`, the framework adapter skips the
-   * validating HEAD for plain range requests (no conditionals, no
-   * If-Range) and serves the seek in a single round-trip -- validators,
-   * bounds, and digest all come from the GET response itself, which is
-   * also inherently TOCTOU-atomic. Any adapter that clamps ranges itself,
-   * rejects a start beyond EOF, and reports the SERVED bounds qualifies
-   * (S3, HTTP, fs, memory). Leave unset for stores that echo the requested
-   * range or fetch metadata themselves anyway (GCS).
-   *
-   * @default false
-   */
-  readonly authoritativeRange?: boolean;
+    /**
+     * Capability flag: this adapter's ranged responses carry bounds and total
+     * size taken from the BACKEND's actual response (`Content-Range`), not
+     * echoed from the request. When `true`, the framework adapter skips the
+     * validating HEAD for plain range requests (no conditionals, no
+     * If-Range) and serves the seek in a single round-trip -- validators,
+     * bounds, and digest all come from the GET response itself, which is
+     * also inherently TOCTOU-atomic. Any adapter that clamps ranges itself,
+     * rejects a start beyond EOF, and reports the SERVED bounds qualifies
+     * (S3, HTTP, fs, memory). Leave unset for stores that echo the requested
+     * range or fetch metadata themselves anyway (GCS).
+     *
+     * @default false
+     */
+    readonly authoritativeRange?: boolean;
 
-  /**
-   * Optional egress-offload path: returns a short-lived URL the client is
-   * redirected to. Used for backends that cannot stream ranges through the
-   * origin, and by the web adapter's `preferSignedUrl` per-request offload.
-   *
-   * `downloadFilename` is RAW untrusted input (the consumer's
-   * ServeContext.filename, verbatim). Implementations that embed it in a
-   * response-content-disposition query parameter or similar MUST sanitize it
-   * (e.g. via `buildContentDisposition`), exactly as the streaming path does.
-   *
-   * `cacheControl`, when provided, SHOULD override the Cache-Control of the
-   * signed response (S3 `response-cache-control` and equivalents). Without
-   * it, the redirect target serves whatever Cache-Control was baked into the
-   * object at upload -- a private document stored with a public/immutable
-   * value would be cached by any CDN in front of the bucket.
-   *
-   * Two adapter-author traps this contract documents:
-   * - **Temporary credentials cap expiry.** A URL presigned under STS/role
-   *   credentials (Lambda, ECS task roles) dies when the SESSION TOKEN
-   *   expires, regardless of `expiresInSeconds`. Effective lifetime is
-   *   `min(expiresInSeconds, credential lifetime remaining)`; long-lived
-   *   links need long-term credentials or a stable re-signing endpoint that
-   *   302s per fetch.
-   * - **CloudFront canned policies break on RFC 8187 dispositions.** A
-   *   sanitized disposition carries `filename*=UTF-8''...`; browsers
-   *   re-encode the apostrophes to `%27`, which no longer matches a
-   *   canned-policy signature (AccessDenied). CloudFront signers must use a
-   *   custom policy with a wildcard query (`...?*`).
-   */
-  /**
-   * Returns an outcome rather than throwing, unlike every other method on this
-   * interface, because DECLINING and FAILING are different answers here and
-   * the caller acts on them differently. `{ ok: false }` says this store
-   * cannot sign (no credential configured, a backend without the capability),
-   * and the serving path falls back to streaming the bytes itself, which is a
-   * correct response. A thrown error says signing was supposed to work and did
-   * not, which is reported and answered as a backend failure. Collapsing the
-   * two would turn "no signing configured" into a 502 on every request.
-   */
-  createSignedUrl?(
-    key: string,
-    opts: { expiresInSeconds: number; downloadFilename?: string; cacheControl?: string },
-  ): Promise<{ ok: true; url: string } | { ok: false; error: string }>;
+    /**
+     * Optional egress-offload path: returns a short-lived URL the client is
+     * redirected to. Used for backends that cannot stream ranges through the
+     * origin, and by the web adapter's `preferSignedUrl` per-request offload.
+     *
+     * Returns an outcome rather than throwing, unlike every other method on
+     * this interface, because DECLINING and FAILING are different answers and
+     * the caller acts on them differently. `{ ok: false }` says this store
+     * cannot sign (no credential configured, a backend without the
+     * capability), and the serving path falls back to streaming the bytes
+     * itself, which is a correct response; `cause` may carry the underlying
+     * error for the store's own diagnostics, and the optional `code` says why
+     * in a form a caller can branch on: `"no-credential"` (no signing
+     * credential is configured) or `"unsupported"` (the backend or this store
+     * cannot sign). `code` may gain a member in a minor release: give a switch
+     * over it a default branch. A thrown error says signing was
+     * supposed to work and did not, which is reported and answered as a
+     * backend failure. Collapsing the two would turn "no signing configured"
+     * into a 502 on every request.
+     *
+     * `downloadFilename` is RAW untrusted input (the consumer's
+     * ServeContext.filename, verbatim). Implementations that embed it in a
+     * response-content-disposition query parameter or similar MUST sanitize it
+     * (e.g. via `buildContentDisposition`), exactly as the streaming path does.
+     *
+     * `cacheControl`, when provided, SHOULD override the Cache-Control of the
+     * signed response (S3 `response-cache-control` and equivalents). Without
+     * it, the redirect target serves whatever Cache-Control was baked into the
+     * object at upload -- a private document stored with a public/immutable
+     * value would be cached by any CDN in front of the bucket.
+     *
+     * `signal` is the request's abort signal, for a signer that makes a
+     * network call; a signer that rejects after it aborted is answered as a
+     * client abort, not a backend failure.
+     *
+     * Two adapter-author traps this contract documents:
+     * - **Temporary credentials cap expiry.** A URL presigned under STS/role
+     *   credentials (Lambda, ECS task roles) dies when the SESSION TOKEN
+     *   expires, regardless of `expiresInSeconds`. Effective lifetime is
+     *   `min(expiresInSeconds, credential lifetime remaining)`; long-lived
+     *   links need long-term credentials or a stable re-signing endpoint that
+     *   302s per fetch.
+     * - **CloudFront canned policies break on RFC 8187 dispositions.** A
+     *   sanitized disposition carries `filename*=UTF-8''...`; browsers
+     *   re-encode the apostrophes to `%27`, which no longer matches a
+     *   canned-policy signature (AccessDenied). CloudFront signers must use a
+     *   custom policy with a wildcard query (`...?*`).
+     */
+    createSignedUrl?(
+        key: string,
+        opts: { expiresInSeconds: number; downloadFilename?: string; cacheControl?: string; signal?: AbortSignal },
+    ): Promise<
+        | { ok: true; url: string }
+        | { ok: false; error: string; code?: "no-credential" | "unsupported"; cause?: unknown }
+    >;
 }
-

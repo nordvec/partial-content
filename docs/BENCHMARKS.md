@@ -1,21 +1,59 @@
 # Benchmarks
 
-Two suites: kernel micro-benchmarks (library overhead only) and end-to-end HTTP serving against `send` and `sirv`. Reproduce with `bun bench.ts` and `npm run bench`.
+Two suites: kernel micro-benchmarks (library overhead only) and end-to-end HTTP
+serving against `send` and `sirv`. Reproduce with `bun bench.ts` and
+`npm run bench`.
 
-Every table states the exact runtime and package build it was measured on. The
-kernel table is current. The two HTTP tables were measured on partial-content
-1.4.0 and have not been re-measured since; treat them as the shape of the cost,
-not as figures for the version you are installing, and re-run them yourself
-with the commands given if the absolute numbers matter to you.
+## How a number earns its place here
+
+A benchmark that measures the load generator instead of the server is worse
+than no benchmark, because it reads as parity and hides both directions of the
+truth. Three rules keep that out of this document.
+
+**The load generator runs in its own process.** Run in-process with the server,
+the client's own HTTP parser dominates the profile (`Buffer.toString` on every
+response body reached 72% of process CPU on the 1 MB scenario), throttling every
+column equally.
+
+**A scenario is published only after it is shown to be server-bound.** The test
+is to add a second load generator: if throughput rises, the first one was the
+bottleneck and the row was measuring it. The 1 MB body and the 64 KB range
+scenarios fail that test -- a second generator roughly DOUBLED them for every
+server, our own included -- so no throughput figure for them appears here. They
+are still run, and still correctness-verified, because a scenario that stops
+serving the right bytes has to fail somewhere; their timing is just not a
+result. At 1 MB that is the honest finding rather than a missing one: transfers
+that size are I/O-bound, and every contender converges there.
+
+**CPU per request is the metric to compare on.** It is client-independent, so it
+survives a saturated generator, a noisy machine, and a different network path,
+and it is the number that decides whether a change to this package is a win: a
+performance change ships only with CPU per request measured before and after,
+on top of throughput. Throughput answers "what did this machine do today"; CPU
+per request answers "what does the server code cost", which is the part a
+library can actually change.
+
+`npm run bench` reports it for every cell, user and system split, alongside the
+throughput table. Every server runs inside the harness process and the load
+generator is a child process, so `process.cpuUsage()` bracketed around the
+measured window counts the serving work and none of the client's; dividing by
+the request count that window completed gives the figure. One server is under
+load at a time, which is what makes the delta attributable to a column. The
+window also contains the harness's idle event-loop polling, identical for every
+column, which is why a cell whose generator is saturated reports a CPU figure
+inflated by amortizing that cost over fewer requests, and another reason those
+cells are not published. For a breakdown of where the microseconds go rather
+than how many there are, run `node --cpu-prof bench/profile-server.mjs` under an
+external `autocannon`.
 
 ## Kernel micro-benchmarks
 
 Throughput of the pure header functions, measured on Bun 1.4.0 against the
 current source: single thread, 2M iterations after a 50k warmup, per-row median
-of three consecutive runs on a shared development machine. Read a row as the
-cost class it belongs to rather than as a certified peak. These measure library
-overhead only -- they do not include network or storage latency. Reproduce with
-`bun bench.ts`.
+of three consecutive runs on a shared development machine. There is no client
+here, so these rows are server-bound by construction. They measure library
+overhead only -- no network, no storage latency. Read a row as the cost class it
+belongs to rather than as a certified peak. Reproduce with `bun bench.ts`.
 
 | Function | Throughput |
 |----------|-----------|
@@ -36,83 +74,108 @@ and the figure that comes back measures the optimizer rather than the function.
 
 ## End-to-end vs `send` and `sirv`
 
-Full HTTP serving (Node 24, `http.createServer`, loopback, 40 connections,
-autocannon, identical fixtures; every cell correctness-verified before
-timing; the load generator runs in a separate process so its parse cost
-never throttles the server column). partial-content runs its shipped dist
-through the node adapter + fsStore. Reproduce with `npm run bench`.
+Measured 2026-09-04 on partial-content 5.0.0, Node v24.11.1, Windows 11
+(10.0.26200), AMD Ryzen 9 5900X (12 cores / 24 threads), 64 GB,
+`http.createServer` over loopback, 40 connections, 5 s per cell, out-of-process
+`autocannon`, identical fixtures, every cell correctness-verified (status and
+byte count) before timing, per-cell median of three consecutive runs on an
+otherwise idle machine. partial-content serves through its shipped `dist` (node
+adapter + `fsStore`), which is exactly what an npm consumer runs: conditional
+evaluation, ETag derivation, digest negotiation, disposition hardening, and the
+audit hooks are all inside the measured column. `send` and `sirv` run with
+defaults plus ETags enabled. Reproduce with `npm run bench`.
 
-| Scenario | partial-content | + `cache` | send | sirv |
+Two scenarios are server-bound and therefore publishable: a 4 KB body and a
+revalidation. `partial-content (cache)` is the same store with the opt-in
+hot-object cache enabled at a 1 s TTL, reported as its own column rather than
+folded into the default one.
+
+CPU per request, user + system microseconds, the metric these comparisons are
+decided on:
+
+| Scenario | partial-content | partial-content (cache) | `send` | `sirv` |
 |---|---|---|---|---|
-| GET 4 KB (200) | 13,185 req/s | **22,594 req/s** | 12,876 req/s | 13,014 req/s |
-| GET 1 MB (200) | 117 req/s | 115 req/s | 117 req/s | 120 req/s |
-| Range 64 KB of 1 MB (206) | **1,566 req/s** | 1,552 req/s | 1,532 req/s | 1,456 req/s |
-| Revalidation (304) | 20,014 req/s | **22,838 req/s** | 19,931 req/s | 33,165 req/s* |
+| GET 4 KB (200) | 86.0 + 138.5 | 32.2 + 26.7 | 82.0 + 179.3 | 95.7 + 177.7 |
+| Revalidation (304) | 67.0 + 106.1 | 30.9 + 30.8 | 47.2 + 92.4 | 17.9 + 20.5 |
 
-Each cell is the per-cell MEDIAN of three consecutive runs on an otherwise
-idle machine (Node 24.11, partial-content 1.4.0): single-run cells on a
-shared dev box swing 10-20% with background load, and medians keep one
-contaminated cell
-from flattering either side. The full conditional chain, digest negotiation,
-disposition hardening, and the disabled-by-default 1.2.0 additions (encoding
-negotiation gate, inline-CSP check, offload hooks) are all in the measured
-column. The 206 row leads because `fsStore` declares `authoritativeRange`:
-one open handle stats, clamps, and reads, so a plain range is a single
-round-trip with bounds, validators, and bytes coherent by construction --
-strictly stronger than a validating HEAD, and faster than it too.
+Throughput on the same runs, for the same two scenarios:
 
-The `cache` column is `fsStore({ root, cache: { ttlMs: 1000 } })`: an opt-in
-hot-object cache (TTL revalidation,
-metadata + bytes captured atomically, bodies only at or below 128 KiB,
-LRU-evicted under both an entry cap (`maxEntries`, default 1024) and a body
-byte budget (`maxBytes`, default 64 MiB; `0` = metadata-only)). Hot small
-files and their ranges serve from memory with zero syscalls. The trade is
-explicit: after an overwrite, responses (including 304 revalidations) can
-affirm the previous representation for up to `ttlMs`; size it against
-acceptable staleness (see DESIGN.md).
+| Scenario | partial-content | partial-content (cache) | `send` | `sirv` |
+|---|---|---|---|---|
+| GET 4 KB (200) | 9,748 req/s | 17,745 req/s | 9,988 req/s | 9,924 req/s |
+| Revalidation (304) | 10,453 req/s | 15,065 req/s | 12,854 req/s | 25,435 req/s |
 
-\* sirv's 304 figure buys throughput with a different contract: at
-`dev: false` it pre-renders complete header sets for a directory snapshot
-taken at boot, so a file created after startup is a 404. In the
-configuration that CAN see runtime-created files (`dev: true`), the same
-runs measure sirv at 5,676 req/s (median) -- a quarter of the `cache`
-column. For a fixed directory of immutable assets sirv's trade is exactly
-right; for object storage (where uploads happen while the server runs) it
-is disqualifying, which is why the boot-snapshot design stays a non-goal
-here. On the rows where server code matters (4 KB bodies, revalidations),
-the `cache` column is the fastest contender that can serve a file uploaded
-a second ago; at 1 MB, all four columns converge on I/O parity.
+Read together: on the 4 KB body partial-content in its default configuration
+costs the least CPU per request of the three libraries (225 us against 261 for
+`send` and 273 for `sirv`) at throughput within 3% of both, and its cache column
+serves the same bytes for a quarter of that. On the revalidation both
+contenders are cheaper than the default column,
+`sirv` by a wide margin, and the next section is why that comparison is not the
+one it appears to be.
 
-## Bun runtime
+These are Windows figures, where the filesystem system-call share is high: system
+time is roughly 60% of the 4 KB cost here and will be a smaller fraction on
+Linux. Compare columns within a table, never a number here against a number from
+another machine.
 
-Same code on Bun 1.3 (partial-content 1.4.0, `Bun.serve`, same machine, same
-out-of-process client -- the web adapter's Request/Response ARE the runtime's native
-primitives there, no node bridge): GET 4 KB 9,418 req/s plain and
-22,898 req/s with the cache; revalidation 12,538 plain and **38,090 req/s**
-with the cache -- a TTL-revalidating cache serving runtime uploads,
-outrunning even sirv's boot-frozen Node figure by 60%. `send` and `sirv`
-are node-stream libraries and cannot ride `Bun.serve` natively. Reproduce:
-`bun bench/bun-server.ts` (plain :18778, cache :18779) + autocannon.
+### The revalidation row is a scope mismatch, not a loss
 
-## Read this fairly in both directions
+`sirv` buys its 304 throughput by pre-rendering complete header sets for a
+directory snapshot taken at startup. A file created after the process starts is
+a `404` to it. That is a sound trade for a fixed directory of immutable build
+assets, and a disqualifying one for anything backed by object storage, where the
+file a user uploaded a second ago has to be servable now.
 
-- At payload sizes where file serving actually spends its time (1 MB
-  bodies), the contenders are at parity: I/O dominates.
-- Small-body transfers, ranged serves, and revalidations run at
-  parity-to-modest-lead against `send` and `sirv` while doing strictly
+Measured in the configuration that CAN see a runtime-created file (`dev: true`,
+per-request lookup), on the same runs as the tables above, the revalidation
+scenario puts `sirv` at 4,279 req/s and 68.2 + 162.9 us/req. Against that,
+partial-content answers 10,453 req/s at 67.0 + 106.1 us/req, and 15,065 req/s at
+30.9 + 30.8 us/req with the cache on: two and a half times the throughput at
+three quarters of the CPU, or three and a half times at a quarter of it. Both
+`sirv` numbers are real; which one is the comparison depends entirely on whether
+your files exist before the server starts.
+
+The boot-snapshot design is a deliberate non-goal here. This package always
+consults the backend, because the backend is the only thing that knows.
+
+### Reading the rest fairly
+
+- The 4 KB row is close in both directions while partial-content does strictly
   more per request: RFC 9530 digest negotiation, audit hooks, pinned-read
-  plumbing, and storage abstraction. Five things make that possible:
-  plain ranges are a single round-trip (`authoritativeRange`: the fs
-  store's one open handle stats, clamps, and reads), transfers at or
-  below 128 KiB take a single positional-read fast path, small bodies
-  travel as plain bytes (no stream machinery), the node adapter consumes
-  `serveObjectRaw` (zero fetch primitives constructed on the Node hot
-  path), and validators are derived once at stat time instead of
-  re-parsing dates on every request.
-- Correctness note found while building this benchmark: `send` honors a
-  request `Cache-Control: no-cache` during conditional evaluation, and
-  spec-compliant fetch clients (undici, browsers) auto-append exactly that
-  header to manually-conditional requests -- so `send` never answers 304 to
-  a fetch()-based revalidation. partial-content deliberately ignores request
-  cache directives here (they address caches, not origin conditional
-  evaluation; see DESIGN.md).
+  plumbing, and a storage abstraction over the filesystem. Five things pay for
+  that: a plain range is a single round-trip (`fsStore` declares
+  `authoritativeRange`, so one open descriptor stats, clamps, and reads),
+  transfers at or below 128 KiB take a single positional-read fast path, that
+  path's open, stat, read and close settle through ONE promise instead of four
+  (worth 18% of user CPU on the 4 KB cell, measured paired against the
+  four-promise form), small bodies travel as plain bytes with no stream
+  machinery, and the node adapter consumes `serveObjectRaw`, constructing zero
+  fetch primitives on the Node hot path. Validators are derived once at stat
+  time rather than re-parsed per request.
+- `fsStore({ cache })` (see [API.md](API.md)) removes the per-request syscalls
+  for hot small files, at the cost of a bounded staleness window. It is off by
+  default because correctness comes first, and it is measured as its own column
+  rather than folded into the figures above.
+- The optimizations that make the 4 KB rows fast do NOT sum. On Bun the runtime
+  provides some of them, and the caching layers overlap with the fast paths
+  underneath them. Adding the individual percentages produces a number no
+  configuration has ever measured.
+
+### Other runtimes
+
+The web adapter's `Request` and `Response` are native primitives on Bun,
+Deno, and Workers, so the same code serves on `Bun.serve` with no Node bridge
+in the path. `send` and `sirv` are Node-stream libraries and have no equivalent
+there, which makes it a runtime comparison rather than a library one; run
+`bun bench/bun-server.ts` (plain on :18778, cached on :18779) with an external
+`autocannon` if the figures for your runtime matter.
+
+### A correctness difference found while building this harness
+
+`send` honors a request `Cache-Control: no-cache` during conditional
+evaluation, and spec-compliant fetch clients (undici, browsers) auto-append
+exactly that header to a manually-conditional request, so `send` never answers
+`304` to a `fetch()`-based revalidation. partial-content ignores request cache
+directives here: they address caches, not an origin's conditional evaluation
+(see [DESIGN.md](DESIGN.md)). Your revalidation rate going up after the switch
+is the intended outcome, not a regression.

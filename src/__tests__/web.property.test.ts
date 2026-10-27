@@ -33,13 +33,29 @@ const headerValue = fc.oneof(
     fc.string(),
     fc.string({ unit: "binary" }),
     fc.constantFrom(
-        "bytes=0-", "bytes=-1", "bytes=0-0,5-9,3-4", "bytes=999999999999999999999-",
-        "bytes = 0-4", "BYTES=0-4", "bytes=4-2", "bytes=,,,", "octets=0-4",
-        'W/"weak"', '"strong"', "*", '"a", W/"b", *',
-        "Thu, 01 Jan 1970 00:00:00 GMT", "not a date", "-1",
-        "gzip;q=nope, *;q=0, identity;q=0.0001", "br;q=1.0000, zstd;q=0.999",
-        "sha-256=10, sha-512=3, unknown=9", "sha-256=0",
-        "evil\r\nX-Injected: 1", "null\u0000byte", " \t leading-ows",
+        "bytes=0-",
+        "bytes=-1",
+        "bytes=0-0,5-9,3-4",
+        "bytes=999999999999999999999-",
+        "bytes = 0-4",
+        "BYTES=0-4",
+        "bytes=4-2",
+        "bytes=,,,",
+        "octets=0-4",
+        'W/"weak"',
+        '"strong"',
+        "*",
+        '"a", W/"b", *',
+        "Thu, 01 Jan 1970 00:00:00 GMT",
+        "not a date",
+        "-1",
+        "gzip;q=nope, *;q=0, identity;q=0.0001",
+        "br;q=1.0000, zstd;q=0.999",
+        "sha-256=10, sha-512=3, unknown=9",
+        "sha-256=0",
+        "evil\r\nX-Injected: 1",
+        "null\u0000byte",
+        " \t leading-ows",
     ),
 );
 
@@ -53,8 +69,13 @@ const requestArb = fc.record({
     mime: fc.option(
         fc.oneof(
             fc.constantFrom(
-                "text/plain", "application/json", "image/svg+xml", "application/pdf",
-                "text/html; charset=utf-16", "application/vnd.api+json", "font/woff2",
+                "text/plain",
+                "application/json",
+                "image/svg+xml",
+                "application/pdf",
+                "text/html; charset=utf-16",
+                "application/vnd.api+json",
+                "font/woff2",
             ),
             fc.string({ maxLength: 40 }),
         ),
@@ -108,7 +129,9 @@ describe("serveObjectRaw: never-throw totality (fuzzed)", () => {
                 assertStructurallySound(parts, r.method);
                 // Drain stream bodies so a mid-stream throw cannot hide.
                 if (parts.body instanceof ReadableStream) {
-                    for await (const _chunk of parts.body) { /* consume */ }
+                    for await (const _chunk of parts.body) {
+                        /* consume */
+                    }
                 }
             }),
             { numRuns: 300 },
@@ -130,7 +153,9 @@ describe("serveObjectRaw: never-throw totality (fuzzed)", () => {
                 );
                 assertStructurallySound(parts, r.method);
                 if (parts.body instanceof ReadableStream) {
-                    for await (const _chunk of parts.body) { /* consume */ }
+                    for await (const _chunk of parts.body) {
+                        /* consume */
+                    }
                 }
             }),
             { numRuns: 200 },

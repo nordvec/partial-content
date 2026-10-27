@@ -72,10 +72,12 @@ safe rather than a DoS vector:
   into a single plain 206 (no framing at all) -- which is why no separate
   "covers the whole file" check exists.
 - **Amplification cap.** If the coalesced set still exceeds `maxRanges` distinct
-  parts (default 50), the ranges are ignored and the full 200 is served.
-  Cost model: each part is one ranged `getObject`, so a request can drive up
-  to `maxRanges` backend reads -- lower it (even to 1) when the backend bills
-  per request.
+  parts (default 8), the ranges are ignored and the full 200 is served.
+  Cost model: up to `maxBackendReads` (default 8) parts each stream from their
+  own ranged `getObject`; past that, the parts are cut from one buffered read
+  of the covering span when it is under 256 KiB, and the full 200 is served
+  otherwise. Lower `maxBackendReads` or `maxRanges` (even to 1) when the
+  backend bills per request.
 - **Request order.** Parts are emitted in the order their range-specs appeared
   in the request (a coalesced part inherits its earliest contributor's
   position), honoring the Section 15.3.7.2 SHOULD.
@@ -99,10 +101,10 @@ weak validators (size+mtime), which is correct -- you cannot guarantee
 byte equality with a weak validator, so OCC via `If-Match` requires a
 content-hash ETag.
 
-**If-Range requires strong validators.** RFC 7233 Section 3.2 requires If-Range\r
-to use strong comparison (same as `If-Match`). If-Range with a weak validator is\r
-actively dangerous: it could splice partial bytes from one representation onto a\r
-cached body from another. When either the client's `If-Range` or the server's\r
+**If-Range requires strong validators.** RFC 9110 Section 13.1.5 requires If-Range
+to use strong comparison (same as `If-Match`). If-Range with a weak validator is
+actively dangerous: it could splice partial bytes from one representation onto a
+cached body from another. When either the client's `If-Range` or the server's
 ETag is weak-prefixed, we ignore the range and serve a full 200.
 
 **If-Range date comparison is exact match, plus the strong-validator rule.**
@@ -125,7 +127,7 @@ compared case-insensitively. `Bytes=0-499` and `BYTES=0-499` are both valid.
 ## Parsing Details
 
 **Quote-aware ETag parsing.** Commas inside quoted ETag values are valid per
-RFC 7232 Section 2.3. Our parser correctly handles `"ver,1", "ver,2"` as
+RFC 9110 Section 8.8.3. Our parser correctly handles `"ver,1", "ver,2"` as
 two ETags, not four fragments. The parser is a single-pass state machine that
 tracks quote boundaries rather than splitting on commas.
 
@@ -229,7 +231,7 @@ RFC 8941 citations here are deliberate -- do not "modernize" them to 9651.
 no parsing behavior is at stake either way.)
 
 **Unknown totals in backend `Content-Range` are passed through as `*`.**
-When an origin answers `bytes a-b/*` (RFC 7233 Section 4.2 -- a streaming
+When an origin answers `bytes a-b/*` (RFC 9110 Section 14.4 -- a streaming
 origin that does not know its full length), the adapter leaves
 `ObjectStream.totalSize` `undefined` and the served 206 repeats `bytes a-b/*`
 honestly. Nothing is fabricated: the 206's `Content-Length` is the range span
@@ -300,7 +302,7 @@ of the HTTP runtime or application layer:
 - **`Date`** - Set automatically by Bun, Node.js, Deno, Cloudflare Workers
 - **`Vary`** - Application-specific (depends on content negotiation)
 - **`Content-Location`** - Application-specific
-- **`Expires`** - Use `Cache-Control` instead (per RFC 7234 Section 5.3)
+- **`Expires`** - Use `Cache-Control` instead (per RFC 9111 Section 5.3)
 
 RFC 9110 Section 15.3.7 requires `Date`, `Cache-Control`, `ETag`, `Expires`,
 `Content-Location`, and `Vary` on 206 responses "if the field would have been
@@ -626,11 +628,11 @@ the store inside the lock immediately before evaluation (nothing from an
 earlier request is ever reused), and the orchestrator executes exactly the
 verdict's action and nothing else.
 
-### The interop-version allowlist {3, 5, 6, 9}
+### The interop-version allowlist {3, 5, 6, 9, 10}
 
 The IETF handler speaks the draft revisions clients implement, identified by
-their interop versions: 3 (draft-01), 5 (draft-03), 6 (draft-04/-05), and 9
-(draft-12). The draft itself forbids cross-version interop, so versions are a
+their interop versions: 3 (draft-01), 5 (draft-03), 6 (draft-04/-05), 9
+(draft-12), and 10 (draft-13 and -14). The draft itself forbids cross-version interop, so versions are a
 compiled allowlist and an unlisted version is answered 400 with the supported
 set named.
 
@@ -643,21 +645,43 @@ The wire differences are encoded in one explicit mapping table, one row per
 version and every difference a named field, so no behavior is reachable by
 guessing at a version number. The most important is the completeness header
 flip: interop 3 sends `Upload-Incomplete` (`?1` asserts NOT complete), interop
-5, 6 and 9 send `Upload-Complete` (`?1` asserts complete). Both names ride
+5, 6, 9 and 10 send `Upload-Complete` (`?1` asserts complete). Both names ride
 requests and responses, so the polarity is a per-version fact, never a renamed
 boolean.
 
-Interop 9 turns on three behaviors the older rows leave off. `Upload-Limit`
+Interop 10 adds one behavior of its own. A 2xx answer to a creation or append
+of an incomplete upload acknowledges that the whole request content was
+received (draft-13), so a creation or append the server interrupted after some
+bytes became durable (the client went away, a newer request preempted it, the
+store yielded) is answered 409 with the durable offset to resume from, where
+the older versions answer 201 or 204 with that offset. An interrupted creation
+keeps its `Location`, since nothing else reaches the durable prefix.
+
+Interop 9 and 10 turn on three behaviors the older rows leave off. `Upload-Limit`
 (an RFC 8941 dictionary of `max-size`, `min-size`, `max-append-size`,
-`min-append-size`, `max-age`) rides a successful offset retrieval and any
-rejection a limit caused, which is the difference between a client that
-retries at a stated number and one that halves its chunk size until something
-sticks; `min-size` is always emitted, defaulting to 0, because an empty
-structured-field value is not a valid dictionary and a server enforcing no
-limits still has to say so rather than send nothing. `GET` becomes an offset
+`min-append-size`, `max-age`) rides a creation that leaves the upload
+incomplete and a successful offset retrieval, both required (draft-13 Sections
+4.2.2 and 4.3.2), and any rejection a limit caused, which is the difference
+between a client that retries at a stated number and one that halves its chunk
+size until something sticks; `min-size` is always emitted, defaulting to 0,
+because an empty structured-field value is not a valid dictionary and a server
+enforcing no limits still has to say so rather than send nothing.
+
+`max-age` is the remaining lifetime of the resource the answer concerns,
+counted from the response (Section 4.1.4), so every answer about a resource
+derives it from one deadline, the creation instant plus `maxAgeSeconds`, and
+floors the seconds left: rounding up would promise time the resource does not
+have, and a client that schedules a resume on that promise finds a 404. A limit
+rejection about an existing resource states that same remaining lifetime
+rather than the configured one, because the section asks that the end time a
+client derives "SHOULD NOT decrease" between responses, and restating the
+configured lifetime would push it forward for the next probe to pull back.
+Only where no resource exists (OPTIONS, a creation refused before allocating)
+is the configured lifetime the answer. `GET` becomes an offset
 probe beside `HEAD`, and the `Allow` on a 405 names it only where the version
 admits it, so the refusal never advertises a method that version does not
-define. And an append to an already-complete upload becomes replayable.
+define. And a content-free append to an already-complete upload becomes
+replayable.
 
 That last one is the one place two supported versions answer the same request
 differently, and it is a conformance obligation rather than a preference.
@@ -670,11 +694,22 @@ the client never received, and says the server "can choose to replay the final
 response to the client if the request to append to the completed upload is
 valid". The behaviors are incompatible, so the version decides and the table
 carries it as a field. A client that wants the retry to succeed asks for
-interop 9.
+interop 9 or 10.
+
+Validity is the load-bearing word, and it is version-independent: only a
+request carrying no content can be a replay of the completion. The same
+section has the server "MUST prevent the offset from exceeding the
+representation's length", and a completed upload sits AT its length, so
+content appended there has nowhere to land. Such a request is refused as a
+length inconsistency (400, the registered `inconsistent-upload-length` problem
+type where the version defines it) on every version, rather than acknowledged
+with a status that would report success for bytes no store received. A
+declared `Content-Length` decides whether content is present; an append that
+declares no size falls back to whether a body arrived at all.
 
 `Repr-Digest` verification (RFC 9530) is the mirror-image decision, and goes
 the other way. It is offered on every version this endpoint serves, interop 9
-included, whose draft revision carries no upload-digest text of its own.
+and 10 included, whose draft revisions carry no upload-digest text of their own.
 RFC 9530 defines the field independently of any upload protocol; honoring an
 assertion the client volunteered cannot break a client that sends none, since
 absent means unverified exactly as before. Withdrawing it from the newest
@@ -695,7 +730,10 @@ the durable artifacts themselves makes the crash case boring: whatever
 survived IS the offset. The engine treats adapter-reported state as
 authoritative truth, and a malformed state (offset past a known length
 without invalidation) throws loudly as an adapter bug rather than laundering
-corruption into protocol answers.
+corruption into protocol answers. The one backend with no listing to derive
+from, R2, keeps a ledger written after each part lands, so it never runs ahead
+of the bytes, and it declares `exactOffsetRecovery: false` because the ledger
+is the adapter's own record rather than backend truth.
 
 ### Three bounds on one append, two consequences
 
@@ -809,14 +847,15 @@ required:
 - **Filesystem**: appends are fsynced before they are acknowledged, because
   `exactOffsetRecovery` is only honest if a post-crash `stat` can never see
   bytes that were acked but not flushed. Completion verifies any asserted
-  SHA-256 by streaming the assembled file, then publishes with a same-volume
+  SHA-256 or SHA-512 by streaming the assembled file, then publishes with a same-volume
   atomic `rename()`: a failed or crashed completion never leaves a torn
   object visible.
 - **S3-compatible**: multipart uploads enforce a 5 MiB floor on every
-  non-final part, so appends buffer to the floor and the sub-minimum
-  remainder is parked in a sidecar object, prepended to the next append or
-  committed as the size-exempt final part at completion. The offset derives
-  from `ListParts` plus the sidecar's size. The optional flexible-checksums
+  non-final part, so appends buffer to the upload's part size (fixed at
+  creation, at least the floor) and the sub-part remainder is parked in a
+  tail object, prepended to the next append or committed as the size-exempt
+  final part at completion. The offset derives from `ListParts` plus the
+  tail's size. The optional flexible-checksums
   mode gives per-part transport integrity only: multipart SHA-256 checksums
   are composite (a hash of per-part hashes), so no S3 backend can verify a
   caller-asserted whole-representation SHA-256 at completion, and the store
@@ -916,10 +955,11 @@ reported skipped, never passed.
 - **No `104 (Upload Resumption Supported)` interim responses** from the Fetch
   handlers: a Fetch `Response` cannot carry interim responses, and the draft
   only asks servers to send 104 when they can. The
-  `onResumptionSupported` hook carries the same facts, so a transport that
-  can write interim responses may emit the 104 itself.
+  `onResumptionSupported` hook carries the same facts, the `Upload-Limit`
+  the 104 must state on interop 9 and 10 included, so a transport that can
+  write interim responses may emit the 104 itself.
 - **No stored final response**: where a revision permits replaying the answer
-  to an append against an already-complete upload (interop 9), the reply is
+  to an append against an already-complete upload (interop 9 and 10), the reply is
   synthesized from the durable facts, the offset and the completeness, not
   served from a copy of the original completion response kept somewhere. The
   durable facts are what a resumable protocol is defined in terms of, and

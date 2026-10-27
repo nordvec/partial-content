@@ -170,9 +170,12 @@ single-node and self-hosted deployments.
 
 The S3 and R2 stores assemble large objects from multipart parts, and both
 backends cap a multipart upload at **10,000 parts**. The largest object a store
-can assemble is therefore `10,000 x minPartSize` (S3) or `10,000 x partSize`
-(R2), roughly 48.8 GiB at the 5 MiB default. Past the ceiling the store fails
-the crossing append with a message naming the knob to raise, rather than
-letting the backend reject completion opaquely. For objects larger than ~49
-GiB, raise `minPartSize`/`partSize` at construction (a 64 MiB part size lifts
-the ceiling to ~625 GiB).
+can assemble is therefore `10,000 x` the upload's part size. An upload with a
+declared length gets a part size grown to fit it (up to the 5 GiB part limit),
+so it needs no tuning. An upload with a deferred length can only assume
+`minPartSize` (S3) or `partSize` (R2), which is roughly 48.8 GiB at the 5 MiB
+default; an append past that is answered `413` as a non-fatal append bound, and
+the client resumes from the durable offset. For deferred-length objects larger
+than ~49 GiB, raise `minPartSize`/`partSize` at construction (a 64 MiB part
+size lifts the ceiling to ~625 GiB). The part size is fixed when an upload is
+created, so a changed value applies to new uploads only.

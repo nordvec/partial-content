@@ -3,12 +3,14 @@
  *
  * A curated extension -> MIME map covering the formats that actually flow
  * through document/media serving: office documents, images, audio/video,
- * archives, fonts, and web assets. Deliberately small and auditable rather
+ * archives, and fonts, plus an opt-in web-asset table. Deliberately small and auditable rather
  * than exhaustive -- for the long tail, pass an explicit `mime` to the
  * serve handler or bring a full database (`mime-types`, `mrmime`).
  *
  * Zero dependencies, aligned with IANA registrations and the WHATWG
- * mimesniff living standard.
+ * mimesniff living standard. The few extensions with no registration carry
+ * an `x-` subtype (RFC 6838 Section 3.4) so an unregistered name is never
+ * mistaken for a standard one.
  *
  * @example
  * ```typescript
@@ -50,81 +52,120 @@
 // Object.prototype members (a function, not a string), breaking the declared
 // contract and crashing downstream header building.
 const MIME_TYPES: Record<string, string> = Object.assign(Object.create(null), {
-  // Documents
-  pdf: "application/pdf",
-  txt: "text/plain",
-  md: "text/markdown",
-  csv: "text/csv",
-  json: "application/json",
-  xml: "application/xml",
-  rtf: "application/rtf",
-  epub: "application/epub+zip",
-  ics: "text/calendar",
-  vcf: "text/vcard",
+    // Documents
+    pdf: "application/pdf",
+    txt: "text/plain",
+    md: "text/markdown",
+    csv: "text/csv",
+    json: "application/json",
+    xml: "application/xml",
+    rtf: "application/rtf",
+    epub: "application/epub+zip",
+    ics: "text/calendar",
+    vcf: "text/vcard",
 
-  // Office (OOXML + legacy + OpenDocument)
-  doc: "application/msword",
-  docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-  xls: "application/vnd.ms-excel",
-  xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-  ppt: "application/vnd.ms-powerpoint",
-  pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-  odt: "application/vnd.oasis.opendocument.text",
-  ods: "application/vnd.oasis.opendocument.spreadsheet",
-  odp: "application/vnd.oasis.opendocument.presentation",
+    // Office (OOXML + legacy + OpenDocument)
+    doc: "application/msword",
+    docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    xls: "application/vnd.ms-excel",
+    xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ppt: "application/vnd.ms-powerpoint",
+    pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    odt: "application/vnd.oasis.opendocument.text",
+    ods: "application/vnd.oasis.opendocument.spreadsheet",
+    odp: "application/vnd.oasis.opendocument.presentation",
 
-  // Images
-  png: "image/png",
-  jpg: "image/jpeg",
-  jpeg: "image/jpeg",
-  gif: "image/gif",
-  webp: "image/webp",
-  avif: "image/avif",
-  svg: "image/svg+xml",
-  ico: "image/x-icon",
-  bmp: "image/bmp",
-  tif: "image/tiff",
-  tiff: "image/tiff",
-  heic: "image/heic",
+    // Images
+    png: "image/png",
+    jpg: "image/jpeg",
+    jpeg: "image/jpeg",
+    gif: "image/gif",
+    webp: "image/webp",
+    avif: "image/avif",
+    svg: "image/svg+xml",
+    ico: "image/x-icon",
+    bmp: "image/bmp",
+    tif: "image/tiff",
+    tiff: "image/tiff",
+    heic: "image/heic",
 
-  // Audio
-  mp3: "audio/mpeg",
-  wav: "audio/wav",
-  ogg: "audio/ogg",
-  oga: "audio/ogg",
-  m4a: "audio/mp4",
-  aac: "audio/aac",
-  flac: "audio/flac",
-  opus: "audio/opus",
+    // Audio
+    mp3: "audio/mpeg",
+    wav: "audio/wav",
+    ogg: "audio/ogg",
+    oga: "audio/ogg",
+    m4a: "audio/mp4",
+    aac: "audio/aac",
+    flac: "audio/flac",
+    opus: "audio/opus",
 
-  // Video
-  mp4: "video/mp4",
-  m4v: "video/mp4",
-  webm: "video/webm",
-  mov: "video/quicktime",
-  avi: "video/x-msvideo",
-  mkv: "video/x-matroska",
-  ogv: "video/ogg",
+    // Video
+    mp4: "video/mp4",
+    m4v: "video/mp4",
+    webm: "video/webm",
+    mov: "video/quicktime",
+    avi: "video/x-msvideo",
+    mkv: "video/x-matroska",
+    ogv: "video/ogg",
 
-  // Archives
-  zip: "application/zip",
-  gz: "application/gzip",
-  tar: "application/x-tar",
-  "7z": "application/x-7z-compressed",
-  rar: "application/vnd.rar",
+    // Streaming manifests and timed text
+    // HLS playlists are UTF-8 text listing sibling segment URIs (RFC 8216
+    // Section 4), so they are served with an explicit charset and, like every
+    // other entry, never `inline` by default: a playlist rendered from the
+    // serving origin is a fetch driver for whatever URIs it names.
+    m3u8: "application/vnd.apple.mpegurl",
+    vtt: "text/vtt",
+    // No IANA registration exists for SubRip; the `x-` subtype records that
+    // (RFC 6838 Section 3.4) rather than inventing a standard-looking name.
+    srt: "application/x-subrip",
 
-  // Fonts
-  woff: "font/woff",
-  woff2: "font/woff2",
-  ttf: "font/ttf",
-  otf: "font/otf",
+    // Archives
+    zip: "application/zip",
+    gz: "application/gzip",
+    tar: "application/x-tar",
+    "7z": "application/x-7z-compressed",
+    rar: "application/vnd.rar",
 
-  // Web assets
-  js: "text/javascript",
-  mjs: "text/javascript",
-  css: "text/css",
-  wasm: "application/wasm",
+    // Fonts
+    woff: "font/woff",
+    woff2: "font/woff2",
+    ttf: "font/ttf",
+    otf: "font/otf",
+
+    // Source maps are JSON documents (RFC 8259), so they inherit the JSON
+    // charset enforcement rather than needing a subtype of their own.
+    map: "application/json",
+    // RFC 9512 registers `application/yaml`; its content is always UTF-8 and
+    // the registration defines no parameters.
+    yaml: "application/yaml",
+    yml: "application/yaml",
 });
+
+/**
+ * Script, style and WebAssembly types, resolved only with
+ * `{ webAssets: true }`. A stored upload named `x.js` served as
+ * `text/javascript` from your own origin is a script any page there can load
+ * with `<script src>` (`X-Content-Type-Options: nosniff` blocks a script
+ * only when its type is NOT a JavaScript type), and `text/css` is the same
+ * for `<link rel=stylesheet>`. Opt in where the files are your own build
+ * output, never for user uploads.
+ */
+const WEB_ASSET_TYPES: Record<string, string> = Object.assign(Object.create(null), {
+    js: "text/javascript",
+    mjs: "text/javascript",
+    css: "text/css",
+    wasm: "application/wasm",
+});
+
+/** Options for {@link lookupMime}. */
+export interface LookupMimeOptions {
+    /**
+     * Also resolve `js`, `mjs`, `css` and `wasm`. Off by default because
+     * those types make stored content loadable as script or style.
+     * @default false
+     */
+    webAssets?: boolean;
+}
 
 // ─── Public API ─────────────────────────────────────────────────────────────
 
@@ -147,18 +188,19 @@ const MIME_TYPES: Record<string, string> = Object.assign(Object.create(null), {
  * lookupMime("pdf");                 // "application/pdf" (bare extension)
  * lookupMime("unknown.xyz");         // undefined
  * lookupMime("no-extension");        // undefined (unless it IS an extension)
+ * lookupMime("app.js");              // undefined
+ * lookupMime("app.js", { webAssets: true }); // "text/javascript"
  * ```
  */
-export function lookupMime(filenameOrExt: string | null | undefined): string | undefined {
-  if (!filenameOrExt) return undefined;
+export function lookupMime(filenameOrExt: string | null | undefined, options?: LookupMimeOptions): string | undefined {
+    if (!filenameOrExt) return undefined;
 
-  const lastDot = filenameOrExt.lastIndexOf(".");
-  // No dot: treat the whole input as a bare extension ("pdf" -> pdf).
-  // Trailing dot ("file.") yields an empty extension -> undefined.
-  const ext = lastDot === -1
-    ? filenameOrExt
-    : filenameOrExt.slice(lastDot + 1);
+    const lastDot = filenameOrExt.lastIndexOf(".");
+    // No dot: treat the whole input as a bare extension ("pdf" -> pdf).
+    // Trailing dot ("file.") yields an empty extension -> undefined.
+    const ext = lastDot === -1 ? filenameOrExt : filenameOrExt.slice(lastDot + 1);
 
-  if (!ext) return undefined;
-  return MIME_TYPES[ext.toLowerCase()];
+    if (!ext) return undefined;
+    const lower = ext.toLowerCase();
+    return MIME_TYPES[lower] ?? (options?.webAssets ? WEB_ASSET_TYPES[lower] : undefined);
 }

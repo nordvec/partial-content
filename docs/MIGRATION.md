@@ -69,7 +69,7 @@ is acceptable. Nothing to change in your code: the token is opaque either way.
   ```typescript
   // doc-check: fragment
   // Or pin the endpoint, if every client of it is current:
-  createUploadHandler(store, { key, location, interopVersions: [9] });
+  createUploadHandler(store, { key, location, policy, interopVersions: [9] });
   ```
 
   Serving fewer versions is the other direction: `interopVersions: [3, 5, 6]`
@@ -412,10 +412,15 @@ walking, so directory-oriented features have no equivalent here by design.
 ### What you lose (on purpose)
 
 No `index.html` resolution, no extension fallback (`/page` -> `page.html`),
-no dotfile policy, no SPA `single` fallback, no precompressed `.gz`/`.br`
-sibling lookup. Those are directory-tree concerns; put them in your router or
-keep `sirv` for that route. A hybrid is normal: `sirv` for the SPA shell,
-partial-content for user files.
+no dotfile policy, no SPA `single` fallback. Those are directory-tree
+concerns; put them in your router or keep `sirv` for that route. A hybrid is
+normal: `sirv` for the SPA shell, partial-content for user files.
+
+Precompressed sibling lookup is NOT on that list: `precompressed: true`
+negotiates `<key>.br` / `<key>.zst` / `<key>.gz` over `Accept-Encoding`
+(RFC 9110 Section 12.5.3) on every store, not just the filesystem. See the
+row in the option table below for what it does that a static middleware's
+`gzip`/`brotli` flags do not.
 
 ### From send
 
@@ -476,7 +481,7 @@ Two behavioral differences worth knowing before you flip traffic:
   (they address caches, not origin conditional evaluation). Your
   revalidation rate will go up, that is the intended fix.
 - **Weak validators under If-Range**: partial-content requires a strong
-  validator on BOTH sides (RFC 7233 §3.2) and refuses the range when only a
+  validator on BOTH sides (RFC 9110 §13.1.5) and refuses the range when only a
   weak ETag exists server-side, falling back to a full 200 rather than
   risking a spliced body.
 
@@ -506,7 +511,8 @@ app.use("/assets", serveObject(store, {
 | `maxAge` (seconds) + `immutable` | `cacheControl` verbatim + `immutable: true` |
 | `setHeaders(res, path, stats)` | `securityHeaders(mime)` |
 | `onNoMatch` | 404 response is built in; wrap the handler to customize |
-| `single`, `extensions`, `gzip`, `brotli`, `ignores`, `dotfiles` | no equivalent, router/CDN concerns here |
+| `gzip`, `brotli` | `precompressed: true` (or an explicit `["br", "zstd", "gzip"]` preference), on every store rather than the local directory only. It negotiates with `Accept-Encoding` per RFC 9110 Section 12.5.3, then treats the sibling as the DISTINCT representation it is: the variant's own ETag and `Last-Modified` drive conditionals and `If-Range`, `Content-Range` addresses the encoded bytes (so a resumed download of a `.br` variant is byte-correct instead of being clamped against the identity size), and `Vary: Accept-Encoding` rides every success response for a compressible type so shared caches key on the request coding |
+| `single`, `extensions`, `ignores`, `dotfiles` | no equivalent, router/CDN concerns here |
 
 ### Checklist
 

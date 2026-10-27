@@ -17,13 +17,13 @@ writeFileSync(join(root, "small.bin"), randomBytes(4 * 1024));
 
 const handler = serveObject(fsStore({ root }), { disposition: "inline" });
 Bun.serve({
-  port: 18778,
-  fetch: (req) => handler(req, { key: "small.bin", mime: "application/octet-stream" }),
+    port: 18778,
+    fetch: (req) => handler(req, { key: "small.bin", mime: "application/octet-stream" }),
 });
 const cachedHandler = serveObject(fsStore({ root, cache: { ttlMs: 1000 } }), { disposition: "inline" });
 Bun.serve({
-  port: 18779,
-  fetch: (req) => cachedHandler(req, { key: "small.bin", mime: "application/octet-stream" }),
+    port: 18779,
+    fetch: (req) => cachedHandler(req, { key: "small.bin", mime: "application/octet-stream" }),
 });
 console.log("bun ready on :18778 (plain) and :18779 (cache)");
 setTimeout(() => process.exit(0), 30_000);

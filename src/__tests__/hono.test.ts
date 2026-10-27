@@ -39,7 +39,10 @@ function memoryStore(): ObjectStore {
             const slice = range ? CONTENT.slice(range.start, range.end + 1) : CONTENT;
             return {
                 body: new ReadableStream<Uint8Array<ArrayBuffer>>({
-                    start(c) { c.enqueue(slice); c.close(); },
+                    start(c) {
+                        c.enqueue(slice);
+                        c.close();
+                    },
                 }),
                 contentLength: slice.length,
                 totalSize: CONTENT.length,
@@ -90,9 +93,7 @@ describe("hono adapter", () => {
 
     test("conditional GET returns 304", async () => {
         const handler = serveObject(memoryStore(), { key: () => "k" });
-        const res = await handler(
-            honoContext({ headers: { "If-None-Match": '"hono-etag"' } }),
-        );
+        const res = await handler(honoContext({ headers: { "If-None-Match": '"hono-etag"' } }));
         expect(res.status).toBe(304);
     });
 });
@@ -103,7 +104,9 @@ describe("serveObject (hono): a throwing key extractor", () => {
     test("answers a hardened 500 and reports the context operation", async () => {
         const reported: Array<{ key: string; operation: string }> = [];
         const handler = serveObject(memoryStore(), {
-            key: () => { throw new Error("route param missing"); },
+            key: () => {
+                throw new Error("route param missing");
+            },
             onError: (_err, ctx) => reported.push(ctx as { key: string; operation: string }),
         });
 
@@ -117,5 +120,20 @@ describe("serveObject (hono): a throwing key extractor", () => {
         // Reported the way every adapter reports it, so a consumer's telemetry
         // does not depend on which adapter they mounted.
         expect(reported).toEqual([{ key: "", operation: "context" }]);
+    });
+
+    test("under an auditKey, onError receives the projection, never the raw error", async () => {
+        const errors: unknown[] = [];
+        const handler = serveObject(memoryStore(), {
+            key: () => {
+                throw new TypeError("no object at private/report.pdf");
+            },
+            auditKey: () => "audit-1",
+            onError: (err) => errors.push(err),
+        });
+
+        expect((await handler(honoContext({}))).status).toBe(500);
+        expect(errors).toEqual([{ name: "TypeError", operation: "context" }]);
+        expect(JSON.stringify(errors)).not.toContain("report.pdf");
     });
 });

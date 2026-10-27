@@ -17,6 +17,9 @@
  *     legacy ones.
  */
 
+import { utf8ByteLength } from "./kernel.ts";
+import { parseMediaType } from "./media-type.ts";
+
 // ─── Types ──────────────────────────────────────────────────────────────────
 
 export interface ContentDispositionOptions {
@@ -66,7 +69,7 @@ const QUOTED_PAIR_REGEXP = /[\\"]/g;
  * encodeURIComponent (so `%` is already handled). This catches characters
  * that encodeURIComponent leaves unescaped but RFC 8187 requires encoded.
  */
-const ENCODE_URL_ATTR_CHAR_REGEXP = /[\x00-\x20"'()*,/:;<=>?@[\\\]{}\x7f]/g; // eslint-disable-line no-control-regex
+const ENCODE_URL_ATTR_CHAR_REGEXP = /[\x00-\x20"'()*,/:;<=>?@[\\\]{}\x7f]/g; // oxlint-disable-line no-control-regex
 
 /**
  * Non-US-ASCII characters. Replaced with `?` in the ASCII fallback
@@ -149,10 +152,7 @@ export function buildContentDisposition(
     // nothing (only controls/bidi/path components) must NOT emit a raw
     // fallback into filename* -- that path leaked un-neutralized bidi
     // overrides, defeating the anti-spoofing guarantee.
-    const sanitized =
-        sanitizeFilename(filename ?? "")
-        || sanitizeFilename(options?.fallback ?? "")
-        || "document";
+    const sanitized = sanitizeFilename(filename ?? "") || sanitizeFilename(options?.fallback ?? "") || "document";
 
     return `${type}${buildFilenameParams(sanitized)}`;
 }
@@ -185,12 +185,11 @@ export function buildContentDisposition(
  * and its filename all came from someone else.
  */
 export function isInlineSafeMediaType(mediaType: string | null | undefined): boolean {
-    if (!mediaType) return false;
-    // Essence only: drop any `; charset=...` / `; boundary=...` parameters and
-    // normalize case before matching (RFC 9110 media-type comparison).
-    const semi = mediaType.indexOf(";");
-    const essence = (semi === -1 ? mediaType : mediaType.slice(0, semi)).trim().toLowerCase();
-    if (essence === "") return false;
+    // Essence only: parameters dropped and case folded (RFC 9110 media-type
+    // comparison). A value off the media-type grammar, a comma list included,
+    // is never inline-safe.
+    const essence = parseMediaType(mediaType)?.essence;
+    if (essence === undefined) return false;
     // Images render as pixels, EXCEPT SVG, which is an executable document.
     if (essence.startsWith("image/")) return essence !== "image/svg+xml";
     // Media plays in a media element; no document/script surface.
@@ -235,7 +234,7 @@ function sanitizeFilename(raw: string): string {
     //    Soft hyphen (U+00AD): invisible except at line breaks, same spoofing
     //    class. NBSP (U+00A0): often mistaken for a regular space.
     const noControls = raw.replace(
-        // eslint-disable-next-line no-control-regex -- matching control characters IS the sanitizer
+        // oxlint-disable-next-line no-control-regex -- matching control characters IS the sanitizer
         /[\r\n\x00-\x1F\x7F\x80-\x9F\u00A0\u00AD\u061C\u180E\u200B-\u200F\u2028\u2029\u202A-\u202E\u2060-\u2064\u2066-\u2069\uFEFF\uFFF9-\uFFFB]/g,
         "",
     );
@@ -251,9 +250,32 @@ function sanitizeFilename(raw: string): string {
     const lastSep = Math.max(noTraversal.lastIndexOf("/"), noTraversal.lastIndexOf("\\"));
     const basename = lastSep >= 0 ? noTraversal.slice(lastSep + 1) : noTraversal;
 
+    // 4. A dot segment names a directory, not a file; a client that saves
+    //    under it writes "." or ".." into the download directory path.
     // May be empty: the caller composes the fallback chain so both the
     // filename and the fallback pass through this same sanitizer.
-    return basename;
+    return basename === "." || basename === ".." ? "" : capFilename(basename);
+}
+
+/** The common filesystem limit on one path component, in UTF-8 bytes. */
+const MAX_FILENAME_BYTES = 255;
+
+/**
+ * Cut a name to {@link MAX_FILENAME_BYTES} UTF-8 bytes on a code-point
+ * boundary, keeping a short extension (up to 16 characters with its dot) so
+ * the saved file still opens with the right application. The loop stops at
+ * the first code point that overflows, so it runs at most 255 times.
+ */
+function capFilename(name: string): string {
+    if (utf8ByteLength(name) <= MAX_FILENAME_BYTES) return name;
+    const dot = name.lastIndexOf(".");
+    const ext = dot > 0 && name.length - dot <= 16 ? name.slice(dot) : "";
+    let out = "";
+    for (const ch of name.slice(0, name.length - ext.length)) {
+        if (utf8ByteLength(out + ch + ext) > MAX_FILENAME_BYTES) break;
+        out += ch;
+    }
+    return out + ext;
 }
 
 /**
@@ -275,11 +297,7 @@ function buildFilenameParams(filename: string): string {
     // quote: RFC 6266 Appendix D advises against relying on quoted-pair
     // escaping (many user agents mishandle `\"`), so those get a
     // filename* companion below, which encodes the quote unambiguously.
-    if (
-        ASCII_TEXT_REGEXP.test(filename)
-        && !HEX_ESCAPE_REGEXP.test(filename)
-        && !filename.includes('"')
-    ) {
+    if (ASCII_TEXT_REGEXP.test(filename) && !HEX_ESCAPE_REGEXP.test(filename) && !filename.includes('"')) {
         if (TOKEN_REGEXP.test(filename)) {
             return `; filename=${filename}`;
         }
@@ -332,10 +350,7 @@ function quoteString(str: string): string {
  * use the lossless `filename*` parameter instead.
  */
 function toAsciiFallback(filename: string): string {
-    return filename
-        .normalize("NFKD")
-        .replace(/\p{M}/gu, "")
-        .replace(NON_ASCII_REGEXP, "?");
+    return filename.normalize("NFKD").replace(/\p{M}/gu, "").replace(NON_ASCII_REGEXP, "?");
 }
 
 /**

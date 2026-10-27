@@ -7,39 +7,39 @@
  * @packageDocumentation
  */
 
-// ─── Range Requests (RFC 7233) ──────────────────────────────────────────────
+// ─── Range Requests (RFC 9110 Section 14) ───────────────────────────────────
 export {
-  parseRangeHeader,
-  parseContentRange,
-  buildRangeResponseHeaders,
-  build416Headers,
-  OPEN_ENDED,
-  isOpenEndedRange,
+    parseRangeHeader,
+    parseContentRange,
+    buildRangeResponseHeaders,
+    build416Headers,
+    OPEN_ENDED,
+    isOpenEndedRange,
 } from "./kernel.ts";
 
 // ─── Multiple Ranges (multipart/byteranges) ─────────────────────────────────
 export {
-  parseRanges,
-  MAX_RANGES_DEFAULT,
-  generateMultipartBoundary,
-  buildMultipartPartHeader,
-  multipartEpilogue,
-  buildMultipartHeaders,
+    parseRanges,
+    MAX_RANGES_DEFAULT,
+    generateMultipartBoundary,
+    buildMultipartPartHeader,
+    multipartEpilogue,
+    buildMultipartHeaders,
 } from "./kernel.ts";
 
 // ─── Header Safety ──────────────────────────────────────────────────────────
 export { sanitizeHeaderValue, isSha256Base64 } from "./kernel.ts";
-export { reservedKeyGuard } from "./object-store.ts";
+export { reservedKeyGuard, redactErrorText } from "./object-store.ts";
 
-// ─── Conditional Requests (RFC 9110 / RFC 7232) ─────────────────────────────
+// ─── Conditional Requests (RFC 9110 Section 13) ─────────────────────────────
 export {
-  isConditionalFresh,
-  isPreconditionFailure,
-  isRangeFresh,
-  build304Headers,
-  build412Headers,
-  evaluateConditionalRequest,
-  evaluateConditionalWrite,
+    isConditionalFresh,
+    isPreconditionFailure,
+    isRangeFresh,
+    build304Headers,
+    build412Headers,
+    evaluateConditionalRequest,
+    evaluateConditionalWrite,
 } from "./kernel.ts";
 
 // ─── Digest Negotiation (RFC 9530) ──────────────────────────────────────────
@@ -61,36 +61,47 @@ export { fromNodeHeaders } from "./kernel.ts";
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 export type {
-  ParsedRange,
-  ParsedContentRange,
-  RangeResponseHeaderOpts,
-  RangeResponseHeaders,
-  EvaluatedRequest,
-  EvaluatedWrite,
-  ETagSource,
-  RangeSet,
-  MultipartResponse,
+    ParsedRange,
+    ParsedContentRange,
+    RangeResponseHeaderOpts,
+    RangeResponseHeaders,
+    EvaluatedRequest,
+    EvaluatedWrite,
+    ETagSource,
+    RangeSet,
+    MultipartResponse,
 } from "./kernel.ts";
 
 // ─── Storage Contract ───────────────────────────────────────────────────────
 export type {
-  ObjectStore,
-  ObjectMetadata,
-  ObjectStream,
-  ServedRange,
-  ResolvedContentRange,
-  HeadObjectOptions,
-  GetObjectOptions,
-  StoreErrorClassifiers,
+    ObjectStore,
+    ObjectMetadata,
+    ObjectStream,
+    ObjectBody,
+    ObjectBodySource,
+    ServedRange,
+    ResolvedContentRange,
+    HeadObjectOptions,
+    GetObjectOptions,
+    StoreErrorClassifiers,
 } from "./object-store.ts";
 
 // ─── Storage Primitives ─────────────────────────────────────────────────────
 export {
-  ObjectNotFoundError, ObjectChangedError, StoreUnavailableError,
-  isObjectNotFoundError, isObjectChangedError, isStoreUnavailableError,
-  nodeStreamToWeb, guardStreamLength, resolveServedRange, classifyStoreRead, parseRetryAfterSeconds } from "./object-store.ts";
+    ObjectNotFoundError,
+    ObjectChangedError,
+    StoreUnavailableError,
+    isObjectNotFoundError,
+    isObjectChangedError,
+    isStoreUnavailableError,
+    nodeStreamToWeb,
+    guardStreamLength,
+    toObjectBody,
+    resolveServedRange,
+    classifyStoreRead,
+    parseRetryAfterSeconds,
+} from "./object-store.ts";
 
 // ─── Content-Disposition (RFC 6266 / RFC 8187) ──────────────────────────────
 export { buildContentDisposition, isInlineSafeMediaType } from "./content-disposition.ts";
 export type { ContentDispositionOptions } from "./content-disposition.ts";
-

@@ -45,13 +45,14 @@ function mockBucket(opts: MockR2Opts = {}): R2Bucket {
             if (opts.missing) return null;
             const requested = options?.range;
             const actual = opts.reportedRange ?? requested;
-            const slice = actual
-                ? CONTENT.slice(actual.offset, actual.offset + actual.length)
-                : CONTENT;
+            const slice = actual ? CONTENT.slice(actual.offset, actual.offset + actual.length) : CONTENT;
             return {
                 ...base,
                 body: new ReadableStream<Uint8Array>({
-                    start(c) { c.enqueue(slice); c.close(); },
+                    start(c) {
+                        c.enqueue(slice);
+                        c.close();
+                    },
                 }),
                 range: actual ?? { offset: 0, length: CONTENT.length },
             };
@@ -130,7 +131,10 @@ describe("r2Store: getObject", () => {
         const seen: Array<string | undefined> = [];
         const bucket = mockBucket();
         const origGet = bucket.get.bind(bucket);
-        bucket.get = (key: string, options?: { range?: { offset: number; length: number }; onlyIf?: { etagMatches?: string } }) => {
+        bucket.get = (
+            key: string,
+            options?: { range?: { offset: number; length: number }; onlyIf?: { etagMatches?: string } },
+        ) => {
             seen.push(options?.onlyIf?.etagMatches);
             return origGet(key, options);
         };
@@ -152,9 +156,7 @@ describe("r2Store: getObject", () => {
         });
         const store = r2Store({ bucket });
 
-        await expect(
-            store.getObject("test.bin", { ifMatch: "abc123etag" }),
-        ).rejects.toBeInstanceOf(ObjectChangedError);
+        await expect(store.getObject("test.bin", { ifMatch: "abc123etag" })).rejects.toBeInstanceOf(ObjectChangedError);
     });
 });
 
