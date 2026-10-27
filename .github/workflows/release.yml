@@ -62,7 +62,7 @@ jobs:
       - name: Install Deno
         run: npm install -g deno@2
       - name: Smoke on Deno
-        run: deno run --allow-read smoke/smoke.mjs
+        run: deno run --allow-read --allow-net=127.0.0.1 smoke/smoke.mjs
 
       - name: Pack
         run: npm pack --ignore-scripts && mv partial-content-*.tgz package.tgz

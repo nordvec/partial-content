@@ -61,8 +61,8 @@ jobs:
         run: node smoke/node-bridge.mjs
       - name: Smoke on Bun
         run: bun smoke/smoke.mjs
-      # Deno via npm (no third-party action to pin); --allow-read for the dist import.
+      # Deno via npm (no third-party action to pin); --allow-read for the dist import, --allow-net for the loopback origin.
       - name: Install Deno
         run: npm install -g deno@2
       - name: Smoke on Deno
-        run: deno run --allow-read smoke/smoke.mjs
+        run: deno run --allow-read --allow-net=127.0.0.1 smoke/smoke.mjs
