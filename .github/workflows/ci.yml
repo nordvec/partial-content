@@ -22,6 +22,7 @@ jobs:
         with:
           bun-version: 1.4.4
       - run: bun install --frozen-lockfile
+      - run: bun run typecheck:tests
       - run: bun run test
 
   cross-runtime:

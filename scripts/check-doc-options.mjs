@@ -16,10 +16,10 @@
  */
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
-import { fileURLToPath } from "node:url";
+import { PKG_DIR } from "./script-entry.mjs";
 import path from "node:path";
 
-const pkgDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const pkgDir = PKG_DIR;
 const require = createRequire(import.meta.url);
 const ts = require("typescript");
 

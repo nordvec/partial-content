@@ -15,10 +15,10 @@
 import { spawnSync } from "node:child_process";
 import { existsSync, rmSync } from "node:fs";
 import { createRequire } from "node:module";
-import { fileURLToPath } from "node:url";
+import { PKG_DIR } from "./script-entry.mjs";
 import path from "node:path";
 
-export const pkgDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+export const pkgDir = PKG_DIR;
 
 /**
  * A mutation run loads the CPU as a test suite does. Inside the development

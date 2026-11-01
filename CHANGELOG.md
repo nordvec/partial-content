@@ -2,229 +2,156 @@
 
 ## 5.0.0 (2026-10-27)
 
-The write path stops inferring facts it can observe. Forty-five changes are
-breaking; `docs/UPGRADING.md` walks each one, and "Changed (breaking)" below
-lists the ones no other section carries. A 4.0.1 patch was prepared and never
-published; its five corrections ship here, under "Upload responses 4.0.0 sent
-that were never conformant".
+The write path stops inferring facts it can observe, and 15 defects in published
+versions are fixed. There are 45 breaking changes; the checklist below links the
+walk-through of each in `docs/UPGRADING.md`. A 4.0.1 patch was prepared and never
+published; its five corrections ship here (see [Upload responses 4.0.0 sent that were never conformant](#upload-responses-400-sent-that-were-never-conformant)).
 
-### License
+### Highlights
 
-This release changes the license from MIT to Apache License 2.0. Versions up
-to and including 4.0.0, the last published release, remain under the MIT
-License exactly as published; 5.0.0 and every later version are licensed under
-Apache-2.0. The tarball now carries the full `LICENSE` text and a `NOTICE`
-file, and `package.json` declares `"license": "Apache-2.0"`. Apache-2.0 adds an
-express patent grant; redistributions must keep the license text and the
-`NOTICE` contents (section 4).
+- Node.js 24 or later is required, and 5.0.0 onward is licensed Apache-2.0 instead of MIT ([License](#license)).
+- Fifteen published-version defects are fixed; upgrading is the remedy, there is no patch release ([Security](#security)).
+- Two options are now required or reshaped: `policy.maxSize` on both handlers and one `auditKey` shape on both dialects.
+- A completion publishes exactly what the caller acknowledged, and never over a key written after it began ([details](#a-completion-publishes-the-right-object-whole)).
+- `fsStore` stays inside its real root by default, and `httpStore` refuses the upload prefixes by default.
+- Azure and filesystem uploads in flight across the upgrade restart, and a Redis locker fleet is drained first.
+- A custom store or locker implements new required fields, and `partial-content/conformance` grows from 15 to 28 write-side checks.
+
+### Upgrading
+
+Each line links its section in `docs/UPGRADING.md`, widest reach first.
+
+- Node.js 24 or later is required (`engines.node`). [12](docs/UPGRADING.md#12-nodejs-24-or-later)
+- `policy.maxSize` is required on both handlers; `Infinity` states no ceiling. [19](docs/UPGRADING.md#19-policymaxsize-is-required)
+- Both dialects take one `auditKey` shape, `({ request, uploadToken }) => string | undefined`. [18](docs/UPGRADING.md#18-both-upload-dialects-take-one-auditkey-shape)
+- `fsStore` stays inside its real root by default, and the fs options are validated. [14](docs/UPGRADING.md#14-fsstore-stays-inside-the-real-root-and-the-fs-options-are-validated)
+- `httpStore` refuses the upload prefixes by default. [11](docs/UPGRADING.md#11-httpstore-refuses-the-upload-prefixes-by-default)
+- `lookupMime` returns no `js`, `mjs`, `css` or `wasm` type unless `webAssets: true`. [33](docs/UPGRADING.md#33-lookupmime-no-longer-returns-web-asset-types-by-default)
+- Multipart responses are bounded at 8 ranges and 8 backend reads. [26](docs/UPGRADING.md#26-multipart-responses-are-bounded-at-8-ranges-and-8-backend-reads)
+- Error messages no longer name the object key; it stays on `key`. [13](docs/UPGRADING.md#13-error-messages-no-longer-name-the-object-key)
+- Appends answer 204, or 200 on completion. [6](docs/UPGRADING.md#6-appends-answer-204-or-200-on-completion)
+- `minAppendSize` binds on requests that declare no size. [7](docs/UPGRADING.md#7-minappendsize-binds-on-requests-that-declare-no-size)
+- The tus checksum extension requires `sha1`. [36](docs/UPGRADING.md#36-the-tus-checksum-extension-requires-sha1)
+- tus `Upload-Metadata` is bounded, and checksum names match without regard to case. [25](docs/UPGRADING.md#25-tus-upload-metadata-is-bounded-and-checksum-names-are-matched-without-case)
+- A content-bearing chunked append to a completed upload is refused. [37](docs/UPGRADING.md#37-a-content-bearing-chunked-append-to-a-completed-upload-is-refused)
+- The upload handlers refuse a bound their wire cannot state. [41](docs/UPGRADING.md#41-the-upload-handlers-refuse-a-bound-their-wire-cannot-state)
+- `key()` runs after the policy, and uploads take `authorize`. [23](docs/UPGRADING.md#23-key-runs-after-the-policy-and-uploads-take-authorize)
+- Timing options are validated at construction. [24](docs/UPGRADING.md#24-timing-options-are-validated-at-construction)
+- `createSignedUrl` declines or throws, and the two are different. [15](docs/UPGRADING.md#15-createsignedurl-declines-or-throws-and-the-two-are-different)
+- `gcsStore` reads fail before the status is committed. [16](docs/UPGRADING.md#16-gcsstore-reads-fail-before-the-status-is-committed)
+- Under an `auditKey`, `onError` receives a `ProjectedError`. [32](docs/UPGRADING.md#32-under-an-auditkey-onerror-receives-a-projectederror)
+- The CORS exposure lists come from their own dialect. [38](docs/UPGRADING.md#38-the-cors-exposure-lists-come-from-their-own-dialect)
+- The IETF dialect's `onError` operation is `"handler"`. [45](docs/UPGRADING.md#45-the-ietf-dialects-onerror-operation-is-handler)
+- Upload state reports `status`. [21](docs/UPGRADING.md#21-upload-state-reports-status)
+- Completion digests are keyed by algorithm. [22](docs/UPGRADING.md#22-completion-digests-are-keyed-by-algorithm)
+- The Redis locker's key and channel names changed: drain in-flight uploads first. [20](docs/UPGRADING.md#20-the-redis-lockers-key-and-channel-names-changed)
+- Terminal outcomes reclaim storage. [9](docs/UPGRADING.md#9-terminal-outcomes-reclaim-storage)
+- Azure block ids carry the upload's segment: an Azure upload in flight restarts. [10](docs/UPGRADING.md#10-azure-block-ids-carry-the-uploads-segment)
+- The Azure discard writes nothing at the key by default. [29](docs/UPGRADING.md#29-the-azure-discard-and-what-it-leaves)
+- `fsUploadStore` keeps one directory per upload: a filesystem upload in flight restarts. [44](docs/UPGRADING.md#44-fsuploadstore-keeps-one-directory-per-upload)
+- `s3UploadStore` writes its sidecar conditionally. [8](docs/UPGRADING.md#8-s3uploadstore-writes-its-sidecar-conditionally)
+- `s3UploadStore` proves the backend honours conditional writes before its first one. [17](docs/UPGRADING.md#17-s3uploadstore-proves-the-backend-honours-conditional-writes)
+- A part ceiling is a `RangeError`, or a `413`. [30](docs/UPGRADING.md#30-a-part-ceiling-is-a-rangeerror-or-a-413)
+- A custom R2 bucket's `head()` must return `customMetadata`. [31](docs/UPGRADING.md#31-a-custom-r2-buckets-head-must-return-custommetadata)
+- A probed outcome states its lifetime as a deadline only. [40](docs/UPGRADING.md#40-a-probed-outcome-states-its-lifetime-as-a-deadline-only)
+- `ParsedContentRange.totalSize` is `undefined` when unknown. [27](docs/UPGRADING.md#27-parsedcontentrangetotalsize-is-undefined-when-unknown)
+- `EvaluatedWrite.status` admits `428`. [28](docs/UPGRADING.md#28-evaluatedwritestatus-admits-428)
+- Closed unions may gain members: give each `switch` a default. [35](docs/UPGRADING.md#35-closed-unions-may-gain-members-give-each-switch-a-default)
+- `ETagSource` uses `ObjectMetadata`'s field names. [5](docs/UPGRADING.md#5-etagsource-uses-objectmetadatas-field-names)
+- Custom stores: extra metadata is fine, only three fields feed the ETag. [34](docs/UPGRADING.md#34-custom-stores-extra-metadata-is-fine-only-three-fields-feed-the-etag)
+- `offset-mismatch` no longer carries `complete`. [4](docs/UPGRADING.md#4-offset-mismatch-no-longer-carries-complete)
+- Capability flags are `boolean`. [3](docs/UPGRADING.md#3-capability-flags-are-boolean)
+- `appendChunk` returns `interrupted`; every store must return it. [1](docs/UPGRADING.md#1-appendchunk-returns-interrupted)
+- `sweepExpired` takes a cutoff object and resolves `{ removed, failed }`. [2](docs/UPGRADING.md#2-sweepexpired-takes-a-cutoff-object)
+- A reaped append surfaces a failed discard. [39](docs/UPGRADING.md#39-a-reaped-append-surfaces-a-failed-discard)
+- `completeUpload` takes `expectedLength` and seals at it. [42](docs/UPGRADING.md#42-completeupload-takes-expectedlength-and-seals-at-it)
+- `UploadLock.lease` is required. [43](docs/UPGRADING.md#43-uploadlocklease-is-required)
 
 ### Security
 
-Every defect below is present in **4.0.0**, the published release under
+Each advisory below affects 4.0.0, the published release under support, and the
+range given; upgrading to 5.0.0 is the remedy. Each links the mechanism, the
+deployments it reaches and the limits that remain.
+
+- **GHSA-qxqq-5xr5-rp75** (Moderate, CVSS 6.3; `>= 1.0.0, < 5.0.0`): With links followed by default, a link planted under an `fsStore` root served any file the process could read, and a link under an `fsUploadStore` root redirected a completed upload outside it. [Details](#filesystem-adapters-resolve-links-outside-the-root)
+- **GHSA-rpmg-6v56-f76w** (Moderate, CVSS 4.7; `>= 1.0.0, < 5.0.0`): A few requests for a planted FIFO exhausted the thread pool the whole process shares (`fsStore`, POSIX). [Details](#a-fifo-at-a-served-path-blocks-the-thread-pool)
+- **GHSA-xf26-3vjx-8jpx** (Moderate, CVSS 4.3; `>= 2.0.0, < 5.0.0`): A tokenless `GET` or `DELETE` carrying `Upload-Complete: ?1` created and published an empty object at the key `key()` chose. [Details](#a-resumable-upload-handler-creates-an-object-on-any-method)
+- **GHSA-6vjh-ggjr-q7xr** (Low, CVSS 3.3; `>= 2.0.0, < 5.0.0` (upload-token disclosure), `<= 4.0.0` (key disclosure, first affected version not determined)): Upload tokens and storage keys reached error messages and event sinks that `auditKey` was meant to keep them out of. [Details](#tokens-and-storage-keys-reach-log-sinks)
+- **GHSA-374f-5x47-pw8j** (Low, CVSS 3.1; `>= 2.0.0, < 5.0.0`): `Upload-Metadata` was work and storage a client chose, and a pair named `__proto__` landed on an object with a prototype. [Details](#upload-metadata-is-bounded)
+- **GHSA-xc69-2qg5-wmr4** (Moderate, CVSS 5.3; `<= 4.0.0` (first affected version not determined)): One request with 50 ranges drove 50 backend reads, and a `NaN` `maxRanges` disabled the cap. [Details](#a-multi-range-request-costs-a-bounded-number-of-backend-reads)
+- **GHSA-jhj3-w6h8-jh3j** (Moderate, CVSS 5.4; `< 5.0.0`): Inline `+xml` and `text/xsl` types beyond the five 4.0.0 sandboxed were served without `Content-Security-Policy: sandbox`. [Details](#active-xml-types-are-sandboxed)
+- **GHSA-xpr4-6p72-3498** (Low, CVSS 3.1; `>= 2.0.0, < 5.0.0`): A read handler fronting `httpStore`, or an `fsStore` addressed with a mixed-separator, mixed-case or dot-segment key, served in-flight upload bytes and key-bearing bookkeeping. [Details](#the-reserved-upload-namespace-is-not-readable)
+- **GHSA-c8f4-mq3p-2gpr** (Low, CVSS 3.7; `<= 4.0.0` (first affected version not determined)): A read could commit its status, or deliver bytes past a part's span, before the representation was confirmed, so a changed object reached the client as a success. [Details](#a-response-is-committed-only-after-the-representation-is-confirmed)
+- **GHSA-p45v-q42w-8p8w** (Moderate, CVSS 5.9; `>= 2.0.0, < 5.0.0`): Concurrent writers overwrote each other's bytes and bookkeeping, and a terminally dead or reaped upload could become appendable again. Narrowed for Azure: one window between a stale holder's record read and its stage of the same index remains. [Details](#concurrent-upload-writers-no-longer-overwrite-each-other)
+- **GHSA-pc6h-x4f9-g882** (Moderate, CVSS 5.3; `>= 2.0.0, < 5.0.0`): A completion could be attributed to, or publish over, an object this upload did not write, or publish a short one. Narrowed for R2 (the multipart `complete()` takes no precondition) and the filesystem adapter (the key reads empty briefly). [Details](#a-completion-publishes-the-right-object-whole)
+- **GHSA-jg7j-hxxf-6v7h** (Moderate, CVSS 5.3; `>= 2.0.0, < 5.0.0`): Abort and sweep could delete a published Azure blob, and a GCS reclaim could leave upload bytes in the bucket with nothing naming them. [Details](#discard-and-reclaim-lose-no-published-object-and-retain-no-bytes)
+- **GHSA-2r7q-g89h-wv9v** (Moderate, CVSS 4.3; `>= 2.0.0, < 5.0.0`): Offsets and limits clients relied on did not hold: a lowered S3 offset, a bypassed `minAppendSize`, a recorded length below the durable offset, a lost token, a false `410` on the filesystem store, and R2 uploads that could not complete. [Details](#offset-and-policy-invariants-hold)
+- **GHSA-fmqh-2pwj-cpgp** (Moderate, CVSS 5.3; `>= 2.2.0, < 5.0.0`): Any client could make a tus handler buffer and hash up to `checksum.maxBufferBytes` for a request it would refuse. [Details](#a-checksummed-tus-request-is-admitted-before-it-is-buffered)
+- **GHSA-qm7x-3vw2-pc79** (Moderate, CVSS 5.4; `>= 1.2.0, < 5.0.0`): A stored type such as `image/png, text/html` was judged inline-safe and served without the sandbox, while a browser renders its last member, HTML. [Details](#a-comma-separated-media-type-is-never-inline-safe)
+
+### Details
+
+#### About the security fixes
+
+Every defect in the sections that follow is present in **4.0.0**, the published release under
 support, and several are older than that release; each is fixed in 5.0.0. The
 supported-version policy is the latest published release, so upgrading to
 5.0.0 is the remedy whichever version is deployed; there is no patch release.
 Each entry names the deployments it reaches. A deployment serving only reads,
 with no upload store, is reached only by the entries marked "read path".
 
-- **A holder whose lock was stolen mid-body could place bytes where the new
-  holder had already written** (`s3UploadStore`, `gcsUploadStore`,
-  `azureUploadStore`, `fsUploadStore`). The upload lock serializes writers but expires, and a
-  body can stream for longer than the lock lives. The write that lands after
-  such a stall was computed from state read before it: the S3 adapter parked
-  its sub-part remainder unconditionally, so a stale remainder was counted
-  after the parts the winner had since committed and published at an offset
-  the client never sent it for; the GCS adapter wrote its chunk object under
-  an index the winner already held, replacing the winner's bytes; the Azure
-  adapter staged its block under an index the winner already held, and Azure
-  replaces a staged block under an existing id. All three now fence the
-  write. The S3 park lands only where no tail exists (`If-None-Match: *`)
-  and carries the offset its bytes belong at, and a tail is counted only at
-  that offset. The GCS chunk write is conditional on the object's absence
-  (`ifGenerationMatch: 0`). The Azure adapter records every accepted block in
-  its info blob under the same conditional write as the rest of the record,
-  re-reads that record before each stage, and refuses an index the record
-  already counts; a listing that disagrees with the record inside the accepted
-  prefix invalidates the upload rather than publishing it. The one window
-  the Azure fence cannot close lies between a stale holder's read of the
-  record and its stage of the same index: if the winner stages that index in
-  between, the stale block replaces the winner's, and the listing still
-  agrees with the record when the two blocks are the same size, because the
-  record counts blocks and bytes, not the content of each block. The record
-  admits one acknowledgement per index, so only one of the two holders is
-  told its block was accepted; the block that holds the index on the blob is
-  whichever staged last. The filesystem adapter tested the signal that
-  reports a lost lease only before each read of the body, so a read already
-  in flight when the lease went resolved afterwards and its bytes were
-  written at an offset the new holder had since made durable; it is tested on
-  both sides of the read now.
-- **The bookkeeping record was written unconditionally** (`gcsUploadStore`,
-  `azureUploadStore`, `fsUploadStore`, `s3UploadStore`, `r2UploadStore`). The record is the
-  only place an upload's invalidation lives, and a writer wrote it back with
-  nothing pinning it to the version it had read, so a record that changed in
-  between was overwritten: the GCS, Azure and filesystem adapters wrote a
-  whole snapshot taken before the new holder's changes, and the S3 adapter
-  re-read and merged but could still write over an invalidation recorded
-  after its read. Either way the flag was cleared and a terminally dead
-  upload was appendable again. Every record write is now conditional on the
-  version it read (GCS `ifGenerationMatch`, with `0` at creation; Azure and
-  S3 the ETag; R2 `onlyIf`; the filesystem keeps each fact in its own
-  write-once file, so only `progress.json` is ever replaced), a refused S3,
-  GCS or Azure write re-reads, merges the terminal flags one-way and retries,
-  failing after three refused attempts, and the length and published ETag
-  are taken from the fresh copy. A read the merge cannot make fails the write
-  rather than falling back to the caller's snapshot. The mechanism is
-  described under "Adapter bookkeeping is written conditionally".
-- **An upload reaped while an append was in flight came back** (`s3UploadStore`,
-  `gcsUploadStore`, `azureUploadStore`, `r2UploadStore`, `fsUploadStore`).
-  The append's closing record write
-  recreated the bookkeeping the abort or sweep had just deleted, from the
-  snapshot the append held, so a cancelled or expired upload was reachable and
-  appendable again under its old token. (On R2 and the filesystem the
-  recreated record named a multipart upload or a data file that was already
-  gone, so it was inert, but it still read as a live upload.) A record write
-  now requires the record
-  to exist: a missing one answers the append `UploadNotFoundError`, and the
-  bytes that append had already written are discarded (the S3 part belongs to
-  a multipart upload that was aborted, and S3 discards it; the GCS chunk object
-  is deleted; the Azure blob's staged state is discarded under the same
-  condition as an abort). The S3 sub-part tail is a separate object that
-  outlived the reap: the append that observes the reap deletes it, and
-  `sweepExpired` reclaims a tail whose sidecar is gone, judged on its own last
-  write, so no upload bytes remain once the record is gone. The conformance harness gains
-  `swept-resource-is-not-resurrected`, so a custom store is held to it.
-- **A completion was attributed to whatever object sat at the key**
-  (`s3UploadStore`, `r2UploadStore`). When the multipart upload was gone, the adapter read the
-  object at the destination key and, if one existed, reported it as this
-  upload's, ETag included. A key that another writer published in the meantime,
-  or that held an object before the upload began, was reported as a completed
-  upload, and `onUploadComplete` fired for bytes this upload never wrote.
-  Completion now records a random publication id and stamps it on the object
-  it publishes (S3 object metadata, R2 `customMetadata`), and a later probe
-  or completion retry adopts the object at the key only when it carries that
-  id, never by size or part count. A record written before the id was minted
-  holds none: a publish it had in flight attributes nothing, and only a
-  completion it had already recorded is adopted, by its stamped ETag or the
-  length it fixed. The R2 adapter read the object at the key the same way
-  (`head`, then reported its ETag) with no check on what it was, and a 5.0 R2
-  store cannot adopt a pre-5.0 publication. A custom R2 bucket `head()` must
-  return `customMetadata`.
-- **A completion that crashed between the rename and the sidecar write read
-  as an invalidated upload** (`fsUploadStore`). The retry found the data file
-  gone and recorded the upload invalidated, although the object had been
-  published, so the client's only recovery for a lost completion response
-  answered 410 for an object that existed. The staged copy's identity is now
-  recorded in `publication.json` before the copy is linked at the key, and a
-  retry adopts the object at the key by file identity.
-- **A partial chunk cleanup after the compose recomposed a suffix onto the
-  key** (`gcsUploadStore`). Completion deleted the chunk objects before
-  recording the upload complete; a crash or a refused delete partway left a
-  live record over the surviving chunks, and the retry composed those onto the
-  destination key, a shorter object over the complete one. The record is
-  written before any chunk is deleted, and a retry answers from it.
-- **Two uploads to one Azure key shared a block namespace** (`azureUploadStore`).
-  Block ids carried a sequence number and nothing else, so a second upload to
-  the same key summed the first one's staged blocks into its offset, committed
-  them into its object, and overwrote them with its own sequence numbers.
-  Block ids now carry a segment of the upload id, and an upload counts,
-  commits and heals from its own segment only. The raw id width is unchanged,
-  so a blob still holding blocks from a 4.x upload accepts the new ids; those
-  blocks carry no segment and belong to no upload, so an upload in flight
-  across the upgrade reads as lost, never as another upload's bytes.
-- **The Azure discard checked, then deleted** (`azureUploadStore`). Abort and
-  sweep read the destination blob's properties to tell staged-only state from
-  a published object and deleted unconditionally; a commit landing between the
-  two requests was the object the delete removed. By default the discard now
-  writes nothing at the destination key: staged blocks are left to Azure's own
-  seven-day collection of uncommitted blocks, so no blob, event or version
-  appears at the key. `discardStaged: "commit-empty"` reclaims them at once by
-  committing an empty block list create-only (`If-None-Match: *`), which drops
-  every unlisted staged block and which the service refuses when a committed
-  blob is already there, and then deleting the zero-byte blob it left pinned to
-  the ETag that commit returned, so a writer that commits in between keeps its
-  blob; a delete the service refuses (a retention policy) throws. With that
-  option the zero-byte blob is briefly visible at the key and raises a
-  `BlobCreated` event, and a container with versioning or soft delete may keep
-  a copy of it.
-- **An Azure record could outgrow the metadata ceiling after creation**
-  (`azureUploadStore`). The info blob's record lives in blob metadata, which
-  Azure caps at 8 KiB, and it grows after creation by the append timestamp, the
-  published ETag and now the block ledger. A key and caller metadata that fit
-  at creation put the first append's write over the cap, leaving a live upload
-  no append could advance and no completion could record. Creation measures
-  the record with every later field at its widest and refuses one that could
-  cross a 7 KiB ceiling.
-- **A first-time length below the durable offset was recorded** (engine). A
-  deferred-length upload whose first length-fixing request declared a total
-  smaller than the bytes already durable persisted it, and every later probe
-  and append answered `length-inconsistent` forever. The total is refused
-  before it is fixed.
-- **An undeclared-size append bypassed `minAppendSize`** (engine).
-  The floor exempts a completing append, and the exemption keyed on the
-  client's statement alone, so a client stating completion on a request that
-  declared no size, at an offset with room left to a known length, sent a body
-  of any size below the floor and kept the upload open. A non-completing
-  request that declared no size passed the floor too, because the test
-  required a declared content size to run at all. The exemption now
-  applies only where the engine can hold the statement to the post-condition
-  before the write: a declared content size, a deferred length, or a zero
-  bound at the durable end.
-- **A creation that failed after publishing lost its token** (orchestrator).
-  A creation carrying the whole body that published its object and then failed
-  in the completion hook, or failed mid-body after a durable prefix landed,
-  reported a store error with no token, so the client had no `Location` to
-  repeat its completing request against and the at-least-once delivery that
-  `onUploadComplete` documents was unreachable. The outcome carries the token,
-  which the dialect renders as `Location`.
-- **A completion could publish an object short of what the upload held**
-  (`gcsUploadStore`, `s3UploadStore`). Both adapters assembled from a listing
-  taken under a record read that was already stale. On GCS a completion that
-  had lost its lock composed whatever chunks its listing returned, and the
-  winner had by then published the whole object and reaped the chunks it
-  consumed, so the loser composed the survivors, or nothing, over the
-  complete object and reported that as its own completion. On S3 two
-  completers reach the commit from separate part listings, and the loser's
-  can be short by the tail the winner has since lifted into a part, which
-  publishes a truncated object over the complete one; the backend cannot
-  catch it, because it was never told what the total should be. The GCS
-  record is re-read after the listing and a settled completion is answered
-  from rather than composed over, and the S3 assembled size is checked
-  against `expectedLength` and the length the upload declared after the
-  seal, and the GCS listing is likewise taken after the seal.
-- **A reclaim deleted the record that named the objects it was reclaiming**
-  (`gcsUploadStore`). Abort and sweep listed an upload's chunks, deleted
-  them, and deleted the record last. An append landing in that window wrote a
-  chunk the listing had not seen, and the record that was the only thing
-  naming it was then deleted, so the bytes stayed in the bucket with nothing
-  able to reach or reclaim them: a deletion that reported success while
-  retaining data. The record delete is now pinned to the generation read
-  before the listing, so an append that moved it has the delete refused and
-  the pass repeats over what it had not seen.
-- **Damaged upload bookkeeping was read on trust and reported as nothing**
-  (`fsUploadStore`, with the not-found it shares with `gcsUploadStore`,
-  `r2UploadStore`, `azureUploadStore` and `s3UploadStore`, whose damaged
-  record was a plain error answered as a server failure). The filesystem sidecar was parsed
-  and used without a shape check, so a record holding a wrong-typed field fed
-  it into offset math, and the sweep compared a non-numeric clock that never
-  ages; it is now validated like every other adapter's record and, when it
-  fails, aged by modification time like a torn one. A record of a completion
-  without its size is damaged the same way, where it was a plain error. A torn sidecar's parse
-  error was carried as the not-found's `cause`, and its text quotes the
-  record, object key included. Every adapter now answers damaged bookkeeping
-  with an `UploadNotFoundError` whose `cause` is an error named
-  `UploadStateCorruptError` carrying nothing read from storage; the client
-  still receives not-found (a resource nobody can resume is unknown to the
-  protocol), and the orchestrator reports it to `onError`, where an
-  expired token stays silent, so corruption on disk is no longer
-  indistinguishable from a resource that ended.
-- **A filesystem error named the file to every caller** (`fsStore`,
-  `fsUploadStore`). An operating-system error such as `EACCES`, `EISDIR` or
-  `EIO` carries the resolved path in its message, stack, `path` and `dest`,
-  and that path holds the object key or the upload token; only an error that
-  reached `onError` was redacted, so a direct caller logging a rejection
-  printed both. Every method of both stores now rejects with each such path
-  replaced by `<path>`, along the whole `cause` chain; `code` and the class
-  are kept, and a not-found still carries its key on `key`.
+One item in this section rests on a trust that ends with the upgrade window: a
+4.x S3 tail carries no offset stamp and is counted where it is found, until the
+first append after the upgrade replaces it. A 4.x S3 completion record is not in
+that class, because completion is terminal and no later write restamps it; such
+a record is held to the length it fixed for as long as it lives, and only one
+that fixed no length is taken on the key's existence, as it always was. The
+Cloudflare Workers runtime is not exercised by the cross-runtime smoke check, so
+the transparent-compression refusal is observed against Node, Deno and Bun only.
+
+#### Filesystem adapters resolve links outside the root
+
+- **`fsStore` followed symbolic links out of its root by default** (read path,
+  `fsStore`). 4.0.0 documented that links under the root were followed by
+  design, so a link planted in the served tree (an upload tree, an extracted
+  archive) served any file the process could read. The store now contains
+  every key to the root's real path: the key's links are resolved and the
+  result must sit inside the real root, and the open itself refuses a link in
+  the final component (`O_NOFOLLOW`) where the platform has it. A link from one
+  place in the root to another still serves; one that leaves it, or that
+  reaches the reserved upload workspace, answers `ObjectNotFoundError`.
+  `symlinks: "follow"` restores the old resolution for a root whose layout
+  links to content kept elsewhere on purpose, and any other value contains.
+  The check and the open are two steps, so a writer that can swap a directory
+  under the root for a link between them is outside what the option defends
+  against. This is a breaking default: see `docs/UPGRADING.md`.
+- **Uploads were published through a link outside the root** (`fsUploadStore`).
+  The workspace directory and the publish destination were created and
+  renamed into with no check of where their links led, so a directory link
+  under the root, or a linked `.uploads`, redirected a completed upload to
+  any location the process could write. Creation and publication now resolve
+  the real root first and publish only inside it.
+
+#### A FIFO at a served path blocks the thread pool
+
+- **A FIFO at a served path blocked the thread pool** (read path, `fsStore`,
+  POSIX). The store opened the path before it checked that it was a regular
+  file, and opening a FIFO parks a thread until a writer appears, so a few
+  requests for a planted FIFO exhausted the pool the whole process shares. The
+  open is non-blocking and a path that is not a regular file is refused.
+
+#### A resumable-upload handler creates an object on any method
+
+- **A tokenless `DELETE` or `GET` could create and publish an empty object**
+  (`createUploadHandler`). Every request without an upload token was routed to
+  creation, and creation was gated on the completeness header alone, so a
+  `DELETE` or `GET` carrying `Upload-Complete: ?1` created an empty upload and
+  published it at whatever key `key()` chose. Only `POST`, `PUT` and `PATCH`
+  create (draft-ietf-httpbis-resumable-upload Section 4.2.1); any other method
+  without a token answers `405` with `Allow: POST, PUT, PATCH, OPTIONS`.
+
+#### Tokens and storage keys reach log sinks
+
 - **The storage key reached the error sink past `auditKey`** (read path, both
   upload dialects, `s3UploadStore`, `fsUploadStore`). `auditKey` substitutes an opaque id for
   the filename-bearing key in the reported context, and the error handed over
@@ -271,11 +198,67 @@ with no upload store, is reached only by the entries marked "read path".
   redacted by name. The backend error carried as `cause` is the backend's own
   and is not rewritten; `redactErrorText` scrubs a whole chain for a sink that
   needs it.
-- **Multipart bytes past a part's range reached the wire** (read path). A
-  chunk that crossed the part's span was framed and written before the span
-  check ran, so the tail of a representation that changed under the read was
-  delivered inside a well-formed part before the response errored. The chunk
-  is withheld.
+- **A filesystem error named the file to every caller** (`fsStore`,
+  `fsUploadStore`). An operating-system error such as `EACCES`, `EISDIR` or
+  `EIO` carries the resolved path in its message, stack, `path` and `dest`,
+  and that path holds the object key or the upload token; only an error that
+  reached `onError` was redacted, so a direct caller logging a rejection
+  printed both. Every method of both stores now rejects with each such path
+  replaced by `<path>`, along the whole `cause` chain; `code` and the class
+  are kept, and a not-found still carries its key on `key`.
+- **Damaged upload bookkeeping was read on trust and reported as nothing**
+  (`fsUploadStore`, with the not-found it shares with `gcsUploadStore`,
+  `r2UploadStore`, `azureUploadStore` and `s3UploadStore`, whose damaged
+  record was a plain error answered as a server failure). The filesystem sidecar was parsed
+  and used without a shape check, so a record holding a wrong-typed field fed
+  it into offset math, and the sweep compared a non-numeric clock that never
+  ages; it is now validated like every other adapter's record and, when it
+  fails, aged by modification time like a torn one. A record of a completion
+  without its size is damaged the same way, where it was a plain error. A torn sidecar's parse
+  error was carried as the not-found's `cause`, and its text quotes the
+  record, object key included. Every adapter now answers damaged bookkeeping
+  with an `UploadNotFoundError` whose `cause` is an error named
+  `UploadStateCorruptError` carrying nothing read from storage; the client
+  still receives not-found (a resource nobody can resume is unknown to the
+  protocol), and the orchestrator reports it to `onError`, where an
+  expired token stays silent, so corruption on disk is no longer
+  indistinguishable from a resource that ended.
+
+#### `Upload-Metadata` is bounded
+
+- **`Upload-Metadata` was unbounded** (`createTusHandler`). Every pair was
+  decoded and handed to `key()` and the store, so the header size was work and
+  storage a client chose, and a pair named `__proto__` or `constructor`
+  landed on an object with a prototype. The header is now limited to 4096
+  bytes and 32 pairs (`400` beyond, configurable with `metadataLimits`), and
+  the parsed result has a null prototype, so those names are ordinary entries.
+  Configured checksum algorithm names are matched case-insensitively: a
+  configured `SHA1` never matched a request before.
+
+#### A multi-range request costs a bounded number of backend reads
+
+- **A multi-range request cost one backend read per part, and a `NaN` cap
+  disabled the cap** (read path). Each part of a `multipart/byteranges`
+  response was its own ranged `getObject`, so one request with 50 ranges, the
+  old `maxRanges` default, drove 50 reads against a metered backend. A
+  `maxRanges` of `NaN` compared false against every count and so allowed
+  unlimited ranges. `maxRanges` now defaults to 8 and fails closed:
+  `serveObject` throws a `TypeError` for a value that is not a safe integer of
+  at least 1, and `parseRanges` answers the full `200` for a `NaN` cap. The new
+  `maxBackendReads` (default 8) bounds the pinned per-part reads; past it the
+  parts are cut from one buffered read of the span covering them when that span
+  is under 256 KiB, and the response is the full `200` otherwise.
+
+#### Active XML types are sandboxed
+
+- **Active XML content rendered inline without the sandbox** (read path).
+  4.0.0 added `Content-Security-Policy: sandbox` to inline SVG, HTML, XHTML and
+  generic XML only. Every `+xml` structured-syntax type (RFC 6839 Section 4.1)
+  and `text/xsl` can run a stylesheet or script when opened as a top-level
+  document, and all of them now get the sandbox when served `inline`.
+
+#### The reserved upload namespace is not readable
+
 - **`httpStore` served the sibling upload store's namespace** (read path). The
   five other read stores refuse keys under their upload store's prefix; the
   http adapter, which cannot know which store sits behind its origin, refused
@@ -302,43 +285,14 @@ with no upload store, is reached only by the entries marked "read path".
   the prefix. `fsUploadStore` refuses a publish key into its own workspace
   through the same guard, where it folded case on Windows only and accepted
   a generated alias such as `UPLOAD~1/`.
-- **`fsStore` followed symbolic links out of its root by default** (read path,
-  `fsStore`). 4.0.0 documented that links under the root were followed by
-  design, so a link planted in the served tree (an upload tree, an extracted
-  archive) served any file the process could read. The store now contains
-  every key to the root's real path: the key's links are resolved and the
-  result must sit inside the real root, and the open itself refuses a link in
-  the final component (`O_NOFOLLOW`) where the platform has it. A link from one
-  place in the root to another still serves; one that leaves it, or that
-  reaches the reserved upload workspace, answers `ObjectNotFoundError`.
-  `symlinks: "follow"` restores the old resolution for a root whose layout
-  links to content kept elsewhere on purpose, and any other value contains.
-  The check and the open are two steps, so a writer that can swap a directory
-  under the root for a link between them is outside what the option defends
-  against. This is a breaking default: see `docs/UPGRADING.md`.
-- **A FIFO at a served path blocked the thread pool** (read path, `fsStore`,
-  POSIX). The store opened the path before it checked that it was a regular
-  file, and opening a FIFO parks a thread until a writer appears, so a few
-  requests for a planted FIFO exhausted the pool the whole process shares. The
-  open is non-blocking and a path that is not a regular file is refused.
-- **Uploads were published through a link outside the root** (`fsUploadStore`).
-  The workspace directory and the publish destination were created and
-  renamed into with no check of where their links led, so a directory link
-  under the root, or a linked `.uploads`, redirected a completed upload to
-  any location the process could write. Creation and publication now resolve
-  the real root first and publish only inside it.
-- **The S3 offset a client had been told could go down** (`s3UploadStore`).
-  Lifting the sub-part tail into a part deleted the tail before the part that
-  replaced it was committed, so a transient failure between the two lowered
-  the durable offset below what the client had been acknowledged, and the
-  client, resuming from the lower offset, wrote different bytes over ones it
-  had been told were safe. Completion lifted the tail before it checked the
-  assembled size, so a refusal left a short part behind. A parked tail now
-  leaves its slot only after its bytes are durable in a part or in a replacing
-  tail, and the assembled size is checked before the tail is lifted, so the
-  derived offset never falls below an acknowledged one. The one exception is
-  an unstamped tail written by a 4.x store, which is removed before its part
-  is sent.
+
+#### A response is committed only after the representation is confirmed
+
+- **Multipart bytes past a part's range reached the wire** (read path). A
+  chunk that crossed the part's span was framed and written before the span
+  check ran, so the tail of a representation that changed under the read was
+  delivered inside a well-formed part before the response errored. The chunk
+  is withheld.
 - **A GCS read committed its status before the first byte** (read path,
   `gcsStore`). `getObject` returned a stream at once, so an object deleted or
   replaced between the metadata read and the first chunk was answered `200`
@@ -347,60 +301,123 @@ with no upload store, is reached only by the entries marked "read path".
   pinned read that finds the object missing or replaced raises
   `ObjectChangedError`, and an unpinned one that finds it missing raises
   `ObjectNotFoundError`, each answered as its status.
-- **R2 wrote an unaligned remainder as a short multipart part**
-  (`r2UploadStore`). R2 requires every part but the last to be the same size,
-  and a part written short for a remainder can never be followed by another,
-  so an upload whose chunks were not a multiple of the part size could not
-  complete. The remainder is now a tail object (`<prefix>/<id>.<uuid>.part`)
-  that the manifest names (`tail: { id, size }`); the manifest's conditional
-  write is the fence, the previous tail is deleted only after the manifest
-  that replaces it is durable, and completion uploads a tail still parked as
-  the one short final part R2 permits. `sweepExpired` reaps tails.
-- **Active XML content rendered inline without the sandbox** (read path).
-  4.0.0 added `Content-Security-Policy: sandbox` to inline SVG, HTML, XHTML and
-  generic XML only. Every `+xml` structured-syntax type (RFC 6839 Section 4.1)
-  and `text/xsl` can run a stylesheet or script when opened as a top-level
-  document, and all of them now get the sandbox when served `inline`.
-- **A multi-range request cost one backend read per part, and a `NaN` cap
-  disabled the cap** (read path). Each part of a `multipart/byteranges`
-  response was its own ranged `getObject`, so one request with 50 ranges, the
-  old `maxRanges` default, drove 50 reads against a metered backend. A
-  `maxRanges` of `NaN` compared false against every count and so allowed
-  unlimited ranges. `maxRanges` now defaults to 8 and fails closed:
-  `serveObject` throws a `TypeError` for a value that is not a safe integer of
-  at least 1, and `parseRanges` answers the full `200` for a `NaN` cap. The new
-  `maxBackendReads` (default 8) bounds the pinned per-part reads; past it the
-  parts are cut from one buffered read of the span covering them when that span
-  is under 256 KiB, and the response is the full `200` otherwise.
-- **A tokenless `DELETE` or `GET` could create and publish an empty object**
-  (`createUploadHandler`). Every request without an upload token was routed to
-  creation, and creation was gated on the completeness header alone, so a
-  `DELETE` or `GET` carrying `Upload-Complete: ?1` created an empty upload and
-  published it at whatever key `key()` chose. Only `POST`, `PUT` and `PATCH`
-  create (draft-ietf-httpbis-resumable-upload Section 4.2.1); any other method
-  without a token answers `405` with `Allow: POST, PUT, PATCH, OPTIONS`.
-- **`Upload-Metadata` was unbounded** (`createTusHandler`). Every pair was
-  decoded and handed to `key()` and the store, so the header size was work and
-  storage a client chose, and a pair named `__proto__` or `constructor`
-  landed on an object with a prototype. The header is now limited to 4096
-  bytes and 32 pairs (`400` beyond, configurable with `metadataLimits`), and
-  the parsed result has a null prototype, so those names are ordinary entries.
-  Configured checksum algorithm names are matched case-insensitively: a
-  configured `SHA1` never matched a request before.
-- **A checksummed request was buffered and hashed before it was admitted**
-  (`createTusHandler` with `checksum`, since 2.2.0). The Checksum extension
-  verifies content before it is stored, which means buffering and hashing up
-  to `checksum.maxBufferBytes`, and any client could make the server do that
-  work for a request it would refuse: a `PATCH` under a token naming nothing
-  or refused by `authorize`, or a creation-with-upload `POST` the policy or
-  the `key` callback refuses, times concurrency. A `PATCH` is now judged by
-  the new lock-free `orchestrator.admit(uploadToken, { authorize })` first
-  (so `authorize` can run twice for one checksummed `PATCH`, on the same key
-  and metadata, while the offset stays the append's to judge under the lock),
-  and a creation verifies only after the policy and `key` admit it and before
-  anything is allocated, so a mismatch leaves no resource behind. A declared
-  `Content-Length` over the cap is refused `413` from the header alone on
-  both.
+
+#### Concurrent upload writers no longer overwrite each other
+
+- **A holder whose lock was stolen mid-body could place bytes where the new
+  holder had already written** (`s3UploadStore`, `gcsUploadStore`,
+  `azureUploadStore`, `fsUploadStore`). The upload lock serializes writers but expires, and a
+  body can stream for longer than the lock lives. The write that lands after
+  such a stall was computed from state read before it: the S3 adapter parked
+  its sub-part remainder unconditionally, so a stale remainder was counted
+  after the parts the winner had since committed and published at an offset
+  the client never sent it for; the GCS adapter wrote its chunk object under
+  an index the winner already held, replacing the winner's bytes; the Azure
+  adapter staged its block under an index the winner already held, and Azure
+  replaces a staged block under an existing id. All three now fence the
+  write. The S3 park lands only where no tail exists (`If-None-Match: *`)
+  and carries the offset its bytes belong at, and a tail is counted only at
+  that offset. The GCS chunk write is conditional on the object's absence
+  (`ifGenerationMatch: 0`). The Azure adapter records every accepted block in
+  its info blob under the same conditional write as the rest of the record,
+  re-reads that record before each stage, and refuses an index the record
+  already counts; a listing that disagrees with the record inside the accepted
+  prefix invalidates the upload rather than publishing it. The one window
+  the Azure fence cannot close lies between a stale holder's read of the
+  record and its stage of the same index: if the winner stages that index in
+  between, the stale block replaces the winner's, and the listing still
+  agrees with the record when the two blocks are the same size, because the
+  record counts blocks and bytes, not the content of each block. The record
+  admits one acknowledgement per index, so only one of the two holders is
+  told its block was accepted; the block that holds the index on the blob is
+  whichever staged last. The filesystem adapter tested the signal that
+  reports a lost lease only before each read of the body, so a read already
+  in flight when the lease went resolved afterwards and its bytes were
+  written at an offset the new holder had since made durable; it is tested on
+  both sides of the read now.
+- **The bookkeeping record was written unconditionally** (`gcsUploadStore`,
+  `azureUploadStore`, `fsUploadStore`, `s3UploadStore`, `r2UploadStore`). The record is the
+  only place an upload's invalidation lives, and a writer wrote it back with
+  nothing pinning it to the version it had read, so a record that changed in
+  between was overwritten: the GCS, Azure and filesystem adapters wrote a
+  whole snapshot taken before the new holder's changes, and the S3 adapter
+  re-read and merged but could still write over an invalidation recorded
+  after its read. Either way the flag was cleared and a terminally dead
+  upload was appendable again. Every record write is now conditional on the
+  version it read (the filesystem keeps each fact in its own write-once file,
+  so only `progress.json` is ever replaced), a refused S3, GCS or Azure write
+  re-reads, merges the terminal flags one-way and retries, and the length and
+  published ETag are taken from the fresh copy. A read the merge cannot make
+  fails the write rather than falling back to the caller's snapshot. The
+  precondition each adapter uses and the retry bound are under
+  [Adapter bookkeeping is written conditionally](#adapter-bookkeeping-is-written-conditionally).
+- **An upload reaped while an append was in flight came back** (`s3UploadStore`,
+  `gcsUploadStore`, `azureUploadStore`, `r2UploadStore`, `fsUploadStore`).
+  The append's closing record write
+  recreated the bookkeeping the abort or sweep had just deleted, from the
+  snapshot the append held, so a cancelled or expired upload was reachable and
+  appendable again under its old token. (On R2 and the filesystem the
+  recreated record named a multipart upload or a data file that was already
+  gone, so it was inert, but it still read as a live upload.) A record write
+  now requires the record
+  to exist: a missing one answers the append `UploadNotFoundError`, and the
+  bytes that append had already written are discarded (the S3 part belongs to
+  a multipart upload that was aborted, and S3 discards it; the GCS chunk object
+  is deleted; the Azure blob's staged state is discarded under the same
+  condition as an abort). The S3 sub-part tail is a separate object that
+  outlived the reap: the append that observes the reap deletes it, and
+  `sweepExpired` reclaims a tail whose sidecar is gone, judged on its own last
+  write, so no upload bytes remain once the record is gone. The conformance harness gains
+  `swept-resource-is-not-resurrected`, so a custom store is held to it.
+- **Two uploads to one Azure key shared a block namespace** (`azureUploadStore`).
+  Block ids carried a sequence number and nothing else, so a second upload to
+  the same key summed the first one's staged blocks into its offset, committed
+  them into its object, and overwrote them with its own sequence numbers.
+  Block ids now carry a segment of the upload id, and an upload counts,
+  commits and heals from its own segment only. The raw id width is unchanged,
+  so a blob still holding blocks from a 4.x upload accepts the new ids; those
+  blocks carry no segment and belong to no upload, so an upload in flight
+  across the upgrade reads as lost, never as another upload's bytes.
+
+#### A completion publishes the right object, whole
+
+- **A completion was attributed to whatever object sat at the key**
+  (`s3UploadStore`, `r2UploadStore`). When the multipart upload was gone, the adapter read the
+  object at the destination key and, if one existed, reported it as this
+  upload's, ETag included. A key that another writer published in the meantime,
+  or that held an object before the upload began, was reported as a completed
+  upload, and `onUploadComplete` fired for bytes this upload never wrote.
+  Completion now records a random publication id and stamps it on the object
+  it publishes (S3 object metadata, R2 `customMetadata`), and a later probe
+  or completion retry adopts the object at the key only when it carries that
+  id, never by size or part count. A record written before the id was minted
+  holds none: a publish it had in flight attributes nothing, and only a
+  completion it had already recorded is adopted, by its stamped ETag or the
+  length it fixed. The R2 adapter read the object at the key the same way
+  (`head`, then reported its ETag) with no check on what it was, and a 5.0 R2
+  store cannot adopt a pre-5.0 publication. A custom R2 bucket `head()` must
+  return `customMetadata`.
+- **A partial chunk cleanup after the compose recomposed a suffix onto the
+  key** (`gcsUploadStore`). Completion deleted the chunk objects before
+  recording the upload complete; a crash or a refused delete partway left a
+  live record over the surviving chunks, and the retry composed those onto the
+  destination key, a shorter object over the complete one. The record is
+  written before any chunk is deleted, and a retry answers from it.
+- **A completion could publish an object short of what the upload held**
+  (`gcsUploadStore`, `s3UploadStore`). Both adapters assembled from a listing
+  taken under a record read that was already stale. On GCS a completion that
+  had lost its lock composed whatever chunks its listing returned, and the
+  winner had by then published the whole object and reaped the chunks it
+  consumed, so the loser composed the survivors, or nothing, over the
+  complete object and reported that as its own completion. On S3 two
+  completers reach the commit from separate part listings, and the loser's
+  can be short by the tail the winner has since lifted into a part, which
+  publishes a truncated object over the complete one; the backend cannot
+  catch it, because it was never told what the total should be. The GCS
+  record is re-read after the listing and a settled completion is answered
+  from rather than composed over, and the S3 assembled size is checked
+  against `expectedLength` and the length the upload declared after the
+  seal, and the GCS listing is likewise taken after the seal.
 - **A completion could overwrite a key written after it began, adopt a
   same-shape foreign object, or omit an acknowledged append** (every upload
   store). 4.0.0 composed the object from a listing and committed it
@@ -420,6 +437,114 @@ with no upload store, is reached only by the entries marked "read path".
   zero-byte upload has no such window). The filesystem adapter replaces an
   existing object by moving it aside and linking the new one, so a reader sees
   the key empty briefly.
+
+#### Discard and reclaim lose no published object and retain no bytes
+
+- **The Azure discard checked, then deleted** (`azureUploadStore`). Abort and
+  sweep read the destination blob's properties to tell staged-only state from
+  a published object and deleted unconditionally; a commit landing between the
+  two requests was the object the delete removed. By default the discard now
+  writes nothing at the destination key: staged blocks are left to Azure's own
+  seven-day collection of uncommitted blocks, so no blob, event or version
+  appears at the key. `discardStaged: "commit-empty"` reclaims them at once by
+  committing an empty block list create-only (`If-None-Match: *`), which drops
+  every unlisted staged block and which the service refuses when a committed
+  blob is already there, and then deleting the zero-byte blob it left pinned to
+  the ETag that commit returned, so a writer that commits in between keeps its
+  blob; a delete the service refuses (a retention policy) throws. With that
+  option the zero-byte blob is briefly visible at the key and raises a
+  `BlobCreated` event, and a container with versioning or soft delete may keep
+  a copy of it.
+- **A reclaim deleted the record that named the objects it was reclaiming**
+  (`gcsUploadStore`). Abort and sweep listed an upload's chunks, deleted
+  them, and deleted the record last. An append landing in that window wrote a
+  chunk the listing had not seen, and the record that was the only thing
+  naming it was then deleted, so the bytes stayed in the bucket with nothing
+  able to reach or reclaim them: a deletion that reported success while
+  retaining data. The record delete is now pinned to the generation read
+  before the listing, so an append that moved it has the delete refused and
+  the pass repeats over what it had not seen.
+
+#### Offset and policy invariants hold
+
+- **A completion that crashed between the rename and the sidecar write read
+  as an invalidated upload** (`fsUploadStore`). The retry found the data file
+  gone and recorded the upload invalidated, although the object had been
+  published, so the client's only recovery for a lost completion response
+  answered 410 for an object that existed. The staged copy's identity is now
+  recorded in `publication.json` before the copy is linked at the key, and a
+  retry adopts the object at the key by file identity.
+- **An Azure record could outgrow the metadata ceiling after creation**
+  (`azureUploadStore`). The info blob's record lives in blob metadata, which
+  Azure caps at 8 KiB, and it grows after creation by the append timestamp, the
+  published ETag and now the block ledger. A key and caller metadata that fit
+  at creation put the first append's write over the cap, leaving a live upload
+  no append could advance and no completion could record. Creation measures
+  the record with every later field at its widest and refuses one that could
+  cross a 7 KiB ceiling.
+- **A first-time length below the durable offset was recorded** (engine). A
+  deferred-length upload whose first length-fixing request declared a total
+  smaller than the bytes already durable persisted it, and every later probe
+  and append answered `length-inconsistent` forever. The total is refused
+  before it is fixed.
+- **An undeclared-size append bypassed `minAppendSize`** (engine).
+  The floor exempts a completing append, and the exemption keyed on the
+  client's statement alone, so a client stating completion on a request that
+  declared no size, at an offset with room left to a known length, sent a body
+  of any size below the floor and kept the upload open. A non-completing
+  request that declared no size passed the floor too, because the test
+  required a declared content size to run at all. The exemption now
+  applies only where the engine can hold the statement to the post-condition
+  before the write: a declared content size, a deferred length, or a zero
+  bound at the durable end.
+- **A creation that failed after publishing lost its token** (orchestrator).
+  A creation carrying the whole body that published its object and then failed
+  in the completion hook, or failed mid-body after a durable prefix landed,
+  reported a store error with no token, so the client had no `Location` to
+  repeat its completing request against and the at-least-once delivery that
+  `onUploadComplete` documents was unreachable. The outcome carries the token,
+  which the dialect renders as `Location`.
+- **The S3 offset a client had been told could go down** (`s3UploadStore`).
+  Lifting the sub-part tail into a part deleted the tail before the part that
+  replaced it was committed, so a transient failure between the two lowered
+  the durable offset below what the client had been acknowledged, and the
+  client, resuming from the lower offset, wrote different bytes over ones it
+  had been told were safe. Completion lifted the tail before it checked the
+  assembled size, so a refusal left a short part behind. A parked tail now
+  leaves its slot only after its bytes are durable in a part or in a replacing
+  tail, and the assembled size is checked before the tail is lifted, so the
+  derived offset never falls below an acknowledged one. The one exception is
+  an unstamped tail written by a 4.x store, which is removed before its part
+  is sent.
+- **R2 wrote an unaligned remainder as a short multipart part**
+  (`r2UploadStore`). R2 requires every part but the last to be the same size,
+  and a part written short for a remainder can never be followed by another,
+  so an upload whose chunks were not a multiple of the part size could not
+  complete. The remainder is now a tail object (`<prefix>/<id>.<uuid>.part`)
+  that the manifest names (`tail: { id, size }`); the manifest's conditional
+  write is the fence, the previous tail is deleted only after the manifest
+  that replaces it is durable, and completion uploads a tail still parked as
+  the one short final part R2 permits. `sweepExpired` reaps tails.
+
+#### A checksummed tus request is admitted before it is buffered
+
+- **A checksummed request was buffered and hashed before it was admitted**
+  (`createTusHandler` with `checksum`, since 2.2.0). The Checksum extension
+  verifies content before it is stored, which means buffering and hashing up
+  to `checksum.maxBufferBytes`, and any client could make the server do that
+  work for a request it would refuse: a `PATCH` under a token naming nothing
+  or refused by `authorize`, or a creation-with-upload `POST` the policy or
+  the `key` callback refuses, times concurrency. A `PATCH` is now judged by
+  the new lock-free `orchestrator.admit(uploadToken, { authorize })` first
+  (so `authorize` can run twice for one checksummed `PATCH`, on the same key
+  and metadata, while the offset stays the append's to judge under the lock),
+  and a creation verifies only after the policy and `key` admit it and before
+  anything is allocated, so a mismatch leaves no resource behind. A declared
+  `Content-Length` over the cap is refused `413` from the header alone on
+  both.
+
+#### A comma-separated media type is never inline-safe
+
 - **A comma-separated media type could skip the sandbox** (read path). In
   `>= 1.2.0, < 5.0.0` a stored type such as `image/png, text/html` was judged
   by its first member, so `isInlineSafeMediaType` (2.3.0 and later) called it
@@ -429,23 +554,24 @@ with no upload store, is reached only by the entries marked "read path".
   parser (`media-type.ts`); an off-grammar value, any comma included, is
   served as `application/octet-stream` and is never inline-safe.
 
-One item in this section rests on a trust that ends with the upgrade window: a
-4.x S3 tail carries no offset stamp and is counted where it is found, until the
-first append after the upgrade replaces it. A 4.x S3 completion record is not in
-that class, because completion is terminal and no later write restamps it; such
-a record is held to the length it fixed for as long as it lives, and only one
-that fixed no length is taken on the key's existence, as it always was. The
-Cloudflare Workers runtime is not exercised by the cross-runtime smoke check, so
-the transparent-compression refusal is observed against Node, Deno and Bun only.
+#### License
 
-### Node.js 24 or later
+This release changes the license from MIT to Apache License 2.0. Versions up
+to and including 4.0.0, the last published release, remain under the MIT
+License exactly as published; 5.0.0 and every later version are licensed under
+Apache-2.0. The tarball now carries the full `LICENSE` text and a `NOTICE`
+file, and `package.json` declares `"license": "Apache-2.0"`. Apache-2.0 adds an
+express patent grant; redistributions must keep the license text and the
+`NOTICE` contents (section 4).
+
+#### Node.js 24 or later
 
 `engines.node` is `>=24.0.0` (was `>=20.0.0`). Node.js 20 reached end of life
 in April 2026, and the repository that builds and tests the package requires
 Node.js 24, so a lower floor was a claim nothing verified. Bun, Deno and the
 edge runtimes are unaffected.
 
-### The engine no longer guesses whether a request carries content
+#### The engine no longer guesses whether a request carries content
 
 A request that declares no content size is an unknown, and the old code
 resolved that unknown in opposite directions in two branches of one function.
@@ -476,7 +602,7 @@ at construction** rather than serving an endpoint that answers 400 forever. Set
 it on the IETF dialect, which advertises `min-append-size` and lets a request
 say it is finished.
 
-### Refusals that cost no more than a refusal
+#### Refusals that cost no more than a refusal
 
 - **A size floor is checked before any byte moves**, on the total the request
   would fix, so a first completing append below the server's `minSize` is
@@ -497,14 +623,14 @@ say it is finished.
   first delivery failed. Reaping the finished resource's bookkeeping stays
   `sweepExpired`'s job. Invalidation still overrides completion.
 
-### `appendChunk` reports whether it ran to the end of the body
+#### `appendChunk` reports whether it ran to the end of the body
 
 `AppendChunkResult` gains `interrupted`. Only the code draining the body knows
 whether it stopped early, and the caller was previously inferring it from an
 abort signal, which says that something asked the write to yield and nothing
 about what happened to the bytes. Every store must now return the field.
 
-### `sweepExpired` takes two clocks and requires one
+#### `sweepExpired` takes two clocks and requires one
 
 `sweepExpired(cutoff)` accepts `idleSinceMs`, `createdBeforeMs`, or both, and
 throws when given neither. Reclamation previously keyed on idleness alone while
@@ -526,7 +652,7 @@ itself: a digest mismatch, and a resource refused as expired or invalidated. A
 failed digest previously left a fully staged representation that no client
 could reach or delete.
 
-### Capability flags can be wrong, and the harness checks them
+#### Capability flags can be wrong, and the harness checks them
 
 `enforcesOffsetCheck` and `atomicCompletion` were typed as the literal `true`,
 so a store could not declare anything else and the checks that refuse a store
@@ -538,7 +664,8 @@ nothing at the destination key, that completion publishes exactly what was
 appended, that an abort spares an object already published, that a store
 which stops mid-body says so (a short append, a torn body, an abort mid-read),
 and that a request ceiling stops a streaming body. `swept-resource-is-not-resurrected`
-holds a sweeping store to the reaped-upload rule under "Security": an append
+holds a sweeping store to the reaped-upload rule under
+[Concurrent upload writers no longer overwrite each other](#concurrent-upload-writers-no-longer-overwrite-each-other): an append
 whose body was in flight when the sweep ran must not write the resource back.
 
 `runConformanceCheck`, `tallyConformance` and `ConformanceAssert` are exported,
@@ -553,24 +680,24 @@ obligation nothing could observe has gone unverified rather than been met, and
 a harness that scored it as a pass would be worth less than the flag it
 replaced, because it would look like proof.
 
-### Appends answer 204, or 200 on completion
+#### Appends answer 204, or 200 on completion
 
 `201 Created` is the status for creating the upload resource, which still
 answers 201 with `Location`. A 201 carrying no `Location` asserts that the
 request created what the target URI names, which an append to an existing
 resource did not.
 
-### Smaller protocol corrections
+#### Smaller protocol corrections
 
 - A completing append that declares a content size now fixes and records the
   representation's total, which was derived at creation and nowhere else.
 - The completion hook is not re-delivered once a delivery has resolved, so a
   repeated bodiless request cannot drive unbounded awaited callbacks.
-- A reported store error is withheld under the caller's `auditKey` (a
-  `ProjectedError`, described under "Security"). `redactErrorText` is exported
-  from the package root for a custom store's error sink; it covers the storage
-  key as well as the token, and reaches an error's own properties and its
-  `cause` chain.
+- `redactErrorText` is exported from the package root for a custom store's
+  error sink; it covers the storage key as well as the token, and reaches an
+  error's own properties and its `cause` chain. What `onError` receives under
+  an `auditKey` (a `ProjectedError`) is under
+  [Tokens and storage keys reach log sinks](#tokens-and-storage-keys-reach-log-sinks).
 - `reservedKeyGuard` takes a list of prefixes as well as one.
 - A request body the store never took is cancelled rather than abandoned.
 - Whether offset retrieval and cancellation refuse upload-state header fields
@@ -592,7 +719,7 @@ resource did not.
   `operation: "append"`, so a caller admitted only to probe receives the
   hook's append refusal.
 
-### `Upload-Limit` counted to one deadline
+#### `Upload-Limit` counted to one deadline
 
 `max-age` is derived from one deadline, the one recorded at creation, on every answer about a resource: the whole seconds left,
 rounded down. A creation whose body streamed has already spent part of it. A
@@ -608,7 +735,7 @@ bound longer than 15 digits, the most an RFC 8941 integer has: a parser
 refuses the whole field on a longer one, which cost the client every limit,
 not only that one.
 
-### A completing upload response names what it published
+#### A completing upload response names what it published
 
 `Repr-Digest` and `ETag` now ride the response that reports an upload
 complete, on both dialects and on both completing paths. A store configured to
@@ -627,31 +754,32 @@ The idempotent replay of an already-complete request deliberately carries
 neither header, because that answer is synthesized from durable facts and holds
 no representation to describe. It is an omission rather than a claim.
 
-### Adapter bookkeeping is written conditionally
+#### Adapter bookkeeping is written conditionally
 
 A store's own metadata record is the only place an upload's invalidation
-lives, and a holder whose lock was stolen while its body streamed used to write
-that record back from a snapshot taken before the new holder's changes, which
-could clear the flag and resurrect a terminally dead upload. The four adapters
-that keep such a record now pin every write to the version they read: `If-Match`
+lives, and the defect this closes is described under
+[Concurrent upload writers no longer overwrite each other](#concurrent-upload-writers-no-longer-overwrite-each-other).
+The four adapters that keep such a record now pin every write to the version
+they read: `If-Match`
 on the S3 sidecar `PutObject` (`If-None-Match: *` at creation), `onlyIf` on the
 R2 manifest, `ifMatch` on the Azure info blob's metadata, `ifGenerationMatch`
 on the GCS bookkeeping object (`0` at creation). A refused S3, GCS or Azure
 write re-reads, merges with the terminal flags one-way, and retries, failing
 after three refused attempts; a refused R2 write is answered with the winner's durable
 offset, as every stale writer is. The data writes that can collide are fenced
-too, and the completions that can be misattributed are recorded; both are
-described under "Security".
+too, and the completions that can be misattributed are recorded; the first
+under the section linked above, the second under
+[A completion publishes the right object, whole](#a-completion-publishes-the-right-object-whole).
 
 The Azure record grows by the accepted-block ledger and the completion seal
 fields, and the filesystem adapter keeps each fact in its own file under one
 directory per upload; neither changes a public type. A persisted S3
 sidecar field of the wrong shape (`length`, `partSize`, `invalidated`,
-`completed`, `metadata`) is damaged bookkeeping (see "Security") rather than
+`completed`, `metadata`) is damaged bookkeeping (see [Tokens and storage keys reach log sinks](#tokens-and-storage-keys-reach-log-sinks)) rather than
 read as absent and written back. Two changes are breaking for an upload in
 flight: the Azure block-id scheme, so **an Azure upload in flight across the
 upgrade reads as invalidated** and must restart, and the filesystem layout
-(see "Changed (breaking)"), so a 4.x filesystem upload in flight answers 404
+(see [Changed (breaking)](#changed-breaking)), so a 4.x filesystem upload in flight answers 404
 and must restart.
 
 `s3UploadStore` gains `sidecarCas` (default `true`). An S3-compatible backend
@@ -675,7 +803,7 @@ multipart commit conditional on the destination state the completion sealed. A
 canary probe fails the first completion on a backend that ignores the
 condition, with an error naming `publishCas: false`.
 
-### A size the backend did not report is never counted
+#### A size the backend did not report is never counted
 
 A backend reply that lacks a size, or carries one that is not a decimal count,
 now fails the call. `azureUploadStore` counted a block listed without a size as
@@ -695,7 +823,7 @@ deferred-length upload whose staged blocks were lost under a blob that lists no
 blocks is invalidated; it used to read as a completed empty upload, and a
 completion retry committed an empty blob over the one at the key.
 
-### Read side
+#### Read side
 
 - The served body is held to the committed `Content-Length`. A stream body
   that closes short of it, or produces bytes past it, errors the response (a
@@ -729,7 +857,7 @@ completion retry committed an empty blob over the one at the key.
   anyway, so a re-validated request was counted twice and a 502 reported a
   timing no response carried.
 
-### Node
+#### Node
 
 `partial-content/node` gains `toWebRequest`, `sendResponse` and `nodeHandler`,
 so the upload dialects run on `http.createServer` without a hand-written
@@ -771,13 +899,13 @@ resource other than the one the client named, and a client-chosen path is what
 `key()` and `resolveToken` read. It throws a `TypeError`, and `nodeHandler`
 answers it `400` and reports it to `onError`.
 
-### Packaging
+#### Packaging
 
 The `prepare` script is gone, so installing from the git repository no longer
 builds `dist/`. Install from the registry, or run `npm run build` after a git
 install.
 
-### Upload responses 4.0.0 sent that were never conformant
+#### Upload responses 4.0.0 sent that were never conformant
 
 Five upload-path corrections, prepared as a 4.0.1 patch that was never
 published. Four of them change a response 4.0.0 sent, and each of those four
@@ -820,7 +948,7 @@ behavior was depending on the server reporting something untrue.
   had moved past, could be reported as an interruption and answered with an
   offset the client could not resume from.
 
-### Changed (breaking)
+#### Changed (breaking)
 
 Each is walked, with before and after code, in `docs/UPGRADING.md`.
 
@@ -874,7 +1002,7 @@ Each is walked, with before and after code, in `docs/UPGRADING.md`.
   on its metadata; `generateETag` refuses a retired name only as an own property
   with its replacement absent.
 - **A multipart response is bounded at 8 ranges and 8 backend reads** (see
-  "Security"): a request with more than 8 coalesced ranges is answered with the
+  [the multi-range section](#a-multi-range-request-costs-a-bounded-number-of-backend-reads)): a request with more than 8 coalesced ranges is answered with the
   full `200` until `maxRanges` and `maxBackendReads` are raised, and an
   invalid `maxRanges` is a `TypeError` at construction.
 - **`lookupMime` returns no `js`, `mjs`, `css` or `wasm` type** unless called as
@@ -926,7 +1054,7 @@ Each is walked, with before and after code, in `docs/UPGRADING.md`.
 - **`CompleteUploadOptions.expectedLength` is required.** A custom store seals
   its completion at that length, refuses every later append, and refuses a
   mismatch by throwing `UploadOffsetConflictError` carrying the length it
-  holds (see "Security").
+  holds (see [A completion publishes the right object, whole](#a-completion-publishes-the-right-object-whole)).
 - **`UploadLock.lease` is required.** It is an `AbortSignal` that fires, with
   reason `UPLOAD_LEASE_LOST`, when the lock is lost. A 4.x custom locker has
   no `lease`, so every completion throws where the orchestrator tests
@@ -939,10 +1067,10 @@ Each is walked, with before and after code, in `docs/UPGRADING.md`.
   `"handler"`**; 4.0.0 sent `"handle"`.
 - **The Azure discard writes nothing at the key by default**
   (`discardStaged: "age-out"`). Abort and sweep leave staged blocks to Azure's
-  seven-day collection; `"commit-empty"` reclaims them at once (see
-  "Security" for its costs).
+  seven-day collection; `"commit-empty"` reclaims them at once (its costs are
+  under [Discard and reclaim lose no published object and retain no bytes](#discard-and-reclaim-lose-no-published-object-and-retain-no-bytes)).
 
-### Changed
+#### Changed
 
 - A future `Last-Modified` is clamped to the response time (RFC 9110 Section
   8.8.2.1) and a date with no zone is read as UTC. One entity-tag form is
@@ -960,7 +1088,7 @@ Each is walked, with before and after code, in `docs/UPGRADING.md`.
 - A store failure after the client aborted is answered `499` and not reported.
 - A `405`, `412` or `416` carries the deny headers every other refusal carries.
 
-### Added
+#### Added
 
 - `UploadPolicy.digestPolicy`: `"advisory"` (the default) ignores a
   `Repr-Digest` (RFC 9530) asserted only in algorithms the store cannot verify,
@@ -1043,7 +1171,7 @@ Each is walked, with before and after code, in `docs/UPGRADING.md`.
   tarball. `docs/API.md` carries regions generated from the source, checked by
   `npm run check:api-docs` before a publish.
 
-### Fixed
+#### Fixed
 
 - A probe of a complete upload re-delivers a completion hook delivery that
   failed. While the hook throws, the probe answers `500` (IETF) or `502` (tus)

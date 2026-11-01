@@ -22,7 +22,7 @@
  */
 import { readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { PKG_DIR, invokedDirectly } from "./script-entry.mjs";
 import ts from "typescript";
 
 /** The TSDoc block directly above `node`, as Markdown-ready text, or "". */
@@ -275,9 +275,8 @@ export function applyRegions(doc, bodies) {
     return { text, stale, problems };
 }
 
-const invokedDirectly = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
-if (invokedDirectly) {
-    const pkgDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+if (invokedDirectly(import.meta.url)) {
+    const pkgDir = PKG_DIR;
     const docPath = path.join(pkgDir, "docs", "API.md");
     const check = process.argv.includes("--check");
     const bodies = new Map(REGIONS.map((r) => [r.id, r.render(readFileSync(path.join(pkgDir, r.source), "utf8"))]));

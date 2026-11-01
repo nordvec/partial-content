@@ -16,7 +16,7 @@
 import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { PKG_DIR, invokedDirectly } from "./script-entry.mjs";
 import { releaseInstantOf } from "./release-date.mjs";
 
 /** Where the build writes the document, relative to the package root. */
@@ -134,9 +134,8 @@ export function buildSbom(pkg, changelog) {
     };
 }
 
-const invokedDirectly = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
-if (invokedDirectly) {
-    const pkgDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+if (invokedDirectly(import.meta.url)) {
+    const pkgDir = PKG_DIR;
     const pkg = JSON.parse(readFileSync(path.join(pkgDir, "package.json"), "utf8"));
     const sbom = buildSbom(pkg, readFileSync(path.join(pkgDir, "CHANGELOG.md"), "utf8"));
     writeFileSync(path.join(pkgDir, SBOM_PATH), `${JSON.stringify(sbom, null, 2)}\n`);
