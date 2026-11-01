@@ -6,11 +6,12 @@ name: release
 #
 # Three jobs, so the code that runs dependencies never shares a job with a
 # credential: `build` installs, tests, runs the prepublish guards and every
-# runtime smoke against the built `dist/`, and packs the tarball with read-only
-# permissions; `publish` holds only `id-token: write` and publishes that exact
-# tarball with no install and no scripts; `release` holds only
-# `contents: write` and creates the GitHub Release. Actions are pinned by
-# commit SHA and Bun by version.
+# runtime smoke against the built `dist/`, packs the tarball and renders the
+# release notes with read-only permissions; `publish` holds only
+# `id-token: write` and publishes that exact tarball with no install and no
+# scripts; `release` holds only `contents: write` and creates the GitHub
+# Release from the rendered notes, running no repository code. Actions are
+# pinned by commit SHA and Bun by version.
 on:
   push:
     tags: ["v*"]
@@ -72,6 +73,17 @@ jobs:
           path: package.tgz
           if-no-files-found: error
 
+      # The release body is the CHANGELOG's top entry with its links pinned to
+      # this tag. Rendered before anything publishes, so an entry the renderer
+      # refuses stops the release here.
+      - name: Render release notes
+        run: node scripts/release-notes.mjs > release-notes.md
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-notes
+          path: release-notes.md
+          if-no-files-found: error
+
   publish:
     needs: build
     runs-on: ubuntu-latest
@@ -100,8 +112,11 @@ jobs:
     permissions:
       contents: write # create the GitHub Release after a successful publish
     steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-notes
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-        run: gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes
+        run: gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file release-notes.md
