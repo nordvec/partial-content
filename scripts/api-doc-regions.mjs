@@ -222,23 +222,6 @@ export function renderChecks(checks) {
 /** Every region the document carries: its id, the source it reads, and how it renders. */
 export const REGIONS = [
     {
-        id: "write-store-methods",
-        source: "src/upload-store.ts",
-        render: (src) =>
-            renderMembers(extractInterfaceMembers(src, "ResumableWriteStore").filter((m) => m.kind === "method")),
-    },
-    {
-        id: "write-store-flags",
-        source: "src/upload-store.ts",
-        render: (src) =>
-            renderMembers(extractInterfaceMembers(src, "ResumableWriteStore").filter((m) => m.kind === "property")),
-    },
-    {
-        id: "write-store-checks",
-        source: "src/conformance.ts",
-        render: (src) => renderChecks(extractChecks(src, "checkResumableWriteStore")),
-    },
-    {
         id: "read-store-checks",
         source: "src/conformance.ts",
         render: (src) => renderChecks(extractChecks(src, "checkObjectStore")),

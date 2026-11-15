@@ -8,14 +8,7 @@
  */
 
 // ─── Range Requests (RFC 9110 Section 14) ───────────────────────────────────
-export {
-    parseRangeHeader,
-    parseContentRange,
-    buildRangeResponseHeaders,
-    build416Headers,
-    OPEN_ENDED,
-    isOpenEndedRange,
-} from "./kernel.ts";
+export { parseRangeHeader, parseContentRange, buildRangeResponseHeaders, build416Headers } from "./kernel.ts";
 
 // ─── Multiple Ranges (multipart/byteranges) ─────────────────────────────────
 export {
@@ -29,7 +22,8 @@ export {
 
 // ─── Header Safety ──────────────────────────────────────────────────────────
 export { sanitizeHeaderValue, isSha256Base64 } from "./kernel.ts";
-export { reservedKeyGuard, redactErrorText } from "./object-store.ts";
+export { reservedKeyGuard, representationCoding } from "./object-store.ts";
+export type { KeyPolicy, ReservedKeyGuardOptions } from "./object-store.ts";
 
 // ─── Conditional Requests (RFC 9110 Section 13) ─────────────────────────────
 export {
@@ -62,6 +56,7 @@ export { fromNodeHeaders } from "./kernel.ts";
 // ─── Types ──────────────────────────────────────────────────────────────────
 export type {
     ParsedRange,
+    ReadRange,
     ParsedContentRange,
     RangeResponseHeaderOpts,
     RangeResponseHeaders,

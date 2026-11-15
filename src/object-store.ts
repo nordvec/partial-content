@@ -7,7 +7,7 @@
  *
  * @packageDocumentation
  */
-import { parseContentRange, type ParsedRange } from "./kernel.ts";
+import { parseContentRange, parseRequestHttpSeconds, type ReadRange, utf8ByteLength } from "./kernel.ts";
 
 // ─── Error Types ────────────────────────────────────────────────────────────
 
@@ -41,32 +41,242 @@ export class ObjectNotFoundError extends Error {
 }
 
 /**
- * Refuse keys that name an upload store's bookkeeping rather than a published
- * object.
+ * Refuse keys that name a partial-content 5.x upload store's bookkeeping
+ * rather than a published object.
  *
- * A read store and an upload store are routinely pointed at the same root or
- * bucket, which is what lets a completed upload be served without copying it.
- * In that arrangement the upload store's own namespace is reachable through
- * the read path: the in-flight bytes of an upload nobody has published yet,
- * and the sidecar naming the key it is destined for, which commonly embeds a
- * filename. Upload tokens are the only handles meant to reach that namespace,
- * and a read handler holds no token.
+ * A location a 5.x upload store shared holds that store's namespace: the
+ * in-flight bytes of an upload nobody published, and the sidecar naming the
+ * key it was destined for, which commonly embeds a filename. Through a read
+ * store over the same location that namespace would be servable.
  *
- * Refusal is the default rather than an opt-in, because the shared arrangement
- * is the documented one and the safe posture has to be what a consumer gets
- * without knowing to ask for it. Pass `reservedPrefix: ""` to serve the whole
- * namespace when no upload store shares it. A store that cannot know which
- * upload store sits behind its location passes every default at once.
+ * Two independent policies are applied. The NAMESPACE policy refuses the
+ * reserved prefixes themselves; pass `reservedPrefix: ""` to serve the whole
+ * location when no upload store ever shared it. The KEY policy
+ * ({@link KeyPolicy}) decides whether a key that is not plain
+ * ({@link isPlainObjectKey}) is refused: it is needed wherever a URL path is
+ * built from the key, because a dot or empty segment can reach another object
+ * (the reserved namespace included) by a spelling the prefix test never sees,
+ * and it only breaks keys where the backend takes the key verbatim. Turning
+ * one off leaves the other in force.
+ *
+ * Refusal is the default rather than an opt-in, because the safe posture has
+ * to be what a consumer gets without knowing to ask for it.
+ *
+ * A prefix that no key can be spelled to match is refused at construction
+ * with a `TypeError`: a leading `/` (`"/.uploads/"`), a `.` or `..` segment
+ * (`"./.uploads"`) or an empty segment (`"a//b/"`). Such a prefix would
+ * silently reserve nothing, so it is a configuration error, not a no-op.
  */
-export function reservedKeyGuard(reservedPrefix: string | readonly string[]): (key: string) => void {
+export function reservedKeyGuard(
+    reservedPrefix: string | readonly string[],
+    opts: ReservedKeyGuardOptions = {},
+): (key: string) => void {
+    return keyGuard(reservedPrefix, opts, false);
+}
+
+/**
+ * The guard of a store that puts the key into a URL path (s3Store, azureStore,
+ * httpStore), where the path is resolved before the backend sees it. On top of
+ * {@link reservedKeyGuard}:
+ *
+ * - a `.` or `..` segment is refused whatever the {@link KeyPolicy}, in every
+ *   spelling {@link hasDotSegment} reads. No backend holds an object such a key
+ *   names, because the URL is resolved first, so there is no key the opt-out
+ *   could serve; `keys: "verbatim"` governs the empty segment, which is a real
+ *   object name on these backends, and nothing else;
+ * - the reserved prefixes are also tested against the key with `\` read as
+ *   `/` and its doubled slashes collapsed, since a URL parser or a backend
+ *   that merges them resolves `/.uploads/x`, `.uploads//x` and `.uploads\x`
+ *   into the workspace.
+ *
+ * Internal: not exported from the package root.
+ */
+export function urlKeyGuard(
+    reservedPrefix: string | readonly string[],
+    opts: ReservedKeyGuardOptions = {},
+): (key: string) => void {
+    return keyGuard(reservedPrefix, opts, true);
+}
+
+function keyGuard(
+    reservedPrefix: string | readonly string[],
+    opts: ReservedKeyGuardOptions,
+    urlBuilt: boolean,
+): (key: string) => void {
+    const { keys = "plain", foldCase = false, maxKeyBytes } = opts;
+    if (maxKeyBytes !== undefined && !(Number.isSafeInteger(maxKeyBytes) && maxKeyBytes > 0)) {
+        throw new TypeError("maxKeyBytes must be a positive integer");
+    }
+    const fold = foldCase ? foldKey : (value: string) => value;
     const prefixes = (typeof reservedPrefix === "string" ? [reservedPrefix] : reservedPrefix)
         .filter((p) => p !== "")
-        .map((p) => (p.endsWith("/") ? p : `${p}/`));
-    if (prefixes.length === 0) return () => {};
+        .map((p) => {
+            const stem = p.endsWith("/") ? p.slice(0, -1) : p;
+            if (!isPlainObjectKey(stem)) {
+                throw new TypeError(
+                    "reservedPrefix must be a plain key path (no leading '/', no '.' or '..' segment, no empty segment); this prefix would reserve nothing",
+                );
+            }
+            return fold(`${stem}/`);
+        });
     const bare = prefixes.map((p) => p.slice(0, -1));
     return (key: string): void => {
-        if (bare.includes(key) || prefixes.some((p) => key.startsWith(p))) throw new ObjectNotFoundError(key);
+        // First, so no later reading of the key costs more than the cap allows.
+        if (maxKeyBytes !== undefined && exceedsUtf8Bytes(key, maxKeyBytes)) throw new ObjectNotFoundError(key);
+        // A prefix test only holds for a key that names itself: one with a dot or empty segment can be
+        // resolved into the reserved namespace by whatever builds the request URL from it.
+        if (urlBuilt && hasDotSegment(key)) throw new ObjectNotFoundError(key);
+        if (keys === "plain" && !isPlainObjectKey(key)) throw new ObjectNotFoundError(key);
+        if (prefixes.length === 0) return;
+        const reserved = (spelled: string): boolean =>
+            bare.includes(spelled) || prefixes.some((p) => spelled.startsWith(p));
+        if (reserved(fold(key))) throw new ObjectNotFoundError(key);
+        // Collapsed in normal form NFKC, so a fullwidth `／` or `＼` counts as the separator it folds to.
+        if (
+            urlBuilt &&
+            reserved(
+                fold(
+                    key
+                        .normalize("NFKC")
+                        .replace(/[/\\]+/g, "/")
+                        .replace(/^\//, ""),
+                ),
+            )
+        )
+            throw new ObjectNotFoundError(key);
     };
+}
+
+/**
+ * A key folded the way a case-insensitive volume equates names: compatibility
+ * normalization (U+017F long s reads as `s`), lower case, and the dotless
+ * `ı` (U+0131), which has no case mapping to `i` but is matched to it by
+ * locale-aware volumes.
+ */
+function foldKey(value: string): string {
+    return value.normalize("NFKC").toLowerCase().replaceAll("ı", "i");
+}
+
+/**
+ * Whether a store refuses a key with an empty or dot segment.
+ *
+ * - `"plain"`: refuse it, as not found. The default wherever a URL path is
+ *   built from the key (an HTTP origin, Azure's blob URL, S3 over a
+ *   fetch-based handler), because the path is resolved before the backend
+ *   sees it.
+ * - `"verbatim"`: take every key as an opaque name. The default where the
+ *   backend receives the key without resolving it (the R2 binding, the GCS
+ *   client, which percent-encodes the whole object name), or where the key was
+ *   already resolved to a path and checked (the filesystem store).
+ *
+ * On a store that builds a URL path from the key (`s3Store`, `azureStore`,
+ * `httpStore`) a `.` or `..` segment is refused under either policy: a URL is
+ * resolved before the backend sees it, so no object is named by such a key and
+ * `"verbatim"` only lets the empty segment through (`reports//q1.pdf`, a real
+ * name on S3 and Azure). `httpStore`, which hands the raw key to a
+ * consumer-built URL, also refuses under either policy a key that would leave
+ * the URL's base (see `HttpStoreOptions.keys`).
+ */
+export type KeyPolicy = "plain" | "verbatim";
+
+/** Options for {@link reservedKeyGuard}. */
+export interface ReservedKeyGuardOptions {
+    /** @default "plain" */
+    keys?: KeyPolicy;
+    /**
+     * Compare the prefixes case-insensitively and in Unicode normal form NFKC.
+     * Case sensitivity is a property of the volume behind an origin, not of
+     * this runtime, so an origin over a case-insensitive volume answers
+     * `.UPLOADS/x` with the `.uploads/x` workspace. Folding refuses a key that
+     * differs from the prefix only by case, which is a refusal, never a
+     * disclosure.
+     * @default false
+     */
+    foldCase?: boolean;
+    /**
+     * Refuse, as not found, a key longer than this many UTF-8 bytes, before
+     * any other test reads it. Set it to the backend's own name limit (S3,
+     * R2, GCS and Azure stop at 1,024 bytes), so the refusal costs no object
+     * and the work spent on a key the requester chose stays bounded.
+     * @default no limit
+     */
+    maxKeyBytes?: number;
+}
+
+/**
+ * The name limit S3, R2, GCS and Azure Blob Storage share: an object name is
+ * at most 1,024 bytes of UTF-8, so a longer key names nothing there.
+ */
+export const BUCKET_KEY_MAX_BYTES = 1024;
+
+/** Whether `key` is longer than `max` bytes of UTF-8, without encoding a key that is far too long. */
+export function exceedsUtf8Bytes(key: string, max: number): boolean {
+    // A UTF-16 code unit is 1 to 3 bytes of UTF-8 (a surrogate pair is 4 for 2 units).
+    if (key.length > max) return true;
+    if (key.length * 3 <= max) return false;
+    return utf8ByteLength(key) > max;
+}
+
+/**
+ * A dot segment as the WHATWG URL Standard (section 4.1, "single-dot" and
+ * "double-dot URL path segment") reads one: `.` or `..`, with any dot spelled
+ * `%2e` in either case.
+ */
+const DOT_SEGMENT = /^(?:\.|%2e){1,2}$/i;
+/**
+ * Text as the URL parser reads it: the basic URL parser (WHATWG URL
+ * Standard, section 4.1) removes every ASCII tab and newline from its input
+ * before it splits the path, so `.\t.` is the `..` segment and `\t` is an
+ * empty one.
+ */
+export function asUrlParserReads(text: string): string {
+    return text.replace(/[\t\n\r]/g, "");
+}
+
+/**
+ * Whether `key` names an object as written, with no segment a URL or path
+ * resolver would rewrite: no empty segment (a leading, trailing or doubled
+ * `/`, which a merging origin collapses) and no `.` or `..` segment in any
+ * spelling. `\` counts as a separator, as it does in an `http:` or `https:`
+ * URL. A key that fails can reach a different object than the one a prefix
+ * check judged, so the reserved-namespace guard refuses it.
+ */
+export function isPlainObjectKey(key: string): boolean {
+    for (const segment of key.split(/[/\\]/)) {
+        const read = asUrlParserReads(segment);
+        if (read === "" || DOT_SEGMENT.test(read)) return false;
+    }
+    return true;
+}
+
+/**
+ * Whether any segment of `key` is a dot segment in a spelling a URL path is
+ * resolved from: `.` or `..` with any dot spelled `%2e`, the key read in
+ * Unicode normal form NFKC before it is split (a fullwidth full stop is a dot,
+ * a fullwidth solidus or reverse solidus a separator), with trailing spaces
+ * ignored, and `\` as a separator. A wider reading than
+ * {@link isPlainObjectKey}, because it decides an unconditional refusal.
+ */
+function hasDotSegment(key: string): boolean {
+    for (const segment of key.normalize("NFKC").split(/[/\\]/)) {
+        if (DOT_SEGMENT.test(withoutTrailingSpaces(asUrlParserReads(segment)))) return true;
+    }
+    return false;
+}
+
+function withoutTrailingSpaces(text: string): string {
+    return withoutTrailing(text, " ");
+}
+
+/**
+ * `text` without its trailing run of the characters in `chars`, in one pass
+ * from the end. A `/[. ]+$/` replace is retried from every character of an
+ * interior run, which is quadratic in a key the requester chooses.
+ */
+export function withoutTrailing(text: string, chars: string): string {
+    let end = text.length;
+    while (end > 0 && chars.includes(text.charAt(end - 1))) end--;
+    return end === text.length ? text : text.slice(0, end);
 }
 
 /**
@@ -116,7 +326,7 @@ export class StoreUnavailableError extends Error {
     /**
      * Suggested back-off in whole seconds, echoed as `Retry-After`. Normalized at
      * construction: a non-negative finite hint is floored to an integer (a
-     * fractional `2.9` -> `2`), and a NaN/negative/infinite/out-of-safe-range hint
+     * fractional `2.9` -> `2`) and capped at one day, and a NaN/negative/infinite hint
      * (from a hostile backend header or a buggy third-party classifier) is dropped
      * entirely. So every consumer -- the web adapter AND anyone reading
      * `.retryAfterSeconds` directly off the frozen contract -- sees a clean
@@ -136,71 +346,101 @@ export class StoreUnavailableError extends Error {
 }
 
 /**
- * Name-based matchers for the read-side store errors, mirroring the write
- * side's. `instanceof` is unreliable across package boundaries: a consumer
+ * Name-based matchers for the store errors. `instanceof` is unreliable across package boundaries: a consumer
  * with two copies of this package in its tree, or a store built against a
  * different install, throws an error that is structurally right and fails the
  * check. The name is the stable identity.
  */
 export function isObjectNotFoundError(err: unknown): err is ObjectNotFoundError {
-    return err instanceof Error && err.name === "ObjectNotFoundError";
+    return isErrorNamed(err, "ObjectNotFoundError");
 }
 export function isObjectChangedError(err: unknown): err is ObjectChangedError {
-    return err instanceof Error && err.name === "ObjectChangedError";
-}
-/**
- * Replace a sensitive identifier with a safe substitute everywhere it appears
- * in an error: the message, the stack, every own property whose value is a
- * string or nests one (an errno `path` or `dest`, a store error's `key`, a
- * backend client's request descriptor), and the `cause` chain.
- *
- * `auditKey` promises an identifier never reaches a log surface, and the
- * error object is delivered to the same sink as the redacted context. The
- * package's own error classes name the storage key in their message AND keep
- * it as an own property, an errno error names the resolved path on `path`
- * and a rename's on `dest`, and a classified backend failure carries the raw
- * backend error as `cause`; rewriting the message alone leaves the identifier
- * one property away.
- *
- * A needle is searched for in every spelling a store can produce, not only the
- * one the caller passed. A key is separated by forward slashes because that is
- * how a consumer spells it, but a filesystem adapter resolves it through the
- * platform path module before naming it in an error, so on a backslash
- * platform the errno `path` and `dest` carry the same key under a separator
- * the literal search would walk straight past.
- *
- * The walk descends into arrays and plain objects, because a backend client's
- * error commonly holds the failing request under a nested own property and the
- * whole error reaches the sink; anything with a prototype of its own is left
- * untouched, since cloning it would not survive as the thing it is. The clone
- * keeps the prototype and every own property descriptor, so `instanceof`,
- * `code` and `status` survive; a redacted `cause` is itself a clone of the
- * same shape. A value carrying none of the needles is returned by identity,
- * so the common path allocates nothing and an untouched branch is shared
- * rather than copied. One depth bound covers the cause chain and the nested
- * walk together, and a cycle terminates at it.
- *
- * Absent and empty needles are skipped rather than searched for: a search for
- * whatever `undefined` stringifies to would substitute into unrelated text.
- */
-export function redactErrorText(err: unknown, needles: readonly (string | undefined)[], replacement: string): unknown {
-    const active = needles.filter((n): n is string => typeof n === "string" && n.length > 0);
-    if (active.length === 0) return err;
-    const spellings = new Set<string>();
-    for (const n of active) {
-        spellings.add(n);
-        if (n.includes("/")) spellings.add(n.replaceAll("/", "\\"));
-    }
-    return redactDepth(err, [...spellings], replacement, 0);
+    return isErrorNamed(err, "ObjectChangedError");
 }
 
+/**
+ * `value instanceof Kind`, or `false` when the test throws: it runs a Proxy's
+ * `getPrototypeOf` trap or a class's own `Symbol.hasInstance`, and a caught
+ * value is arbitrary.
+ */
+export function isInstance<T>(value: unknown, Kind: abstract new (...args: never[]) => T): value is T {
+    try {
+        return value instanceof Kind;
+    } catch {
+        // Unreadable, so not an instance any classifier here recognises.
+        return false;
+    }
+}
+
+/**
+ * Whether `err` is an `Error` with this `name`. Total: a thrown value is
+ * arbitrary (a Proxy, an object with a throwing getter), and a classifier that
+ * throws replaces the failure it was asked to classify.
+ */
+export function isErrorNamed(err: unknown, name: string): boolean {
+    try {
+        return err instanceof Error && err.name === name;
+    } catch {
+        // Unreadable, so not an error any classifier here recognises.
+        return false;
+    }
+}
+
+/**
+ * One property of a thrown value, or `undefined` when reading it throws. A
+ * throwing getter or a Proxy trap carries its own error, whose message is free
+ * text; the projection must stay total so that text never escapes it.
+ */
+export function readField(obj: object, field: string): unknown {
+    try {
+        return (obj as Record<string, unknown>)[field];
+    } catch {
+        // The read's own error is dropped on purpose: its text is what the projection withholds.
+        return undefined;
+    }
+}
+
+/** A {@link ReadRange} as a `Range` request field: `bytes=a-b`, or the open `bytes=a-` when it has no end. */
+export function rangeHeaderValue(range: ReadRange): string {
+    return `bytes=${range.start}-${range.end ?? ""}`;
+}
+
+/**
+ * The value at `path` under a thrown value (`readPath(err, "$metadata",
+ * "httpStatusCode")`), or `undefined` when any step is not an object or its
+ * read throws. How a classifier reads an SDK error: the error is arbitrary.
+ */
+export function readPath(value: unknown, ...path: string[]): unknown {
+    let at = value;
+    for (const field of path) {
+        if ((typeof at !== "object" && typeof at !== "function") || at === null) return undefined;
+        at = readField(at, field);
+    }
+    return at;
+}
+
+/** An integer HTTP status code, 100 to 599. */
+function isHttpStatus(value: unknown): value is number {
+    return typeof value === "number" && Number.isInteger(value) && value >= 100 && value <= 599;
+}
+
+/**
+ * The shape of an error class name or code (`AbortError`, `ECONNREFUSED`,
+ * `ERR_SOCKET_TIMEOUT`): a string of any other shape is free text and is not
+ * projected.
+ */
+const IDENTIFIER = /^[A-Za-z][A-Za-z0-9_]{0,63}$/;
+
+/** How deep a cause chain is followed before {@link projectError} stops. */
 const REDACT_CAUSE_DEPTH = 8;
 
 /**
  * The allow-listed form of an error bound for a sink that must not see the
- * storage key. Only fields that name a failure class pass: a string `name`, a
- * string or numeric `code`, a numeric `status`, the failed `operation`, and
- * the `cause` projected the same way. The message, the stack and every other
+ * storage key. Only fields that name a failure class pass: an
+ * identifier-shaped `name` (otherwise `"Error"`), an identifier-shaped or
+ * finite numeric `code`, an integer `status` from 100 to 599, the
+ * failed `operation`, and the `cause` projected the same way. A field whose
+ * read throws is left out. The message, the stack and every other
  * property stay behind, because the key can sit in any of them in any
  * spelling (a percent-encoded request path, a resolved filesystem path).
  */
@@ -214,132 +454,106 @@ export interface ProjectedError {
 
 /**
  * Project `err` to a {@link ProjectedError}. A thrown non-object projects to
- * its `typeof`; a cause chain (a cycle included) stops at the redaction depth
- * bound.
+ * its `typeof`; a cause chain (a cycle included) stops at a fixed depth.
  */
 export function projectError(err: unknown, operation?: string, depth = 0): ProjectedError {
     const out: ProjectedError = { name: typeof err };
     if (typeof err === "object" && err !== null) {
-        const { name, code, status, cause } = err as Record<string, unknown>;
-        out.name = typeof name === "string" ? name : "Error";
-        if (typeof code === "string" || typeof code === "number") out.code = code;
-        if (typeof status === "number") out.status = status;
+        const name = readField(err, "name");
+        const code = readField(err, "code");
+        const status = readField(err, "status");
+        const cause = readField(err, "cause");
+        out.name = typeof name === "string" && IDENTIFIER.test(name) ? name : "Error";
+        if (
+            (typeof code === "string" && IDENTIFIER.test(code)) ||
+            (typeof code === "number" && Number.isFinite(code))
+        ) {
+            out.code = code;
+        }
+        if (isHttpStatus(status)) out.status = status;
         if (cause !== undefined && depth < REDACT_CAUSE_DEPTH) out.cause = projectError(cause, undefined, depth + 1);
     }
     if (operation !== undefined) out.operation = operation;
     return out;
 }
 
-/**
- * Redact one value of any shape, returning it by identity when nothing in it
- * carries a needle so an untouched branch is never copied.
- *
- * Only a string is rewritten. An array or a plain object is descended into and
- * rebuilt when a leaf below it changed; an object with a prototype of its own
- * is returned untouched, because a clone of it would be a plain object wearing
- * the same properties and no longer the thing the consumer expects to receive.
- * An `Error` hands back to {@link redactDepth} so a nested error is redacted as
- * an error rather than as a bag of properties.
- */
-function redactValue(value: unknown, needles: readonly string[], replacement: string, depth: number): unknown {
-    if (typeof value === "string") {
-        if (!needles.some((n) => value.includes(n))) return value;
-        return needles.reduce((acc, n) => acc.replaceAll(n, replacement), value);
-    }
-    if (value === null || typeof value !== "object" || depth > REDACT_CAUSE_DEPTH) return value;
-    if (value instanceof Error) return redactDepth(value, needles, replacement, depth);
-    if (Array.isArray(value)) {
-        let touched = false;
-        const next = value.map((entry) => {
-            const redacted = redactValue(entry, needles, replacement, depth + 1);
-            if (redacted !== entry) touched = true;
-            return redacted;
-        });
-        return touched ? next : value;
-    }
-    const proto: unknown = Object.getPrototypeOf(value);
-    if (proto !== Object.prototype && proto !== null) return value;
-    let touched = false;
-    const next: Record<string, unknown> = {};
-    for (const [name, entry] of Object.entries(value as Record<string, unknown>)) {
-        const redacted = redactValue(entry, needles, replacement, depth + 1);
-        if (redacted !== entry) touched = true;
-        next[name] = redacted;
-    }
-    return touched ? next : value;
-}
-
-function redactDepth(err: unknown, needles: readonly string[], replacement: string, depth: number): unknown {
-    if (!(err instanceof Error) || depth > REDACT_CAUSE_DEPTH) return err;
-    const descriptors: Record<string, PropertyDescriptor> = Object.getOwnPropertyDescriptors(err);
-    let touched = false;
-    for (const [name, d] of Object.entries(descriptors)) {
-        // `cause` has its own walk below, which reads it off the instance so an
-        // accessor-defined cause is covered too; redacting it here as well would
-        // build one clone and then discard it for another.
-        if (name === "cause" || !("value" in d)) continue;
-        const redacted = redactValue(d.value, needles, replacement, depth + 1);
-        if (redacted !== d.value) {
-            descriptors[name] = { ...d, value: redacted };
-            touched = true;
-        }
-    }
-    // `message` and `stack` are own properties on every engine this package
-    // runs on, but a subclass may define either as an accessor on its
-    // prototype, and `cause` may be one too; all three are read through the
-    // instance so each is covered. Only a string message or stack is rewritten.
-    for (const name of ["message", "stack", "cause"] as const) {
-        if (name !== "cause" && name in descriptors) continue;
-        const value: unknown = err[name];
-        const redacted =
-            name === "cause"
-                ? redactDepth(value, needles, replacement, depth + 1)
-                : typeof value === "string"
-                  ? redactValue(value, needles, replacement, depth + 1)
-                  : value;
-        if (redacted !== value) {
-            descriptors[name] = { value: redacted, writable: true, enumerable: false, configurable: true };
-            touched = true;
-        }
-    }
-    if (!touched) return err;
-    return Object.create(Object.getPrototypeOf(err) as object, descriptors) as Error;
-}
-
 export function isStoreUnavailableError(err: unknown): err is StoreUnavailableError {
-    return err instanceof Error && err.name === "StoreUnavailableError";
+    return isErrorNamed(err, "StoreUnavailableError");
 }
+
+/**
+ * The longest back-off this package relays, in seconds (one day). A longer
+ * hint is a malformed or hostile one, and relaying it would park a client's
+ * retry for as long as the number says.
+ */
+const MAX_RETRY_AFTER_SECONDS = 86_400;
 
 /**
  * Normalize a `Retry-After` value to whole non-negative seconds, or `undefined`.
  *
  * The single sanctioned parser shared by every adapter and the web layer.
- * Accepts the delay-seconds form (a number, or a numeric string) and -- when
- * `allowHttpDate` is set -- the HTTP-date form (RFC 9110 Section 10.2.3) as a
- * non-negative delta from now. Everything else yields `undefined`: NaN,
- * Infinity, negatives, and any value whose floor exceeds `Number.MAX_SAFE_INTEGER`
- * (so a huge finite hint can never serialize as `1e+21`, which violates the
- * `delay-seconds = DIGIT+` grammar), plus non-numeric text. A hostile header or
- * a buggy third-party classifier therefore can never emit a malformed header.
+ * Accepts the delay-seconds form (a number, or a string of digits) and -- when
+ * `allowHttpDate` is set -- an HTTP-date in one of the three RFC 9110 Section
+ * 5.6.7 forms, as a non-negative delta from now. Everything else yields
+ * `undefined`: NaN, Infinity, negatives, and any text outside those two
+ * grammars (`1.5`, `+7`, a partial date), which is never read as "retry now".
+ * A delay longer than one day is capped at one day. A hostile header or a
+ * buggy third-party classifier therefore can never emit a malformed or
+ * unbounded header.
  */
 export function parseRetryAfterSeconds(raw: unknown, opts?: { allowHttpDate?: boolean }): number | undefined {
     if (typeof raw === "number") {
         if (!Number.isFinite(raw) || raw < 0) return undefined;
-        const floored = Math.floor(raw);
-        return Number.isSafeInteger(floored) ? floored : undefined;
+        return Math.min(Math.floor(raw), MAX_RETRY_AFTER_SECONDS);
     }
     if (typeof raw !== "string") return undefined;
     const trimmed = raw.trim();
-    if (/^\d+$/.test(trimmed)) {
-        const n = Number(trimmed);
-        return Number.isSafeInteger(n) ? n : undefined;
-    }
+    if (/^\d+$/.test(trimmed)) return Math.min(Number(trimmed), MAX_RETRY_AFTER_SECONDS);
     if (opts?.allowHttpDate) {
-        const when = Date.parse(trimmed);
+        const when = parseRequestHttpSeconds(trimmed);
         if (Number.isNaN(when)) return undefined;
-        return Math.max(0, Math.round((when - Date.now()) / 1000));
+        return Math.min(Math.max(0, Math.round((when - Date.now()) / 1000)), MAX_RETRY_AFTER_SECONDS);
     }
     return undefined;
+}
+
+/**
+ * The advised back-off in an SDK error's response headers, as whole seconds.
+ *
+ * The classifiers run on arbitrary error shapes, so the access is structural
+ * and total: `headers` may be a `Headers`-like object with a `get` method or a
+ * plain record, and a missing header, a non-function `get`, or a getter that
+ * throws all yield `undefined`. A throw here would replace the throttle the
+ * classifier is deciding and turn a 429 or 503 into a 502.
+ */
+export function retryAfterFrom(headers: unknown): number | undefined {
+    if (typeof headers !== "object" || headers === null) return undefined;
+    try {
+        const get = (headers as { get?: unknown }).get;
+        const raw =
+            typeof get === "function"
+                ? (get as (name: string) => unknown).call(headers, "retry-after")
+                : (headers as Record<string, unknown>)["retry-after"];
+        return parseRetryAfterSeconds(raw, { allowHttpDate: true });
+    } catch {
+        // A hostile or buggy header bag must not replace the throttle verdict.
+        return undefined;
+    }
+}
+
+/**
+ * End a read that cannot be served: release whatever the backend left open,
+ * then throw `err`. A release that throws or rejects never masks `err`, which
+ * is the failure the caller needs to classify.
+ */
+export function failRead(release: () => unknown, err: unknown): never {
+    try {
+        const released = release();
+        if (released instanceof Promise) released.catch(() => undefined);
+    } catch {
+        // Best effort: the read's own failure is what surfaces.
+    }
+    throw err;
 }
 
 // ─── Error Classification ─────────────────────────────────────────────────────
@@ -397,9 +611,19 @@ export async function classifyStoreRead<T>(
     try {
         return await op();
     } catch (err) {
-        if (classifiers.notFound(err)) throw new ObjectNotFoundError(key, err);
-        if (classifiers.changed?.(err)) throw new ObjectChangedError(key, err);
-        const throttled = classifiers.throttled(err);
+        // Each classifier runs on an arbitrary thrown value; one that throws on it
+        // answers "not this class", so its own error never replaces the failure.
+        const classified = <R>(classify: ((e: unknown) => R) | undefined): R | false => {
+            try {
+                return classify ? classify(err) : false;
+            } catch {
+                // Unreadable to this classifier.
+                return false;
+            }
+        };
+        if (classified(classifiers.notFound)) throw new ObjectNotFoundError(key, err);
+        if (classified(classifiers.changed)) throw new ObjectChangedError(key, err);
+        const throttled = classified(classifiers.throttled);
         if (throttled) {
             throw new StoreUnavailableError(key, {
                 cause: err,
@@ -434,10 +658,18 @@ export interface HeadObjectOptions {
  * `conditions.ifMatch`, GCS etag + generation pinning), making the HEAD->GET
  * pair atomic: either the exact validated bytes are streamed, or the adapter
  * throws {@link ObjectChangedError}.
+ *
+ * A store that reports `etag` or `lastModified` from `headObject` either
+ * enforces `ifMatch` (and says so with {@link ObjectStore.pinsReads}) or
+ * reports the same validator from `getObject`, which is what the read is
+ * compared against when it cannot be pinned.
  */
 export interface GetObjectOptions {
-    /** Validated byte range to stream. Omit for full content. */
-    range?: ParsedRange;
+    /**
+     * Validated byte range to stream. Omit for full content. `end` is
+     * `undefined` for a read to the end of the object ({@link ReadRange}).
+     */
+    range?: ReadRange;
     /**
      * Cancel signal. Cancels the backend stream when the client disconnects,
      * preventing orphaned TCP connections.
@@ -516,10 +748,9 @@ export function nodeStreamToWeb(
     // signal across many getObject calls would otherwise accumulate one
     // listener (and one retained stream reference) per completed transfer
     // until the signal is aborted or GC'd.
-    const abortListener = signal && destroy ? destroy : undefined;
-    if (signal && abortListener) signal.addEventListener("abort", abortListener);
+    if (signal && destroy) signal.addEventListener("abort", destroy);
     const detach = () => {
-        if (signal && abortListener) signal.removeEventListener?.("abort", abortListener);
+        if (signal && destroy) signal.removeEventListener?.("abort", destroy);
     };
 
     const iterator = iterable[Symbol.asyncIterator]();
@@ -760,7 +991,87 @@ export interface ObjectMetadata {
      * `storedContentType`.
      */
     contentType?: string;
+    /**
+     * The content coding the stored bytes are in (`gzip`, `br`, ...), when the
+     * object was stored already encoded; omit it for identity bytes.
+     *
+     * The coding is representation metadata: `contentLength`, the ETag, the
+     * digest and every byte range describe the ENCODED bytes (RFC 9110
+     * Section 14.2), and the response carries `Content-Encoding` so the
+     * client decodes them. A store whose backend or client library decodes
+     * transparently MUST either turn that off so the bytes match
+     * `contentLength`, or refuse the object; serving decoded bytes under the
+     * encoded length is the corruption this field exists to prevent. Pass the
+     * raw stored value through {@link representationCoding}.
+     */
+    contentEncoding?: string;
 }
+
+/**
+ * Normalize a stored `Content-Encoding` value for {@link ObjectMetadata.contentEncoding}.
+ *
+ * - A coding in the IANA HTTP Content Coding Registry (`gzip`, `deflate`, `br`,
+ *   `zstd`, `compress`, `aes128gcm`, `dcb`, `dcz`, `exi`, `pack200-gzip`;
+ *   `x-gzip` and `x-compress` are spelled as their registered names) is
+ *   returned lower-cased, as a comma list when the object was coded more than
+ *   once. The store does not decode, so a registered coding it cannot itself
+ *   decode is still served under its own name.
+ * - `identity`, `none`, the upload-transfer marker `aws-chunked`, the MIME
+ *   transfer-encoding names (`base64`, `binary`, `7bit`, `8bit`,
+ *   `quoted-printable`) and anything that is plainly not a coding (a charset
+ *   name, a media type, a value with whitespace, `;`, `=` or `/`) are
+ *   identity: the value is `undefined`. Uploaders and legacy tooling store
+ *   such values, and an object that 5.x served as identity bytes stays
+ *   servable.
+ * - Any other token throws a `TypeError`: serving bytes under a coding the
+ *   client may not know is the corruption {@link ObjectMetadata.contentEncoding}
+ *   exists to prevent, so a corrupt or unregistered stored value is a loud failure.
+ */
+export function representationCoding(stored: string | null | undefined): string | undefined {
+    const codings: string[] = [];
+    for (const member of (stored ?? "").split(",")) {
+        const token = member.trim().toLowerCase();
+        if (token === "" || IDENTITY_CODING.has(token) || NOT_A_CODING.test(token)) continue;
+        const registered = REGISTERED_CODINGS[token];
+        if (registered === undefined) throw new TypeError("stored content coding is not a registered coding");
+        codings.push(registered);
+    }
+    return codings.length === 0 ? undefined : codings.join(", ");
+}
+
+const REGISTERED_CODINGS: Readonly<Record<string, string | undefined>> = Object.assign(Object.create(null), {
+    gzip: "gzip",
+    "x-gzip": "gzip",
+    deflate: "deflate",
+    br: "br",
+    zstd: "zstd",
+    compress: "compress",
+    "x-compress": "compress",
+    // Registered in the IANA HTTP Content Coding Registry: a client that knows
+    // the coding decodes it, so the bytes are served under their own name.
+    aes128gcm: "aes128gcm",
+    dcb: "dcb",
+    dcz: "dcz",
+    exi: "exi",
+    "pack200-gzip": "pack200-gzip",
+});
+/**
+ * `identity`, the upload-transfer marker `aws-chunked`, `none`, and the MIME
+ * Content-Transfer-Encoding names some uploaders write into this field: none
+ * of them is a content coding, and each means the stored bytes are unencoded.
+ */
+const IDENTITY_CODING: ReadonlySet<string> = new Set([
+    "identity",
+    "aws-chunked",
+    "none",
+    "base64",
+    "binary",
+    "7bit",
+    "8bit",
+    "quoted-printable",
+]);
+/** A charset name, or a value no coding token can be: whitespace, `;`, `=` or `/` inside it. */
+const NOT_A_CODING = /[\s;=/]|^(?:utf-?\d+|us-ascii|ascii|iso-8859-\d+|windows-\d+|latin-?1)$/;
 
 // ─── Stream Result ──────────────────────────────────────────────────────────
 
@@ -769,13 +1080,13 @@ export interface ObjectMetadata {
  * (`bytes start-end/total` without the total: {@link ObjectStream.totalSize}
  * carries it, or is `undefined` when the backend reported `bytes a-b/*`).
  *
- * SERVED is the operative word: the orchestrator validates bounds, byte
- * counts, and representation identity, but deliberately relays whatever
- * span the backend answered (an authoritative backend clamping past-EOF
- * ends is normal). An origin that answers a SHIFTED span therefore yields
- * a truthful-but-unrequested 206; clients detect it via `Content-Range`,
- * and custom orchestrators comparing against the requested range should
- * check `range.start`.
+ * SERVED is the operative word. An `authoritativeRange` store resolves the
+ * range itself (it clamps past-EOF ends, and answers an open range), so the
+ * orchestrator relays the span it answered after validating bounds, byte
+ * counts and representation identity. Any other store was asked for a range
+ * already resolved against a HEAD, and a served span that differs from it is
+ * an incoherent store (a shifted label, or an object that changed): the read
+ * is refused as a 502 rather than relabelled.
  */
 export interface ServedRange {
     /** First byte position served (0-based, inclusive). */
@@ -895,6 +1206,13 @@ export interface ObjectStream {
      * S3: map from `x-amz-checksum-sha256` on GetObject response.
      */
     digest?: string;
+    /**
+     * The content coding the stored bytes are in (`gzip`, `br`, ...), when the
+     * object was stored already encoded. Same meaning as
+     * {@link ObjectMetadata.contentEncoding}; read it from the GET so it
+     * describes the bytes the body carries.
+     */
+    contentEncoding?: string;
 }
 
 // ─── Store Contract ─────────────────────────────────────────────────────────
@@ -930,13 +1248,13 @@ export interface ObjectStore {
      * @param key - Object key within the bucket.
      * @param opts - Cancellation ({@link HeadObjectOptions}).
      */
-    headObject(key: string, opts?: HeadObjectOptions): Promise<ObjectMetadata>;
+    headObject: (key: string, opts?: HeadObjectOptions) => Promise<ObjectMetadata>;
 
     /**
      * Stream an object, optionally a byte range.
      *
-     * The adapter receives a `ParsedRange` in `opts.range` and formats it for
-     * the backend (e.g. `bytes=${start}-${end}`). `range.end` may exceed the
+     * The adapter receives a {@link ReadRange} in `opts.range` and formats it
+     * for the backend ({@link rangeHeaderValue} for a `Range` field). `range.end` may exceed the
      * object size (RFC 9110 lets servers clamp a last-byte-pos past EOF, and
      * the fast range path uses an open end deliberately); adapters clamp it
      * and report the bounds ACTUALLY served. `range.start` beyond EOF is the
@@ -948,10 +1266,25 @@ export interface ObjectStore {
      * @param key - Object key within the bucket.
      * @param opts - Range, cancellation, and pinning
      *   ({@link GetObjectOptions}). Stores that cannot pin reads may ignore
-     *   `ifMatch`; the web adapter keeps a response-side guard (actual
-     *   Content-Range + GET validators) for that case.
+     *   `ifMatch`, provided the read reports the validators the HEAD did; the
+     *   web adapter keeps a response-side guard (actual Content-Range + GET
+     *   validators) for that case.
      */
-    getObject(key: string, opts?: GetObjectOptions): Promise<ObjectStream>;
+    getObject: (key: string, opts?: GetObjectOptions) => Promise<ObjectStream>;
+
+    /**
+     * Capability flag: `getObject` enforces `ifMatch` (and the `pin` it issued)
+     * itself and throws {@link ObjectChangedError} when the object no longer
+     * matches. Set it `true` only for a store that does: the web adapter then
+     * treats a pinned read as the HEAD's representation without comparing GET
+     * validators, and emits the HEAD's validators and digest over it. A store
+     * that ignores `ifMatch` leaves it unset, and a read with no validator of
+     * its own to compare is served without the HEAD's ETag and digest.
+     * `checkObjectStore` probes it.
+     *
+     * @default false
+     */
+    readonly pinsReads?: boolean;
 
     /**
      * Capability flag. When `false`, the framework adapter degrades gracefully

@@ -25,6 +25,8 @@
 import { serveObject as serveObjectWeb, type ServeObjectOptions, type ServeContext } from "./web.ts";
 import type { ObjectStore } from "./index.ts";
 import { projectError } from "./object-store.ts";
+import { plainTextErrorParts } from "./error-response.ts";
+import { guardSink, UNKEYED_AUDIT_KEY } from "./hooks.ts";
 
 // Re-export for convenience
 export type { ServeObjectOptions, ServeContext } from "./web.ts";
@@ -83,7 +85,9 @@ export interface HonoServeOptions extends ServeObjectOptions {
      * Extract an audit-safe identifier reported as `key` in every
      * `onServe`/`onTransfer`/`onError` event instead of the storage key
      * (which commonly embeds a filename -- personal data that must stay out
-     * of log records). The store still reads by the real key.
+     * of log records). The store still reads by the real key. When the
+     * extractor returns `undefined` the events carry the constant `"unkeyed"`,
+     * never the storage key.
      */
     auditKey?: (c: HonoContext) => string | undefined;
 }
@@ -115,6 +119,9 @@ export interface HonoServeOptions extends ServeObjectOptions {
 export function serveObject(store: ObjectStore, opts: HonoServeOptions): (c: HonoContext) => HonoResponse {
     const { key: keyFn, mime: mimeFn, filename: filenameFn, auditKey: auditKeyFn, ...serveOpts } = opts;
     const handler = serveObjectWeb(store, serveOpts);
+    // The adapter reports a failing extractor itself, so its sink is guarded
+    // here the same way the handler guards its own.
+    const onError = guardSink(serveOpts.onError);
 
     return async function honoHandler(c: HonoContext): Promise<Response> {
         let ctx: ServeContext;
@@ -123,7 +130,10 @@ export function serveObject(store: ObjectStore, opts: HonoServeOptions): (c: Hon
                 key: await keyFn(c),
                 mime: mimeFn?.(c),
                 filename: filenameFn?.(c),
-                auditKey: auditKeyFn?.(c),
+                // A configured extractor that yields nothing still keys the
+                // request: falling back to the storage key would put a filename
+                // into the audit trail the extractor exists to keep it out of.
+                auditKey: auditKeyFn ? (auditKeyFn(c) ?? UNKEYED_AUDIT_KEY) : undefined,
             };
         } catch (err) {
             // A throwing extractor is consumer code failing: surface it to the
@@ -132,16 +142,9 @@ export function serveObject(store: ObjectStore, opts: HonoServeOptions): (c: Hon
             // `onError` reports the `context` operation on every adapter, so a
             // consumer's telemetry does not depend on which one they mounted.
             // Under an auditKey it is the projection: the raw error may name the key.
-            serveOpts.onError?.(auditKeyFn ? projectError(err, "context") : err, { key: "", operation: "context" });
-            return new Response("Internal Server Error", {
-                status: 500,
-                headers: {
-                    "Content-Type": "text/plain; charset=utf-8",
-                    "Content-Security-Policy": "default-src 'none'",
-                    "X-Content-Type-Options": "nosniff",
-                    "Cache-Control": "no-store",
-                },
-            });
+            onError?.(auditKeyFn ? projectError(err, "context") : err, { key: "", operation: "context" });
+            const { bytes, headers } = plainTextErrorParts("Internal Server Error");
+            return new Response(bytes, { status: 500, headers });
         }
 
         return handler(c.req.raw, ctx);

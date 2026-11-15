@@ -2,7 +2,7 @@
   {
     "name": "kernel (.)",
     "path": "dist/index.js",
-    "limit": "7.25 kB",
+    "limit": "7.5 kB",
     "ignore": [
       "node:fs",
       "node:fs/promises",
@@ -18,7 +18,7 @@
   {
     "name": "/web",
     "path": "dist/web.js",
-    "limit": "9.65 kB",
+    "limit": "11.5 kB",
     "ignore": [
       "node:fs",
       "node:fs/promises",
@@ -34,7 +34,7 @@
   {
     "name": "/node",
     "path": "dist/node.js",
-    "limit": "11.5 kB",
+    "limit": "12 kB",
     "ignore": [
       "node:fs",
       "node:fs/promises",
@@ -50,7 +50,7 @@
   {
     "name": "/hono",
     "path": "dist/hono.js",
-    "limit": "9.7 kB",
+    "limit": "11.5 kB",
     "ignore": [
       "node:fs",
       "node:fs/promises",
@@ -66,7 +66,7 @@
   {
     "name": "/s3",
     "path": "dist/s3.js",
-    "limit": "9.4 kB",
+    "limit": "4.5 kB",
     "ignore": [
       "node:fs",
       "node:fs/promises",
@@ -82,7 +82,7 @@
   {
     "name": "/r2",
     "path": "dist/r2.js",
-    "limit": "4.75 kB",
+    "limit": "2 kB",
     "ignore": [
       "node:fs",
       "node:fs/promises",
@@ -98,7 +98,7 @@
   {
     "name": "/gcs",
     "path": "dist/gcs.js",
-    "limit": "6.7 kB",
+    "limit": "4.25 kB",
     "ignore": [
       "node:fs",
       "node:fs/promises",
@@ -114,7 +114,7 @@
   {
     "name": "/azure",
     "path": "dist/azure.js",
-    "limit": "7.7 kB",
+    "limit": "4.25 kB",
     "ignore": [
       "node:fs",
       "node:fs/promises",
@@ -130,7 +130,7 @@
   {
     "name": "/fs",
     "path": "dist/fs.js",
-    "limit": "6.75 kB",
+    "limit": "3.25 kB",
     "ignore": [
       "node:fs",
       "node:fs/promises",
@@ -146,7 +146,7 @@
   {
     "name": "/http",
     "path": "dist/http.js",
-    "limit": "2.25 kB",
+    "limit": "4.75 kB",
     "ignore": [
       "node:fs",
       "node:fs/promises",
@@ -162,7 +162,7 @@
   {
     "name": "/memory",
     "path": "dist/memory.js",
-    "limit": "2.75 kB",
+    "limit": "1 kB",
     "ignore": [
       "node:fs",
       "node:fs/promises",
@@ -192,56 +192,8 @@
     ]
   },
   {
-    "name": "/redis-locker",
-    "path": "dist/redis-locker.js",
-    "limit": "1.75 kB",
-    "ignore": [
-      "node:fs",
-      "node:fs/promises",
-      "node:path",
-      "node:stream",
-      "node:buffer",
-      "node:crypto",
-      "node:os",
-      "node:http",
-      "node:events"
-    ]
-  },
-  {
-    "name": "/tus",
-    "path": "dist/tus.js",
-    "limit": "9.85 kB",
-    "ignore": [
-      "node:fs",
-      "node:fs/promises",
-      "node:path",
-      "node:stream",
-      "node:buffer",
-      "node:crypto",
-      "node:os",
-      "node:http",
-      "node:events"
-    ]
-  },
-  {
-    "name": "/upload",
-    "path": "dist/upload.js",
-    "limit": "9.3 kB",
-    "ignore": [
-      "node:fs",
-      "node:fs/promises",
-      "node:path",
-      "node:stream",
-      "node:buffer",
-      "node:crypto",
-      "node:os",
-      "node:http",
-      "node:events"
-    ]
-  },
-  {
     "name": "conformance (./conformance)",
     "path": "dist/conformance.js",
-    "limit": "7.3 kB"
+    "limit": "4.25 kB"
   }
 ]

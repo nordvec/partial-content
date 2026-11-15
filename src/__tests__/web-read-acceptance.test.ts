@@ -1,6 +1,6 @@
 import { describe, test, expect } from "bun:test";
 import { serveObject } from "../web";
-import type { ObjectStore, ObjectStream, ParsedRange } from "../index";
+import type { ObjectStore, ObjectStream, ReadRange } from "../index";
 
 /**
  * A store that cannot pin a read: it ignores `ifMatch`, and the object it holds
@@ -26,15 +26,15 @@ function replacedAfterFirstHead(first: Version, later: Version, getOverride?: Ve
             const v = heads++ === 0 ? first : later;
             return { contentLength: bytes.length, ...v };
         },
-        async getObject(_key: string, opts?: { range?: ParsedRange }): Promise<ObjectStream> {
+        async getObject(_key: string, opts?: { range?: ReadRange }): Promise<ObjectStream> {
             const v = getOverride ?? later;
             const r = opts?.range;
-            const slice = r ? bytes.slice(r.start, r.end + 1) : bytes;
+            const slice = r ? bytes.slice(r.start, (r.end ?? bytes.length - 1) + 1) : bytes;
             return {
                 body: slice,
                 contentLength: slice.length,
                 totalSize: bytes.length,
-                range: r ? { start: r.start, end: r.end } : undefined,
+                range: r ? { start: r.start, end: r.end ?? bytes.length - 1 } : undefined,
                 ...v,
             };
         },
@@ -83,6 +83,37 @@ describe("a body read is accepted against the validating HEAD on every path", ()
         const res = await serveObject(store)(get({ "If-None-Match": '"other"' }), { key: "f" });
         expect(res.status).toBe(200);
         expect(res.headers.get("Repr-Digest")).toBeNull();
+    });
+
+    test("a sent ifMatch is no proof of a pinned read from a store that ignores it", async () => {
+        // HEAD names "v1", the object is overwritten with same-length bytes, and
+        // the read (ifMatch ignored) names nothing: the 206 must not carry "v1".
+        const old = new TextEncoder().encode("AAAAAAAAAA");
+        const replaced = new TextEncoder().encode("BBBBBBBBBB");
+        const store: ObjectStore = {
+            supportsRange: true,
+            async headObject() {
+                return { contentLength: old.length, etag: '"v1"', digest: DIGEST_OLD };
+            },
+            async getObject(_key, opts): Promise<ObjectStream> {
+                const r = opts?.range ?? { start: 0, end: replaced.length - 1 };
+                return {
+                    body: replaced.slice(r.start, (r.end ?? replaced.length - 1) + 1),
+                    contentLength: (r.end ?? replaced.length - 1) - r.start + 1,
+                    totalSize: replaced.length,
+                    range: opts?.range ? { start: r.start, end: r.end ?? replaced.length - 1 } : undefined,
+                };
+            },
+        };
+        const res = await serveObject(store)(get({ Range: "bytes=5-9", "If-Range": '"v1"' }), { key: "f" });
+        expect(res.status).toBe(206);
+        expect(await res.text()).toBe("BBBBB");
+        expect(res.headers.get("ETag")).toBeNull();
+        expect(res.headers.get("Repr-Digest")).toBeNull();
+        // The same store declaring that it enforces the pin is believed.
+        const pinning = serveObject({ ...store, pinsReads: true });
+        const pinned = await pinning(get({ Range: "bytes=5-9", "If-Range": '"v1"' }), { key: "f" });
+        expect(pinned.headers.get("ETag")).toBe('"v1"');
     });
 
     test("an unchanged object keeps its HEAD digest on a full 200 and a multipart 206", async () => {

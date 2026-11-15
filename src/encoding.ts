@@ -194,9 +194,8 @@ export function isCompressibleMime(mime: string): boolean {
     if (essence === undefined) return false;
     if (essence.startsWith("text/")) return essence !== "text/event-stream";
     if (COMPRESSIBLE_EXACT.has(essence)) return true;
-    const slash = essence.indexOf("/");
-    if (slash === -1) return false;
-    const subtype = essence.slice(slash + 1);
+    // A parsed essence is always `type/subtype`.
+    const subtype = essence.slice(essence.indexOf("/") + 1);
     if (essence.startsWith("application/") && COMPRESSIBLE_APPLICATION_SUBTYPES.has(subtype)) {
         return true;
     }

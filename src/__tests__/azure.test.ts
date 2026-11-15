@@ -7,7 +7,6 @@ import {
     StoreUnavailableError,
     type AzureStoreOptions,
 } from "../azure";
-import { OPEN_ENDED } from "../index";
 
 // ─── Mock Azure Container Client ────────────────────────────────────────────
 
@@ -58,6 +57,18 @@ interface MockAzureOpts {
     sasError?: Error;
     /** Runs inside generateSasUrl, before it answers. */
     onSign?: () => void;
+    /** Counts getBlobClient calls: no SDK client is built for a refused key. */
+    clientRequests?: { count: number };
+    /** The abortSignal each getProperties / download call received. */
+    signals?: { props: Array<AbortSignal | undefined>; download: Array<AbortSignal | undefined> };
+    /** Throw this exact value from both getProperties and download. */
+    throwError?: unknown;
+    /** Advertise the full length but end the body one byte early (a graceful short read). */
+    shortBody?: boolean;
+    /** The stored Content-Encoding the download reports. */
+    contentEncoding?: string;
+    /** A download body stream without a destroy() method. */
+    noDestroy?: boolean;
 }
 
 /** The SDK's refusal when the client holds no shared-key credential. */
@@ -103,11 +114,20 @@ async function* iterate(buf: Buffer): AsyncGenerator<Buffer> {
     yield buf;
 }
 
+/** Throws `value` untouched: the throttle classifier is tested against thrown values that are not Errors. */
+function throwRaw(value: unknown): never {
+    // oxlint-disable-next-line typescript/only-throw-error -- a non-Error throw is the subject of the classification tests
+    throw value;
+}
+
 function mockContainer(opts: MockAzureOpts = {}): AzureContainerClient {
     return {
         getBlobClient(_name: string) {
+            if (opts.clientRequests) opts.clientRequests.count += 1;
             return {
-                async getProperties() {
+                async getProperties(options?: { abortSignal?: AbortSignal }) {
+                    opts.signals?.props.push(options?.abortSignal);
+                    if (opts.throwError !== undefined) throwRaw(opts.throwError);
                     if (opts.missing) throw restError(404);
                     if (opts.throttled) throw restError(503);
                     if (opts.throttledMessage412) throw restErrorWith(503, "ServerBusy req-id 41200-2b3c ...");
@@ -120,8 +140,14 @@ function mockContainer(opts: MockAzureOpts = {}): AzureContainerClient {
                         lastModified: LAST_MODIFIED,
                     };
                 },
-                async download(offset?: number, count?: number, options?: { conditions?: { ifMatch?: string } }) {
+                async download(
+                    offset?: number,
+                    count?: number,
+                    options?: { conditions?: { ifMatch?: string }; abortSignal?: AbortSignal },
+                ) {
                     opts.calls?.push({ offset, count, ifMatch: options?.conditions?.ifMatch });
+                    opts.signals?.download.push(options?.abortSignal);
+                    if (opts.throwError !== undefined) throwRaw(opts.throwError);
                     if (opts.missing) throw restError(404);
                     if (opts.throttled) throw restError(503);
                     if (opts.genericError) throw new Error("azure generic failure");
@@ -138,23 +164,30 @@ function mockContainer(opts: MockAzureOpts = {}): AzureContainerClient {
                     const end =
                         count !== undefined ? Math.min(offset! + count - 1, CONTENT.length - 1) : CONTENT.length - 1;
                     const slice = CONTENT.subarray(offset ?? 0, end + 1);
-                    const nodeStream = Object.assign(iterate(Buffer.from(slice)), {
-                        destroy() {
-                            opts.onDestroy?.();
-                        },
-                    });
+                    const served = opts.shortBody ? slice.subarray(0, slice.length - 1) : slice;
+                    const nodeStream = Object.assign(
+                        iterate(Buffer.from(served)),
+                        opts.noDestroy
+                            ? {}
+                            : {
+                                  destroy() {
+                                      opts.onDestroy?.();
+                                  },
+                              },
+                    );
                     return {
                         readableStreamBody:
                             opts.blobBody || opts.noBody
                                 ? undefined
                                 : (nodeStream as unknown as NodeJS.ReadableStream & AsyncIterable<Buffer>),
-                        blobBody: opts.blobBody ? Promise.resolve(new Blob([Uint8Array.from(slice)])) : undefined,
+                        blobBody: opts.blobBody ? Promise.resolve(new Blob([Uint8Array.from(served)])) : undefined,
                         contentLength: opts.noLength ? undefined : slice.length,
                         contentRange: isRanged
                             ? opts.badContentRange
                                 ? "bytes garbage"
                                 : `bytes ${offset}-${end}/${CONTENT.length}`
                             : undefined,
+                        contentEncoding: opts.contentEncoding,
                         etag: ETAG,
                         lastModified: LAST_MODIFIED,
                     };
@@ -458,17 +491,284 @@ describe("azureStore: createSignedUrl", () => {
     });
 });
 
-describe("azureStore: OPEN_ENDED wire translation", () => {
+describe("azureStore: open range wire translation", () => {
     test("an open-ended range downloads with offset and NO count", async () => {
         const calls: Array<{ offset?: number; count?: number; ifMatch?: string }> = [];
         const store = azureStore({ containerClient: mockContainer({ calls }) });
 
-        const result = await store.getObject("test.bin", { range: { start: 5, end: OPEN_ENDED } });
+        const result = await store.getObject("test.bin", { range: { start: 5, end: undefined } });
 
-        // The sentinel MUST NOT surface as a literal count.
+        // An open range MUST NOT surface as a count.
         expect(calls[0]?.offset).toBe(5);
         expect(calls[0]?.count).toBeUndefined();
         expect(result.range).toEqual({ start: 5, end: 19 });
         expect(result.contentLength).toBe(15);
+    });
+});
+
+describe("azureStore: capability flags", () => {
+    test("advertises range support and authoritative 206 bounds", () => {
+        const store = azureStore({ containerClient: mockContainer() });
+        expect(store.supportsRange).toBe(true);
+        expect(store.authoritativeRange).toBe(true);
+    });
+});
+
+describe("azureStore: reserved keys and key policy", () => {
+    const RESERVED = ".partial-content-uploads/in-flight/abc";
+
+    test("every read refuses a key under the default reserved prefix before the SDK is touched", async () => {
+        const clientRequests = { count: 0 };
+        const store = azureStore({ containerClient: mockContainer({ clientRequests }) });
+
+        await expect(store.headObject(RESERVED)).rejects.toBeInstanceOf(ObjectNotFoundError);
+        await expect(store.getObject(RESERVED)).rejects.toBeInstanceOf(ObjectNotFoundError);
+        await expect(store.getObject(RESERVED, { range: { start: 0, end: 3 } })).rejects.toBeInstanceOf(
+            ObjectNotFoundError,
+        );
+        await expect(store.createSignedUrl!(RESERVED, { expiresInSeconds: 60 })).rejects.toBeInstanceOf(
+            ObjectNotFoundError,
+        );
+        expect(clientRequests.count).toBe(0);
+    });
+
+    test("the reserved prefix's bare name is refused too", async () => {
+        const clientRequests = { count: 0 };
+        const store = azureStore({ containerClient: mockContainer({ clientRequests }) });
+        await expect(store.headObject(".partial-content-uploads")).rejects.toBeInstanceOf(ObjectNotFoundError);
+        expect(clientRequests.count).toBe(0);
+    });
+
+    test("a signed URL is never minted for a reserved key", async () => {
+        const sasCalls: AzureSasOptions[] = [];
+        const store = azureStore({ containerClient: mockContainer({ sasCalls }) });
+        await expect(store.createSignedUrl!(RESERVED, { expiresInSeconds: 60 })).rejects.toBeInstanceOf(
+            ObjectNotFoundError,
+        );
+        expect(sasCalls).toHaveLength(0);
+    });
+
+    test("reservedPrefix: '' reserves nothing", async () => {
+        const clientRequests = { count: 0 };
+        const store = azureStore({ containerClient: mockContainer({ clientRequests }), reservedPrefix: "" });
+
+        expect((await store.headObject(RESERVED)).contentLength).toBe(20);
+        expect((await store.getObject(RESERVED)).contentLength).toBe(20);
+        expect(clientRequests.count).toBe(2);
+    });
+
+    test("a caller-supplied reservedPrefix replaces the default", async () => {
+        const store = azureStore({ containerClient: mockContainer(), reservedPrefix: ["private/"] });
+
+        await expect(store.headObject("private/a.pdf")).rejects.toBeInstanceOf(ObjectNotFoundError);
+        expect((await store.headObject(RESERVED)).contentLength).toBe(20);
+    });
+
+    test("the default key policy refuses an empty or dot segment before the SDK is touched", async () => {
+        const clientRequests = { count: 0 };
+        const store = azureStore({ containerClient: mockContainer({ clientRequests }) });
+
+        for (const key of ["a//b", "a/./b", "a/../b"]) {
+            await expect(store.headObject(key)).rejects.toBeInstanceOf(ObjectNotFoundError);
+            await expect(store.getObject(key)).rejects.toBeInstanceOf(ObjectNotFoundError);
+        }
+        expect(clientRequests.count).toBe(0);
+    });
+
+    test("keys: 'verbatim' passes an empty segment through to the SDK", async () => {
+        const clientRequests = { count: 0 };
+        const store = azureStore({ containerClient: mockContainer({ clientRequests }), keys: "verbatim" });
+
+        expect((await store.headObject("a//b")).contentLength).toBe(20);
+        expect(clientRequests.count).toBe(1);
+    });
+
+    test("keys: 'verbatim' still refuses a dot segment, the SDK would resolve it", async () => {
+        const clientRequests = { count: 0 };
+        const store = azureStore({ containerClient: mockContainer({ clientRequests }), keys: "verbatim" });
+
+        for (const key of ["../private/x.pdf", "a/../.partial-content-uploads/x", "a/./b"]) {
+            await expect(store.headObject(key)).rejects.toBeInstanceOf(ObjectNotFoundError);
+            await expect(store.getObject(key)).rejects.toBeInstanceOf(ObjectNotFoundError);
+        }
+        expect(clientRequests.count).toBe(0);
+    });
+
+    test("keys: 'verbatim' still honours the reserved prefix", async () => {
+        const store = azureStore({ containerClient: mockContainer(), keys: "verbatim" });
+        await expect(store.headObject(RESERVED)).rejects.toBeInstanceOf(ObjectNotFoundError);
+    });
+});
+
+describe("azureStore: abort signal forwarding", () => {
+    const newSignals = () => ({
+        props: [] as Array<AbortSignal | undefined>,
+        download: [] as Array<AbortSignal | undefined>,
+    });
+
+    test("headObject without a signal option still reads", async () => {
+        const store = azureStore({ containerClient: mockContainer() });
+        expect((await store.headObject("doc.pdf", {})).contentLength).toBe(20);
+    });
+
+    test("headObject rejects with the reason of an already-aborted signal", async () => {
+        const reason = new Error("client went away");
+        const clientRequests = { count: 0 };
+        const store = azureStore({ containerClient: mockContainer({ clientRequests }) });
+        await expect(store.headObject("doc.pdf", { signal: AbortSignal.abort(reason) })).rejects.toBe(reason);
+        expect(clientRequests.count).toBe(0);
+    });
+
+    test("headObject hands its signal to getProperties", async () => {
+        const signals = newSignals();
+        const store = azureStore({ containerClient: mockContainer({ signals }) });
+        const controller = new AbortController();
+        await store.headObject("doc.pdf", { signal: controller.signal });
+        expect(signals.props).toEqual([controller.signal]);
+    });
+
+    test("getObject hands its signal to download", async () => {
+        const signals = newSignals();
+        const store = azureStore({ containerClient: mockContainer({ signals }) });
+        const controller = new AbortController();
+        await store.getObject("doc.pdf", { signal: controller.signal });
+        expect(signals.download).toEqual([controller.signal]);
+    });
+
+    test("aborting after getObject resolves destroys the live body stream", async () => {
+        let destroyed = 0;
+        const store = azureStore({
+            containerClient: mockContainer({
+                onDestroy: () => {
+                    destroyed += 1;
+                },
+            }),
+        });
+        const controller = new AbortController();
+        await store.getObject("doc.pdf", { signal: controller.signal });
+        expect(destroyed).toBe(0);
+        controller.abort();
+        expect(destroyed).toBe(1);
+    });
+});
+
+describe("azureStore: body length accounting", () => {
+    test("a body that ends short of the committed length fails the read", async () => {
+        const store = azureStore({ containerClient: mockContainer({ shortBody: true }) });
+        const result = await store.getObject("doc.pdf");
+        await expect(drain(result.body)).rejects.toThrow(/bytes/);
+    });
+
+    test("a buffered body that ends short of the committed length fails the read", async () => {
+        const store = azureStore({ containerClient: mockContainer({ blobBody: true, shortBody: true }) });
+        const result = await store.getObject("doc.pdf");
+        await expect(drain(result.body)).rejects.toThrow(/bytes/);
+    });
+});
+
+describe("azureStore: release of a degenerate download", () => {
+    test("a stream without destroy() is tolerated when the length is missing", async () => {
+        const store = azureStore({ containerClient: mockContainer({ noLength: true, noDestroy: true }) });
+        await expect(store.getObject("doc.pdf")).rejects.toThrow(/no contentLength/);
+    });
+
+    test("a buffered response has nothing to destroy when the length is missing", async () => {
+        const store = azureStore({ containerClient: mockContainer({ noLength: true, blobBody: true }) });
+        await expect(store.getObject("doc.pdf")).rejects.toThrow(/no contentLength/);
+    });
+
+    test("a corrupt stored Content-Encoding destroys the live socket and fails the read", async () => {
+        let destroyed = false;
+        const store = azureStore({
+            containerClient: mockContainer({
+                contentEncoding: "not-a-coding",
+                onDestroy: () => {
+                    destroyed = true;
+                },
+            }),
+        });
+        await expect(store.getObject("doc.pdf")).rejects.toThrow(/registered coding/);
+        expect(destroyed).toBe(true);
+    });
+
+    test("a registered stored Content-Encoding is reported on the stream", async () => {
+        const store = azureStore({ containerClient: mockContainer({ contentEncoding: "GZIP" }) });
+        const result = await store.getObject("doc.pdf");
+        expect(result.contentEncoding).toBe("gzip");
+    });
+});
+
+describe("azureStore: throttle classification", () => {
+    async function headError(error: unknown): Promise<unknown> {
+        const store = azureStore({ containerClient: mockContainer({ throwError: error }) });
+        return store.headObject("doc.pdf").then(
+            () => undefined,
+            (err: unknown) => err,
+        );
+    }
+
+    test("code ServerBusy alone throttles, whatever the status", async () => {
+        expect(await headError(restErrorWithCode(500, "ServerBusy"))).toBeInstanceOf(StoreUnavailableError);
+    });
+
+    test("status 429 alone throttles", async () => {
+        expect(await headError(restError(429))).toBeInstanceOf(StoreUnavailableError);
+    });
+
+    test("a status-less RestError naming ServerBusy or OperationTimedOut throttles", async () => {
+        expect(await headError(restErrorMessageOnly("ServerBusy: try later"))).toBeInstanceOf(StoreUnavailableError);
+        expect(await headError(restErrorMessageOnly("OperationTimedOut: slow"))).toBeInstanceOf(StoreUnavailableError);
+    });
+
+    test("a status-less RestError with an unrelated message is not a throttle", async () => {
+        const err = restErrorMessageOnly("socket hang up");
+        expect(await headError(err)).toBe(err);
+    });
+
+    test("a plain Error naming ServerBusy is not a throttle", async () => {
+        const err = new Error("ServerBusy");
+        expect(await headError(err)).toBe(err);
+    });
+
+    test("a non-Error value carrying a RestError name and ServerBusy message is not a throttle", async () => {
+        const thrown = { name: "RestError", message: "ServerBusy" };
+        expect(await headError(thrown)).toBe(thrown);
+    });
+
+    test("a numeric status is authoritative over a ServerBusy message", async () => {
+        const err = restErrorWith(500, "ServerBusy");
+        expect(await headError(err)).toBe(err);
+    });
+
+    test("a plain Error with no status and a generic message stays unclassified", async () => {
+        const err = new Error("azure generic failure");
+        expect(await headError(err)).toBe(err);
+    });
+
+    test("a throttle without a Retry-After header carries no retryAfterSeconds", async () => {
+        const err = await headError(restError(503));
+        expect((err as StoreUnavailableError).retryAfterSeconds).toBeUndefined();
+    });
+
+    test("a throwing Retry-After getter still yields the throttle", async () => {
+        const err = restError(503);
+        (err as unknown as { response: unknown }).response = {
+            headers: {
+                get() {
+                    throw new Error("header access failed");
+                },
+            },
+        };
+        const caught = await headError(err);
+        expect(caught).toBeInstanceOf(StoreUnavailableError);
+        expect((caught as StoreUnavailableError).retryAfterSeconds).toBeUndefined();
+    });
+
+    test("a non-function Retry-After getter still yields the throttle", async () => {
+        const err = restError(503);
+        (err as unknown as { response: unknown }).response = { headers: { get: "retry-after" } };
+        const caught = await headError(err);
+        expect(caught).toBeInstanceOf(StoreUnavailableError);
+        expect((caught as StoreUnavailableError).retryAfterSeconds).toBeUndefined();
     });
 });

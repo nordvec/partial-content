@@ -1,5 +1,9 @@
 # Migration
 
+This page covers the 3.x to 4.0 changes and describes the write-side store API
+of those releases. The write-side store API was removed in 6.0, with no
+replacement; see [UPGRADING.md](UPGRADING.md#1-upload-support-is-removed).
+
 ## partial-content 3.x to 4.0
 
 Seven breaking changes: four on surfaces every consumer touches, and three on
@@ -494,8 +498,9 @@ private files. If you are replacing it outright:
 ```js
 import { serveObject } from "partial-content/node";
 import { fsStore } from "partial-content/fs";
+import path from "node:path";
 
-const store = fsStore({ root: "public", cache: { ttlMs: 1000 } });
+const store = fsStore({ root: path.resolve("public"), cache: { ttlMs: 1000 } });
 
 app.use("/assets", serveObject(store, {
   key: (req) => req.path.slice(1),

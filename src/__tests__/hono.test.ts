@@ -36,7 +36,9 @@ function memoryStore(): ObjectStore {
         }),
         getObject: async (_key, getOpts) => {
             const range = getOpts?.range;
-            const slice = range ? CONTENT.slice(range.start, range.end + 1) : CONTENT;
+            const slice = range
+                ? CONTENT.slice(range.start, range.end === undefined ? undefined : range.end + 1)
+                : CONTENT;
             return {
                 body: new ReadableStream<Uint8Array<ArrayBuffer>>({
                     start(c) {
@@ -46,7 +48,7 @@ function memoryStore(): ObjectStore {
                 }),
                 contentLength: slice.length,
                 totalSize: CONTENT.length,
-                range: range ? { start: range.start, end: range.end } : undefined,
+                range: range ? { start: range.start, end: range.start + slice.length - 1 } : undefined,
                 etag: '"hono-etag"',
             };
         },
@@ -135,5 +137,38 @@ describe("serveObject (hono): a throwing key extractor", () => {
         expect((await handler(honoContext({}))).status).toBe(500);
         expect(errors).toEqual([{ name: "TypeError", operation: "context" }]);
         expect(JSON.stringify(errors)).not.toContain("report.pdf");
+    });
+
+    test("an auditKey extractor that yields nothing keys the request as unkeyed, never by the storage key", async () => {
+        const failing: ObjectStore = {
+            ...memoryStore(),
+            headObject: async () => {
+                throw new Error("backend rejected private/report.pdf");
+            },
+        };
+        const seen: { err: unknown; key: string }[] = [];
+        const handler = serveObject(failing, {
+            key: () => "private/report.pdf",
+            auditKey: () => undefined,
+            onError: (err, ctx) => void seen.push({ err, key: ctx.key }),
+        });
+
+        const res = await handler(honoContext({ headers: { "if-none-match": '"x"' } }));
+
+        expect(res.status).toBe(502);
+        expect(seen).toEqual([{ err: { name: "Error", operation: "head" }, key: "unkeyed" }]);
+        expect(JSON.stringify(seen)).not.toContain("report.pdf");
+    });
+
+    test("a rejecting onError on a failing extractor is swallowed", async () => {
+        const handler = serveObject(memoryStore(), {
+            key: () => {
+                throw new Error("boom");
+            },
+            onError: async () => {
+                throw new Error("sink down");
+            },
+        });
+        expect((await handler(honoContext({}))).status).toBe(500);
     });
 });

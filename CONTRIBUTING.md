@@ -104,4 +104,8 @@ Publishing is CI-only via npm Trusted Publishing: bump the version and
 release workflow builds, tests and smoke-tests the packed `dist/` on Node 24,
 Bun and Deno with read-only permissions, publishes that exact tarball with
 provenance from a job holding only the OIDC permission, and then creates the
-GitHub Release. There is no manual `npm publish` path.
+GitHub Release. There is no manual `npm publish` path. The maintainers' dev
+home is mirrored into this repository, deletions included, by `scripts/sync-public.mjs`:
+the mirrored tree is one committed state of the dev home (HEAD, or `--rev <commit>`),
+read from that commit's objects and never from a working tree, and the commit it came
+from is printed so the commit that lands the mirror here can name it.

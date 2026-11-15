@@ -581,4 +581,33 @@ describe("dot-segment and over-long filenames", () => {
         const exact = `${"b".repeat(251)}.txt`;
         expect(buildContentDisposition(exact)).toBe(`attachment; filename=${exact}`);
     });
+
+    const servedName = (raw: string) => /filename=([^;]+)$/.exec(buildContentDisposition(raw))![1]!;
+
+    test("a name at 256 bytes loses one character from the stem", () => {
+        expect(servedName(`${"b".repeat(252)}.txt`)).toBe(`${"b".repeat(251)}.txt`);
+    });
+
+    test("a short name is left alone, dotted or not", () => {
+        expect(servedName("readme")).toBe("readme");
+        expect(servedName("archive.tar.gz")).toBe("archive.tar.gz");
+    });
+
+    test("an extension of 16 characters with its dot survives the cut", () => {
+        const ext = `.${"e".repeat(15)}`;
+        expect(servedName(`${"a".repeat(300)}${ext}`)).toBe(`${"a".repeat(255 - ext.length)}${ext}`);
+    });
+
+    test("a longer trailing segment is not an extension and the name is cut at 255", () => {
+        const name = `${"a".repeat(300)}.${"e".repeat(16)}`;
+        expect(servedName(name)).toBe("a".repeat(255));
+    });
+
+    test("an over-long name with no dot is cut at 255", () => {
+        expect(servedName("c".repeat(300))).toBe("c".repeat(255));
+    });
+
+    test("an over-long name whose only dot leads it is cut at 255", () => {
+        expect(servedName(`.${"d".repeat(300)}`)).toBe(`.${"d".repeat(254)}`);
+    });
 });

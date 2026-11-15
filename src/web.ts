@@ -22,7 +22,14 @@
  * // The handler takes (request, context): the caller resolves the storage
  * // key (and optional mime/filename) and passes them as the ServeContext.
  * export async function GET(req: Request) {
- *   return handler(req, { key: new URL(req.url).pathname.slice(1) });
+ *   // A key is the object's name, so the request path is percent-decoded first.
+ *   let key: string;
+ *   try {
+ *     key = decodeURIComponent(new URL(req.url).pathname.slice(1));
+ *   } catch {
+ *     return new Response("Bad Request", { status: 400 });
+ *   }
+ *   return handler(req, { key });
  * }
  * export const HEAD = GET;
  * ```
@@ -50,7 +57,6 @@ import {
     multipartEpilogue,
     generateMultipartBoundary,
     MAX_RANGES_DEFAULT,
-    OPEN_ENDED,
     parseRetryAfterSeconds,
     negotiateEncoding,
     isCompressibleMime,
@@ -59,9 +65,13 @@ import {
     type ObjectBody,
     type ObjectStream,
     type ParsedRange,
+    type ReadRange,
 } from "./index.ts";
-import { fixedLength, projectError } from "./object-store.ts";
+import { fixedLength, isErrorNamed, projectError, readField } from "./object-store.ts";
 import { resolveMediaType, type MediaType } from "./media-type.ts";
+import { VariantHits, VariantMisses } from "./variant-misses.ts";
+import { guardHook, guardSink, type Hook } from "./hooks.ts";
+import { DENY_HEADERS, plainTextErrorParts } from "./error-response.ts";
 
 // Re-export kernel types so consumers only need one import
 export type { ObjectStore, ObjectMetadata, ObjectStream, ObjectBody, ParsedRange, ETagSource } from "./index.ts";
@@ -70,8 +80,7 @@ export type { ProjectedError } from "./object-store.ts";
 // ─── Constants ───────────────────────────────────────────────────────────────
 
 /**
- * One reusable UTF-8 encoder for the module (multipart part headers, plain-text
- * error bodies), mirroring the kernel's hoisted encoder. `TextEncoder` is
+ * One reusable UTF-8 encoder for the module (multipart part headers), mirroring the kernel's hoisted encoder. `TextEncoder` is
  * stateless, so a single instance is safe to share and avoids a per-response
  * allocation.
  */
@@ -89,6 +98,7 @@ const STATUS_TEXT = {
     412: "Precondition Failed",
     416: "Range Not Satisfiable",
     499: "Client Closed Request",
+    500: "Internal Server Error",
     502: "Bad Gateway",
     503: "Service Unavailable",
 } as const satisfies Record<number, string>;
@@ -119,6 +129,10 @@ const PRECOMPRESSED_SUFFIX = {
  * May gain a member in a minor release: give a switch over it a default branch.
  */
 export type PrecompressedCoding = keyof typeof PRECOMPRESSED_SUFFIX;
+
+/** Narrow a negotiated coding name to one this module serves a sibling for. */
+const isPrecompressedCoding = (coding: string): coding is PrecompressedCoding =>
+    Object.hasOwn(PRECOMPRESSED_SUFFIX, coding);
 
 /** Default server preference: best ratio first (RFC 9110 lets ties go to us). */
 const DEFAULT_PRECOMPRESSED: readonly PrecompressedCoding[] = ["br", "zstd", "gzip"];
@@ -154,7 +168,12 @@ export interface ServableRequest {
 
 /** Metadata resolved by the consumer before the handler runs. */
 export interface ServeContext {
-    /** Storage key (path within the bucket). */
+    /**
+     * Storage key: the object's name as the store knows it (`reports/q1 2026.pdf`),
+     * never URL text (`reports/q1%202026.pdf`). Percent-decode a request path
+     * before using it as a key, and authorize the decoded key: a store that
+     * builds a URL encodes the key itself.
+     */
     key: string;
     /** Override MIME type. When omitted, defaults to "application/octet-stream". */
     mime?: string;
@@ -183,13 +202,18 @@ export interface ServeContext {
      * `status`, `operation`, `cause` projected the same way) instead of the
      * raw error, whose message, stack and properties can carry the key.
      * When omitted, events carry the storage key and errors arrive unchanged.
+     * The Node and Hono adapters that take an `auditKey` extractor pass the
+     * constant `"unkeyed"` when it returns `undefined`, so a request the
+     * extractor yields nothing for never falls back to the storage key.
      */
     auditKey?: string;
 }
 
 export interface ServeObjectOptions {
     /**
-     * Content-Disposition strategy.
+     * Content-Disposition strategy. A function's result must be `"inline"` or
+     * `"attachment"`: anything else (a promise included) answers 500 with
+     * `onError` operation `"context"`.
      * - `"inline"` -- render in the browser (PDF, images, video)
      * - `"attachment"` -- force download
      * - A function mapping MIME to disposition type (for per-type policy)
@@ -200,7 +224,12 @@ export interface ServeObjectOptions {
 
     /**
      * Cache-Control value for 200/206 responses.
-     * @default "private, no-cache"
+     *
+     * The default carries `no-transform`: the responses carry digests and
+     * strong validators that describe the exact bytes, and an intermediary that
+     * re-compresses or transcodes the payload would make them lie.
+     *
+     * @default "private, no-cache, no-transform"
      */
     cacheControl?: string;
 
@@ -223,6 +252,9 @@ export interface ServeObjectOptions {
      * the corresponding 200 would have carried, and this option is the
      * mechanism for `Vary`. Security headers riding along on a bodyless 304
      * are harmless.
+     *
+     * Must return a plain object synchronously: any other result (a promise
+     * included) answers 500 with `onError` operation `"context"`.
      *
      * @default No extra headers.
      */
@@ -286,7 +318,7 @@ export interface ServeObjectOptions {
      * header carries; an attempt that re-validates against a changed object
      * does not report. Use to ship metrics to your RUM/APM backend.
      */
-    onTiming?: (metrics: { storeMs: number; evaluateMs: number; totalMs: number }) => void;
+    onTiming?: Hook<[metrics: { storeMs: number; evaluateMs: number; totalMs: number }]>;
 
     /**
      * Fallback filename used by buildContentDisposition when no filename is
@@ -305,9 +337,9 @@ export interface ServeObjectOptions {
      *
      * The error is NOT exposed to the client (the response body is generic).
      *
-     * @param error - The original error from the storage backend, or its
-     * allow-listed `ProjectedError` when the request set `ServeContext.auditKey`
-     * (a hook's own failure, operation `audit`, arrives as thrown)
+     * @param error - The error as thrown, or its allow-listed `ProjectedError`
+     * when the request set `ServeContext.auditKey`, whatever failed (the
+     * store, the context, or one of your own hooks)
      * @param context - Additional context about the failed operation
      * (`sign` = a signed-URL provider threw during a redirect;
      * `audit` = the consumer's own onServe/onTransfer hook threw; the
@@ -315,11 +347,14 @@ export interface ServeObjectOptions {
      * of crashing. `context` = a consumer-supplied key/mime/filename
      * extractor threw in a server adapter; the request became a 500).
      *
-     * Must not throw. `onServe`/`onTransfer` failures are routed HERE, but
-     * there is no sink for a failure of the error sink itself: a throwing
-     * `onError` escapes the handler on every error path.
+     * Every callback option (`onError`, `onServe`, `onTransfer`, `onTiming`)
+     * may be async: the returned promise is observed, never awaited. A
+     * synchronous throw or a rejected promise from `onServe`, `onTransfer` or
+     * `onTiming` is routed HERE (operation `audit`). There is no sink for a
+     * failure of the error sink itself: a throwing or rejecting `onError` is
+     * swallowed.
      */
-    onError?: (error: unknown, context: ServeErrorContext) => void;
+    onError?: Hook<[error: unknown, context: ServeErrorContext]>;
 
     /**
      * Audit callback for compliance logging (SOC 2 CC7.2, ISO 27001 A.8.15).
@@ -333,7 +368,7 @@ export interface ServeObjectOptions {
      * onServe: (event) => logger.info({ ...event }, "file.served")
      * ```
      */
-    onServe?: (event: ServeAuditEvent) => void;
+    onServe?: Hook<[event: ServeAuditEvent]>;
 
     /**
      * Transfer-completion callback for true egress accounting and truncation
@@ -364,7 +399,7 @@ export interface ServeObjectOptions {
      * }
      * ```
      */
-    onTransfer?: (event: TransferEvent) => void;
+    onTransfer?: Hook<[event: TransferEvent]>;
 
     /**
      * Maximum number of distinct (coalesced) byte ranges to serve as
@@ -421,10 +456,26 @@ export interface ServeObjectOptions {
      * `.br` variant byte-correct (a naive fs server computes ranges against
      * the identity size and corrupts them).
      *
+     * Authority: a variant is a sibling key the DEPLOYER must control, never
+     * one a user can name. The authorization you check for `key` covers its
+     * variants, so any party who can write `<key>.br` can replace what every
+     * client that accepts `br` receives for `key`. A variant is served only
+     * while the identity object exists and is not newer than the variant:
+     * deleting the identity stops its variants being served (erasure), and a
+     * variant older than a replaced identity is skipped.
+     *
      * Scope and cost:
      * - Selection only, never on-the-fly compression (transforming at serve
      *   time breaks byte-exact ranges and digests). You upload the variants.
-     * - One extra `headObject` probe per acceptable coding until a hit; probes
+     * - One `headObject` for the identity object per request, sent in the same
+     *   round as the variant probes (no extra round trip), and one probe per
+     *   acceptable coding not remembered as missing; a coding the store
+     *   confirmed is remembered for 30 s and ends the probing at it. A plain
+     *   GET for a remembered variant sends the variant's `getObject` together
+     *   with the identity `headObject` (two calls, one round trip) and takes
+     *   the variant's validators from that read; a range or conditional
+     *   request still probes the variant's `headObject` first, since its
+     *   304, 412 or 416 answer opens no body. Probes
      *   are skipped entirely for non-compressible types (media, archives) and
      *   for multi-range requests (multipart of an encoded representation has
      *   no interoperable framing, so those serve the identity bytes).
@@ -451,6 +502,11 @@ export interface ServeObjectOptions {
      * probing, cache priming), so HEAD always serves real headers from the
      * origin and the predicate only ever evaluates GET requests.
      *
+     * The redirect is decided before the object's existence is known: a missing
+     * key reaches the client as the storage backend's own error page, not this
+     * handler's 404. The predicate must return a boolean (a promise included is
+     * refused with a 500, operation `"context"`).
+     *
      * @example
      * ```ts
      * preferSignedUrl: ({ isRange, isConditional }) => !isRange && !isConditional
@@ -470,6 +526,9 @@ export interface ServeObjectOptions {
      * Note the adapter contract: backends running under TEMPORARY credentials
      * (STS/Lambda roles) silently cap a presigned URL's life at the
      * credential's remaining lifetime, whatever expiry you request.
+     *
+     * Must be a safe integer of at least 1 (a TypeError at construction
+     * otherwise).
      *
      * @default 60
      */
@@ -597,6 +656,23 @@ export interface TransferEvent extends ServedIdentity {
 // ─── Handler ────────────────────────────────────────────────────────────────
 
 /**
+ * A response as plain parts (status, reason phrase, headers, body) for a
+ * server that writes them natively; {@link serveObjectRaw} returns it.
+ */
+export interface RawResponseParts {
+    status: number;
+    /** Reason phrase (e.g. "Partial Content", "Client Closed Request"). */
+    statusText: string;
+    headers: Record<string, string>;
+    /**
+     * `null` for bodyless statuses (HEAD, 304, 412, 416, 302, 405). Otherwise
+     * the same `<ArrayBuffer>`-backed {@link ObjectBody} a store serves, so
+     * `new Response(parts.body)` compiles under DOM lib.
+     */
+    body: ObjectBody | null;
+}
+
+/**
  * Serve an object from an {@link ObjectStore} with full conditional-request
  * and range-request support (RFC 9110 Sections 13 and 14).
  *
@@ -616,31 +692,29 @@ export interface TransferEvent extends ServedIdentity {
  * HEAD values. If the GET response omits Content-Range for a range request,
  * the handler degrades to 200 (never emits a lying 206).
  */
-export interface RawResponseParts {
-    status: number;
-    /** Reason phrase (e.g. "Partial Content", "Client Closed Request"). */
-    statusText: string;
-    headers: Record<string, string>;
-    /**
-     * `null` for bodyless statuses (HEAD, 304, 412, 416, 302, 405). Otherwise
-     * the same `<ArrayBuffer>`-backed {@link ObjectBody} a store serves, so
-     * `new Response(parts.body)` compiles under DOM lib.
-     */
-    body: ObjectBody | null;
-}
-
 export function serveObject(store: ObjectStore, opts: ServeObjectOptions = {}) {
     const raw = serveObjectRaw(store, opts);
     return async function handleServe(req: ServableRequest, ctx: ServeContext): Promise<Response> {
         const parts = await raw(req, ctx);
         // BodyInit accepts both body forms; byte bodies take the runtime's
         // static-body fast path (no stream machinery).
-        return new Response(parts.body, {
+        const init: WorkersResponseInit = {
             status: parts.status,
             statusText: parts.statusText,
             headers: parts.headers,
-        });
+        };
+        // A body that already carries a content coding must reach the client as
+        // is. Cloudflare Workers otherwise compresses a response again
+        // according to its Content-Encoding header; other runtimes ignore the
+        // member.
+        if (parts.headers["Content-Encoding"]) init.encodeBody = "manual";
+        return new Response(parts.body, init);
     };
+}
+
+/** `ResponseInit` plus the Workers-only `encodeBody` member, typed locally. */
+interface WorkersResponseInit extends ResponseInit {
+    encodeBody?: "automatic" | "manual";
 }
 
 /**
@@ -650,11 +724,15 @@ export function serveObject(store: ObjectStore, opts: ServeObjectOptions = {}) {
  * (the bundled node adapter does) -- constructing a Response + Headers pair
  * per request just to immediately deconstruct them is measurable overhead
  * on hot paths.
+ *
+ * A response whose headers carry `Content-Encoding` has a body that is already
+ * encoded. A consumer building its own `Response` on Cloudflare Workers must
+ * pass `encodeBody: "manual"` for it, or the runtime compresses it again.
  */
 export function serveObjectRaw(store: ObjectStore, opts: ServeObjectOptions = {}) {
     const {
         disposition: dispositionOpt = "attachment",
-        cacheControl: rawCacheControl = "private, no-cache",
+        cacheControl: rawCacheControl = "private, no-cache, no-transform",
         immutable: immutableOpt = false,
         etag: etagEnabled = true,
         securityHeaders,
@@ -663,7 +741,7 @@ export function serveObjectRaw(store: ObjectStore, opts: ServeObjectOptions = {}
         timing: timingEnabled = false,
         onTiming,
         fallbackFilename = "download",
-        onError: onErrorBase,
+        onError: rawOnError,
         onServe: rawOnServe,
         onTransfer: rawOnTransfer,
         maxRanges = MAX_RANGES_DEFAULT,
@@ -685,6 +763,12 @@ export function serveObjectRaw(store: ObjectStore, opts: ServeObjectOptions = {}
     ) {
         throw new TypeError("serveObject: maxRanges and maxBackendReads must be integers >= 1");
     }
+    if (typeof dispositionOpt !== "function" && dispositionOpt !== "inline" && dispositionOpt !== "attachment") {
+        throw new TypeError('serveObject: disposition must be "inline", "attachment" or a function');
+    }
+    if (!(Number.isSafeInteger(signedUrlExpiresSeconds) && signedUrlExpiresSeconds > 0)) {
+        throw new TypeError("serveObject: signedUrlExpiresSeconds must be an integer >= 1");
+    }
 
     // Resolve the exposure list once: `true` means the protocol's own
     // non-safelisted headers; a string is caller-verbatim.
@@ -700,39 +784,63 @@ export function serveObjectRaw(store: ObjectStore, opts: ServeObjectOptions = {}
               ? null
               : resolvePrecompressedList(precompressed);
 
-    // A consumer's audit hook must never break the never-throw contract: the
-    // bodyless emissions (302/304/412/416/HEAD) fire outside any guard, so a
-    // throwing hook would escape the handler. Route hook failures to onError;
-    // the response itself is unaffected.
-    const onServeBase = rawOnServe
-        ? (event: ServeAuditEvent): void => {
-              try {
-                  rawOnServe(event);
-              } catch (err) {
-                  onErrorBase?.(err, { key: event.key, operation: "audit" });
-              }
-          }
-        : undefined;
-
-    // Same guard for the transfer hook, which fires from inside the body's
-    // stream machinery (during the runtime's consumption, after the handler has
-    // returned). A throw there would error the response stream mid-flight;
-    // route it to onError instead so the transfer completes cleanly.
-    const onTransferBase = rawOnTransfer
-        ? (event: TransferEvent): void => {
-              try {
-                  rawOnTransfer(event);
-              } catch (err) {
-                  onErrorBase?.(err, { key: event.key, operation: "audit" });
-              }
-          }
-        : undefined;
+    // A consumer's observer hook must never break the never-throw contract. The
+    // audit hook fires for bodyless emissions (302/304/412/416/HEAD) outside any
+    // guard; the transfer hook fires from inside the body's stream machinery,
+    // after the handler has returned, where a throw would error the response
+    // mid-flight; an async hook's rejection would be unhandled. Hook failures
+    // route to onError and the response is unaffected, and the sink itself is
+    // guarded the same way so every consumer callback goes through one runner.
+    const onErrorBase = guardSink(rawOnError);
+    // The one place that decides what the sink receives. The error travels to
+    // the same sink as the context, and the key can sit anywhere in it (a
+    // message, an own property, a cause's request descriptor) in any spelling.
+    // Under an auditKey the sink receives an allow-listed projection instead,
+    // so no search for the key can miss, whatever failed: the store, the
+    // context, or one of the caller's own hooks.
+    const sinkFor = (auditKey: string | undefined): typeof onErrorBase =>
+        onErrorBase && auditKey !== undefined
+            ? (err: unknown, context: ServeErrorContext): void =>
+                  onErrorBase(projectError(err, context.operation), { ...context, key: auditKey })
+            : onErrorBase;
 
     // Resolve Cache-Control once (append immutable if configured)
     const cacheControl =
         immutableOpt && !rawCacheControl.includes("immutable") ? `${rawCacheControl}, immutable` : rawCacheControl;
 
+    // Variant keys the store recently answered not-found for, so a compressible
+    // object with no precompressed sibling does not pay the probes on every
+    // request. Scoped to this handler (one store).
+    const variantMisses = new VariantMisses(VARIANT_MISS_TTL_MS, VARIANT_MISS_MAX, VARIANT_MISS_KEY_MAX);
+    // The variant keys the store recently confirmed, under the same bounds: a
+    // repeat request probes down to the first remembered one and no further.
+    const variantHits = new VariantHits(VARIANT_MISS_TTL_MS, VARIANT_MISS_MAX, VARIANT_MISS_KEY_MAX);
+
+    // The handler never rejects: a consumer policy callback that throws or
+    // returns a value of the wrong shape (disposition, securityHeaders,
+    // preferSignedUrl), or a context of the wrong shape, is a 500 reported as
+    // operation "context", the same answer the Node and Hono adapters give for
+    // a throwing extractor.
     return async function handleServeRaw(req: ServableRequest, ctx: ServeContext): Promise<RawResponseParts> {
+        try {
+            return await serveRequest(req, ctx);
+        } catch (err) {
+            if (clientAborted(req.signal)) return clientClosed();
+            const key = typeof ctx?.key === "string" ? ctx.key : "";
+            sinkFor(ctx?.auditKey)?.(err, { key, operation: "context" });
+            return plainTextError(500, "Internal Server Error");
+        }
+    };
+
+    async function serveRequest(req: ServableRequest, ctx: ServeContext): Promise<RawResponseParts> {
+        // The context is caller input a JS caller can get wrong; a wrong shape
+        // is the caller's bug, answered as one rather than blamed on the store.
+        if (typeof ctx !== "object" || ctx === null) throw new TypeError("serveObject: ctx must be an object");
+        if (ctx.cacheControl !== undefined && typeof ctx.cacheControl !== "string") {
+            throw new TypeError("serveObject: ctx.cacheControl must be a string");
+        }
+        if (typeof ctx.key !== "string") throw new TypeError("serveObject: ctx.key must be a string");
+
         // Method validation: only GET and HEAD are valid for file serving.
         // OPTIONS gets its standard method-discovery answer (204 + Allow, no
         // Content-Length per RFC 9110 Section 8.6); everything else gets 405
@@ -763,22 +871,25 @@ export function serveObjectRaw(store: ObjectStore, opts: ServeObjectOptions = {}
         // fill in the rest as they learn it.
         const auditKey = ctx.auditKey;
         const tag: ServedIdentity = { key: auditKey ?? key };
-        const onServe = onServeBase && ((event: ServeAuditEvent): void => onServeBase({ ...event, ...tag }));
-        const onTransfer = onTransferBase && ((event: TransferEvent): void => onTransferBase({ ...event, ...tag }));
-        // The error travels to the same sink as the context, and the key can sit
-        // anywhere in it (a message, an own property, a cause's request
-        // descriptor) in any spelling. Under an auditKey the sink receives an
-        // allow-listed projection instead, so no search for the key can miss.
-        const onError =
-            onErrorBase && auditKey !== undefined
-                ? (err: unknown, context: ServeErrorContext): void =>
-                      onErrorBase(projectError(err, context.operation), { ...context, key: auditKey })
-                : onErrorBase;
-        const auditCtx = onServe && { onServe, mime }; // A store error is reported and classified, unless the client already
+        const onError = sinkFor(auditKey);
+        // A hook's own failure goes to the sink, and the response is unaffected.
+        const hookFailed = (err: unknown): void => onError?.(err, { key, operation: "audit" });
+        const onServeGuarded = guardHook(rawOnServe, hookFailed);
+        const onTransferGuarded = guardHook(rawOnTransfer, hookFailed);
+        const onServe = onServeGuarded && ((event: ServeAuditEvent): void => onServeGuarded({ ...event, ...tag }));
+        const onTransfer =
+            onTransferGuarded && ((event: TransferEvent): void => onTransferGuarded({ ...event, ...tag }));
+        const auditCtx = onServe && { onServe, mime };
+        // The timing hook fires while the response is being assembled, where a
+        // throw would turn a healthy 200/206 into a 502.
+        const onTimingGuarded = guardHook(onTiming, hookFailed);
+        // A store error is reported and classified, unless the client already
         // went away: a store whose read fails once the request signal aborted
-        // need not throw an AbortError, and the result is a client abort.
+        // need not throw an AbortError, and the result is a client abort. An
+        // AbortError with a live signal is the store's own cancellation
+        // (a deadline), which is a store failure.
         const fail = (err: unknown, failedKey: string, operation: "head" | "get"): RawResponseParts => {
-            if (isAbortError(err, req.signal)) return clientClosed();
+            if (clientAborted(req.signal)) return clientClosed();
             onError?.(err, { key: failedKey, operation });
             return storeErrorResponse(err);
         };
@@ -810,7 +921,7 @@ export function serveObjectRaw(store: ObjectStore, opts: ServeObjectOptions = {}
             } catch (err) {
                 // Never-throw contract: a rejecting signed-URL provider becomes a
                 // reported 502, never an escaped rejection (which crashes Express 4).
-                if (isAbortError(err, req.signal)) return clientClosed();
+                if (clientAborted(req.signal)) return clientClosed();
                 onError?.(err, { key, operation: "sign" });
                 return storeErrorResponse(undefined);
             }
@@ -830,11 +941,13 @@ export function serveObjectRaw(store: ObjectStore, opts: ServeObjectOptions = {}
 
         // Resolve Content-Disposition
         const dispositionType = typeof dispositionOpt === "function" ? dispositionOpt(mime) : dispositionOpt;
-        // Coerce on BOTH paths. A JS caller's disposition extractor can return an
-        // arbitrary computed string; with a filename, buildContentDisposition
-        // coerces it, but without one the value would previously reach the header
-        // verbatim. Anything but "inline" is "attachment", the safe default.
-        const safeDisposition = dispositionType === "inline" ? "inline" : "attachment";
+        // A callback's result is read where it is used: a promise or any other
+        // value is a caller bug, refused rather than coerced to a disposition
+        // the caller did not choose.
+        if (dispositionType !== "inline" && dispositionType !== "attachment") {
+            throw new TypeError('serveObject: disposition must be "inline" or "attachment"');
+        }
+        const safeDisposition = dispositionType;
         const disposition = ctx.filename
             ? buildContentDisposition(ctx.filename, { type: safeDisposition, fallback: fallbackFilename })
             : safeDisposition;
@@ -842,17 +955,18 @@ export function serveObjectRaw(store: ObjectStore, opts: ServeObjectOptions = {}
         // Active content rendered inline (SVG, HTML, XSLT-capable XML) executes
         // in the serving origin when a user opens it as a top-level document --
         // `nosniff` does not stop a genuine `image/svg+xml` from running its
-        // embedded scripts. Default a sandbox CSP onto exactly that combination;
-        // a caller's securityHeaders can override it (spread order below).
+        // embedded scripts. Put a sandbox CSP on exactly that combination; a
+        // caller's own CSP is enforced alongside it, never instead of it.
         // Attachment responses and passive types (images, video, PDF) are
         // unaffected.
-        const activeInlineCsp =
-            safeDisposition === "inline" && isActiveContentMime(mediaType.essence)
-                ? { "Content-Security-Policy": "sandbox" }
-                : undefined;
+        const sandboxInline = safeDisposition === "inline" && isActiveContentMime(mediaType.essence);
 
         // Extra caller headers for success responses (200/206/304)
-        const extraHeaders = { ...activeInlineCsp, ...securityHeaders?.(mime) };
+        const callerHeaders = securityHeaders?.(mime);
+        if (securityHeaders && !isPlainObject(callerHeaders)) {
+            throw new TypeError("serveObject: securityHeaders must return a plain object");
+        }
+        const extraHeaders = withSandboxPolicy(callerHeaders, sandboxInline);
 
         const effectiveCacheControl = ctx.cacheControl ?? cacheControl;
 
@@ -898,18 +1012,24 @@ export function serveObjectRaw(store: ObjectStore, opts: ServeObjectOptions = {}
         // answered with a bare 302 defeats exactly the clients that send HEAD
         // (PDF.js size probing, cache priming), and costs the backend nothing
         // to answer at the origin.
-        if (
-            !isHead &&
-            store.createSignedUrl &&
-            ((rangelessOffload && !hasConditional) ||
-                preferSignedUrl?.({
+        let offload = false;
+        if (!isHead && store.createSignedUrl) {
+            offload = rangelessOffload && !hasConditional;
+            if (!offload && preferSignedUrl) {
+                const preferred = preferSignedUrl({
                     key,
                     mime,
                     method: "GET",
                     isRange: Boolean(rangeHeader),
                     isConditional: hasConditional || hasIfRange,
-                }))
-        ) {
+                });
+                if (typeof preferred !== "boolean") {
+                    throw new TypeError("serveObject: preferSignedUrl must return a boolean");
+                }
+                offload = preferred;
+            }
+        }
+        if (offload) {
             // A declined signature (`null`) falls through to streaming the bytes.
             const redirected = await redirect();
             if (redirected) return redirected;
@@ -922,35 +1042,58 @@ export function serveObjectRaw(store: ObjectStore, opts: ServeObjectOptions = {}
         // drift guard are all evaluated against the encoded bytes. Multi-range
         // requests are excluded (multipart framing of an encoded representation
         // has no interoperable definition) and serve the identity object.
+        //
+        // A variant is served only under the identity object's authority: the
+        // identity must exist (a variant of a deleted or never-written key is
+        // not served) and the variant must not be older than it (a stale
+        // sibling of a replaced object is not served). The identity's HEAD
+        // rides the same round as the variant probes.
         let effectiveKey = key;
         let contentEncoding: string | undefined;
-        let variantMeta: ObjectMetadata | undefined;
+        // The metadata of `effectiveKey` the negotiation round already fetched,
+        // consumed by the first Path A attempt so it does not HEAD again.
+        let probedMeta: ObjectMetadata | undefined;
+        let identityMeta: ObjectMetadata | undefined;
+        // The variant's read when the negotiation round already opened it; handed
+        // to the first response attempt, which owns its body from then on.
+        let openedVariant: { stream: ObjectStream; getMs: number } | undefined;
         const negotiating = precompressedCodings !== null && isCompressibleMime(mime);
         if (negotiating && !isMultiRange) {
-            const candidates = negotiateEncoding(headers.get("accept-encoding"), precompressedCodings);
-            for (const coding of candidates) {
-                const variantKey = key + PRECOMPRESSED_SUFFIX[coding as PrecompressedCoding];
-                try {
-                    variantMeta = await store.headObject(variantKey, { signal: req.signal });
-                    effectiveKey = variantKey;
-                    contentEncoding = tag.contentEncoding = coding;
-                    if (auditKey === undefined) tag.variantKey = variantKey;
-                    break;
-                } catch (err) {
-                    if (isAbortError(err, req.signal)) return clientClosed();
-                    if (isNotFoundStoreError(err)) continue; // no such variant: next coding
-                    // Any other probe failure (throttle, outage) must not fail the
-                    // request -- the identity representation is always servable.
-                    // Surface it for telemetry and stop probing: an unhealthy backend
-                    // does not need more speculative HEADs.
-                    onError?.(err, { key: variantKey, operation: "head" });
-                    break;
-                }
+            const candidates = negotiateEncoding(headers.get("accept-encoding"), precompressedCodings).filter(
+                isPrecompressedCoding,
+            );
+            // Only a plain GET (Path C) opens its body without first needing the
+            // variant's metadata; a range or a conditional evaluates against that
+            // metadata before any body is opened (304, 412 and 416 open none).
+            const probe = await probeVariants(
+                store,
+                key,
+                candidates,
+                req.signal,
+                variantMisses,
+                variantHits,
+                !needsHead,
+            );
+            if (probe.kind === "aborted") return clientClosed();
+            if (probe.kind === "identityFailed") return fail(probe.err, key, "head");
+            identityMeta = probe.identity;
+            probedMeta = identityMeta;
+            if (probe.failure) {
+                // A probe failure (throttle, outage) must not fail the request --
+                // the identity representation is always servable. Surface it for
+                // telemetry; the identity read follows.
+                onError?.(probe.failure.err, { key: probe.failure.variantKey, operation: probe.failure.operation });
+            } else if (probe.hit) {
+                probedMeta = probe.hit.meta;
+                openedVariant = probe.hit.opened;
+                effectiveKey = probe.hit.variantKey;
+                contentEncoding = tag.contentEncoding = probe.hit.coding;
+                if (auditKey === undefined) tag.variantKey = probe.hit.variantKey;
             }
         }
 
         // Response-building context shared by all response paths
-        const rctx: ResponseContext = {
+        const makeContext = (coding: string | undefined): ResponseContext => ({
             mediaType,
             disposition,
             extraHeaders,
@@ -964,13 +1107,31 @@ export function serveObjectRaw(store: ObjectStore, opts: ServeObjectOptions = {}
             isHead,
             // A range-incapable store is served rangeless: advertise it.
             acceptRanges: store.supportsRange === false ? "none" : "bytes",
-            contentEncoding,
+            contentEncoding: coding,
             // The response is encoding-negotiated whenever probing is CONFIGURED
             // for this type -- also when identity was chosen (the variant may
             // appear later) and on multi-range identity responses -- so shared
             // caches always key compressible objects on Accept-Encoding.
             varyAcceptEncoding: negotiating,
             exposeHeaders,
+        });
+        let rctx = makeContext(contentEncoding);
+
+        // A negotiated variant can disappear between the probe and the read (a
+        // deploy replacing its siblings). The identity object is still there, so
+        // a variant that is gone is answered from it, once: returns whether the
+        // request switched, so the caller re-runs against the identity key.
+        const dropVariant = (): boolean => {
+            if (effectiveKey === key) return false;
+            variantHits.delete(effectiveKey);
+            variantMisses.add(effectiveKey, Date.now());
+            effectiveKey = key;
+            probedMeta = identityMeta;
+            contentEncoding = undefined;
+            delete tag.contentEncoding;
+            delete tag.variantKey;
+            rctx = makeContext(undefined);
+            return true;
         };
 
         // ── Path B: plain range on an authoritative-range store ──────────────
@@ -982,7 +1143,14 @@ export function serveObjectRaw(store: ObjectStore, opts: ServeObjectOptions = {}
         // (video seeking, PDF.js chunked loading). Suffix ranges (`bytes=-N`)
         // and anything the strict parser rejects fall through to Path A, whose
         // HEAD-resolved evaluation handles them.
-        if (rangeHeader && !hasConditional && !hasIfRange && !isHead && store.authoritativeRange && !variantMeta) {
+        if (
+            rangeHeader &&
+            !hasConditional &&
+            !hasIfRange &&
+            !isHead &&
+            store.authoritativeRange &&
+            effectiveKey === key
+        ) {
             const fastRange = parseFastRange(rangeHeader);
             if (fastRange) {
                 let parts: RawResponseParts | null = null;
@@ -1006,7 +1174,10 @@ export function serveObjectRaw(store: ObjectStore, opts: ServeObjectOptions = {}
                                   speculativeErr = err;
                               }
                             : undefined,
-                        timingCtx: timingEnabled ? { storeMs: 0, evaluateMs: 0, onTiming } : undefined,
+                        // A body failing on the wire is the served response's, never
+                        // a speculative attempt's: it goes to the real sink.
+                        onBodyError: onError && ((err) => onError(err, { key, operation: "get" })),
+                        timingCtx: timingEnabled ? { storeMs: 0, evaluateMs: 0, onTiming: onTimingGuarded } : undefined,
                         auditCtx,
                         // A speculative success IS the served response, so it must meter.
                         // A failure returns 502 (no store body) and falls to Path A, which
@@ -1045,15 +1216,19 @@ export function serveObjectRaw(store: ObjectStore, opts: ServeObjectOptions = {}
         for (let attempt = 0; needsHead; attempt++) {
             let meta: ObjectMetadata;
             const t0 = timingEnabled ? performance.now() : 0;
-            if (attempt === 0 && variantMeta) {
-                // The negotiation probe already fetched this representation's
+            if (attempt === 0 && probedMeta) {
+                // The negotiation round already fetched this representation's
                 // metadata; a second HEAD would race it for no benefit. Retries
-                // (attempt > 0) re-fetch: the variant changed under a pinned read.
-                meta = variantMeta;
+                // (attempt > 0) re-fetch: the object changed under a pinned read.
+                meta = probedMeta;
             } else {
                 try {
                     meta = await store.headObject(effectiveKey, { signal: req.signal });
                 } catch (err) {
+                    if (isNotFoundStoreError(err) && dropVariant()) {
+                        attempt = -1; // the identity object gets its own full attempt
+                        continue;
+                    }
                     return fail(err, effectiveKey, "head");
                 }
             }
@@ -1114,13 +1289,8 @@ export function serveObjectRaw(store: ObjectStore, opts: ServeObjectOptions = {}
                 // would have carried to be generated on the 304 too, and
                 // securityHeaders is the mechanism that adds Vary to the 200.
                 // Negotiated responses add their own Vary member the same way.
-                const headers304: Record<string, string> = { ...evaluation.headers, ...rctx.extraHeaders };
-                if (rctx.varyAcceptEncoding) headers304["Vary"] = appendVaryAcceptEncoding(headers304["Vary"]);
                 // A cross-origin revalidator needs ETag readable off the 304 too.
-                if (rctx.exposeHeaders && !headers304["Access-Control-Expose-Headers"]) {
-                    headers304["Access-Control-Expose-Headers"] = rctx.exposeHeaders;
-                }
-                return respond(304, headers304);
+                return respond(304, applyNegotiationHeaders({ ...evaluation.headers, ...rctx.extraHeaders }, rctx));
             }
             if (evaluation.status === 412 || evaluation.status === 416) {
                 audit(evaluation.status);
@@ -1150,10 +1320,10 @@ export function serveObjectRaw(store: ObjectStore, opts: ServeObjectOptions = {}
             // Weak validators cannot assert byte equality anyway; the response-side
             // guard still protects those reads.
             const pinEtag = meta.etag && !meta.etag.startsWith("W/") ? meta.etag : undefined;
-            const timingCtx = timingEnabled ? { storeMs, evaluateMs, onTiming } : undefined;
+            const timingCtx = timingEnabled ? { storeMs, evaluateMs, onTiming: onTimingGuarded } : undefined;
             let singleRange = evaluation.range ?? undefined;
             let multi: ParsedRange[] | undefined;
-            let partStore: Pick<ObjectStore, "getObject"> = store;
+            let partStore: Pick<ObjectStore, "getObject" | "pinsReads"> = store;
 
             // ── Multi-range: serve multipart/byteranges ──────────────────────────
             // evaluateConditionalRequest already settled 412/304 above (conditionals
@@ -1163,7 +1333,9 @@ export function serveObjectRaw(store: ObjectStore, opts: ServeObjectOptions = {}
             // the full 200 below; parseRanges returning null (amplification, or
             // malformed syntax) does the same, and one coalesced range (the whole
             // file included) is served as a plain 206.
-            if (isMultiRange && isRangeFresh(headers, etag, meta.lastModified)) {
+            // An object stored already encoded has no interoperable multipart
+            // framing either (see the negotiation note above): it serves whole.
+            if (isMultiRange && !meta.contentEncoding && isRangeFresh(headers, etag, meta.lastModified)) {
                 const set = parseRanges(rangeHeader, meta.contentLength, maxRanges);
                 if (set === "unsatisfiable") {
                     audit(416);
@@ -1204,6 +1376,7 @@ export function serveObjectRaw(store: ObjectStore, opts: ServeObjectOptions = {}
                     : streamFromStore({
                           store,
                           key: effectiveKey,
+                          variantFallback: effectiveKey !== key,
                           range: singleRange,
                           ifMatch: pinEtag,
                           pin: meta.pin,
@@ -1224,6 +1397,10 @@ export function serveObjectRaw(store: ObjectStore, opts: ServeObjectOptions = {}
                 // buildHeaders -- is deterministic, so a retry just wastes a
                 // HEAD+GET and drops the first failure from onError. Report it now.
                 if (isObjectChangedError(err) && attempt === 0) continue;
+                if (isNotFoundStoreError(err) && dropVariant()) {
+                    attempt = -1; // the identity object gets its own full attempt
+                    continue;
+                }
                 return fail(err, effectiveKey, "get");
             }
         }
@@ -1233,24 +1410,255 @@ export function serveObjectRaw(store: ObjectStore, opts: ServeObjectOptions = {}
         // builder RangeError), a throwing onServe hook, or a store throwing
         // ObjectChangedError without a pin must become a 502, not a rejected
         // handler (which crashes Express 4 processes).
-        try {
-            return await streamFromStore({
-                store,
-                key: effectiveKey,
-                ctx: rctx,
-                signal: req.signal,
-                onError,
-                timingCtx: timingEnabled ? { storeMs: 0, evaluateMs: 0, onTiming } : undefined,
-                auditCtx,
-                onTransfer,
-            });
-        } catch (err) {
-            return fail(err, effectiveKey, "get");
+        for (;;) {
+            const opened = openedVariant;
+            openedVariant = undefined;
+            try {
+                return await streamFromStore({
+                    store,
+                    key: effectiveKey,
+                    variantFallback: effectiveKey !== key,
+                    opened,
+                    ctx: rctx,
+                    signal: req.signal,
+                    onError,
+                    timingCtx: timingEnabled ? { storeMs: 0, evaluateMs: 0, onTiming: onTimingGuarded } : undefined,
+                    auditCtx,
+                    onTransfer,
+                });
+            } catch (err) {
+                if (isNotFoundStoreError(err) && dropVariant()) continue;
+                return fail(err, effectiveKey, "get");
+            }
         }
-    };
+    }
 }
 
 // ─── Internal Helpers ───────────────────────────────────────────────────────
+
+/**
+ * How long a not-found precompressed variant is remembered. A variant uploaded
+ * inside this window is served from the next request after it expires; until
+ * then the identity object answers, which is always a correct response.
+ */
+const VARIANT_MISS_TTL_MS = 30_000;
+/** Bound on remembered misses per handler; the oldest entry is dropped first. */
+const VARIANT_MISS_MAX = 4096;
+/** A key longer than this is probed every time: it comes from the request path and must not choose what stays in memory. */
+const VARIANT_MISS_KEY_MAX = 1024;
+
+/** The outcome of probing a request's identity object and candidate variants. */
+type VariantProbe =
+    | { kind: "aborted" }
+    /** The identity object's own HEAD failed (not "not found"): the request fails as a store error. */
+    | { kind: "identityFailed"; err: unknown }
+    | {
+          kind: "settled";
+          /** The identity object's metadata; absent when it was not probed or does not exist. */
+          identity: ObjectMetadata | undefined;
+          /** The variant to serve, always one the identity authorizes. */
+          hit?: {
+              coding: PrecompressedCoding;
+              variantKey: string;
+              meta: ObjectMetadata;
+              /** The variant's read, already opened by a remembered-hit probe; the response is built from it. */
+              opened?: { stream: ObjectStream; getMs: number };
+          };
+          /** A probe failure ranked above the first hit: the identity is served. */
+          failure?: { err: unknown; variantKey: string; operation: "head" | "get" };
+      };
+
+/** Whether a variant is older than the identity object it stands in for; unknown ages never disqualify. */
+function isStaleVariant(variant: Pick<ObjectMetadata, "lastModified">, identity: ObjectMetadata): boolean {
+    if (!variant.lastModified || !identity.lastModified) return false;
+    return Date.parse(variant.lastModified) < Date.parse(identity.lastModified);
+}
+
+/** A candidate variant: its coding and the sibling key that holds it. */
+interface VariantCandidate {
+    coding: PrecompressedCoding;
+    variantKey: string;
+}
+
+/**
+ * The candidates to ask the store about, in preference order, minus the
+ * remembered misses and ending at the first remembered hit. `direct` is that
+ * hit when it is read instead of probed: only for `readVariant`, and only when
+ * nothing ranks above it.
+ */
+function planProbes(
+    key: string,
+    candidates: readonly PrecompressedCoding[],
+    misses: VariantMisses,
+    hits: VariantHits,
+    now: number,
+    readVariant: boolean,
+): { probes: VariantCandidate[]; direct?: VariantCandidate } {
+    const ranked = candidates
+        .map((coding) => ({ coding, variantKey: key + PRECOMPRESSED_SUFFIX[coding] }))
+        .filter(({ variantKey }) => !misses.has(variantKey, now));
+    const remembered = ranked.findIndex(({ variantKey }) => hits.has(variantKey, now));
+    const probes = remembered === -1 ? ranked : ranked.slice(0, remembered + 1);
+    return { probes, direct: readVariant && remembered === 0 ? ranked[0] : undefined };
+}
+
+/**
+ * Probe the candidate siblings and the identity object at once, so negotiation
+ * costs one round trip however many codings the client accepts, and take the
+ * best-ranked hit the identity authorizes. Candidates arrive in preference
+ * order, and every probe has been sent by the time the first answer is read, so
+ * each not-found is remembered for {@link VARIANT_MISS_TTL_MS} (see
+ * {@link VariantMisses}), whatever the outcome ranked above it, and skipped
+ * meanwhile. A variant the store confirmed is remembered the same way (see
+ * {@link VariantHits}): the probe stops at the first remembered one, since
+ * nothing ranked below it can win, so a repeat request sends one variant HEAD
+ * plus the identity HEAD. When `readVariant` is set (a plain GET, which needs
+ * no variant metadata before it opens the body) and the remembered hit is the
+ * only candidate left, the variant is read instead of probed: its GET and the
+ * identity HEAD go out together and the GET's own validators stand in for the
+ * variant HEAD (see {@link readRememberedVariant}).
+ *
+ * The verdict is taken in rank order: a client abort, or any other probe
+ * failure ranked above the first hit, ends the walk with that outcome and the
+ * caller serves identity; the first hit wins, unless the identity object is
+ * missing (nothing authorizes a variant) or newer than the variant (the
+ * variant is a stale build output, remembered as a miss).
+ */
+async function probeVariants(
+    store: Pick<ObjectStore, "headObject" | "getObject">,
+    key: string,
+    candidates: readonly PrecompressedCoding[],
+    signal: AbortSignal | undefined,
+    misses: VariantMisses,
+    hits: VariantHits,
+    readVariant: boolean,
+): Promise<VariantProbe> {
+    const now = Date.now();
+    const { probes, direct } = planProbes(key, candidates, misses, hits, now, readVariant);
+    if (direct) return readRememberedVariant(store, key, direct, signal, misses, hits, now);
+    if (probes.length === 0) return { kind: "settled", identity: undefined };
+    const [identityOutcome, ...settled] = await Promise.allSettled([
+        store.headObject(key, { signal }),
+        ...probes.map((p) => store.headObject(p.variantKey, { signal })),
+    ]);
+    for (const [i, outcome] of settled.entries()) {
+        const { variantKey } = probes[i]!;
+        if (outcome.status === "fulfilled") misses.delete(variantKey);
+        else if (isNotFoundStoreError(outcome.reason)) {
+            misses.add(variantKey, now);
+            hits.delete(variantKey);
+        }
+    }
+    let identity: ObjectMetadata | undefined;
+    if (identityOutcome!.status === "fulfilled") identity = identityOutcome!.value;
+    else if (clientAborted(signal)) return { kind: "aborted" };
+    else if (!isNotFoundStoreError(identityOutcome!.reason)) {
+        return { kind: "identityFailed", err: identityOutcome!.reason };
+    }
+    for (const [i, outcome] of settled.entries()) {
+        const { coding, variantKey } = probes[i]!;
+        if (outcome.status === "fulfilled") {
+            if (!identity) break;
+            if (isStaleVariant(outcome.value, identity)) {
+                misses.add(variantKey, now);
+                hits.delete(variantKey);
+                continue;
+            }
+            hits.add(variantKey, now);
+            return { kind: "settled", identity, hit: { coding, variantKey, meta: outcome.value } };
+        }
+        if (clientAborted(signal)) return { kind: "aborted" };
+        if (!isNotFoundStoreError(outcome.reason)) {
+            return { kind: "settled", identity, failure: { err: outcome.reason, variantKey, operation: "head" } };
+        }
+    }
+    return { kind: "settled", identity };
+}
+
+/**
+ * The remembered-hit form of {@link probeVariants}: the variant's GET and the
+ * identity's HEAD are sent together, so the pair costs two calls in one round
+ * trip where a HEAD of each and then the GET cost three calls in two.
+ *
+ * The variant is served only while the identity exists and is not newer than
+ * it, judged on the validators the GET itself returned. Every other outcome
+ * releases the opened body and answers from the identity object: a missing
+ * identity, a newer identity (the variant is remembered as a miss), a variant
+ * answered not-found (the memo is cleared and it is remembered as a miss), or
+ * a variant read that failed otherwise (reported, never fatal).
+ */
+async function readRememberedVariant(
+    store: Pick<ObjectStore, "headObject" | "getObject">,
+    key: string,
+    { coding, variantKey }: VariantCandidate,
+    signal: AbortSignal | undefined,
+    misses: VariantMisses,
+    hits: VariantHits,
+    now: number,
+): Promise<VariantProbe> {
+    const t0 = performance.now();
+    const [identityOutcome, readOutcome] = await Promise.allSettled([
+        store.headObject(key, { signal }),
+        store.getObject(variantKey, { signal }),
+    ]);
+    const release = (): void => {
+        if (readOutcome.status === "fulfilled") cancelBody(readOutcome.value.body);
+    };
+    let identity: ObjectMetadata | undefined;
+    if (identityOutcome.status === "fulfilled") identity = identityOutcome.value;
+    else if (clientAborted(signal)) {
+        release();
+        return { kind: "aborted" };
+    } else if (!isNotFoundStoreError(identityOutcome.reason)) {
+        release();
+        return { kind: "identityFailed", err: identityOutcome.reason };
+    }
+    if (readOutcome.status === "rejected") {
+        if (clientAborted(signal)) return { kind: "aborted" };
+        if (isNotFoundStoreError(readOutcome.reason)) {
+            misses.add(variantKey, now);
+            hits.delete(variantKey);
+            return { kind: "settled", identity };
+        }
+        return { kind: "settled", identity, failure: { err: readOutcome.reason, variantKey, operation: "get" } };
+    }
+    const opened = readOutcome.value;
+    if (!identity || isStaleVariant(opened, identity)) {
+        release();
+        if (identity) {
+            misses.add(variantKey, now);
+            hits.delete(variantKey);
+        }
+        return { kind: "settled", identity };
+    }
+    misses.delete(variantKey);
+    hits.add(variantKey, now);
+    return {
+        kind: "settled",
+        identity,
+        hit: { coding, variantKey, meta: opened, opened: { stream: opened, getMs: performance.now() - t0 } },
+    };
+}
+
+/** Whether a Content-Security-Policy value already carries a `sandbox` directive in any of its policies. */
+const HAS_SANDBOX_DIRECTIVE = /(?:^|[;,])\s*sandbox(?:\s|;|,|$)/i;
+
+/**
+ * The caller's extra headers with the inline-active-content sandbox applied.
+ *
+ * A Content-Security-Policy field may carry several comma-separated policies
+ * and a browser enforces each, so the sandbox is APPENDED as its own policy to
+ * a caller's CSP rather than replaced by it: a routine hardening header must
+ * not silently remove the sandbox. A caller policy that already has a
+ * `sandbox` directive is left as written.
+ */
+function withSandboxPolicy(caller: Record<string, string> | undefined, sandbox: boolean): Record<string, string> {
+    if (!sandbox) return { ...caller };
+    const own = Object.entries(caller ?? {}).find(([k]) => k.toLowerCase() === "content-security-policy");
+    if (own === undefined) return { ...caller, "Content-Security-Policy": "sandbox" };
+    const [name, policy] = own;
+    return HAS_SANDBOX_DIRECTIVE.test(policy) ? { ...caller } : { ...caller, [name]: `${policy}, sandbox` };
+}
 
 /**
  * Wrap a headers view so Range and If-Range read as absent.
@@ -1274,7 +1682,7 @@ function withoutRangeHeaders(headers: { get(name: string): string | null }): { g
 function resolvePrecompressedList(codings: readonly PrecompressedCoding[]): readonly PrecompressedCoding[] | null {
     if (codings.length === 0) return null;
     for (const coding of codings) {
-        if (!(coding in PRECOMPRESSED_SUFFIX)) {
+        if (!isPrecompressedCoding(coding)) {
             throw new TypeError(`serveObject: unknown precompressed coding "${coding}"`);
         }
     }
@@ -1314,19 +1722,19 @@ function appendVaryAcceptEncoding(existing: string | undefined): string {
 
 /**
  * Parse a Range header for the single-round-trip fast path (no totalSize
- * available yet). Accepts only `bytes=a-b` and `bytes=a-` (open end becomes
- * MAX_SAFE_INTEGER; RFC 9110 Section 14.1.2 lets the server clamp a
+ * available yet). Accepts only `bytes=a-b` and `bytes=a-` (an open end is left
+ * absent; RFC 9110 Section 14.1.2 lets the server clamp a
  * last-byte-pos past EOF, and authoritative-range backends do). Everything
  * else -- suffix ranges, multi-range, malformed specs -- returns null so the
  * validating HEAD path evaluates it with the real object size.
  */
-function parseFastRange(header: string): { start: number; end: number } | null {
+function parseFastRange(header: string): ReadRange | null {
     const m = /^bytes=(\d+)-(\d*)$/.exec(header.trim());
     if (!m) return null;
     const start = Number(m[1]);
     if (!Number.isSafeInteger(start)) return null;
-    const end = m[2] ? Number(m[2]) : OPEN_ENDED;
-    if (!Number.isSafeInteger(end) || end < start) return null;
+    const end = m[2] ? Number(m[2]) : undefined;
+    if (end !== undefined && (!Number.isSafeInteger(end) || end < start)) return null;
     return { start, end };
 }
 
@@ -1369,22 +1777,9 @@ interface ProtocolMeta {
     etag?: string;
     lastModified?: string;
     digest?: string;
+    /** Coding the store reports for the stored bytes (`Content-Encoding`). */
+    contentEncoding?: string;
 }
-
-/**
- * Locked-down headers for bodyless denial responses (304 excepted, which
- * carries only validators). A `default-src 'none'` CSP plus `nosniff` so a
- * 412/416 body can never be sniffed or execute anything, and `no-store` so a
- * transient denial is never cached (a 416 in particular advertises
- * `Accept-Ranges: bytes` per RFC 9110 Section 14.3 and must not linger in a
- * shared cache).
- * Spread onto the protocol headers the kernel produced for the status.
- */
-const DENY_HEADERS = {
-    "Content-Security-Policy": "default-src 'none'",
-    "X-Content-Type-Options": "nosniff",
-    "Cache-Control": "no-store",
-} as const;
 
 /**
  * Append `; charset=utf-8` to a textual Content-Type when charset enforcement
@@ -1412,7 +1807,17 @@ function applyAdapterHeaders(base: Record<string, string>, ctx: ResponseContext)
     };
     if (ctx.crossOriginResourcePolicy) headers["Cross-Origin-Resource-Policy"] = ctx.crossOriginResourcePolicy;
     if (ctx.timingAllowOrigin) headers["Timing-Allow-Origin"] = ctx.timingAllowOrigin;
-    // Caller extraHeaders win (already spread above): only fill when absent.
+    return applyNegotiationHeaders(headers, ctx);
+}
+
+/**
+ * The headers a response carries because of the handler's options rather than
+ * its status: cross-origin exposure and the Accept-Encoding Vary member. Shared
+ * by every success status including the 304, so a header added here reaches
+ * them all.
+ */
+function applyNegotiationHeaders(headers: Record<string, string>, ctx: ResponseContext): Record<string, string> {
+    // Caller extraHeaders win (already spread into `headers`): only fill when absent.
     if (ctx.exposeHeaders && !headers["Access-Control-Expose-Headers"]) {
         headers["Access-Control-Expose-Headers"] = ctx.exposeHeaders;
     }
@@ -1448,10 +1853,12 @@ function buildHeaders(ctx: ResponseContext, meta: ProtocolMeta): Record<string, 
     // Range-incapable stores advertise honestly instead of inviting 206s
     // the pipeline will never grant.
     if (ctx.acceptRanges === "none") protocol["Accept-Ranges"] = "none";
-    // A negotiated precompressed variant IS the representation: its coding is
-    // representation metadata, and the surrounding validators/digest/ranges
-    // already describe the encoded bytes.
-    if (ctx.contentEncoding) protocol["Content-Encoding"] = ctx.contentEncoding;
+    // A negotiated precompressed variant, or an object stored already encoded,
+    // IS the representation: its coding is representation metadata, and the
+    // surrounding validators/digest/ranges already describe the encoded bytes
+    // (RFC 9110 Section 14.2). The negotiated coding names the variant key.
+    const coding = ctx.contentEncoding ?? meta.contentEncoding;
+    if (coding) protocol["Content-Encoding"] = coding;
 
     return applyAdapterHeaders(protocol, ctx);
 }
@@ -1465,6 +1872,7 @@ function buildHeadResponse(meta: ObjectMetadata, etag: string | undefined, ctx: 
             etag,
             lastModified: meta.lastModified,
             digest: meta.digest,
+            contentEncoding: meta.contentEncoding,
         }),
     );
 }
@@ -1493,7 +1901,7 @@ interface AuditContext {
 interface StreamOpts {
     store: ObjectStore;
     key: string;
-    range?: { start: number; end: number };
+    range?: ReadRange;
     /** Opaque adapter pin token from the HEAD metadata (GetObjectOptions.pin). */
     pin?: string;
     /**
@@ -1502,12 +1910,34 @@ interface StreamOpts {
      * ObjectChangedError, which propagates to the caller for re-validation.
      */
     ifMatch?: string;
+    /**
+     * The key is a negotiated variant with an identity object behind it: a
+     * missing variant propagates to the caller, which answers from the identity
+     * key instead of reporting a 404 for an object that exists.
+     */
+    variantFallback?: boolean;
+    /** A read of `key` already opened (and timed) by the negotiation round: used instead of a `getObject`. */
+    opened?: { stream: ObjectStream; getMs: number };
+    /**
+     * The range was resolved against a HEAD (a store that is not
+     * `authoritativeRange`), so the span the store served must be the span
+     * asked for: a different label is an incoherent store, not a clamp.
+     */
+    exactRange?: boolean;
+    /** The store enforces `ifMatch` itself ({@link ObjectStore.pinsReads}). */
+    pinsReads?: boolean;
     headEtag?: string;
     headLastModified?: string;
     reprDigest?: string;
     ctx: ResponseContext;
     signal?: AbortSignal;
     onError?: (error: unknown, context: { key: string; operation: "head" | "get" }) => void;
+    /**
+     * Receives a failure of the response body once it is on the wire (a source
+     * that errors mid-stream, a length mismatch). Defaults to `onError`; a caller
+     * whose `onError` only captures a speculative attempt passes the real sink.
+     */
+    onBodyError?: (error: unknown) => void;
     timingCtx?: TimingContext;
     auditCtx?: AuditContext;
     /**
@@ -1521,20 +1951,59 @@ interface StreamOpts {
 /**
  * Stream bytes from the store, building a proper 200/206 response.
  *
- * Maps store failures to responses internally, with one exception:
- * ObjectChangedError (a pinned read losing its race) is rethrown so the
- * caller can re-validate against the object's new state.
+ * Maps store failures to responses internally, with two exceptions rethrown to
+ * the caller: ObjectChangedError (a pinned read losing its race, to re-validate
+ * against the object's new state) and, for a negotiated variant, a missing
+ * object (to answer from the identity key).
  */
 async function streamFromStore(opts: StreamOpts): Promise<RawResponseParts> {
+    const { store, key, range, ifMatch, variantFallback, pin, signal, onError, timingCtx } = opts;
+
+    if (opts.opened) {
+        return respondFromRead(
+            { ...opts, exactRange: !store.authoritativeRange, pinsReads: store.pinsReads === true },
+            opts.opened.stream,
+            opts.opened.getMs,
+        );
+    }
+    const t0 = timingCtx ? performance.now() : 0;
+    let result: ObjectStream;
+    try {
+        result = await store.getObject(key, { range, signal, ifMatch, pin });
+    } catch (err) {
+        if (isObjectChangedError(err) || (variantFallback && isNotFoundStoreError(err))) throw err;
+        if (clientAborted(signal)) return clientClosed();
+        onError?.(err, { key, operation: "get" });
+        return storeErrorResponse(err);
+    }
+    return respondFromRead(
+        { ...opts, exactRange: !store.authoritativeRange, pinsReads: store.pinsReads === true },
+        result,
+        timingCtx ? performance.now() - t0 : 0,
+    );
+}
+
+/**
+ * Turn an opened store read into the response, after checking it is coherent
+ * and the representation the conditionals were evaluated against. Owns the
+ * read's body from here: every path either hands it to the response or
+ * cancels it.
+ */
+function respondFromRead(
+    opts: Omit<StreamOpts, "store" | "variantFallback" | "opened">,
+    result: ObjectStream,
+    getMs: number,
+): RawResponseParts {
     const {
-        store,
         key,
         range,
         ifMatch,
         pin,
+        pinsReads,
         headEtag,
         headLastModified,
         reprDigest,
+        exactRange,
         ctx,
         signal,
         onError,
@@ -1542,18 +2011,7 @@ async function streamFromStore(opts: StreamOpts): Promise<RawResponseParts> {
         auditCtx,
         onTransfer,
     } = opts;
-
-    const t0 = timingCtx ? performance.now() : 0;
-    let result: Awaited<ReturnType<ObjectStore["getObject"]>>;
-    try {
-        result = await store.getObject(key, { range, signal, ifMatch, pin });
-    } catch (err) {
-        if (isObjectChangedError(err)) throw err;
-        if (isAbortError(err, signal)) return clientClosed();
-        onError?.(err, { key, operation: "get" });
-        return storeErrorResponse(err);
-    }
-    const getMs = timingCtx ? performance.now() - t0 : 0;
+    const onBodyError = opts.onBodyError ?? ((err: unknown) => onError?.(err, { key, operation: "get" }));
 
     // Derive the response ETag from the GET result itself: strong from the
     // backend's own ETag when present, weak from size + mtime otherwise. This keeps
@@ -1570,15 +2028,19 @@ async function streamFromStore(opts: StreamOpts): Promise<RawResponseParts> {
     const actualRange = range ? (result.range ?? null) : null;
     const incoherent = (detail: string): RawResponseParts => {
         const err = new Error(`Store returned incoherent ${detail}`);
-        onError?.(err, { key, operation: "get" });
         // The body was never handed to a response: cancel a stream form or the
         // backing resource (fs file handle, pooled HTTP socket) stays open
-        // until GC. Byte bodies hold nothing.
+        // until GC. Byte bodies hold nothing. Cancelled before the sink is
+        // told, so a throwing onError cannot strand it.
         cancelBody(result.body);
+        onError?.(err, { key, operation: "get" });
         return storeErrorResponse(err);
     };
     if (actualRange && !isServableRange(actualRange, result.totalSize)) {
         return incoherent(`range ${actualRange.start}-${actualRange.end}/${result.totalSize}`);
+    }
+    if (exactRange && range && actualRange && (actualRange.start !== range.start || actualRange.end !== range.end)) {
+        return incoherent(`range ${actualRange.start}-${actualRange.end} for requested ${range.start}-${range.end}`);
     }
     // Byte-count coherence: the emitted Content-Length is derived from the range
     // span (206) or totalSize (200), but the body streams result.contentLength
@@ -1607,6 +2069,7 @@ async function streamFromStore(opts: StreamOpts): Promise<RawResponseParts> {
     const verified = acceptRead(key, { etag: headEtag, lastModified: headLastModified }, got, result.body, {
         ifMatch,
         pin,
+        pinsReads,
     });
     const finalEtag = ctx.emitETag ? (got.etag ?? (verified ? headEtag : undefined)) : undefined;
     const finalLastModified = got.lastModified ?? (verified ? headLastModified : undefined);
@@ -1626,6 +2089,7 @@ async function streamFromStore(opts: StreamOpts): Promise<RawResponseParts> {
             etag: finalEtag,
             lastModified: finalLastModified,
             digest: finalDigest,
+            contentEncoding: result.contentEncoding,
         });
         // Reported only once the read is accepted and the headers commit, so a
         // re-validated attempt or a refused store result never reports.
@@ -1676,7 +2140,8 @@ async function streamFromStore(opts: StreamOpts): Promise<RawResponseParts> {
                 : boundBody(result.body, {
                       expected: result.contentLength,
                       report,
-                      onLengthMismatch: (err) => onError?.(err, { key, operation: "get" }),
+                      signal,
+                      onFailure: onBodyError,
                   });
 
         return respond(status, headers, body);
@@ -1688,7 +2153,7 @@ async function streamFromStore(opts: StreamOpts): Promise<RawResponseParts> {
 
 /** Options for {@link serveMultipart}. */
 interface MultipartOpts {
-    store: Pick<ObjectStore, "getObject">;
+    store: Pick<ObjectStore, "getObject" | "pinsReads">;
     key: string;
     /** Coalesced, satisfiable ranges (length >= 2), clamped to the object size. */
     ranges: ParsedRange[];
@@ -1755,7 +2220,7 @@ async function serveMultipart(opts: MultipartOpts): Promise<RawResponseParts> {
         firstStream = await store.getObject(key, { range: ranges[0], signal, ifMatch, pin });
     } catch (err) {
         if (isObjectChangedError(err)) throw err;
-        if (isAbortError(err, signal)) return clientClosed();
+        if (clientAborted(signal)) return clientClosed();
         onError?.(err, { key, operation: "get" });
         return storeErrorResponse(err);
     }
@@ -1765,13 +2230,32 @@ async function serveMultipart(opts: MultipartOpts): Promise<RawResponseParts> {
     // non-pinning store (one that cannot honor ifMatch/pin), a concurrent
     // overwrite between parts would otherwise splice bytes across
     // representations or under-run the precomputed Content-Length. A first-part
-    // mismatch re-validates once via the orchestrator's retry loop. A byte
-    // body's REAL length is checkable here too (streams settle lazily below).
-    if (
-        !servedSpanMatches(firstStream, ranges[0]!) ||
-        (firstStream.body instanceof Uint8Array &&
-            firstStream.body.byteLength !== ranges[0]!.end - ranges[0]!.start + 1)
-    ) {
+    // mismatch re-validates once via the orchestrator's retry loop. A store
+    // that ignored the range and answered with the whole representation is
+    // served as the 200 RFC 9110 Section 14.2 permits, as the single-range
+    // path does.
+    if (firstStream.range === undefined) {
+        return respondFromRead(
+            {
+                key,
+                ifMatch,
+                pin,
+                pinsReads: store.pinsReads === true,
+                headEtag: etag,
+                headLastModified: lastModified,
+                reprDigest: digest,
+                ctx,
+                signal,
+                onError,
+                timingCtx,
+                auditCtx,
+                onTransfer,
+            },
+            firstStream,
+            getMs,
+        );
+    }
+    if (!firstPartMatches(firstStream, ranges[0]!)) {
         cancelBody(firstStream.body);
         throw new ObjectChangedError(key);
     }
@@ -1782,148 +2266,160 @@ async function serveMultipart(opts: MultipartOpts): Promise<RawResponseParts> {
     const verified = acceptRead(key, { etag, lastModified }, readValidators(ctx, firstStream), firstStream.body, {
         ifMatch,
         pin,
+        pinsReads: store.pinsReads === true,
     });
-    const headDescribes = verified ? { etag, lastModified, digest } : {};
+    // From here the first part is owned by this function until the returned
+    // body takes it: anything that throws before the return releases it, so a
+    // failure never strands a descriptor-backed stream (the rule
+    // streamFromStore states for its single body).
+    try {
+        const headDescribes = verified ? { etag, lastModified, digest } : {};
 
-    const multipart = buildMultipartHeaders({
-        boundary,
-        ranges,
-        totalSize,
-        contentType: partContentType,
-        etag: headDescribes.etag,
-        lastModified: headDescribes.lastModified,
-        // RFC 9530 Section 4: respect Want-Repr-Digest negotiation exactly like
-        // buildHeaders does for single-range responses; weight 0 or an algorithm
-        // list without sha-256 means "do not send".
-        digest: ctx.digestWanted ? headDescribes.digest : undefined,
-        cacheControl: ctx.cacheControl,
-    });
+        const multipart = buildMultipartHeaders({
+            boundary,
+            ranges,
+            totalSize,
+            contentType: partContentType,
+            etag: headDescribes.etag,
+            lastModified: headDescribes.lastModified,
+            // RFC 9530 Section 4: respect Want-Repr-Digest negotiation exactly like
+            // buildHeaders does for single-range responses; weight 0 or an algorithm
+            // list without sha-256 means "do not send".
+            digest: ctx.digestWanted ? headDescribes.digest : undefined,
+            cacheControl: ctx.cacheControl,
+        });
 
-    // Ownership of the eagerly-fetched first part transfers to the generator the
-    // moment it takes the part's reader (or yields its bytes). Until then, a
-    // consumer cancel would strand firstStream: gen.return() only runs the
-    // reader's finally if control already entered the try. Track the handoff so
-    // the outer cancel can release it in the pre-handoff window (suspendedStart,
-    // or suspended at the part-header yield).
-    let firstPartOwned = false;
-    const enc = UTF8_ENCODER;
-    async function* multipartChunks(): AsyncGenerator<Uint8Array> {
-        for (let i = 0; i < ranges.length; i++) {
-            const range = ranges[i]!;
-            yield enc.encode(buildMultipartPartHeader(boundary, range, totalSize, partContentType));
-            const stream = i === 0 ? firstStream : await store.getObject(key, { range, signal, ifMatch, pin });
-            // Lazy parts settle AFTER headers commit, so a mismatch can only be
-            // surfaced as a stream error (a reset). That still beats splicing bytes
-            // from a changed representation or under-running the committed length.
-            // The span check alone would miss a SAME-SIZE overwrite (right byte count,
-            // different bytes); comparing each part's validator against the first
-            // catches that too, since any overwrite changes the fs weak ETag (mtime)
-            // and the S3 strong ETag (content hash). Stores that return no GET
-            // validator fall back to the span check.
-            if (i > 0 && (!servedSpanMatches(stream, range) || !sameRepresentation(firstStream, stream))) {
-                cancelBody(stream.body);
-                throw new ObjectChangedError(key);
-            }
-            // Handoff point: cleanup is now guaranteed by the reader's finally below.
-            // No await or yield sits between here and getReader(), so a cancel
-            // cannot interleave. A byte body runs through the same counted path.
-            if (i === 0) firstPartOwned = true;
-            const partSpan = range.end - range.start + 1;
-            const reader = (
-                stream.body instanceof Uint8Array ? new Response(stream.body).body! : stream.body
-            ).getReader();
-            let partBytes = 0;
-            try {
-                for (;;) {
-                    const { done, value } = await reader.read();
-                    // A chunk that crosses the span is withheld, not framed and
-                    // then complained about: bytes past the range (the tail of a
-                    // representation that changed under the read) would otherwise
-                    // be on the wire inside a well-formed part before the error.
-                    if (done || (partBytes += value.byteLength) > partSpan) break;
-                    yield value;
+        // Ownership of the eagerly-fetched first part transfers to the generator the
+        // moment it takes the part's reader (or yields its bytes). Until then, a
+        // consumer cancel would strand firstStream: gen.return() only runs the
+        // reader's finally if control already entered the try. Track the handoff so
+        // the outer cancel can release it in the pre-handoff window (suspendedStart,
+        // or suspended at the part-header yield).
+        let firstPartOwned = false;
+        const enc = UTF8_ENCODER;
+        async function* multipartChunks(): AsyncGenerator<Uint8Array> {
+            for (let i = 0; i < ranges.length; i++) {
+                const range = ranges[i]!;
+                yield enc.encode(buildMultipartPartHeader(boundary, range, totalSize, partContentType));
+                const stream = i === 0 ? firstStream : await store.getObject(key, { range, signal, ifMatch, pin });
+                // Lazy parts settle AFTER headers commit, so a mismatch can only be
+                // surfaced as a stream error (a reset). That still beats splicing bytes
+                // from a changed representation or under-running the committed length.
+                // The span check alone would miss a SAME-SIZE overwrite (right byte count,
+                // different bytes); comparing each part's validator against the first
+                // catches that too, since any overwrite changes the fs weak ETag (mtime)
+                // and the S3 strong ETag (content hash). Stores that return no GET
+                // validator fall back to the span check.
+                if (i > 0 && (!servedSpanMatches(stream, range) || !sameRepresentation(firstStream, stream))) {
+                    cancelBody(stream.body);
+                    throw new ObjectChangedError(key);
                 }
-            } finally {
-                // Release the backend resource on normal completion AND on an early
-                // generator return (client cancelled mid-part).
-                reader.cancel().catch(() => {
-                    /* already-settled reader */
-                });
+                // Handoff point: cleanup is now guaranteed by the reader's finally below.
+                // No await or yield sits between here and getReader(), so a cancel
+                // cannot interleave. A byte body runs through the same counted path.
+                if (i === 0) firstPartOwned = true;
+                const partSpan = range.end - range.start + 1;
+                const reader = (
+                    stream.body instanceof Uint8Array ? new Response(stream.body).body! : stream.body
+                ).getReader();
+                let partBytes = 0;
+                try {
+                    for (;;) {
+                        const { done, value } = await reader.read();
+                        // A chunk that crosses the span is withheld, not framed and
+                        // then complained about: bytes past the range (the tail of a
+                        // representation that changed under the read) would otherwise
+                        // be on the wire inside a well-formed part before the error.
+                        if (done || (partBytes += value.byteLength) > partSpan) break;
+                        yield value;
+                    }
+                } finally {
+                    // Release the backend resource on normal completion AND on an early
+                    // generator return (client cancelled mid-part).
+                    reader.cancel().catch(() => {
+                        /* already-settled reader */
+                    });
+                }
+                // A short (or long) part means the source diverged from the span the
+                // committed Content-Length was computed from. Erroring the stream (a
+                // reset the client sees as a failed transfer) beats emitting
+                // well-formed framing around a torn part: adapters with internal
+                // length guards catch this earlier; this is the store-agnostic
+                // backstop at the framing layer.
+                if (partBytes !== partSpan) {
+                    throw new Error(`multipart part ${range.start}-${range.end} changed mid-read`);
+                }
+                yield enc.encode("\r\n");
             }
-            // A short (or long) part means the source diverged from the span the
-            // committed Content-Length was computed from. Erroring the stream (a
-            // reset the client sees as a failed transfer) beats emitting
-            // well-formed framing around a torn part: adapters with internal
-            // length guards catch this earlier; this is the store-agnostic
-            // backstop at the framing layer.
-            if (partBytes !== partSpan) {
-                throw new Error(`multipart part ${range.start}-${range.end} changed mid-read`);
-            }
-            yield enc.encode("\r\n");
+            yield enc.encode(multipartEpilogue(boundary));
         }
-        yield enc.encode(multipartEpilogue(boundary));
+
+        const gen = multipartChunks();
+        const rawBody = new ReadableStream<Uint8Array<ArrayBuffer>>({
+            async pull(controller) {
+                try {
+                    const { done, value } = await gen.next();
+                    if (done) controller.close();
+                    // Part headers (encoder output) and part bodies are ArrayBuffer-backed;
+                    // narrow so the multipart body stays Response-assignable under the DOM
+                    // lib, where BodyInit requires an ArrayBuffer-backed view.
+                    else controller.enqueue(value as Uint8Array<ArrayBuffer>);
+                } catch (err) {
+                    controller.error(err);
+                }
+            },
+            async cancel(reason) {
+                await gen.return?.(reason as undefined);
+                // Cancelled before the generator took ownership of the eagerly-fetched
+                // first part (suspendedStart, or suspended at the part-header yield):
+                // gen.return ran no finally, so release it here. A byte-body first part
+                // is a no-op in cancelBody; a stream part's file handle/socket is freed.
+                if (!firstPartOwned) cancelBody(firstStream.body);
+            },
+        });
+
+        const headers = applyAdapterHeaders(multipart.headers, ctx);
+
+        // Server-Timing mirrors streamFromStore: the store figure covers the HEAD
+        // plus the eagerly-fetched first part (lazy parts settle after headers
+        // commit and cannot be measured into a header that has already left).
+        if (timingCtx) headers["Server-Timing"] = reportTiming(timingCtx, getMs);
+
+        // Audit reports the multipart body's granted length (framing + all parts).
+        auditCtx?.onServe({
+            key,
+            method: "GET",
+            status: 206,
+            mime: auditCtx.mime,
+            bytesServed: multipart.contentLength,
+            etag,
+        });
+
+        // The generator holds each part to its span; the committed total rides
+        // here too so the runtime receives a fixed-length body (and a framing
+        // miscount errors the stream instead of under-running Content-Length).
+        const body = boundBody(rawBody, {
+            expected: multipart.contentLength,
+            signal,
+            onFailure: (err) => onError?.(err, { key, operation: "get" }),
+            report:
+                onTransfer &&
+                ((bytesTransferred, completed) =>
+                    onTransfer({
+                        key,
+                        method: "GET",
+                        status: 206,
+                        bytesExpected: multipart.contentLength,
+                        bytesTransferred,
+                        completed,
+                    })),
+        });
+
+        return respond(206, headers, body);
+    } catch (err) {
+        cancelBody(firstStream.body);
+        throw err;
     }
-
-    const gen = multipartChunks();
-    const rawBody = new ReadableStream<Uint8Array<ArrayBuffer>>({
-        async pull(controller) {
-            try {
-                const { done, value } = await gen.next();
-                if (done) controller.close();
-                // Part headers (encoder output) and part bodies are ArrayBuffer-backed;
-                // narrow so the multipart body stays Response-assignable under the DOM
-                // lib, where BodyInit requires an ArrayBuffer-backed view.
-                else controller.enqueue(value as Uint8Array<ArrayBuffer>);
-            } catch (err) {
-                controller.error(err);
-            }
-        },
-        async cancel(reason) {
-            await gen.return?.(reason as undefined);
-            // Cancelled before the generator took ownership of the eagerly-fetched
-            // first part (suspendedStart, or suspended at the part-header yield):
-            // gen.return ran no finally, so release it here. A byte-body first part
-            // is a no-op in cancelBody; a stream part's file handle/socket is freed.
-            if (!firstPartOwned) cancelBody(firstStream.body);
-        },
-    });
-
-    const headers = applyAdapterHeaders(multipart.headers, ctx);
-
-    // Server-Timing mirrors streamFromStore: the store figure covers the HEAD
-    // plus the eagerly-fetched first part (lazy parts settle after headers
-    // commit and cannot be measured into a header that has already left).
-    if (timingCtx) headers["Server-Timing"] = reportTiming(timingCtx, getMs);
-
-    // Audit reports the multipart body's granted length (framing + all parts).
-    auditCtx?.onServe({
-        key,
-        method: "GET",
-        status: 206,
-        mime: auditCtx.mime,
-        bytesServed: multipart.contentLength,
-        etag,
-    });
-
-    // The generator holds each part to its span; the committed total rides
-    // here too so the runtime receives a fixed-length body (and a framing
-    // miscount errors the stream instead of under-running Content-Length).
-    const body = boundBody(rawBody, {
-        expected: multipart.contentLength,
-        report:
-            onTransfer &&
-            ((bytesTransferred, completed) =>
-                onTransfer({
-                    key,
-                    method: "GET",
-                    status: 206,
-                    bytesExpected: multipart.contentLength,
-                    bytesTransferred,
-                    completed,
-                })),
-    });
-
-    return respond(206, headers, body);
 }
 
 /** What {@link boundBody} holds a body to, and whom it tells. */
@@ -1935,8 +2431,17 @@ interface BoundBodyOpts {
     expected?: number;
     /** Transfer-completion report; see {@link boundBody}. */
     report?: (bytesTransferred: number, completed: boolean) => void;
-    /** Receives the error a length mismatch raised, before the stream is errored. */
-    onLengthMismatch?: (err: Error) => void;
+    /**
+     * The request's abort signal: a source failure while it is aborted is the
+     * client leaving, not a store failure, and is not reported.
+     */
+    signal?: AbortSignal;
+    /**
+     * The one terminal reporter for a failed body: the source erroring after
+     * the headers committed (a lazy multipart part included) and a length
+     * mismatch, each before the stream is errored.
+     */
+    onFailure?: (err: unknown) => void;
 }
 
 /**
@@ -1964,10 +2469,13 @@ interface BoundBodyOpts {
  */
 function boundBody(
     source: ObjectBody,
-    { expected, report, onLengthMismatch }: BoundBodyOpts,
+    { expected, report, signal, onFailure }: BoundBodyOpts,
 ): ReadableStream<Uint8Array<ArrayBuffer>> {
     let transferred = 0;
     let settled = false;
+    // Set when the consumer cancels: a source that ends short after that is the
+    // consumer leaving, never a store failure.
+    let cancelled = false;
     const settle = (completed: boolean): void => {
         if (settled) return;
         settled = true;
@@ -1975,7 +2483,7 @@ function boundBody(
     };
     const lengthMismatch = (what: string): Error => {
         const err = new Error(`body: stream ${what} (${transferred} bytes delivered, ${expected} committed)`);
-        onLengthMismatch?.(err);
+        if (!cancelled && !clientAborted(signal)) onFailure?.(err);
         settle(false);
         return err;
     };
@@ -1994,9 +2502,14 @@ function boundBody(
                 res = await reader.read();
             } catch (err) {
                 settle(false);
+                if (cancelled) return;
+                if (!clientAborted(signal)) onFailure?.(err);
                 controller.error(err);
                 return;
             }
+            // The read was pending when the consumer cancelled: the stream is closed,
+            // so there is nothing to enqueue or to report.
+            if (cancelled) return;
             if (res.done) {
                 if (expected !== undefined && transferred !== expected) {
                     controller.error(lengthMismatch("closed short of the committed length"));
@@ -2022,6 +2535,7 @@ function boundBody(
             }
         },
         async cancel(reason) {
+            cancelled = true;
             settle(false);
             await reader.cancel(reason);
         },
@@ -2054,12 +2568,20 @@ function coalescedSpan(ranges: ParsedRange[]): ParsedRange | undefined {
  * A span served with other bounds, or ending short of them, is an object that
  * changed under a non-pinning store: the read throws ObjectChangedError before
  * any header commits, so the caller re-validates once and no part is short.
+ * A store that ignored the range and answered the whole representation is
+ * passed through unbuffered, as it is on the per-part path, so the caller
+ * answers it with a plain 200 (RFC 9110 Section 14.2).
  */
-function spanReader(store: Pick<ObjectStore, "getObject">, span: ParsedRange): Pick<ObjectStore, "getObject"> {
-    let read: Promise<ObjectStream & { body: Uint8Array<ArrayBuffer> }> | undefined;
+function spanReader(
+    store: Pick<ObjectStore, "getObject" | "pinsReads">,
+    span: ParsedRange,
+): Pick<ObjectStore, "getObject" | "pinsReads"> {
+    let read: Promise<ObjectStream> | undefined;
     return {
+        pinsReads: store.pinsReads,
         async getObject(key, opts) {
             const whole = await (read ??= store.getObject(key, { ...opts, range: span }).then(async (r) => {
+                if (r.range === undefined) return r;
                 if (servedSpanMatches(r, span)) {
                     const body = new Uint8Array(await new Response(r.body).arrayBuffer());
                     if (body.byteLength === r.contentLength) return { ...r, body };
@@ -2067,11 +2589,28 @@ function spanReader(store: Pick<ObjectStore, "getObject">, span: ParsedRange): P
                 cancelBody(r.body);
                 throw new ObjectChangedError(key);
             }));
-            const range = opts!.range!;
-            const body = whole.body.subarray(range.start - span.start, range.end - span.start + 1);
-            return { ...whole, range, contentLength: body.byteLength, body };
+            if (whole.range === undefined || !(whole.body instanceof Uint8Array)) return whole;
+            const { start, end } = opts!.range!;
+            // Every multipart part is a closed range.
+            if (end === undefined) throw new TypeError("spanReader: a part range has an end");
+            const body = whole.body.subarray(start - span.start, end - span.start + 1);
+            return { ...whole, range: { start, end }, contentLength: body.byteLength, body };
         },
     };
+}
+
+/**
+ * True when the first multipart part is exactly its span. A byte body's real
+ * length is checkable here too (a stream body settles lazily).
+ */
+function firstPartMatches(
+    stream: { range?: { start: number; end: number }; contentLength: number; body: ObjectStream["body"] },
+    range: ParsedRange,
+): boolean {
+    return (
+        servedSpanMatches(stream, range) &&
+        (!(stream.body instanceof Uint8Array) || stream.body.byteLength === range.end - range.start + 1)
+    );
 }
 
 /**
@@ -2142,7 +2681,8 @@ function readValidators(
  * GET would otherwise always mismatch; those fall back to Last-Modified.
  *
  * Returns whether the read is verified to be the HEAD's representation: a
- * validator pair was compared and agreed, or the read was pinned to it. A
+ * validator pair was compared and agreed, or the read was pinned to it (an
+ * issued `pin`, or an `ifMatch` the store declares it enforces). A
  * caller emits HEAD values the read omits only for a verified read.
  */
 function acceptRead(
@@ -2150,7 +2690,7 @@ function acceptRead(
     head: { etag?: string; lastModified?: string },
     got: { etag?: string; lastModified?: string },
     body: ReadableStream<Uint8Array> | Uint8Array,
-    pins: { ifMatch?: string; pin?: string },
+    pins: { ifMatch?: string; pin?: string; pinsReads?: boolean },
 ): boolean {
     const etagsComparable = !!head.etag && !!got.etag && head.etag.startsWith("W/") === got.etag.startsWith("W/");
     if (
@@ -2163,7 +2703,8 @@ function acceptRead(
         throw new ObjectChangedError(key);
     }
     const compared = etagsComparable || (!!head.lastModified && !!got.lastModified);
-    return compared || pins.ifMatch !== undefined || pins.pin !== undefined;
+    // A sent `ifMatch` is proof of a pinned read only from a store that enforces it.
+    return compared || pins.pin !== undefined || (pins.ifMatch !== undefined && pins.pinsReads === true);
 }
 
 /** Release a body that will never reach a response (stream forms only). */
@@ -2205,11 +2746,20 @@ function isServableRange(r: { start: number; end: number }, totalSize: number | 
 }
 
 /**
- * Check if an error is an AbortError (client disconnected).
- * Works across runtimes: DOMException in browsers/Workers, AbortError in Node.
+ * Whether the client went away. Decided from the request signal alone: an
+ * `AbortError` a store raises while the signal is live is the store's own
+ * cancellation (a deadline, an SDK abort), a store failure, and is reported as
+ * one. With no signal supplied the handler cannot know the client left.
  */
-function isAbortError(err: unknown, signal?: AbortSignal): boolean {
-    return !!signal?.aborted || (err instanceof Error && err.name === "AbortError");
+function clientAborted(signal?: AbortSignal): boolean {
+    return signal?.aborted === true;
+}
+
+/** Whether a value is a plain object (a literal or null-prototype record), not a promise, array or class instance. */
+function isPlainObject(value: unknown): value is Record<string, string> {
+    if (typeof value !== "object" || value === null) return false;
+    const proto: unknown = Object.getPrototypeOf(value);
+    return proto === Object.prototype || proto === null;
 }
 
 /**
@@ -2220,28 +2770,20 @@ function isAbortError(err: unknown, signal?: AbortSignal): boolean {
  * non-ASCII characters (String.length counts UTF-16 units, not bytes).
  */
 function plainTextError(
-    status: 404 | 502 | 503,
+    status: 404 | 500 | 502 | 503,
     body: string,
     extraHeaders?: Record<string, string>,
 ): RawResponseParts {
-    const bytes = UTF8_ENCODER.encode(body);
-    return respond(
-        status,
-        {
-            "Content-Type": "text/plain; charset=utf-8",
-            "Content-Length": String(bytes.byteLength),
-            "Accept-Ranges": "none",
-            // 404 is heuristically cacheable (RFC 9111 Section 4.2.2): without
-            // this, a CDN can cache a transient miss and keep serving it after
-            // the object appears. Errors must never outlive their cause.
-            ...DENY_HEADERS,
-            ...extraHeaders,
-        },
-        bytes,
-    );
+    const { bytes, headers } = plainTextErrorParts(body);
+    return respond(status, { ...headers, ...extraHeaders }, bytes);
 }
 
-/** A bodyless denial (405/412/416) carrying {@link DENY_HEADERS}. */
+/**
+ * A bodyless denial (405/412/416) carrying {@link DENY_HEADERS}, spread onto
+ * the protocol headers the kernel produced for the status: a 416 advertises
+ * `Accept-Ranges: bytes` (RFC 9110 Section 14.3) and must not linger in a
+ * shared cache.
+ */
 function deny(status: 405 | 412 | 416, headers: Record<string, string>): RawResponseParts {
     return respond(status, { ...headers, ...DENY_HEADERS });
 }
@@ -2275,13 +2817,19 @@ function storeErrorResponse(err: unknown): RawResponseParts {
  * Check if a store error represents a missing object (404).
  */
 function isNotFoundStoreError(err: unknown): boolean {
-    if (typeof err === "object" && err !== null && "status" in err) {
-        return (err as { status: unknown }).status === 404;
-    }
-    if (err instanceof Error) {
-        return isObjectNotFoundError(err) || err.name === "NotFound";
-    }
-    return false;
+    const status = storeErrorField(err, "status");
+    if (status !== undefined) return status === 404;
+    return isObjectNotFoundError(err) || isErrorNamed(err, "NotFound");
+}
+
+/**
+ * One field of a store error, or `undefined` when `err` is not an object or
+ * the read throws. A store is third-party code and its error an arbitrary
+ * value; a classifier that throws on one would answer 500 for a store failure
+ * and skip the cleanup that follows the classification.
+ */
+function storeErrorField(err: unknown, field: string): unknown {
+    return typeof err === "object" && err !== null ? readField(err, field) : undefined;
 }
 
 /**
@@ -2291,10 +2839,7 @@ function isNotFoundStoreError(err: unknown): boolean {
  * the kernel class.
  */
 function isUnavailableStoreError(err: unknown): boolean {
-    if (typeof err === "object" && err !== null && "status" in err) {
-        if ((err as { status: unknown }).status === 503) return true;
-    }
-    return isStoreUnavailableError(err);
+    return storeErrorField(err, "status") === 503 || isStoreUnavailableError(err);
 }
 
 /**
@@ -2307,8 +2852,7 @@ function isUnavailableStoreError(err: unknown): boolean {
  * header.
  */
 function retryAfterSeconds(err: unknown): number | undefined {
-    if (typeof err !== "object" || err === null || !("retryAfterSeconds" in err)) return undefined;
-    return parseRetryAfterSeconds((err as { retryAfterSeconds: unknown }).retryAfterSeconds);
+    return parseRetryAfterSeconds(storeErrorField(err, "retryAfterSeconds"));
 }
 
 /**

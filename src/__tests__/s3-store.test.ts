@@ -1,8 +1,7 @@
-import { describe, test, expect, mock } from "bun:test";
+import { describe, test, expect, mock, vi } from "bun:test";
 import { fileURLToPath } from "node:url";
-import { s3Store, s3UploadStore, ObjectChangedError, StoreUnavailableError } from "../s3";
+import { s3Store, ObjectChangedError, ObjectNotFoundError, StoreUnavailableError } from "../s3";
 import { nodeStreamToWeb } from "../object-store";
-import { OPEN_ENDED } from "../index";
 import { asStream } from "./helpers";
 
 // ─── Mock S3Client ──────────────────────────────────────────────────────────
@@ -125,9 +124,9 @@ describe("s3Store", () => {
         expect(result.range).toEqual({ start: 0, end: 499 });
     });
 
-    test("getObject with an OPEN_ENDED range emits the bare open form on the wire", async () => {
-        // The fast path hands adapters `end: OPEN_ENDED`; the wire form MUST
-        // be `bytes=500-`, never a literal 16-digit last-byte-pos that a
+    test("getObject with an open range emits the bare open form on the wire", async () => {
+        // The fast path hands adapters an absent `end`; the wire form MUST
+        // be `bytes=500-`, never a literal last-byte-pos that a
         // strict proxy or backend may reject.
         const { client, sentCommands } = createMockS3Client({
             get: {
@@ -137,7 +136,7 @@ describe("s3Store", () => {
         });
         const store = s3Store({ client, bucket: "docs" });
 
-        const result = await store.getObject("file.pdf", { range: { start: 500, end: OPEN_ENDED } });
+        const result = await store.getObject("file.pdf", { range: { start: 500, end: undefined } });
 
         expect((sentCommands[0].input as Record<string, unknown>).Range).toBe("bytes=500-");
         expect(result.range).toEqual({ start: 500, end: 9999 });
@@ -487,7 +486,7 @@ describe("s3Store: SDK body shapes", () => {
 describe("s3Store: createSignedUrl", () => {
     test("returns ok with a presigned URL and forwards the disposition", async () => {
         const seen: Array<{ input: Record<string, unknown>; expiresIn?: number }> = [];
-        mock.module("@aws-sdk/s3-request-presigner", () => ({
+        vi.doMock("@aws-sdk/s3-request-presigner", () => ({
             getSignedUrl: async (
                 _client: unknown,
                 command: { input: Record<string, unknown> },
@@ -515,7 +514,7 @@ describe("s3Store: createSignedUrl", () => {
 
     test("forces attachment + inert content type even without a downloadFilename", async () => {
         const seen: Array<{ input: Record<string, unknown> }> = [];
-        mock.module("@aws-sdk/s3-request-presigner", () => ({
+        vi.doMock("@aws-sdk/s3-request-presigner", () => ({
             getSignedUrl: async (_client: unknown, command: { input: Record<string, unknown> }) => {
                 seen.push({ input: command.input });
                 return "https://bucket.s3.example/doc?signature=abc";
@@ -535,7 +534,7 @@ describe("s3Store: createSignedUrl", () => {
 
     test("cacheControl override rides the signed response, absent when unset", async () => {
         const seen: Array<{ input: Record<string, unknown> }> = [];
-        mock.module("@aws-sdk/s3-request-presigner", () => ({
+        vi.doMock("@aws-sdk/s3-request-presigner", () => ({
             getSignedUrl: async (_client: unknown, command: { input: Record<string, unknown> }) => {
                 seen.push({ input: command.input });
                 return "https://bucket.s3.example/doc?signature=abc";
@@ -559,7 +558,7 @@ describe("s3Store: createSignedUrl", () => {
     test("a signing failure throws: ok: false is reserved for a store that cannot sign", async () => {
         // A credential provider that fails means signing was supposed to work.
         // Answering ok: false would silently turn it into a streamed response.
-        mock.module("@aws-sdk/s3-request-presigner", () => ({
+        vi.doMock("@aws-sdk/s3-request-presigner", () => ({
             getSignedUrl: async () => {
                 throw new Error("credentials expired");
             },
@@ -603,7 +602,7 @@ describe("s3Store: createSignedUrl", () => {
     test("an aborted signal is honoured before and after signing", async () => {
         let signed = 0;
         const controller = new AbortController();
-        mock.module("@aws-sdk/s3-request-presigner", () => ({
+        vi.doMock("@aws-sdk/s3-request-presigner", () => ({
             getSignedUrl: async () => {
                 signed += 1;
                 controller.abort(new Error("caller went away"));
@@ -700,7 +699,7 @@ describe("throttle classification by name, with no HTTP status", () => {
     });
 });
 
-describe("s3 factories refuse a target they cannot address", () => {
+describe("s3 factory refuses a target it cannot address", () => {
     /**
      * Both factories reach the same check, and both are worth asserting: the
      * failure they prevent is a misconfiguration that used to surface as a 502
@@ -708,7 +707,6 @@ describe("s3 factories refuse a target they cannot address", () => {
      */
     const factories: [string, (opts: unknown) => unknown][] = [
         ["s3Store", (opts) => s3Store(opts as Parameters<typeof s3Store>[0])],
-        ["s3UploadStore", (opts) => s3UploadStore(opts as Parameters<typeof s3UploadStore>[0])],
     ];
 
     const client = { send: async () => ({}) };
@@ -730,7 +728,7 @@ describe("s3 factories refuse a target they cannot address", () => {
         }
 
         test(`${factory} refuses options that are absent entirely`, () => {
-            expect(() => build(undefined)).toThrow(TypeError);
+            expect(() => build(undefined)).toThrow(new RegExp(`^${factory}: options\.client is required`));
         });
 
         test(`${factory} refuses a bucket that is not a non-empty string`, () => {
@@ -753,4 +751,214 @@ describe("s3 factories refuse a target they cannot address", () => {
             expect(() => build({ client, bucket: "documents" })).not.toThrow();
         });
     }
+});
+
+// ─── Reserved keys and key policy ───────────────────────────────────────────
+
+describe("s3Store: reserved keys are refused on every read, signing included", () => {
+    /** A store whose client and presigner count every call that reaches them. */
+    function countingStore(opts: { reservedPrefix?: string; keys?: "plain" | "verbatim" } = {}) {
+        let sends = 0;
+        let signs = 0;
+        vi.doMock("@aws-sdk/s3-request-presigner", () => ({
+            getSignedUrl: async () => {
+                signs += 1;
+                return "https://bucket.s3.example/doc?signature=abc";
+            },
+        }));
+        const { client } = createMockS3Client({});
+        const send = (client as unknown as { send: (c: unknown) => Promise<unknown> }).send;
+        (client as unknown as { send: (c: unknown) => Promise<unknown> }).send = (c) => {
+            sends += 1;
+            return send(c);
+        };
+        const store = s3Store({ client, bucket: "b", ...opts });
+        return { store, calls: () => ({ sends, signs }) };
+    }
+
+    const reads: [string, (store: ReturnType<typeof s3Store>, key: string) => Promise<unknown>][] = [
+        ["headObject", (store, key) => store.headObject(key)],
+        ["getObject", (store, key) => store.getObject(key)],
+        ["createSignedUrl", (store, key) => store.createSignedUrl!(key, { expiresInSeconds: 60 })],
+    ];
+
+    for (const [name, read] of reads) {
+        test(`${name} refuses a key under the default reserved prefix before the backend sees it`, async () => {
+            const { store, calls } = countingStore();
+            await expect(read(store, ".uploads/staged-part")).rejects.toBeInstanceOf(ObjectNotFoundError);
+            await expect(read(store, ".uploads")).rejects.toBeInstanceOf(ObjectNotFoundError);
+            expect(calls()).toEqual({ sends: 0, signs: 0 });
+        });
+
+        test(`${name} refuses a key with an empty segment under the default key policy`, async () => {
+            const { store, calls } = countingStore();
+            await expect(read(store, "docs//q1.pdf")).rejects.toBeInstanceOf(ObjectNotFoundError);
+            expect(calls()).toEqual({ sends: 0, signs: 0 });
+        });
+    }
+
+    test("createSignedUrl signs an ordinary key", async () => {
+        const { store, calls } = countingStore();
+        await expect(store.createSignedUrl!("docs/q1.pdf", { expiresInSeconds: 60 })).resolves.toMatchObject({
+            ok: true,
+        });
+        expect(calls().signs).toBe(1);
+    });
+
+    test("verbatim keys reach the backend with their empty segment", async () => {
+        const { store, calls } = countingStore({ keys: "verbatim" });
+        await expect(store.headObject("docs//q1.pdf")).resolves.toMatchObject({ contentLength: 10000 });
+        // The reserved prefix still holds under the verbatim policy.
+        await expect(store.headObject(".uploads/staged-part")).rejects.toBeInstanceOf(ObjectNotFoundError);
+        expect(calls().sends).toBe(1);
+    });
+
+    test("verbatim keys still refuse a dot segment on every read, signing included", async () => {
+        const { store, calls } = countingStore({ keys: "verbatim" });
+        for (const [, read] of reads) {
+            for (const key of ["../private/x.pdf", "a/../.uploads/x", "a/./b"]) {
+                await expect(read(store, key)).rejects.toBeInstanceOf(ObjectNotFoundError);
+            }
+        }
+        expect(calls()).toEqual({ sends: 0, signs: 0 });
+    });
+
+    test("an empty reserved prefix reserves nothing", async () => {
+        const { store, calls } = countingStore({ reservedPrefix: "" });
+        await expect(store.headObject(".uploads/staged-part")).resolves.toMatchObject({ contentLength: 10000 });
+        expect(calls().sends).toBe(1);
+    });
+});
+
+// ─── Responses the store refuses to trust ───────────────────────────────────
+
+describe("s3Store: degenerate responses fail the read and release the body", () => {
+    /** A body that records whether its reader cancelled it. */
+    function trackedBody() {
+        let onCancel!: () => void;
+        const cancelled = new Promise<true>((resolve) => {
+            onCancel = () => resolve(true);
+        });
+        const body = new ReadableStream<Uint8Array>({
+            pull(controller) {
+                controller.enqueue(new Uint8Array(4));
+            },
+            cancel() {
+                onCancel();
+            },
+        });
+        const cancelledWithin = (ms: number) =>
+            Promise.race([cancelled, new Promise<false>((resolve) => setTimeout(() => resolve(false), ms))]);
+        return { body, cancelledWithin };
+    }
+
+    const cases: [string, Record<string, unknown>, RegExp][] = [
+        ["no ContentLength", { ContentLength: undefined }, /no ContentLength/],
+        ["an unregistered stored coding", { ContentLength: 8, ContentEncoding: "x-unheard-of" }, /registered coding/],
+        [
+            "an unparseable Content-Range",
+            { ContentLength: 8, ContentRange: "bytes garbage" },
+            /unparseable Content-Range/,
+        ],
+    ];
+
+    for (const [label, response, message] of cases) {
+        test(`${label} rejects and cancels the live body`, async () => {
+            const { body, cancelledWithin } = trackedBody();
+            const { client } = createMockS3Client({ get: { Body: body, ...response } });
+            const store = s3Store({ client, bucket: "b" });
+            await expect(store.getObject("doc")).rejects.toThrow(message);
+            expect(await cancelledWithin(1000)).toBe(true);
+        });
+    }
+
+    test("a GET with no body is an error, not an empty object", async () => {
+        const { client } = createMockS3Client({ get: { Body: undefined } });
+        await expect(s3Store({ client, bucket: "b" }).getObject("doc")).rejects.toThrow(/empty body/);
+    });
+
+    test("a HEAD with no ContentLength is an error, not a zero-length object", async () => {
+        const { client } = createMockS3Client({ head: { ContentLength: undefined } });
+        await expect(s3Store({ client, bucket: "b" }).headObject("doc")).rejects.toThrow(/no ContentLength/);
+    });
+
+    test("a Node body that ends short of ContentLength errors the stream", async () => {
+        async function* iterate(): AsyncGenerator<Uint8Array> {
+            yield new Uint8Array(3);
+        }
+        const nodeBody = Object.assign(iterate(), { destroy() {} });
+        const { client } = createMockS3Client({
+            get: { Body: nodeBody as unknown as ReadableStream<Uint8Array>, ContentLength: 9 },
+        });
+        const result = await s3Store({ client, bucket: "b" }).getObject("doc");
+        const reader = asStream(result.body).getReader();
+        const drain = async () => {
+            for (;;) if ((await reader.read()).done) break;
+        };
+        await expect(drain()).rejects.toThrow(/expected 9/);
+    });
+
+    test("a missing Last-Modified is absent, not a crash", async () => {
+        const { client } = createMockS3Client({ head: { LastModified: undefined }, get: { LastModified: undefined } });
+        const store = s3Store({ client, bucket: "b" });
+        expect((await store.headObject("doc")).lastModified).toBeUndefined();
+        const result = await store.getObject("doc");
+        expect(result.lastModified).toBeUndefined();
+        await asStream(result.body).cancel();
+    });
+});
+
+describe("s3Store: the caller's signal reaches the SDK", () => {
+    test("headObject and getObject hand the signal to send as its abortSignal", async () => {
+        const { client } = createMockS3Client({});
+        type Send = (c: unknown, o?: { abortSignal?: AbortSignal }) => Promise<unknown>;
+        const send = (client as unknown as { send: Send }).send;
+        const seen: unknown[] = [];
+        (client as unknown as { send: Send }).send = (c, o) => {
+            seen.push(o?.abortSignal);
+            return send(c);
+        };
+        const store = s3Store({ client, bucket: "b" });
+        const signal = new AbortController().signal;
+        await store.headObject("doc", { signal });
+        const result = await store.getObject("doc", { signal });
+        await asStream(result.body).cancel();
+        expect(seen).toEqual([signal, signal]);
+    });
+
+    test("the store tells the orchestrator its 206 bounds are authoritative", () => {
+        const { client } = createMockS3Client({});
+        expect(s3Store({ client, bucket: "b" }).authoritativeRange).toBe(true);
+    });
+});
+
+describe("s3Store: throttle back-off hints", () => {
+    function failingWith(err: Error) {
+        const { client } = createMockS3Client({});
+        (client as unknown as { send: (c: unknown) => Promise<unknown> }).send = async () => {
+            throw err;
+        };
+        return s3Store({ client, bucket: "b" });
+    }
+
+    test("a Retry-After given as an HTTP date becomes seconds", async () => {
+        const retryAt = new Date(Date.now() + 120_000).toUTCString();
+        const store = failingWith(
+            Object.assign(new Error("slow down"), {
+                $metadata: { httpStatusCode: 503 },
+                $response: { headers: { "retry-after": retryAt } },
+            }),
+        );
+        const err = (await store.getObject("doc").catch((e: unknown) => e)) as StoreUnavailableError;
+        expect(err).toBeInstanceOf(StoreUnavailableError);
+        expect(err.retryAfterSeconds).toBeGreaterThan(100);
+        expect(err.retryAfterSeconds).toBeLessThanOrEqual(120);
+    });
+
+    test("a status-only 503 with no throttle name is a throttle", async () => {
+        const store = failingWith(
+            Object.assign(new Error("service unavailable"), { $metadata: { httpStatusCode: 503 } }),
+        );
+        await expect(store.headObject("doc")).rejects.toBeInstanceOf(StoreUnavailableError);
+    });
 });

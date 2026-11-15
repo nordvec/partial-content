@@ -1,4 +1,4 @@
-import { describe, test, expect } from "bun:test";
+import { describe, test, expect, spyOn } from "bun:test";
 import { gcsStore, ObjectNotFoundError, ObjectChangedError, StoreUnavailableError, type GcsStoreOptions } from "../gcs";
 import { asStream } from "./helpers";
 import type { ObjectStream } from "../index";
@@ -28,7 +28,19 @@ interface GcsReadCall {
     end?: number;
 }
 
+/** One recorded bucket.file() call: the name and whether a generation pin was passed. */
+interface GcsFileCall {
+    key: string;
+    pinned: boolean;
+}
+
 interface MockGcsOpts {
+    /** Record every bucket.file() call, i.e. every time the backend is reached for an object. */
+    fileCalls?: GcsFileCall[];
+    /** The Content-Encoding getMetadata reports. */
+    contentEncoding?: string;
+    /** The read stream has no destroy() method. */
+    noDestroy?: boolean;
     missing?: boolean;
     /** getMetadata throws a NON-404 error (auth failure, 500). */
     metadataError?: Error;
@@ -45,7 +57,7 @@ interface MockGcsOpts {
     /** getSignedUrl rejects (missing signing credentials, IAM denial). */
     signError?: Error;
     /** The size getMetadata reports in place of the real one; `{}` reports none. */
-    reportedSize?: { size?: string };
+    reportedSize?: { size?: string | number };
     /** The read stream fails on its first chunk, as the SDK does once the response is an error. */
     streamError?: Error;
     /** The read stream yields nothing until destroyed. */
@@ -71,7 +83,8 @@ function mockStorage(opts: MockGcsOpts = {}): GcsStorage {
     return {
         bucket(_name: string) {
             return {
-                file(_key: string, fileOpts?: { generation?: string | number }) {
+                file(key: string, fileOpts?: { generation?: string | number }) {
+                    opts.fileCalls?.push({ key, pinned: fileOpts !== undefined });
                     return {
                         async getMetadata() {
                             if (opts.metadataCalls) opts.metadataCalls.count++;
@@ -86,6 +99,7 @@ function mockStorage(opts: MockGcsOpts = {}): GcsStorage {
                                     generation: opts.noGeneration ? undefined : GENERATION,
                                     updated: "2025-06-28T12:00:00.000Z",
                                     metadata: opts.customMetadata,
+                                    contentEncoding: opts.contentEncoding,
                                 },
                             ] as [
                                 {
@@ -94,6 +108,7 @@ function mockStorage(opts: MockGcsOpts = {}): GcsStorage {
                                     generation?: string;
                                     updated: string;
                                     metadata?: Record<string, string>;
+                                    contentEncoding?: string;
                                 },
                             ];
                         },
@@ -114,7 +129,10 @@ function mockStorage(opts: MockGcsOpts = {}): GcsStorage {
                             const slice = Buffer.from(CONTENT.subarray(start, end + 1));
                             opts.onStreamOpen?.();
                             const { promise: destroyed, resolve: markDestroyed } = Promise.withResolvers<void>();
-                            return Object.assign(iterate(slice, opts, destroyed), {
+                            const stream = iterate(slice, opts, destroyed);
+                            if (opts.noDestroy)
+                                return stream as unknown as NodeJS.ReadableStream & AsyncIterable<Buffer>;
+                            return Object.assign(stream, {
                                 destroy() {
                                     if (opts.destroyed) opts.destroyed.count++;
                                     markDestroyed();
@@ -638,5 +656,332 @@ describe("gcsStore: createSignedUrl", () => {
         const signOpts = { expiresInSeconds: 60, signal: controller.signal };
 
         await expect(store.createSignedUrl!("doc.pdf", signOpts)).rejects.toBe(reason);
+    });
+});
+
+describe("gcsStore: reserved upload namespace and key policy", () => {
+    const RESERVED = ".partial-content-uploads/upload-1/data";
+
+    test("every read refuses a key under the default reserved prefix before the backend or signer is reached", async () => {
+        const fileCalls: GcsFileCall[] = [];
+        const metadataCalls = { count: 0 };
+        const signCalls: GcsSignedUrlConfig[] = [];
+        const store = gcsStore({ storage: mockStorage({ fileCalls, metadataCalls, signCalls }), bucket: "b" });
+
+        for (const key of [RESERVED, ".partial-content-uploads"]) {
+            await expect(store.headObject(key)).rejects.toBeInstanceOf(ObjectNotFoundError);
+            await expect(store.getObject(key)).rejects.toBeInstanceOf(ObjectNotFoundError);
+            await expect(store.createSignedUrl!(key, { expiresInSeconds: 60 })).rejects.toBeInstanceOf(
+                ObjectNotFoundError,
+            );
+        }
+        expect(fileCalls).toHaveLength(0);
+        expect(metadataCalls.count).toBe(0);
+        expect(signCalls).toHaveLength(0);
+    });
+
+    test("the refusal carries the key on the error, not in the message", async () => {
+        const store = gcsStore({ storage: mockStorage(), bucket: "b" });
+        const err = await store.headObject(RESERVED).catch((e: unknown) => e);
+        expect(err).toBeInstanceOf(ObjectNotFoundError);
+        expect((err as ObjectNotFoundError).key).toBe(RESERVED);
+        expect((err as Error).message).toBe("Object not found");
+    });
+
+    test("an empty reservedPrefix reserves nothing", async () => {
+        const signCalls: GcsSignedUrlConfig[] = [];
+        const store = gcsStore({ storage: mockStorage({ signCalls }), bucket: "b", reservedPrefix: "" });
+
+        expect((await store.headObject(RESERVED)).contentLength).toBe(20);
+        expect(await drain((await store.getObject(RESERVED)).body)).toBe("0123456789abcdefghij");
+        expect(await store.createSignedUrl!(RESERVED, { expiresInSeconds: 60 })).toEqual({ ok: true, url: SIGNED_URL });
+        expect(signCalls).toHaveLength(1);
+    });
+
+    test("a custom reservedPrefix replaces the default", async () => {
+        const store = gcsStore({ storage: mockStorage(), bucket: "b", reservedPrefix: ["private/", "tmp/"] });
+
+        await expect(store.headObject("tmp/x")).rejects.toBeInstanceOf(ObjectNotFoundError);
+        await expect(store.headObject("private/x")).rejects.toBeInstanceOf(ObjectNotFoundError);
+        expect((await store.headObject(RESERVED)).contentLength).toBe(20);
+    });
+
+    test("the default policy takes a key with an empty segment verbatim, an explicit plain policy refuses it", async () => {
+        const fileCalls: GcsFileCall[] = [];
+        const verbatim = gcsStore({ storage: mockStorage({ fileCalls }), bucket: "b" });
+        expect((await verbatim.headObject("a//b")).contentLength).toBe(20);
+        expect(fileCalls.map((c) => c.key)).toEqual(["a//b"]);
+
+        const explicitVerbatim = gcsStore({ storage: mockStorage(), bucket: "b", keys: "verbatim" });
+        expect((await explicitVerbatim.headObject("a//b")).contentLength).toBe(20);
+
+        const plainCalls: GcsFileCall[] = [];
+        const plain = gcsStore({ storage: mockStorage({ fileCalls: plainCalls }), bucket: "b", keys: "plain" });
+        await expect(plain.headObject("a//b")).rejects.toBeInstanceOf(ObjectNotFoundError);
+        await expect(plain.getObject("a/./b")).rejects.toBeInstanceOf(ObjectNotFoundError);
+        await expect(plain.createSignedUrl!("/a", { expiresInSeconds: 60 })).rejects.toBeInstanceOf(
+            ObjectNotFoundError,
+        );
+        expect(plainCalls).toHaveLength(0);
+    });
+
+    test("the store declares range support", () => {
+        expect(gcsStore({ storage: mockStorage(), bucket: "b" }).supportsRange).toBe(true);
+    });
+});
+
+describe("gcsStore: headObject options and pins", () => {
+    test("an options object without a signal reads normally", async () => {
+        const store = gcsStore({ storage: mockStorage(), bucket: "b" });
+        expect((await store.headObject("doc.pdf", {})).contentLength).toBe(20);
+    });
+
+    test("an aborted signal rejects with its reason before the backend is reached", async () => {
+        const metadataCalls = { count: 0 };
+        const store = gcsStore({ storage: mockStorage({ metadataCalls }), bucket: "b" });
+        const reason = new Error("client went away");
+
+        await expect(store.headObject("doc.pdf", { signal: AbortSignal.abort(reason) })).rejects.toBe(reason);
+        await expect(store.getObject("doc.pdf", { signal: AbortSignal.abort(reason) })).rejects.toBe(reason);
+        expect(metadataCalls.count).toBe(0);
+    });
+
+    test("an object without a generation yields no pin", async () => {
+        const store = gcsStore({ storage: mockStorage({ noGeneration: true }), bucket: "b" });
+        expect((await store.headObject("doc.pdf")).pin).toBeUndefined();
+    });
+});
+
+describe("gcsStore: ranged reads", () => {
+    test("a range starting at the object size is a RangeError and opens no stream", async () => {
+        const reads: GcsReadCall[] = [];
+        const store = gcsStore({ storage: mockStorage({ reads }), bucket: "b" });
+
+        await expect(store.getObject("doc.pdf", { range: { start: 20, end: 25 } })).rejects.toThrow(RangeError);
+        await expect(store.getObject("doc.pdf", { range: { start: 20, end: 25 } })).rejects.toThrow(
+            /range start is past the 20-byte object/,
+        );
+        await expect(store.getObject("doc.pdf", { range: { start: 99, end: undefined } })).rejects.toThrow(
+            /range start is past the 20-byte object/,
+        );
+        expect(reads).toHaveLength(0);
+    });
+
+    test("the same bound holds on the pinned path", async () => {
+        const store = gcsStore({ storage: mockStorage(), bucket: "b" });
+        const meta = await store.headObject("doc.pdf");
+        await expect(store.getObject("doc.pdf", { range: { start: 20, end: 20 }, pin: meta.pin })).rejects.toThrow(
+            /range start is past the 20-byte object/,
+        );
+    });
+
+    test("the last byte is still readable", async () => {
+        const store = gcsStore({ storage: mockStorage(), bucket: "b" });
+        const result = await store.getObject("doc.pdf", { range: { start: 19, end: 19 } });
+        expect(await drain(result.body)).toBe("j");
+        expect(result.contentLength).toBe(1);
+    });
+
+    test("an end past the object is clamped to the last byte in the report and the backend read", async () => {
+        const reads: GcsReadCall[] = [];
+        const store = gcsStore({ storage: mockStorage({ reads }), bucket: "b" });
+        const result = await store.getObject("doc.pdf", { range: { start: 15, end: 100 } });
+
+        expect(result.range).toEqual({ start: 15, end: 19 });
+        expect(result.contentLength).toBe(5);
+        expect(reads[0]?.end).toBe(19);
+        expect(await drain(result.body)).toBe("fghij");
+    });
+
+    test("an open-ended range reads to the last byte", async () => {
+        const store = gcsStore({ storage: mockStorage(), bucket: "b" });
+        const result = await store.getObject("doc.pdf", { range: { start: 15, end: undefined } });
+
+        expect(result.range).toEqual({ start: 15, end: 19 });
+        expect(result.contentLength).toBe(5);
+        expect(await drain(result.body)).toBe("fghij");
+    });
+
+    test("the read is generation-pinned only when the object has a generation", async () => {
+        const pinnedCalls: GcsFileCall[] = [];
+        const pinned = gcsStore({ storage: mockStorage({ fileCalls: pinnedCalls }), bucket: "b" });
+        await asStream((await pinned.getObject("doc.pdf")).body).cancel();
+        // getMetadata read, then the generation-pinned stream.
+        expect(pinnedCalls.map((c) => c.pinned)).toEqual([false, true]);
+
+        const unpinnedCalls: GcsFileCall[] = [];
+        const unpinned = gcsStore({
+            storage: mockStorage({ fileCalls: unpinnedCalls, noGeneration: true }),
+            bucket: "b",
+        });
+        await asStream((await unpinned.getObject("doc.pdf")).body).cancel();
+        expect(unpinnedCalls.map((c) => c.pinned)).toEqual([false, false]);
+    });
+});
+
+describe("gcsStore: reported sizes", () => {
+    test("a zero size and a numeric size are both honest", async () => {
+        const zero = gcsStore({ storage: mockStorage({ reportedSize: { size: "0" } }), bucket: "b" });
+        expect((await zero.headObject("doc.pdf")).contentLength).toBe(0);
+
+        const numeric = gcsStore({ storage: mockStorage({ reportedSize: { size: 20 } }), bucket: "b" });
+        expect((await numeric.headObject("doc.pdf")).contentLength).toBe(20);
+    });
+
+    for (const [label, size] of [
+        ["an empty string", ""],
+        ["a negative number", -1],
+        ["a fractional number", 1.5],
+        ["NaN", Number.NaN],
+    ] as const) {
+        test(`${label} is not a usable size`, async () => {
+            const store = gcsStore({ storage: mockStorage({ reportedSize: { size } }), bucket: "b" });
+            await expect(store.headObject("doc.pdf")).rejects.toThrow(/without a usable size/);
+        });
+    }
+});
+
+describe("gcsStore: digest metadata key edge cases", () => {
+    test("an unset or empty option never reads a metadata entry named after it", async () => {
+        const unset = gcsStore({
+            storage: mockStorage({ customMetadata: { undefined: DIGEST } }),
+            bucket: "b",
+        });
+        expect((await unset.headObject("doc.pdf")).digest).toBeUndefined();
+
+        const empty = gcsStore({
+            storage: mockStorage({ customMetadata: { "": DIGEST } }),
+            bucket: "b",
+            digestMetadataKey: "",
+        });
+        expect((await empty.headObject("doc.pdf")).digest).toBeUndefined();
+    });
+
+    test("an object with no custom metadata at all yields no digest", async () => {
+        const store = gcsStore({ storage: mockStorage(), bucket: "b", digestMetadataKey: "sha256" });
+        expect((await store.headObject("doc.pdf")).digest).toBeUndefined();
+    });
+});
+
+describe("gcsStore: pin token validation", () => {
+    test("a pin with a numeric generation is trusted and pins the read to it", async () => {
+        const reads: GcsReadCall[] = [];
+        const metadataCalls = { count: 0 };
+        const store = gcsStore({ storage: mockStorage({ reads, metadataCalls }), bucket: "b" });
+
+        const result = await store.getObject("doc.pdf", { pin: JSON.stringify({ generation: 12345, size: 20 }) });
+        expect(metadataCalls.count).toBe(0);
+        expect(reads[0]?.generation).toBe(12345);
+        await asStream(result.body).cancel();
+    });
+
+    test("a pin for an empty object is trusted without a metadata read", async () => {
+        const metadataCalls = { count: 0 };
+        const store = gcsStore({ storage: mockStorage({ metadataCalls }), bucket: "b" });
+
+        const result = await store.getObject("doc.pdf", { pin: JSON.stringify({ generation: GENERATION, size: 0 }) });
+        expect(metadataCalls.count).toBe(0);
+        expect(result.totalSize).toBe(0);
+        await asStream(result.body).cancel();
+    });
+
+    test("array and array-like generations revalidate", async () => {
+        const metadataCalls = { count: 0 };
+        const store = gcsStore({ storage: mockStorage({ metadataCalls }), bucket: "b" });
+
+        const pins = [
+            JSON.stringify({ generation: [1], size: 20 }),
+            JSON.stringify({ generation: { length: 3 }, size: 20 }),
+        ];
+        for (const pin of pins) {
+            const result = await store.getObject("doc.pdf", { pin });
+            expect(await drain(result.body)).toBe("0123456789abcdefghij");
+        }
+        expect(metadataCalls.count).toBe(pins.length);
+    });
+
+    test("a stored content coding survives the pin round trip without a second metadata read", async () => {
+        const metadataCalls = { count: 0 };
+        const store = gcsStore({ storage: mockStorage({ metadataCalls, contentEncoding: "gzip" }), bucket: "b" });
+
+        const meta = await store.headObject("doc.pdf");
+        expect(meta.contentEncoding).toBe("gzip");
+        const result = await store.getObject("doc.pdf", { ifMatch: meta.etag, pin: meta.pin });
+        expect(result.contentEncoding).toBe("gzip");
+        expect(metadataCalls.count).toBe(1);
+        await asStream(result.body).cancel();
+    });
+
+    test("a pin whose content coding is not in normalized form revalidates", async () => {
+        const metadataCalls = { count: 0 };
+        const store = gcsStore({ storage: mockStorage({ metadataCalls }), bucket: "b" });
+
+        const codings: unknown[] = ["x-gzip", "GZIP", "identity", "not-a-coding", 123];
+        for (const contentEncoding of codings) {
+            const pin = JSON.stringify({ generation: GENERATION, size: 20, contentEncoding });
+            const result = await store.getObject("doc.pdf", { pin });
+            expect(result.contentEncoding).toBeUndefined();
+            await asStream(result.body).cancel();
+        }
+        expect(metadataCalls.count).toBe(codings.length);
+    });
+});
+
+describe("gcsStore: throttle hints", () => {
+    const throttle = (retryAfter?: string) =>
+        Object.assign(new Error("slow down"), {
+            code: 503,
+            response: retryAfter === undefined ? undefined : { headers: { "retry-after": retryAfter } },
+        });
+
+    test("a delay-seconds Retry-After is echoed on the StoreUnavailableError", async () => {
+        const store = gcsStore({ storage: mockStorage({ metadataError: throttle("30") }), bucket: "b" });
+        const err = await store.headObject("doc.pdf").catch((e: unknown) => e);
+        expect(err).toBeInstanceOf(StoreUnavailableError);
+        expect((err as StoreUnavailableError).retryAfterSeconds).toBe(30);
+    });
+
+    test("an HTTP-date Retry-After is converted to a delay", async () => {
+        const date = new Date(Date.now() + 120_000).toUTCString();
+        const store = gcsStore({ storage: mockStorage({ metadataError: throttle(date) }), bucket: "b" });
+        const err = await store.headObject("doc.pdf").catch((e: unknown) => e);
+        expect(err).toBeInstanceOf(StoreUnavailableError);
+        const seconds = (err as StoreUnavailableError).retryAfterSeconds;
+        expect(seconds).toBeGreaterThanOrEqual(100);
+        expect(seconds).toBeLessThanOrEqual(120);
+    });
+
+    test("a throttle with no usable hint carries no retry delay", async () => {
+        for (const error of [throttle(), throttle("soon")]) {
+            const store = gcsStore({ storage: mockStorage({ metadataError: error }), bucket: "b" });
+            const err = await store.headObject("doc.pdf").catch((e: unknown) => e);
+            expect(err).toBeInstanceOf(StoreUnavailableError);
+            expect((err as StoreUnavailableError).retryAfterSeconds).toBeUndefined();
+        }
+    });
+});
+
+describe("gcsStore: read stream teardown", () => {
+    test("a failing stream without a destroy method still surfaces its own error", async () => {
+        const store = gcsStore({
+            storage: mockStorage({ streamError: new Error("connection reset"), noDestroy: true }),
+            bucket: "b",
+        });
+        await expect(store.getObject("doc.pdf")).rejects.toThrow("connection reset");
+    });
+
+    test("the abort listener used while opening the stream is removed once it is open", async () => {
+        const controller = new AbortController();
+        const added = spyOn(controller.signal, "addEventListener");
+        const removed = spyOn(controller.signal, "removeEventListener");
+        const store = gcsStore({ storage: mockStorage(), bucket: "b" });
+
+        const result = await store.getObject("doc.pdf", { signal: controller.signal });
+        const openingListener = added.mock.calls[0]?.[1];
+        expect(openingListener).toBeFunction();
+        expect(removed.mock.calls.some(([type, listener]) => type === "abort" && listener === openingListener)).toBe(
+            true,
+        );
+        await asStream(result.body).cancel();
     });
 });

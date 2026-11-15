@@ -12,7 +12,7 @@ import { SEL_AS_ANY, SEL_MATH_RANDOM, SEL_NAIVE_COMMENT_STRIP, SEL_RECURSIVE_REM
 //
 // A later override REPLACES a rule's options for the files it matches rather
 // than merging them, so every selector applying to the same files must stay in
-// ONE `nordvec/no-restricted-syntax` array. Do not add a second override.
+// ONE `nordvec/no-restricted-syntax` array: `shippedRules` below is that array.
 const SEL_BUN_GLOBAL = {
     // The repo defaults to Bun builtins everywhere else, which is exactly why
     // this needs a guard rather than a convention: the habit is correct in every
@@ -28,20 +28,51 @@ const SEL_OBJECT_KEY_IN_ERROR_MESSAGE = {
     // filename, and an error message is free text that every log line and error
     // tracker prints whole, `cause` chain included. The read-side errors carry
     // the key on their `key` field, which a consumer can drop, hash or redact by
-    // name; a message cannot be scrubbed without knowing the key. An upload
-    // token is a bearer credential, and every adapter's bookkeeping names embed
-    // it, so the builders of those names are refused alongside the token.
-    // `bodyToBytes` is listed because its context string becomes its message.
+    // name; a message cannot be scrubbed without knowing the key.
     selector:
-        ":matches(NewExpression, CallExpression[callee.type='Super'], CallExpression[callee.name='bodyToBytes']) > :matches(TemplateLiteral, BinaryExpression) Identifier[name=/^(key|path|prefix|objectKey|targetKey|token|uploadToken|infoKey|partKey|infoName|infoBlobName|manifestName|chunkName|chunkPrefix|composePrefix)$/]",
+        ":matches(NewExpression, CallExpression[callee.type='Super']) > :matches(TemplateLiteral, BinaryExpression) Identifier[name=/^(key|path|prefix|objectKey|targetKey)$/]",
     message:
-        "An error message never names the object key or an upload token: a key is often a user's filename, a token is a credential, and no consumer can scrub free text. Carry the key on the error's `key` field (ObjectNotFoundError and its siblings) or in the onError context.",
+        "An error message never names the object key: a key is often a user's filename, and no consumer can scrub free text. Carry the key on the error's `key` field (ObjectNotFoundError and its siblings) or in the onError context.",
 };
 
 // `.stryker-tmp/` holds mutation-run sandboxes: whole copies of the package,
 // tsconfig included. The sandbox is a build artifact of `test:mutation`,
 // never a lint target.
 const base = packageBase({ ignores: [".stryker-tmp/**"], allowRequireImports: true });
+
+// The one rule set for shipped source.
+const shippedRules = {
+    "nordvec/no-restricted-syntax": [
+        "error",
+        SEL_BUN_GLOBAL,
+        SEL_AS_ANY,
+        SEL_NAIVE_COMMENT_STRIP,
+        SEL_MATH_RANDOM,
+        SEL_OBJECT_KEY_IN_ERROR_MESSAGE,
+    ],
+    "no-empty": ["error", { allowEmptyCatch: false }],
+    // The escape set in content-disposition.ts deliberately matches control
+    // characters, and says so with a disable. Enabling the rule is what makes
+    // that disable mean something: with the rule off it was inert, so a
+    // second, accidental control-character class could have gone in unnoticed
+    // beside an annotation that looked like it was guarding the file.
+    "no-control-regex": "error",
+    "no-restricted-imports": [
+        "error",
+        {
+            patterns: [
+                {
+                    // Zero runtime dependencies is the package's headline property. A
+                    // monorepo import would compile here and be unresolvable for every
+                    // npm consumer, since none of these are published alongside it.
+                    group: ["@nordvec/*", "@/*", "apps/*", "**/apps/**", "**/packages/**"],
+                    message:
+                        "Zero dependencies and standalone-publishable: this package may not import from the monorepo. Its adapters live in its own subpath exports.",
+                },
+            ],
+        },
+    ],
+};
 
 export default {
     ...base,
@@ -62,38 +93,7 @@ export default {
             // dist/, not about what the suite is executed by.
             files: ["src/**/*.ts"],
             excludeFiles: ["src/__tests__/**/*.ts"],
-            rules: {
-                "nordvec/no-restricted-syntax": [
-                    "error",
-                    SEL_BUN_GLOBAL,
-                    SEL_AS_ANY,
-                    SEL_NAIVE_COMMENT_STRIP,
-                    SEL_MATH_RANDOM,
-                    SEL_OBJECT_KEY_IN_ERROR_MESSAGE,
-                ],
-                "no-empty": ["error", { allowEmptyCatch: false }],
-                // The escape set in content-disposition.ts deliberately matches control
-                // characters, and says so with a disable. Enabling the rule is what makes
-                // that disable mean something: with the rule off it was inert, so a
-                // second, accidental control-character class could have gone in unnoticed
-                // beside an annotation that looked like it was guarding the file.
-                "no-control-regex": "error",
-                "no-restricted-imports": [
-                    "error",
-                    {
-                        patterns: [
-                            {
-                                // Zero runtime dependencies is the package's headline property. A
-                                // monorepo import would compile here and be unresolvable for every
-                                // npm consumer, since none of these are published alongside it.
-                                group: ["@nordvec/*", "@/*", "apps/*", "**/apps/**", "**/packages/**"],
-                                message:
-                                    "Zero dependencies and standalone-publishable: this package may not import from the monorepo. Its adapters live in its own subpath exports.",
-                            },
-                        ],
-                    },
-                ],
-            },
+            rules: shippedRules,
         },
         {
             files: ["src/__tests__/**/*.ts"],

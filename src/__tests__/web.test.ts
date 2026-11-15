@@ -7,9 +7,9 @@ import {
     type ServeObjectOptions,
     type TransferEvent,
 } from "../web";
-import { OPEN_ENDED, ObjectNotFoundError, StoreUnavailableError, isInlineSafeMediaType } from "../index";
+import { ObjectNotFoundError, StoreUnavailableError, isInlineSafeMediaType } from "../index";
 import { lookupMime } from "../mime";
-import type { ObjectStore, ObjectMetadata, ObjectStream, ParsedRange } from "../index";
+import type { ObjectStore, ObjectMetadata, ObjectStream, ParsedRange, ReadRange } from "../index";
 import { memoryStore as kvStore } from "../memory";
 
 /**
@@ -22,10 +22,11 @@ import { memoryStore as kvStore } from "../memory";
  * "cannot read properties of undefined" several lines later, inside a mock,
  * which reads as a broken test rather than a changed caller.
  */
-function requireRange(getOpts?: { range?: ParsedRange }): ParsedRange {
+function requireRange(getOpts?: { range?: ReadRange }): ParsedRange {
     const range = getOpts?.range;
     if (!range) throw new Error("store mock was called without a range; the caller under test changed");
-    return range;
+    if (range.end === undefined) throw new Error("store mock expected a closed range, got an open one");
+    return { start: range.start, end: range.end };
 }
 
 // ─── In-Memory Store ────────────────────────────────────────────────────────
@@ -88,18 +89,18 @@ function memoryStore(opts: MemoryStoreOpts = {}): ObjectStore {
             };
         },
 
-        async getObject(key: string, getOpts?: { range?: ParsedRange; ifMatch?: string }): Promise<ObjectStream> {
+        async getObject(key: string, getOpts?: { range?: ReadRange; ifMatch?: string }): Promise<ObjectStream> {
             const range = getOpts?.range;
             opts.calls?.push(`get:${key}:${range ? `${range.start}-${range.end}` : "full"}`);
             // oxlint-disable-next-line typescript/only-throw-error -- the fixture value is rethrown as given (see `error`)
             if ("error" in opts) throw opts.error;
 
-            const slice = range ? data.slice(range.start, range.end + 1) : data;
+            const slice = range ? data.slice(range.start, (range.end ?? data.length - 1) + 1) : data;
             const served =
                 opts.rangeOverride !== undefined
                     ? (opts.rangeOverride ?? undefined)
                     : range
-                      ? { start: range.start, end: range.end }
+                      ? { start: range.start, end: range.end ?? data.length - 1 }
                       : undefined;
 
             return {
@@ -139,7 +140,7 @@ describe("serveObject: 200 full content", () => {
         expect(res.headers.get("Last-Modified")).toBe(LAST_MODIFIED);
         expect(res.headers.get("X-Content-Type-Options")).toBe("nosniff");
         expect(res.headers.get("Content-Disposition")).toBe("attachment");
-        expect(res.headers.get("Cache-Control")).toBe("private, no-cache");
+        expect(res.headers.get("Cache-Control")).toBe("private, no-cache, no-transform");
     });
 
     test("Path C (no conditionals) derives a weak ETag from size + mtime when the store has no hash", async () => {
@@ -217,23 +218,49 @@ describe("serveObject: range requests", () => {
         expect(res.headers.get("Content-Length")).toBe("20");
     });
 
-    test("backend's ACTUAL served range wins over the requested range", async () => {
-        // Object shrank between HEAD (20 bytes) and GET: backend clamped the
-        // requested 0-9 to 0-4/5. Headers must reflect the actual bytes.
-        const store = memoryStore({ etag: ETAG });
-        store.getObject = async () => ({
-            body: streamOf(bytesOf("01234")),
-            contentLength: 5,
-            totalSize: 5,
-            range: { start: 0, end: 4 },
-            etag: ETAG,
-        });
+    test("an authoritative backend's ACTUAL served range wins over the requested range", async () => {
+        // The backend clamped the requested 0-9 to 0-4/5. Headers must reflect
+        // the actual bytes.
+        const store: ObjectStore = {
+            ...memoryStore({ etag: ETAG }),
+            authoritativeRange: true,
+            getObject: async () => ({
+                body: streamOf(bytesOf("01234")),
+                contentLength: 5,
+                totalSize: 5,
+                range: { start: 0, end: 4 },
+                etag: ETAG,
+            }),
+        };
         const handler = serveObject(store);
         const res = await handler(req({ Range: "bytes=0-9" }), { key: KEY });
 
         expect(res.status).toBe(206);
         expect(res.headers.get("Content-Range")).toBe("bytes 0-4/5");
         expect(res.headers.get("Content-Length")).toBe("5");
+    });
+
+    test("a range resolved against a HEAD is served exactly or refused, never relabelled", async () => {
+        // The object shrank between HEAD (20 bytes) and GET and the store answered
+        // 0-4 for the requested 0-9: the HEAD fixed the span, so a different label
+        // is not a clamp.
+        const errors: unknown[] = [];
+        const store: ObjectStore = {
+            ...memoryStore({ etag: ETAG }),
+            authoritativeRange: false,
+            getObject: async () => ({
+                body: streamOf(bytesOf("01234")),
+                contentLength: 5,
+                totalSize: 5,
+                range: { start: 0, end: 4 },
+                etag: ETAG,
+            }),
+        };
+        const handler = serveObject(store, { onError: (e) => errors.push(e) });
+        const res = await handler(req({ Range: "bytes=0-9" }), { key: KEY });
+
+        expect(res.status).toBe(502);
+        expect(errors).toHaveLength(1);
     });
 
     test("incoherent served range from the store fails loudly with 502 and cancels the stream", async () => {
@@ -479,7 +506,8 @@ describe("serveObject: error handling", () => {
             throw new DOMException("The operation was aborted", "AbortError");
         };
         const handler = serveObject(store);
-        const res = await handler(req(), { key: KEY });
+        const aborted = new Request("http://localhost/files/test.bin", { signal: AbortSignal.abort() });
+        const res = await handler(aborted, { key: KEY });
         expect(res.status).toBe(499);
     });
 });
@@ -1084,13 +1112,13 @@ describe("plain-range fast path (authoritative-range stores)", () => {
                 calls.push(`head:${key}`);
                 return { contentLength: data.length, etag: '"auth-v1"' };
             },
-            async getObject(key: string, getOpts?: { range?: ParsedRange }): Promise<ObjectStream> {
+            async getObject(key: string, getOpts?: { range?: ReadRange }): Promise<ObjectStream> {
                 const range = getOpts?.range;
-                calls.push(`get:${key}:${range ? `${range.start}-${range.end}` : "full"}`);
+                calls.push(`get:${key}:${range ? `${range.start}-${range.end ?? ""}` : "full"}`);
                 if (range && range.start >= data.length) {
                     throw new Error("InvalidRange: start beyond EOF");
                 }
-                const end = range ? Math.min(range.end, data.length - 1) : data.length - 1;
+                const end = Math.min(range?.end ?? data.length - 1, data.length - 1);
                 const slice = range ? data.slice(range.start, end + 1) : data;
                 return {
                     body: streamOf(slice),
@@ -1167,9 +1195,9 @@ describe("plain-range fast path (authoritative-range stores)", () => {
                 calls.push(`head:${key}`);
                 return { contentLength: 10 };
             },
-            async getObject(key: string, getOpts?: { range?: ParsedRange }): Promise<ObjectStream> {
+            async getObject(key: string, getOpts?: { range?: ReadRange }): Promise<ObjectStream> {
                 const range = getOpts?.range;
-                calls.push(`get:${key}:${range ? `${range.start}-${range.end}` : "full"}`);
+                calls.push(`get:${key}:${range ? `${range.start}-${range.end ?? ""}` : "full"}`);
                 return {
                     body: streamOf(bytesOf("0123456789")),
                     contentLength: 10,
@@ -1227,7 +1255,8 @@ describe("plain-range fast path (authoritative-range stores)", () => {
         const origGet = store.getObject.bind(store);
         store.getObject = async (key, getOpts) => {
             const result = await origGet(key, getOpts);
-            if (getOpts?.range) result.range = { start: getOpts.range.start, end: getOpts.range.end };
+            if (getOpts?.range)
+                result.range = { start: getOpts.range.start, end: getOpts.range.end ?? Number.MAX_SAFE_INTEGER };
             return result;
         };
         const handler = serveObject(store);
@@ -1271,9 +1300,9 @@ describe("plain-range fast path (authoritative-range stores)", () => {
     });
 
     test("open-ended fast range sends bytes=a- on the wire, not a 16-digit end", async () => {
-        // Verifies the OPEN_ENDED sentinel never leaks as a literal
-        // last-byte-pos into a store that formats a Range header.
-        let seenRange: { start: number; end: number } | undefined;
+        // Verifies an open range reaches the store as an absent end, never as a
+        // literal last-byte-pos a store would format into a Range header.
+        let seenRange: ReadRange | undefined;
         const data = bytesOf("0123456789abcdefghij");
         const store: ObjectStore = {
             supportsRange: true,
@@ -1294,9 +1323,9 @@ describe("plain-range fast path (authoritative-range stores)", () => {
         const handler = serveObject(store);
         const res = await handler(req({ Range: "bytes=15-" }), { key: KEY });
         expect(res.status).toBe(206);
-        // The adapter received the OPEN_ENDED sentinel; a real adapter maps it
-        // to `bytes=15-`. Assert the sentinel is what flows (not a clamped end).
-        expect(seenRange).toEqual({ start: 15, end: OPEN_ENDED });
+        // The adapter received an absent end; a real adapter maps it
+        // to `bytes=15-`. Assert the open form is what flows (not a clamped end).
+        expect(seenRange).toEqual({ start: 15, end: undefined });
     });
 });
 
@@ -1566,6 +1595,151 @@ describe("the body is held to the committed Content-Length", () => {
     });
 });
 
+describe("a consumer that leaves is not a store failure", () => {
+    /** Delivers `first`, then stays open until it is cancelled, claiming `claimed` bytes. */
+    function stallingStore(first: string, claimed: number): ObjectStore {
+        return {
+            supportsRange: true,
+            async headObject(): Promise<ObjectMetadata> {
+                return { contentLength: claimed, etag: ETAG };
+            },
+            async getObject(): Promise<ObjectStream> {
+                let sent = false;
+                const body = new ReadableStream<Uint8Array<ArrayBuffer>>({
+                    pull(controller) {
+                        if (!sent) {
+                            sent = true;
+                            controller.enqueue(bytesOf(first));
+                            return Promise.resolve();
+                        }
+                        return new Promise<void>(() => {});
+                    },
+                });
+                return { body, contentLength: claimed, totalSize: claimed, etag: ETAG };
+            },
+        };
+    }
+
+    const settleTimers = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 40));
+
+    test("cancelling after a partial read reports nothing", async () => {
+        const failures: string[] = [];
+        const events: TransferEvent[] = [];
+        const handler = serveObject(stallingStore("aaaaa", 10), {
+            onError: (err) => failures.push(String(err)),
+            onTransfer: (e) => events.push(e),
+        });
+        const res = await handler(req(), { key: KEY });
+        const reader = res.body!.getReader();
+        expect((await reader.read()).done).toBe(false);
+        await reader.cancel();
+        await settleTimers();
+
+        expect(failures).toEqual([]);
+        expect(events).toEqual([expect.objectContaining({ bytesTransferred: 5, completed: false })]);
+    });
+
+    test("cancelling after the request's signal aborted reports nothing", async () => {
+        const failures: string[] = [];
+        const ac = new AbortController();
+        const handler = serveObject(stallingStore("aaaaa", 10), { onError: (err) => failures.push(String(err)) });
+        const res = await handler(new Request("http://localhost/files/test.bin", { signal: ac.signal }), { key: KEY });
+        const reader = res.body!.getReader();
+        expect((await reader.read()).done).toBe(false);
+        ac.abort();
+        await reader.cancel();
+        await settleTimers();
+
+        expect(failures).toEqual([]);
+    });
+
+    test("a source that ends short with no cancel is still reported once", async () => {
+        const failures: Array<{ key: string; operation: string }> = [];
+        const handler = serveObject(claimingStore(["aaaaa"], 10), { onError: (_err, ctx) => failures.push(ctx) });
+        const res = await handler(req(), { key: KEY });
+        await expect(res.arrayBuffer()).rejects.toThrow(/closed short/);
+        expect(failures).toEqual([{ key: KEY, operation: "get" }]);
+    });
+
+    describe("multipart", () => {
+        const BIG = "0123456789abcdefghij".repeat(10);
+
+        /** Every part delivers two bytes fewer than its span, then closes after a delay. */
+        function shortPartStore(): ObjectStore {
+            const data = bytesOf(BIG);
+            return {
+                supportsRange: true,
+                async headObject(): Promise<ObjectMetadata> {
+                    return { contentLength: data.length, etag: ETAG };
+                },
+                async getObject(_key, getOpts?: { range?: ReadRange }): Promise<ObjectStream> {
+                    const range = requireRange(getOpts);
+                    const slice = data.slice(range.start, range.end + 1);
+                    let released = false;
+                    const body = new ReadableStream<Uint8Array<ArrayBuffer>>({
+                        start(controller) {
+                            controller.enqueue(slice.slice(0, slice.length - 2));
+                            setTimeout(() => {
+                                if (!released) controller.close();
+                            }, 20);
+                        },
+                        cancel() {
+                            released = true;
+                        },
+                    });
+                    return {
+                        body,
+                        contentLength: slice.length,
+                        totalSize: data.length,
+                        range: { start: range.start, end: range.end },
+                        etag: ETAG,
+                    };
+                },
+            };
+        }
+
+        test("cancelling while a part is short reports nothing", async () => {
+            const failures: string[] = [];
+            const handler = serveObject(shortPartStore(), { onError: (err) => failures.push(String(err)) });
+            const res = await handler(req({ Range: "bytes=0-4,110-114" }), { key: KEY });
+            const reader = res.body!.getReader();
+            expect((await reader.read()).done).toBe(false);
+            await reader.cancel();
+            await settleTimers();
+
+            expect(failures).toEqual([]);
+        });
+
+        test("cancelling after the request's signal aborted reports nothing", async () => {
+            const failures: string[] = [];
+            const ac = new AbortController();
+            const handler = serveObject(shortPartStore(), { onError: (err) => failures.push(String(err)) });
+            const res = await handler(
+                new Request("http://localhost/files/test.bin", {
+                    headers: { Range: "bytes=0-4,110-114" },
+                    signal: ac.signal,
+                }),
+                { key: KEY },
+            );
+            const reader = res.body!.getReader();
+            expect((await reader.read()).done).toBe(false);
+            ac.abort();
+            await reader.cancel();
+            await settleTimers();
+
+            expect(failures).toEqual([]);
+        });
+
+        test("a short part with no cancel is still reported once", async () => {
+            const failures: Array<{ key: string; operation: string }> = [];
+            const handler = serveObject(shortPartStore(), { onError: (_err, ctx) => failures.push(ctx) });
+            const res = await handler(req({ Range: "bytes=0-4,110-114" }), { key: KEY });
+            await expect(res.arrayBuffer()).rejects.toThrow(/changed mid-read/);
+            expect(failures).toEqual([{ key: KEY, operation: "get" }]);
+        });
+    });
+});
+
 // ─── Multi-range (multipart/byteranges) ─────────────────────────────────────
 
 describe("multi-range serving (multipart/byteranges)", () => {
@@ -1699,13 +1873,13 @@ describe("multi-range serving (multipart/byteranges)", () => {
             async headObject(): Promise<ObjectMetadata> {
                 return { contentLength: data.length, etag: ETAG };
             },
-            async getObject(_key: string, getOpts?: { range?: ParsedRange }): Promise<ObjectStream> {
+            async getObject(_key: string, getOpts?: { range?: ReadRange }): Promise<ObjectStream> {
                 const range = getOpts?.range;
                 return {
                     body: streamOf(data), // full body...
                     contentLength: data.length, // ...but claims the range span
                     totalSize: data.length,
-                    range: range ? { start: range.start, end: range.end } : undefined,
+                    range: range ? { start: range.start, end: range.end ?? data.length - 1 } : undefined,
                 };
             },
         };
@@ -1732,14 +1906,16 @@ describe("multi-range serving (multipart/byteranges)", () => {
             async headObject(): Promise<ObjectMetadata> {
                 return { contentLength: data.length, etag: ETAG };
             },
-            async getObject(_key: string, getOpts?: { range?: ParsedRange }): Promise<ObjectStream> {
+            async getObject(_key: string, getOpts?: { range?: ReadRange }): Promise<ObjectStream> {
                 getCalls++;
                 const range = getOpts!.range!;
-                const slice = data.subarray(range.start, range.end + 1);
+                const slice = data.subarray(range.start, (range.end ?? data.length - 1) + 1);
+                // Left open, as a live backend body is until it is released: a
+                // source the framing already drained would be closed, and a closed
+                // stream has nothing left to cancel.
                 const body = new ReadableStream<Uint8Array<ArrayBuffer>>({
                     start(c) {
                         c.enqueue(slice);
-                        c.close();
                     },
                     cancel() {
                         firstCancelled = true;
@@ -1749,7 +1925,7 @@ describe("multi-range serving (multipart/byteranges)", () => {
                     body,
                     contentLength: slice.length,
                     totalSize: data.length,
-                    range: { start: range.start, end: range.end },
+                    range: { start: range.start, end: range.end ?? data.length - 1 },
                     etag: ETAG,
                 };
             },
@@ -1776,15 +1952,15 @@ describe("multi-range serving (multipart/byteranges)", () => {
             async headObject(): Promise<ObjectMetadata> {
                 return { contentLength: data.length, etag: ETAG };
             },
-            async getObject(_key: string, getOpts?: { range?: ParsedRange }): Promise<ObjectStream> {
+            async getObject(_key: string, getOpts?: { range?: ReadRange }): Promise<ObjectStream> {
                 const range = getOpts!.range!;
-                const slice = data.subarray(range.start, range.end + 1);
+                const slice = data.subarray(range.start, (range.end ?? data.length - 1) + 1);
                 const etag = call++ === 0 ? ETAG : '"overwritten-same-size"';
                 return {
                     body: streamOf(slice),
                     contentLength: slice.length,
                     totalSize: data.length,
-                    range: { start: range.start, end: range.end },
+                    range: { start: range.start, end: range.end ?? data.length - 1 },
                     etag,
                 };
             },
@@ -1907,14 +2083,14 @@ describe("HEAD-to-GET validator drift guard (non-pinning stores)", () => {
                     lastModified: LAST_MODIFIED,
                 };
             },
-            async getObject(_key: string, getOpts?: { range?: ParsedRange }): Promise<ObjectStream> {
+            async getObject(_key: string, getOpts?: { range?: ReadRange }): Promise<ObjectStream> {
                 const range = getOpts?.range;
-                const slice = range ? v2.subarray(range.start, range.end + 1) : v2;
+                const slice = range ? v2.subarray(range.start, (range.end ?? v2.length - 1) + 1) : v2;
                 return {
                     body: streamOf(slice),
                     contentLength: slice.length,
                     totalSize: 20,
-                    range: range ? { start: range.start, end: range.end } : undefined,
+                    range: range ? { start: range.start, end: range.end ?? v2.length - 1 } : undefined,
                     etag: '"v2"',
                     lastModified: LAST_MODIFIED,
                 };
@@ -2191,14 +2367,14 @@ describe("inline active-content CSP", () => {
         expect(png.headers.get("Content-Security-Policy")).toBeNull();
     });
 
-    test("caller securityHeaders override the default", async () => {
+    test("a caller securityHeaders CSP composes with the sandbox directive", async () => {
         const handler = serveObject(memoryStore({ etag: ETAG }), {
             disposition: "inline",
             securityHeaders: () => ({ "Content-Security-Policy": "script-src 'none'" }),
         });
         const res = await handler(req(), { key: KEY, mime: "text/html" });
 
-        expect(res.headers.get("Content-Security-Policy")).toBe("script-src 'none'");
+        expect(res.headers.get("Content-Security-Policy")).toBe("script-src 'none', sandbox");
     });
 });
 
@@ -2383,18 +2559,18 @@ describe("precompressed gating (defaults and explicit lists)", () => {
 
         expect(res.headers.get("Content-Encoding")).toBe("br");
         expect(await res.text()).toBe("b".repeat(10));
-        expect(heads).toEqual(["data.json.br"]);
+        expect(heads).toEqual(["data.json", "data.json.br"]);
     });
 
-    test("the winning probe's metadata is reused: exactly one HEAD per serve", async () => {
+    test("the negotiation round's metadata is reused: each key is HEADed once per serve", async () => {
         const heads: string[] = [];
         const handler = serveObject(brStore(heads), { precompressed: true });
         const res = await handler(req({ "Accept-Encoding": "br" }), CTX);
 
         expect(res.headers.get("Content-Encoding")).toBe("br");
-        // The variant probe IS the validating HEAD; re-HEADing the variant
-        // (or the identity key) would double storage round-trips per request.
-        expect(heads).toEqual(["data.json.br"]);
+        // The probes ARE the validating HEADs (the identity authorizes the
+        // variant); re-HEADing either would double storage round-trips.
+        expect(heads).toEqual(["data.json", "data.json.br"]);
     });
 
     test("probe failure without onError still falls back cleanly (never-throw)", async () => {
@@ -2563,14 +2739,31 @@ describe("abort classification (client disconnect vs backend failure)", () => {
         };
     }
 
-    test("an Error named AbortError is a client disconnect: bodyless 499", async () => {
-        const err = new Error("aborted");
-        err.name = "AbortError";
-        const handler = serveObject(getThrowingStore(err));
-        const res = await handler(req(), { key: KEY });
+    test("a failing read once the request signal aborted is a client disconnect: bodyless 499", async () => {
+        const reported: unknown[] = [];
+        const handler = serveObject(getThrowingStore(new Error("socket reset")), { onError: (e) => reported.push(e) });
+        const aborted = new Request("http://localhost/files/test.bin", { signal: AbortSignal.abort() });
+        const res = await handler(aborted, { key: KEY });
 
         expect(res.status).toBe(499);
         expect(res.headers.get("Content-Length")).toBe("0");
+        expect(reported).toEqual([]);
+    });
+
+    test("an Error named AbortError with a live signal is the store's own cancellation: 502, reported", async () => {
+        const err = new Error("origin timeout");
+        err.name = "AbortError";
+        const reported: Array<{ key: string; operation: string }> = [];
+        const handler = serveObject(getThrowingStore(err), { onError: (_e, ctx) => reported.push(ctx) });
+
+        const plain = await handler(req(), { key: KEY });
+        expect(plain.status).toBe(502);
+        const conditional = await handler(req({ "If-None-Match": '"other"' }), { key: KEY });
+        expect(conditional.status).toBe(502);
+        expect(reported).toEqual([
+            { key: KEY, operation: "get" },
+            { key: KEY, operation: "get" },
+        ]);
     });
 
     test("a non-abort DOMException is a backend failure, reported to onError", async () => {
@@ -2588,7 +2781,11 @@ describe("abort classification (client disconnect vs backend failure)", () => {
         const abortErr = new Error("gone");
         abortErr.name = "AbortError";
         const aborted = serveObject(getThrowingStore(abortErr));
-        const resAbort = await aborted(req({ Range: "bytes=0-4,150-154" }), { key: KEY });
+        const abortedRequest = new Request("http://localhost/files/test.bin", {
+            headers: { Range: "bytes=0-4,150-154" },
+            signal: AbortSignal.abort(),
+        });
+        const resAbort = await aborted(abortedRequest, { key: KEY });
         expect(resAbort.status).toBe(499);
 
         const failed = serveObject(getThrowingStore(new DOMException("t", "TimeoutError")));
@@ -2751,11 +2948,11 @@ describe("plain-range fast path: malformed headers fall back to validation", () 
                 calls.push(`head:${key}`);
                 return { contentLength: data.length, etag: '"fp-v1"' };
             },
-            async getObject(key: string, getOpts?: { range?: ParsedRange }): Promise<ObjectStream> {
+            async getObject(key: string, getOpts?: { range?: ReadRange }): Promise<ObjectStream> {
                 const range = getOpts?.range;
-                calls.push(`get:${key}:${range ? `${range.start}-${range.end}` : "full"}`);
+                calls.push(`get:${key}:${range ? `${range.start}-${range.end ?? ""}` : "full"}`);
                 if (range && range.start >= data.length) throw new Error("InvalidRange");
-                const end = range ? Math.min(range.end, data.length - 1) : data.length - 1;
+                const end = Math.min(range?.end ?? data.length - 1, data.length - 1);
                 const slice = range ? data.slice(range.start, end + 1) : data;
                 return {
                     body: streamOf(slice),
@@ -2857,14 +3054,14 @@ describe("weak/strong validator comparability in the drift guard", () => {
                 heads++;
                 return { contentLength: 20, etag: 'W/"v1"' };
             },
-            async getObject(_key, getOpts?: { range?: ParsedRange }): Promise<ObjectStream> {
+            async getObject(_key, getOpts?: { range?: ReadRange }): Promise<ObjectStream> {
                 const range = getOpts?.range;
-                const slice = range ? data.slice(range.start, range.end + 1) : data;
+                const slice = range ? data.slice(range.start, (range.end ?? data.length - 1) + 1) : data;
                 return {
                     body: streamOf(slice),
                     contentLength: slice.length,
                     totalSize: 20,
-                    range: range ? { start: range.start, end: range.end } : undefined,
+                    range: range ? { start: range.start, end: range.end ?? data.length - 1 } : undefined,
                     etag: '"v1"',
                 };
             },
@@ -2891,7 +3088,7 @@ describe("multipart per-part representation coherence", () => {
             async headObject(): Promise<ObjectMetadata> {
                 return { contentLength: data.length, etag: partMeta(0).etag, lastModified: LM };
             },
-            async getObject(_key, getOpts?: { range?: ParsedRange }): Promise<ObjectStream> {
+            async getObject(_key, getOpts?: { range?: ReadRange }): Promise<ObjectStream> {
                 call++;
                 const range = requireRange(getOpts);
                 const slice = data.slice(range.start, range.end + 1);
@@ -2926,7 +3123,7 @@ describe("multipart per-part representation coherence", () => {
         // Lazy parts settle after the 206 commits: the divergence surfaces as
         // a body reset (visible failure), not as spliced multipart framing.
         expect(res.status).toBe(206);
-        await expect(res.arrayBuffer()).rejects.toThrow();
+        await expect(res.arrayBuffer()).rejects.toThrow("Object changed since validation");
     });
 
     test("matching Last-Modified across parts (no ETags) serves", async () => {
@@ -2947,7 +3144,7 @@ describe("multipart byte-body length verification", () => {
             async headObject(): Promise<ObjectMetadata> {
                 return { contentLength: data.length, etag: '"mb-v1"' };
             },
-            async getObject(_key, getOpts?: { range?: ParsedRange }): Promise<ObjectStream> {
+            async getObject(_key, getOpts?: { range?: ReadRange }): Promise<ObjectStream> {
                 const range = requireRange(getOpts);
                 const span = range.end - range.start + 1;
                 const slice = data.slice(range.start, range.end + 1);
@@ -2976,7 +3173,7 @@ describe("multipart byte-body length verification", () => {
         const handler = serveObject(shortByteStore((r) => r.start === 150));
         const res = await handler(req({ Range: "bytes=0-4,150-154" }), { key: KEY });
         expect(res.status).toBe(206);
-        await expect(res.arrayBuffer()).rejects.toThrow();
+        await expect(res.arrayBuffer()).rejects.toThrow("changed mid-read");
     });
 
     test("a LATER byte part longer than its span is withheld whole, never framed", async () => {
@@ -2986,7 +3183,7 @@ describe("multipart byte-body length verification", () => {
             async headObject(): Promise<ObjectMetadata> {
                 return { contentLength: data.length, etag: '"mb-v1"' };
             },
-            async getObject(_key, getOpts?: { range?: ParsedRange }): Promise<ObjectStream> {
+            async getObject(_key, getOpts?: { range?: ReadRange }): Promise<ObjectStream> {
                 const range = requireRange(getOpts);
                 const span = range.end - range.start + 1;
                 const end = range.start === 150 ? range.end + 12 : range.end + 1;
@@ -3011,7 +3208,7 @@ describe("multipart byte-body length verification", () => {
                     seen += new TextDecoder().decode(value);
                 }
             })(),
-        ).rejects.toThrow();
+        ).rejects.toThrow("changed mid-read");
         expect(seen).not.toContain(BIG.slice(150, 155));
     });
 
@@ -3026,7 +3223,7 @@ describe("multipart byte-body length verification", () => {
             async headObject(): Promise<ObjectMetadata> {
                 return { contentLength: data.length, etag: '"mb-v1"' };
             },
-            async getObject(_key, getOpts?: { range?: ParsedRange }): Promise<ObjectStream> {
+            async getObject(_key, getOpts?: { range?: ReadRange }): Promise<ObjectStream> {
                 const range = requireRange(getOpts);
                 const span = range.end - range.start + 1;
                 const slice = data.slice(range.start, range.end + 1);

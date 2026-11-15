@@ -248,7 +248,7 @@ function sanitizeFilename(raw: string): string {
     //    Integration APIs sometimes return full paths like "/uploads/2024/report.pdf".
     //    Uses lastIndexOf instead of split().pop() to avoid array allocation.
     const lastSep = Math.max(noTraversal.lastIndexOf("/"), noTraversal.lastIndexOf("\\"));
-    const basename = lastSep >= 0 ? noTraversal.slice(lastSep + 1) : noTraversal;
+    const basename = noTraversal.slice(lastSep + 1);
 
     // 4. A dot segment names a directory, not a file; a client that saves
     //    under it writes "." or ".." into the download directory path.
@@ -264,14 +264,20 @@ const MAX_FILENAME_BYTES = 255;
  * Cut a name to {@link MAX_FILENAME_BYTES} UTF-8 bytes on a code-point
  * boundary, keeping a short extension (up to 16 characters with its dot) so
  * the saved file still opens with the right application. The loop stops at
- * the first code point that overflows, so it runs at most 255 times.
+ * the first code point that overflows, so it runs at most 255 times, and that
+ * stop always lands before the extension: a name past the limit has more than
+ * 255 bytes of stem plus extension to walk.
+ *
+ * A name past the limit is at least 64 characters (four bytes each at most), so
+ * the extension test alone rules out a missing dot (`dot` is -1) and a leading
+ * one: either leaves more than 16 characters from `dot` to the end.
  */
 function capFilename(name: string): string {
     if (utf8ByteLength(name) <= MAX_FILENAME_BYTES) return name;
     const dot = name.lastIndexOf(".");
-    const ext = dot > 0 && name.length - dot <= 16 ? name.slice(dot) : "";
+    const ext = name.length - dot <= 16 ? name.slice(dot) : "";
     let out = "";
-    for (const ch of name.slice(0, name.length - ext.length)) {
+    for (const ch of name) {
         if (utf8ByteLength(out + ch + ext) > MAX_FILENAME_BYTES) break;
         out += ch;
     }

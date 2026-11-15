@@ -1,181 +1,30 @@
 # Deployment
 
-Operational guidance for running the resumable-upload handlers behind a
-reverse proxy and across more than one instance. The read side (range and
-conditional serving) has no special deployment needs; everything here is about
-the upload (`PATCH`-streaming) path.
+Operational guidance for running the serving handlers. Range and conditional
+serving need no proxy configuration of their own: a reverse proxy that passes
+`Range`, `If-Range` and the conditional request fields through, and does not
+rewrite `ETag`, serves them correctly.
 
-## Reverse proxies buffer uploads by default, and that breaks resumability
+## Verifying a custom read store before it carries traffic
 
-The single most common self-host failure is a proxy that buffers the whole
-`PATCH` body before forwarding it. It defeats the entire point of resumable
-uploads (the server never sees bytes until the client finishes, so a dropped
-connection loses everything), and on large uploads the proxy either runs out of
-buffer disk or pre-empts the app with its own opaque `413`. Every proxy in
-front of an upload endpoint must be told to **stream request bodies through,
-not buffer them**, and to **not impose its own body-size ceiling** (the handler
-enforces `maxSize`/`maxAppendSize` itself, and returns the protocol-correct
-status with `Tus-Max-Size`; a proxy `413` is a dead end a client cannot
-interpret).
-
-### nginx
-
-```nginx
-location /files/ {
-    proxy_pass http://app;
-
-    # Stream the PATCH body straight through instead of buffering it whole.
-    proxy_request_buffering off;
-    proxy_buffering off;
-    proxy_http_version 1.1;
-
-    # Let the APP enforce size limits (it returns Tus-Max-Size); 0 = unlimited
-    # at the proxy so a large upload is never cut off by an opaque proxy 413.
-    client_max_body_size 0;
-
-    # The handler builds the resource `Location` from the request's scheme and
-    # host; forward both so resumes target the right URL behind TLS termination.
-    proxy_set_header Host              $host;
-    proxy_set_header X-Forwarded-Proto $scheme;
-    proxy_set_header X-Forwarded-Host  $host;
-    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
-
-    # Uploads can idle between chunks on a slow link; keep the proxy from
-    # reaping a live-but-quiet connection.
-    proxy_read_timeout 3600s;
-    proxy_send_timeout 3600s;
-}
-```
-
-On HTTP/2, nginx caps how much of a request body it pre-reads
-(`http2_body_preread_size`, default 64k); raising it improves throughput for
-large HTTP/2 uploads at the cost of proxy memory.
-
-### Apache (mod_proxy)
-
-```apache
-<Location /files/>
-    ProxyPass        http://app/files/
-    ProxyPassReverse http://app/files/
-
-    # Do not buffer the request body to disk before forwarding.
-    SetEnv proxy-sendcl 1
-    ProxyReceiveBufferSize 0
-
-    RequestHeader set X-Forwarded-Proto "https"
-    ProxyPreserveHost On
-</Location>
-
-# Apache buffers to a temp file past this; set high or the app never streams.
-LimitRequestBody 0
-```
-
-### Caddy
-
-Caddy streams request bodies by default and needs no buffering flags. Just
-forward the scheme/host so `Location` is built correctly:
-
-```caddy
-reverse_proxy /files/* app:8080 {
-    header_up X-Forwarded-Proto {scheme}
-    header_up Host {host}
-}
-```
-
-## CORS: expose the protocol response headers
-
-A cross-origin browser upload cannot resume unless the browser is allowed to
-**read** the protocol response headers. It is easy to expose `Location` and
-forget `Upload-Offset`, which silently breaks every resume. The package
-publishes the exact list so you never assemble it by hand:
-
-```typescript
-import { TUS_EXPOSED_HEADERS } from "partial-content/tus";
-// or UPLOAD_EXPOSED_HEADERS from "partial-content/upload" for the IETF dialect
-
-const cors = {
-  "Access-Control-Allow-Origin": origin,
-  "Access-Control-Expose-Headers": TUS_EXPOSED_HEADERS.join(", "),
-  // Allow-Headers is the mirror image (the request headers a client sends);
-  // assemble it from the same protocol surface for your dialect.
-};
-```
-
-The package ships no CORS middleware on purpose: the origin allow-list and
-credential policy are yours to own. `TUS_EXPOSED_HEADERS` /
-`UPLOAD_EXPOSED_HEADERS` are the one part that must not drift.
-
-## Running more than one instance
-
-Upload interactions on a single resource are serialized by a lock. The default
-locker is in-process and correct for exactly one instance. If more than one
-server can receive requests for the same upload (a horizontally scaled
-deployment without upload-affinity routing), supply a shared locker:
-
-```typescript
-// doc-check: fragment
-import { redisUploadLocker } from "partial-content/redis-locker";
-
-const handler = createTusHandler(store, {
-  /* ... */
-  locker: redisUploadLocker(redisClient),   // any Redis-protocol server
-});
-```
-
-See the API reference (Locking) for the client-adapter shape and the hold-id /
-watchdog / preemption semantics. Alternatively, route all requests for one
-upload resource to the same instance (sticky sessions keyed on the upload
-`Location`) and keep the in-process locker.
-
-How long a request waits for a contended resource before answering `423` is
-`UploadOrchestratorOptions.lockTimeoutMs` (15 s by default, from whichever
-locker is installed). The dialect factories do not expose it, so a deployment
-that wants a shorter wait than the default builds its orchestrator directly,
-or lowers the locker's own `acquireTimeoutMs`.
-
-## Verifying a custom store before it carries traffic
-
-`createUploadOrchestrator` refuses a store that declares
-`atomicCompletion: false` or `enforcesOffsetCheck: false`, and it cannot do
-more than that: a store which declares the at-write offset check and does not
-perform it constructs cleanly and serves uploads correctly until a lock is
-stolen from a holder that stalled past its TTL. Run
-`checkResumableWriteStore` from `partial-content/conformance` against a
-staging bucket as a CI step or a startup self-test. It needs no test framework
-and no dependencies, and it reports every gap in one run rather than the
-first. `restartable: false` is for a store that is in-process by
-construction; it SKIPS the cross-instance durability checks rather than
-passing them, and the report says so.
-
-A custom read store has its own harness, `checkObjectStore`, over the same
-report shape. It pins the head length, a byte-identical full read, the exact
-window a ranged read was asked for, an honest total size on that partial read,
-and a not-found the adapter can tell from an outage. It only reads, so unlike
-the write-side run it needs no disposable keys: point it at an object the
-staging bucket already serves, and pass that object's exact bytes. See the API
-reference (Store conformance) for both check lists and the options.
+A custom `ObjectStore` has a harness, `checkObjectStore` from
+`partial-content/conformance`. It pins the head length, a byte-identical full
+read, the exact window a ranged read was asked for, an honest total size on
+that partial read, and a not-found the adapter can tell from an outage. It
+only reads, so it needs no disposable keys: point it at an object the staging
+bucket already serves, and pass that object's exact bytes. It needs no test
+framework and no dependencies, and it reports every gap in one run rather
+than the first, so it fits a CI step or a startup self-test. See the API
+reference (Store conformance) for the check list and the options.
 
 ## Storage on a network volume
 
 The filesystem store (`partial-content/fs`) runs on whatever volume you mount.
 On a busy shared/network volume (SMB, NFS) an otherwise-fine file open can
 momentarily fail with a share violation, and under load any local filesystem
-can exhaust the process file-descriptor table; the store retries these
-transient open failures with a short backoff, so a single momentary failure
-does not sink a whole `PATCH`. For heavy sustained throughput, object storage
+can exhaust the process file-descriptor table. The store does not retry a
+failed open: the request fails and the error reaches `onError`,
+so a client retry is the recovery and the file-descriptor ceiling is yours to
+size. For heavy sustained throughput, object storage
 (`/s3`, `/r2`, `/gcs`, `/azure`) is the better fit; the fs store is ideal for
 single-node and self-hosted deployments.
-
-## Object-storage part limits
-
-The S3 and R2 stores assemble large objects from multipart parts, and both
-backends cap a multipart upload at **10,000 parts**. The largest object a store
-can assemble is therefore `10,000 x` the upload's part size. An upload with a
-declared length gets a part size grown to fit it (up to the 5 GiB part limit),
-so it needs no tuning. An upload with a deferred length can only assume
-`minPartSize` (S3) or `partSize` (R2), which is roughly 48.8 GiB at the 5 MiB
-default; an append past that is answered `413` as a non-fatal append bound, and
-the client resumes from the durable offset. For deferred-length objects larger
-than ~49 GiB, raise `minPartSize`/`partSize` at construction (a 64 MiB part
-size lifts the ceiling to ~625 GiB). The part size is fixed when an upload is
-created, so a changed value applies to new uploads only.

@@ -116,16 +116,32 @@ describe("checkChangelogShape", () => {
     it("refuses a Security bullet with no GHSA id, and a Security section with no bullets", () => {
         const sec = `${GHSA}\n- A fix with no advisory.`;
         expect(shape("5.0.0", entry({ security: sec }), UPGRADING)).toMatch(
-            /exactly one well-formed GHSA id: - A fix with no advisory/,
+            /must open with its bold GHSA id.*: - A fix with no advisory/,
         );
         for (const bad of [
             "- **GHSA-TBD**: impact.",
             "- **GHSA-aaaa-bbbb-cccc**: letters outside the id alphabet.",
-            `${GHSA} and **GHSA-3v5w-x8c9-f2g4**`,
+            "- **GHSA-2c4f-hjm6-pq7r-cccc**: a fourth group is not an id.",
+            "- GHSA-2c4f-hjm6-pq7r: not bold.",
+            "- A fix for **GHSA-2c4f-hjm6-pq7r** that does not lead with it.",
+            "- [**GHSA-2c4f-hjm6-pq7r**](https://example.com/GHSA-2c4f-hjm6-pq7r): link text first.",
         ]) {
-            expect(shape("5.0.0", entry({ security: bad }), UPGRADING)).toMatch(/exactly one well-formed GHSA id/);
+            expect(shape("5.0.0", entry({ security: bad }), UPGRADING)).toMatch(/must open with its bold GHSA id/);
         }
         expect(shape("5.0.0", entry({ security: "Prose only." }), UPGRADING)).toMatch(/no bullets/);
+    });
+
+    it("accepts a back-reference to a second advisory after the leading id, and refuses one id leading two bullets", () => {
+        const backRef = `${GHSA} Completes the fix of GHSA-3v5w-x8c9-f2g4.`;
+        expect(shape("5.0.0", entry({ security: backRef }), UPGRADING)).toBeNull();
+        expect(shape("5.0.0", entry({ security: `${GHSA}\n${GHSA}` }), UPGRADING)).toMatch(
+            /names GHSA-2c4f-hjm6-pq7r in two bullets/,
+        );
+    });
+
+    it("refuses a Security heading demoted under Details", () => {
+        const demoted = entry({ details: "#### Subject\n\nMechanism.\n\n#### Security\n\n- **GHSA-2c4f-hjm6-pq7r**" });
+        expect(shape("5.0.0", demoted, UPGRADING)).toMatch(/`### Details` holds a `Security` heading/);
     });
 
     it("refuses an Upgrading checklist whose line count differs from UPGRADING.md's part", () => {

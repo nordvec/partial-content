@@ -52,9 +52,14 @@ function strykerBin() {
 export function runStryker(args, env = process.env) {
     const stryker = [underBun ? "node" : process.execPath, strykerBin(), "run", ...args];
     const [command, ...rest] = existsSync(SUITE_SLOT)
-        ? [process.execPath, SUITE_SLOT, "mutation", "--", ...stryker]
+        ? [process.execPath, SUITE_SLOT, `mutation:${path.basename(pkgDir)}`, "--", ...stryker]
         : stryker;
     return spawnSync(command, rest, { cwd: pkgDir, stdio: "inherit", env });
+}
+
+/** The argument that sets Stryker's worker count on the command line, or null. */
+export function concurrencyFlag(args) {
+    return args.find((a) => /^(-c|--concurrency)(=|$|\d)/.test(a)) ?? null;
 }
 
 const TEMP_DIR = ".stryker-tmp";

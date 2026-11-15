@@ -1,6 +1,6 @@
 # Examples
 
-Recipes beyond the README's Quick Start. Every serving handler manages the full HTTP protocol (200, 206, 304, 412, 416, HEAD) automatically; the upload handlers manage the full resumable-upload protocol (creation, offset probes, appends, termination, expiry) the same way.
+Recipes beyond the README's Quick Start. Every serving handler manages the full HTTP protocol (200, 206, 304, 412, 416, HEAD) automatically.
 
 ## Hono
 
@@ -334,6 +334,56 @@ const handler = serveObject(s3Store({ client, bucket: "assets" }), {
 // and Range support over the encoded bytes.
 ```
 
+The siblings are keys you write: keep user-named uploads out of a namespace
+served with `precompressed`, since the authorization you check for `app.js`
+covers `app.js.br`. A variant is served only while `app.js` exists and is not
+newer than the variant.
+
+## Authorized proxy from object storage
+
+Proxy private files through your own server so every request is authorized and audited, with full range and conditional-request support. This is the path behind `<video>`/`<audio>` seeking and PDF.js progressive loading: the media element sends `Range` to your origin, you re-check access, and only that slice is read from storage.
+
+```typescript
+import { serveObject } from "partial-content/web";
+import { s3Store, type S3StoreOptions } from "partial-content/s3";
+
+// Yours to supply: a configured S3 client, your logger and meter, and the
+// authorization check that owns access.
+declare const client: S3StoreOptions["client"];
+declare const logger: { info(fields: object, msg: string): void; error(fields: object, msg: string): void };
+declare const meter: { recordEgress(key: string, bytes: number): void };
+declare const authorize: (request: Request, key: string) =>
+  Promise<{ id: string; path: string; mimeType: string; filename: string } | null>;
+
+const store = s3Store({ client, bucket: "private-documents" });
+
+const handler = serveObject(store, {
+  disposition: "inline",
+  cacheControl: "private, no-cache",
+  // Bytes GRANTED, at header-commit time.
+  onServe: (event) => logger.info({ ...event }, "file.served"),
+  // Bytes ACTUALLY transferred, once the body settles. `completed === false`
+  // means the client disconnected early.
+  onTransfer: (event) => meter.recordEgress(event.key, event.bytesTransferred),
+  onError: (err, ctx) => logger.error({ err, ...ctx }, "file.error"),
+});
+
+export async function serveFile(request: Request, key: string) {
+  // Deny here and not a single byte is read.
+  const file = await authorize(request, key);
+  if (!file) return new Response("Not found", { status: 404 });
+
+  return handler(request, {
+    key: file.path,
+    mime: file.mimeType,
+    filename: file.filename,
+    // Storage keys usually embed the filename (personal data). auditKey
+    // replaces `key` in every hook event with an opaque id.
+    auditKey: file.id,
+  });
+}
+```
+
 ## Split proxy/redirect on one route (preferSignedUrl)
 
 Proxy the requests where the protocol layer earns its keep (ranges,
@@ -352,398 +402,6 @@ const handler = serveObject(store, {
   cacheControl: "private, no-cache", // rides the signed response too
 });
 ```
-
-## Resumable uploads: a tus 1.0 endpoint
-
-Upload and serving are two sides of the same storage: point an upload store
-and a read store at the same root/bucket/map and a completed upload is
-immediately servable with ranges, conditionals, and Repr-Digest.
-
-That shared location also puts the upload store's own bookkeeping inside the
-read store's namespace: the in-flight bytes of an upload nobody has published
-yet, and the sidecar naming the key it is destined for, which commonly embeds a
-filename. An upload token is the only handle meant to reach any of that, and a
-read handler holds no token. So `fsStore`, `s3Store`, `r2Store`, `gcsStore` and
-`azureStore` refuse keys at or under a `reservedPrefix` with the same
-`ObjectNotFoundError` a missing object gets, on `headObject`, `getObject` and
-`createSignedUrl`. It defaults to the sibling upload store's own prefix
-(`.uploads/` for fs and s3, `.partial-content-uploads/` for r2, gcs and azure),
-so the safe posture is what you get without asking for it. Set
-`reservedPrefix: ""` to serve the whole namespace when no upload store shares
-the location, or name your own when you changed `uploadPrefix`. `memoryStore`
-needs none of this: its in-flight uploads live in a separate map, never in
-`objects`.
-
-```typescript
-import { createTusHandler } from "partial-content/tus";
-import { serveObject } from "partial-content/web";
-import { fsStore, fsUploadStore } from "partial-content/fs";
-
-// Wherever you log.
-declare const logger: { info(fields: object, msg: string): void; error(fields: object, msg: string): void };
-
-const root = "/var/data/files";
-const uploads = createTusHandler(fsUploadStore({ root }), {
-  // The server decides the key; the client filename stays metadata.
-  key: () => crypto.randomUUID(),
-  location: (token) => `/files/upload/${token}`,
-  resolveToken: (req) => new URL(req.url).pathname.split("/").pop() || undefined,
-  policy: { maxSize: 1024 * 1024 * 1024, maxAgeSeconds: 24 * 60 * 60 },
-  onUploadEvent: ({ uploadToken, event }) => logger.info({ uploadToken, ...event }, "upload"),
-  onError: (err, ctx) => logger.error({ err, ...ctx }, "upload.error"),
-});
-const downloads = serveObject(fsStore({ root }), { disposition: "attachment" });
-
-// Mount: POST /files/upload creates; HEAD/PATCH/DELETE /files/upload/<token>
-// probe, append, and terminate; OPTIONS discovers capabilities. Authorize
-// BEFORE calling the handler, exactly like the serving side.
-```
-
-On a raw Node server the dialect handlers are still Fetch handlers, so the
-route converts with `toWebRequest` and writes back with `sendResponse`, and
-everything between the two (routing, the session check) stays yours:
-
-```typescript
-import { createServer } from "node:http";
-import { toWebRequest, sendResponse } from "partial-content/node";
-import { createTusHandler } from "partial-content/tus";
-import { fsUploadStore } from "partial-content/fs";
-
-// Your session check.
-declare function authorized(req: Request): Promise<boolean>;
-
-const uploads = createTusHandler(fsUploadStore({ root: "/var/data/files" }), {
-  key: () => crypto.randomUUID(),
-  location: (token) => `/files/upload/${token}`,
-  resolveToken: (req) => new URL(req.url).pathname.split("/")[3] || undefined,
-  policy: { maxSize: 1024 * 1024 * 1024 },
-});
-
-createServer(async (req, res) => {
-  if (!req.url?.startsWith("/files/upload")) {
-    res.writeHead(404).end();
-    return;
-  }
-  // The configured origin, not the client's Host header, is what the
-  // `Location` on a 201 is built from.
-  const request = toWebRequest(req, { origin: "https://files.example.com" });
-  const response = (await authorized(request)) ? await uploads(request) : new Response(null, { status: 401 });
-  await sendResponse(res, response);
-}).listen(3000);
-```
-
-A chunked PATCH with no `Content-Length` (the ordinary tus shape for a
-stream of unknown length) arrives as a `Request` with no length rather than a
-fabricated one. A sender that opens a body and then goes quiet is torn down
-after `readStallTimeoutMs` (60 s), because a `Request` body is read outside
-the server's own `requestTimeout`. The bridge never answers
-`Expect: 100-continue` itself; see `onExpectContinue` in `docs/API.md`.
-
-Browser clients: any tus 1.0 client works unmodified. Give it the creation
-URL as its endpoint; the `Location` header on the 201 is the upload resource
-every follow-up request (offset probe, append, termination) targets, and the
-client resumes an interrupted transfer by re-probing that URL with HEAD. The
-handler advertises `creation`, `creation-with-upload`,
-`creation-defer-length`, `termination`, and `expiration`, so clients that use
-those extensions (unknown-length streams, upload cancellation, expiry
-display) negotiate them automatically. Cross-origin uploaders additionally
-need the tus headers exposed via `extraHeaders` (e.g.
-`Access-Control-Expose-Headers: Location, Upload-Offset, Upload-Length,
-Upload-Expires, Tus-Resumable`) plus your CORS layer's
-`Access-Control-Allow-*` response.
-
-Housekeeping: expired resources refuse probes and appends on their own
-(`maxAgeSeconds`), but a client that never comes back to `DELETE` them leaves
-their storage to be reclaimed by the store's sweep hook.
-Run it on a schedule with the same cutoff:
-
-```typescript
-import { fsUploadStore } from "partial-content/fs";
-
-const root = "/var/data/files";
-const store = fsUploadStore({ root });
-
-// e.g. hourly. The two cutoffs are different clocks and at least one is
-// required, because a sweep with neither reclaims nothing while looking like
-// a retention control.
-const MAX_AGE_SECONDS = 24 * 60 * 60;
-const now = Date.now();
-await store.sweepExpired({
-  // Abandoned transfers: anchored on the last append, falling back to
-  // creation. Keep it comfortably longer than your longest single append,
-  // since the sweep holds no lock and an append in flight has not moved
-  // lastAppendAt yet, so a short cutoff can reap a resource being written to.
-  idleSinceMs: now - 4 * 60 * 60 * 1000,
-  // The lifetime every request already refuses the resource for. Derived from
-  // the same policy value, so a resource becomes reclaimable at the moment it
-  // stops being usable rather than lingering until it also goes idle.
-  createdBeforeMs: now - MAX_AGE_SECONDS * 1000,
-});
-```
-
-## Resumable uploads: a custom ResumableWriteStore
-
-Any backend that can append durably and publish atomically can host
-resumable uploads. Implement the write contract; the object you pass to
-`createTusHandler`/`createUploadHandler` is checked structurally, and the
-error classes are matched by `name`, so a custom store can throw
-equivalently-named errors without importing them (or import them from a
-built-in store subpath such as `partial-content/memory`). Every store subpath
-also re-exports the contract types (`ResumableWriteStore`,
-`SweepingWriteStore`, `StoredUploadState`, `CreateUploadOptions`,
-`AppendChunkOptions`, `CompleteUploadOptions`, `CompletedUpload`), so the
-classes and the types you need come from one import.
-
-```typescript
-import {
-  UploadNotFoundError,
-  UploadOffsetConflictError,
-  UploadAppendBoundError,
-  UploadOverrunError,
-  type ResumableWriteStore,
-} from "partial-content/memory";
-
-// Your own storage layer, whatever it is. Spelling it out is what lets the
-// compiler check the store below against the contract instead of trusting it.
-interface UploadBackend {
-  allocate(opts: {
-    key: string;
-    length?: number;
-    metadata?: Record<string, string>;
-    createdAt: number;
-  }): Promise<string>;
-  find(uploadToken: string): Promise<{
-    key: string;
-    length?: number;
-    isComplete: boolean;
-    isInvalidated: boolean;
-    createdAt: number;
-    lastAppendAt?: number;
-    metadata?: Record<string, string>;
-  } | null>;
-  sumDurableBytes(uploadToken: string): Promise<number>;
-  recordLength(uploadToken: string, length: number): Promise<void>;
-  append(
-    uploadToken: string,
-    offset: number,
-    body: ReadableStream<Uint8Array> | Uint8Array,
-    opts: { maxBytes?: number; now: number; signal?: AbortSignal },
-  ): Promise<{ bytesWritten: number; crossedBound?: number; interrupted: boolean }>;
-  markInvalidated(uploadToken: string): Promise<void>;
-  publishAtomically(uploadToken: string): Promise<{ etag?: string; digest?: string }>;
-  discard(uploadToken: string): Promise<void>;
-  reap(cutoff: {
-    idleSinceMs?: number;
-    createdBeforeMs?: number;
-  }): Promise<{ removed: number; failed: number }>;
-}
-declare const backend: UploadBackend;
-
-// Annotate the object: the handler checks it structurally at the call site,
-// but the annotation makes the compiler check it HERE, against the contract,
-// so a missing method or a wrong signature is reported where you can see it.
-const myUploadStore: ResumableWriteStore = {
-  // ── Capability flags: HONEST, per backend, never aspirational ──
-  atomicCompletion: true,      // completeUpload must be all-or-nothing
-  enforcesOffsetCheck: true,   // appendChunk refuses a claim that disagrees
-                               // with durable state (see below)
-  // Both are typed `true`: the orchestrator refuses a store that reports
-  // false, so there is no value to write here other than the honest one.
-  digestOnComplete: false as const, // e.g. ["sha-256"] ONLY if you verify before publishing
-  // Disclosures, not switches. Nothing branches on them; they tell whoever
-  // picks this store what they are picking:
-  exactOffsetRecovery: true,   // only if the derived offset is crash-durable
-  // appendGranularity / uniformPartSize / maxAppendSize: set when the
-  // backend forces them; omit for byte-exact appends.
-
-  async createUpload({ key, length, metadata, now }) {
-    // Allocate the resource; fold EVERYTHING resumption needs into the
-    // token (the built-ins encode key + backend upload id). Nothing
-    // upstream ever parses it.
-    //
-    // The token MUST come from a CSPRNG, with at least the ~122 bits a v4
-    // UUID carries. Possession of it IS the authorization: the upload is
-    // reachable by URL for minutes or days after the request that created
-    // it, and nothing in either protocol re-authenticates the follow-ups, so
-    // whoever holds the token can append to, probe and cancel that upload.
-    // Building one from the key, a counter or a timestamp turns "authorized
-    // the creation" into "authorized anyone who can guess a neighbour".
-    const uploadToken = await backend.allocate({ key, length, metadata, createdAt: now });
-    return { uploadToken };
-  },
-
-  async getUploadState(uploadToken) {
-    const record = await backend.find(uploadToken);
-    if (!record) throw new UploadNotFoundError(uploadToken);
-    return {
-      // The key this upload publishes to, as given at creation. You already
-      // persist it in order to publish at all, and reporting it is what lets
-      // a caller pair an upload with the object it became: the key is chosen
-      // before a token exists, so nothing else can make that pairing without
-      // racing. It is the key `onUploadComplete` carries.
-      key: record.key,
-      // THE rule: derive the offset from the backend's own durable
-      // bookkeeping (part listing, block list, fsynced size). Never
-      // persist an offset counter next to the data: the two cannot be
-      // written atomically, and their post-crash drift is the corruption
-      // resumable uploads exist to prevent.
-      offset: await backend.sumDurableBytes(uploadToken),
-      length: record.length,            // immutable once known
-      // One lifecycle field; "invalidated" is terminal and recorded durably.
-      status: record.isInvalidated ? "invalidated" : record.isComplete ? "complete" : "incomplete",
-      createdAt: record.createdAt,
-      lastAppendAt: record.lastAppendAt,
-      metadata: record.metadata,
-    };
-  },
-
-  async appendChunk(uploadToken, offset, body, { maxBytes, maxBytesFatal, length, now, signal }) {
-    // The preflight the `enforcesOffsetCheck: true` above promises. Required,
-    // not defensive: the lock serializes writers but cannot prove the writer
-    // still holds it, and an expiry-based distributed lock can be stolen from
-    // a holder that stalls past its TTL and resumes. Re-deriving durable state
-    // here is what makes that holder's next append loud instead of silently
-    // interleaved. A dead or already-published resource refuses every append.
-    const record = await backend.find(uploadToken);
-    if (!record) throw new UploadNotFoundError(uploadToken);
-    const durableOffset = await backend.sumDurableBytes(uploadToken);
-    if (record.isComplete || record.isInvalidated || offset !== durableOffset) {
-      throw new UploadOffsetConflictError(uploadToken, durableOffset);
-    }
-    // Deferred-length flow: the first append to carry a length persists it, so
-    // the next getUploadState reports it and it turns immutable. It only ever
-    // arrives once, and only while the resource has no length.
-    if (length !== undefined && record.length === undefined) {
-      await backend.recordLength(uploadToken, length);
-    }
-
-    // Only you see the stream, so only you can hold it to `maxBytes`. Honor
-    // `signal` at every chunk boundary inside the write, flushing what you
-    // have: the orchestrator's grace window is already built into it, and the
-    // preflight above is not a transaction, so the signal is what stops a
-    // holder that stalled MID-call and came back. `now` is recorded as
-    // lastAppendAt. Report the bytes made DURABLE (the next getUploadState
-    // must agree) plus the bound the body tried to cross, if any.
-    const { bytesWritten, crossedBound, interrupted } = await backend.append(
-      uploadToken, offset, body, { maxBytes, now, signal },
-    );
-
-    // `maxBytesFatal` decides what crossing the bound means, and the two cases
-    // are opposites. Past a REPRESENTATION bound (room toward a known length,
-    // or the policy's total maxSize) the upload can never be completed
-    // coherently, so the death is recorded durably before it is reported:
-    // every later probe and append must refuse.
-    if (crossedBound !== undefined && maxBytesFatal) {
-      await backend.markInvalidated(uploadToken);
-      throw new UploadOverrunError(uploadToken, crossedBound);
-    }
-    // This REQUEST's ceiling instead. The prefix just written stays durable
-    // and the resource stays healthy, so the caller answers 413 and the client
-    // resumes from the truthful offset in smaller chunks.
-    if (crossedBound !== undefined) {
-      throw new UploadAppendBoundError(uploadToken, offset + bytesWritten);
-    }
-    // Report whether the write stopped before the body ran out. Only the code
-    // draining the body knows, so it is a fact the store returns rather than
-    // one the caller infers: an abort signal says something asked the write to
-    // yield, never what happened to the bytes.
-    return { bytesWritten, interrupted };
-  },
-
-  async completeUpload(uploadToken, { expectedDigests, now }) {
-    // Publish atomically: after success the object is readable under its
-    // key; after ANY failure nothing new is visible to readers. If you
-    // listed algorithms in digestOnComplete, verify expectedDigests against
-    // the assembled bytes BEFORE publishing and throw an
-    // UploadDigestMismatchError-named error on mismatch.
-    const { etag, digest } = await backend.publishAtomically(uploadToken);
-    return { etag, digest };
-  },
-
-  async abortUpload(uploadToken) {
-    // Idempotent (already-gone is fine), and it must discard only the upload
-    // resource: an object this upload already published is live data, so a
-    // replayed DELETE must not be able to destroy it.
-    await backend.discard(uploadToken);
-  },
-
-  async sweepExpired({ idleSinceMs, createdBeforeMs }) {
-    // Optional, and it takes two independent clocks because a resource can be
-    // past its lifetime while still looking busy: honor whichever the caller
-    // gave, reaping a resource that matches either.
-    // Reclaim the BYTES, not just the record: do what abortUpload does to
-    // each resource. A metadata-only sweep strands the data with nothing
-    // left pointing at it, which is a storage-limitation gap, not a cleanup.
-    // Runs without the upload's lock (a store has no locker), so the caller's
-    // idle cutoff must exceed the longest single append the deployment permits.
-    // Isolate each resource and report what could not be reclaimed as
-    // `failed`: one resource your backend refuses to delete must not end the
-    // scan, or a single busy upload stops a scheduled sweep from reclaiming
-    // anything and it reports success by not throwing. What stays is retried
-    // by the next pass; `failed` is what the caller alerts on.
-    return backend.reap({ idleSinceMs, createdBeforeMs });
-  },
-};
-```
-
-The dialect handlers do not call these methods concurrently for one upload
-resource: the orchestrator serializes every interaction (probes included)
-under a cooperative-preemption lock and re-derives fresh state before each
-decision. Your store's job is durability and honesty, not coordination --
-just remember the default lock is in-process, so multi-instance deployments
-supply a shared `locker`: `redisUploadLocker` from
-`partial-content/redis-locker` for any Redis-protocol server, or your own
-(see API.md, Locking).
-
-## Proving a custom write store meets the contract
-
-Two of those capability flags are checked at construction, and both are
-CLAIMS. `createUploadOrchestrator` can see that a store declares
-`enforcesOffsetCheck: true`; it cannot see whether `appendChunk` actually
-refuses a stale offset, and a store that declares the check and skips it
-presents as working right up to the moment a lock is stolen from a holder
-that stalled past its TTL.
-
-`partial-content/conformance` runs the obligations as assertions instead. It
-is not a test file and pulls in no test framework, so the same call works as a
-CI step, a startup self-test against a staging bucket, or a one-off script:
-
-```typescript
-import { checkResumableWriteStore, formatConformanceReport } from "partial-content/conformance";
-import { memoryUploadStore } from "partial-content/memory";
-
-// Your store's factory. Two obligations are only observable across
-// instances (an offset held in process memory looks identical to a
-// backend-derived one until a second instance reads the same upload), so
-// the harness takes a factory and calls it more than once.
-const objects = {};
-const report = await checkResumableWriteStore(
-  () => memoryUploadStore({ objects }),
-  {
-    // Disposable keys: the harness publishes to some and aborts others.
-    key: (n) => `conformance/${n}`,
-    // memoryUploadStore holds its in-flight uploads per instance, so a
-    // fresh one is genuinely a different store. Saying so SKIPS the
-    // cross-instance checks; it does not pass them, and the report says
-    // "SKIP" rather than counting an unverified guarantee as green.
-    // A store backed by a filesystem or an object store leaves this alone.
-    restartable: false,
-  },
-);
-
-console.log(formatConformanceReport(report));
-if (!report.ok) {
-  throw new Error(`store failed ${report.failed} of ${report.checks.length} conformance checks`);
-}
-```
-
-`formatConformanceReport` returns the text and prints nothing, so the sink is
-yours. Each failure names the obligation and explains the consequence rather
-than the assertion, because the author reading it believes the store is
-correct: a skipped offset check reports "declared but not implemented, so a
-stalled writer interleaves silently", not "expected throw". Check names are
-stable, so a store with a known gap can allow-list one by `name` in its own
-CI instead of ignoring the whole report.
 
 ## Proving a custom ObjectStore meets the read contract
 
@@ -786,8 +444,8 @@ if (!report.ok) {
 ```
 
 A store instance is passed rather than a factory, because nothing in the read
-contract is observed across instances. What the write side expresses through
-`restartable`, the read side expresses through the store's own declaration: a
+contract is observed across instances. What the harness checks follows the
+store's own declaration: a
 store with `supportsRange: false` has the two range checks reported "SKIP"
 rather than "PASS", since the serving path never asks it for a window, and so
 does an object too short to slice a meaningful window from. An unverified

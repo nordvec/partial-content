@@ -3,8 +3,10 @@
  *
  * Bun has no native StrykerJS test-runner plugin, so we drive the real suite
  * through the `command` runner (`bun test`). That means no per-test coverage
- * analysis: every surviving-or-killed decision reruns the whole suite, which is
- * cheap here (~700ms, zero runtime deps) and keeps the run hermetic.
+ * analysis: every mutant reruns whatever command it is given. An ad-hoc
+ * `--mutate` run gives it the whole suite (cheap for one module, zero runtime
+ * deps, hermetic); the CI runner narrows it to the test files that load the
+ * module (see `commandRunner` below).
  *
  * Sandbox mode (the default) copies the package to a temp dir and runs there,
  * so a concurrent editor in the live tree can never collide with a mutant run.
@@ -14,13 +16,29 @@
  *
  * @type {import('@stryker-mutator/api/core').PartialStrykerOptions}
  */
+import { existsSync } from "node:fs";
+import { resolve } from "node:path";
+
+// The monorepo caps the commit of every `bun test` tree with a preload this
+// package's synced copy does not have; the flag is empty there.
+const capPath = resolve(import.meta.dirname, "..", "..", "scripts", "setup", "test-commit-cap-preload.ts");
+const CAP_PRELOAD = existsSync(capPath) ? ` --preload "${capPath.replaceAll("\\", "/")}"` : "";
+
 export default {
     testRunner: "command",
     commandRunner: {
-        // Full suite per mutant: fast enough here and avoids false survivors
-        // from a module being exercised by a sibling suite (no perTest data).
-        command: "bun test --isolate --timeout 30000",
+        // Full suite per mutant for an ad-hoc `--mutate` run. The CI runner
+        // (scripts/mutation-ci.mjs) sets STRYKER_TEST_COMMAND to the test files
+        // that import the module, which is all a mutant can be observed by.
+        command: (process.env.STRYKER_TEST_COMMAND ?? "bun test --isolate --timeout 30000").replace(
+            /^bun test/,
+            `bun test${CAP_PRELOAD}`,
+        ),
     },
+
+    // The sandbox copy of bunfig.toml would resolve its preloads from the wrong
+    // depth; the cap preload is named on the command line instead.
+    ignorePatterns: ["bunfig.toml"],
 
     // Default empty: the test:mutation script always passes --mutate <file> so a
     // bare run fails fast rather than mutating the entire package by accident.
@@ -36,7 +54,10 @@ export default {
 
     // A mutant still running well past the ~700ms suite is a spinning
     // loop-condition mutant; fail it fast rather than wait out the factor.
-    timeoutMS: 15000,
+    // scripts/mutation-ci.mjs raises it with the full suite's own run time when
+    // it narrows the command, so the budget a mutant gets does not shrink with
+    // the subset.
+    timeoutMS: Number(process.env.STRYKER_TIMEOUT_MS ?? 15000),
     timeoutFactor: 2,
 
     // Lower locally with STRYKER_CONCURRENCY=1 if the initial dry run OOMs.

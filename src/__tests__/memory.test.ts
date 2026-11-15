@@ -1,4 +1,4 @@
-import { describe, test, expect } from "bun:test";
+import { describe, test, expect, spyOn } from "bun:test";
 import { drain } from "./helpers";
 import { serveObject } from "../web";
 import { memoryStore, ObjectNotFoundError, ObjectChangedError } from "../memory";
@@ -167,6 +167,39 @@ describe("memoryStore: construction", () => {
 
     test("a map is accepted", () => {
         expect(() => memoryStore({ objects: { "a.txt": { body: "hi" } } })).not.toThrow();
+    });
+});
+
+describe("memoryStore: option and bound edges", () => {
+    test("a missing or null objects map is refused with the same message", () => {
+        expect(() => memoryStore(undefined as never)).toThrow(/options\.objects is required/);
+        expect(() => memoryStore({ objects: null } as never)).toThrow(/options\.objects is required/);
+    });
+
+    test("options with no signal are accepted", async () => {
+        const store = memoryStore({ objects: { k: { body: "x" } } });
+        expect((await store.headObject("k", {})).contentLength).toBe(1);
+    });
+
+    test("a range starting exactly at the end is beyond the object", async () => {
+        const store = memoryStore({ objects: { k: { body: "abc" } } });
+        await expect(store.getObject("k", { range: { start: 3, end: 3 } })).rejects.toBeInstanceOf(RangeError);
+    });
+
+    test("a string body encodes once while it stands, and again when it changes", async () => {
+        const entry = { body: "first" };
+        const store = memoryStore({ objects: { k: entry } });
+        const encode = spyOn(TextEncoder.prototype, "encode");
+        try {
+            await store.headObject("k");
+            await store.headObject("k");
+            expect(encode).toHaveBeenCalledTimes(1);
+            entry.body = "second!";
+            expect((await store.headObject("k")).contentLength).toBe(7);
+            expect(encode).toHaveBeenCalledTimes(2);
+        } finally {
+            encode.mockRestore();
+        }
     });
 });
 

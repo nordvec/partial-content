@@ -1,11 +1,73 @@
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
+import { removeTree } from "./temp-cleanup.ts";
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from "node:http";
 import { EventEmitter } from "node:events";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { serveObject } from "../node";
 import { fsStore } from "../fs";
+
+/**
+ * An object of `chunks` chunks and a response whose `write` always reports a
+ * full send buffer, so the pump parks after every chunk until a test emits
+ * 'drain'. The stream is exactly the committed length, so nothing but
+ * backpressure can stop it, and long enough that a cancel finds it still open.
+ */
+function backpressured({ chunks = 2, onCancel }: { chunks?: number; onCancel?: () => void } = {}) {
+    const chunk = new TextEncoder().encode("01234");
+    const contentLength = chunk.length * chunks;
+    let sent = 0;
+    const store: ObjectStore = {
+        supportsRange: true,
+        async headObject() {
+            return { contentLength };
+        },
+        async getObject() {
+            return {
+                body: new ReadableStream<Uint8Array<ArrayBuffer>>({
+                    pull(controller) {
+                        controller.enqueue(chunk);
+                        if (++sent === chunks) controller.close();
+                    },
+                    cancel: onCancel,
+                }),
+                contentLength,
+                totalSize: contentLength,
+            };
+        },
+    };
+    const req = Object.assign(new EventEmitter(), {
+        method: "GET",
+        url: "/x",
+        headers: {} as Record<string, string | string[] | undefined>,
+    }) as unknown as IncomingMessage;
+    const res = Object.assign(new EventEmitter(), {
+        headersSent: false,
+        destroyed: false,
+        ended: false,
+        written: 0,
+        writeHead() {
+            res.headersSent = true;
+            return res;
+        },
+        write(): boolean {
+            res.written++;
+            return false;
+        },
+        end() {
+            res.ended = true;
+        },
+        destroy() {
+            res.destroyed = true;
+        },
+        /** Settles once the pump waits on a drain. */
+        async parked() {
+            while (res.listenerCount("drain") === 0) await new Promise((resolve) => setTimeout(resolve, 1));
+        },
+    });
+    return { store, req, res };
+}
 
 // Full-stack integration: real http.createServer + real fs store + real fetch.
 
@@ -34,7 +96,7 @@ beforeAll(async () => {
 
 afterAll(async () => {
     await new Promise<void>((resolve) => server.close(() => resolve()));
-    await rm(root, { recursive: true, force: true });
+    await removeTree(root);
 });
 
 describe("node adapter over real HTTP", () => {
@@ -237,57 +299,206 @@ describe("node adapter failure paths", () => {
         // stall timeout must reject into the error path: cancel the reader and
         // destroy the response.
         let readerCancelled = false;
+        const { store, req, res } = backpressured({
+            chunks: 6,
+            onCancel: () => {
+                readerCancelled = true;
+            },
+        });
+        const handler = serveObject(store, { key: () => "x", writeStallTimeoutMs: 30 });
+
+        await handler(req, res as unknown as ServerResponse);
+
+        expect(res.destroyed).toBe(true);
+        expect(readerCancelled).toBe(true);
+        expect(res.ended).toBe(false);
+        expect(res.written).toBe(1);
+        expect(res.listenerCount("drain")).toBe(0);
+        expect(res.listenerCount("close")).toBe(0);
+    });
+
+    test("a drain resumes the transfer and leaves no listener behind", async () => {
+        const { store, req, res } = backpressured();
+        const handler = serveObject(store, { key: () => "x", writeStallTimeoutMs: 60_000 });
+
+        const serving = handler(req, res as unknown as ServerResponse);
+        await res.parked();
+        expect(res.written).toBe(1);
+        res.emit("drain");
+        await res.parked();
+        res.emit("drain");
+        await serving;
+
+        expect(res.ended).toBe(true);
+        expect(res.written).toBe(2);
+        expect(res.destroyed).toBe(false);
+        expect(res.listenerCount("drain")).toBe(0);
+        expect(res.listenerCount("close")).toBe(0);
+    });
+
+    test("a close during backpressure stops the transfer with the stall bound disabled", async () => {
+        let readerCancelled = false;
+        const { store, req, res } = backpressured({
+            chunks: 6,
+            onCancel: () => {
+                readerCancelled = true;
+            },
+        });
+        const handler = serveObject(store, { key: () => "x", writeStallTimeoutMs: 0 });
+
+        const serving = handler(req, res as unknown as ServerResponse);
+        await res.parked();
+        res.destroyed = true;
+        res.emit("close");
+        await serving;
+
+        expect(res.written).toBe(1);
+        expect(readerCancelled).toBe(true);
+    });
+
+    test("a stall bound of 0 waits for the drain however long it takes", async () => {
+        const { store, req, res } = backpressured();
+        const handler = serveObject(store, { key: () => "x", writeStallTimeoutMs: 0 });
+
+        const serving = handler(req, res as unknown as ServerResponse);
+        await res.parked();
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        expect(res.destroyed).toBe(false);
+        res.emit("drain");
+        await res.parked();
+        res.emit("drain");
+        await serving;
+        expect(res.ended).toBe(true);
+    });
+
+    test("a stall bound past the largest timer delay is capped, not fired at once", async () => {
+        // A timer delay above 2^31 - 1 ms fires after about a millisecond.
+        const { store, req, res } = backpressured();
+        const handler = serveObject(store, { key: () => "x", writeStallTimeoutMs: 2 ** 32 });
+
+        const serving = handler(req, res as unknown as ServerResponse);
+        await res.parked();
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        expect(res.destroyed).toBe(false);
+        res.emit("drain");
+        await res.parked();
+        res.emit("drain");
+        await serving;
+        expect(res.ended).toBe(true);
+    });
+
+    test("a client that leaves mid-transfer aborts the store read, and the listener is detached after", async () => {
+        let seen: AbortSignal | undefined;
+        const { store, req, res } = backpressured({ chunks: 6 });
+        const getObject = store.getObject.bind(store);
+        store.getObject = (key, opts) => {
+            seen = opts?.signal;
+            return getObject(key, opts);
+        };
+        const handler = serveObject(store, { key: () => "x", writeStallTimeoutMs: 0 });
+
+        const serving = handler(req, res as unknown as ServerResponse);
+        await res.parked();
+        expect(seen?.aborted).toBe(false);
+        res.emit("close");
+        expect(seen?.aborted).toBe(true);
+        res.destroyed = true;
+        res.emit("close");
+        await serving;
+        expect(res.listenerCount("close")).toBe(0);
+    });
+
+    test("a completed transfer carries the reason phrase and detaches the disconnect listener", async () => {
+        const { store, req, res } = backpressured();
+        res.write = () => {
+            res.written++;
+            return true;
+        };
+        let writeHeadArgs: unknown[] = [];
+        const writeHead = res.writeHead;
+        res.writeHead = (...args: unknown[]) => {
+            writeHeadArgs = args;
+            return writeHead();
+        };
+        await serveObject(store, { key: () => "x" })(req, res as unknown as ServerResponse);
+
+        expect(res.ended).toBe(true);
+        expect(writeHeadArgs.slice(0, 2)).toEqual([200, "OK"]);
+        expect(res.listenerCount("close")).toBe(0);
+    });
+
+    test("a writeHead that throws over a byte body tears the socket down and the handler resolves", async () => {
+        const { req, res } = backpressured();
         const store: ObjectStore = {
             supportsRange: true,
             async headObject() {
                 return { contentLength: 5 };
             },
             async getObject() {
-                return {
-                    body: new ReadableStream<Uint8Array<ArrayBuffer>>({
-                        pull(controller) {
-                            controller.enqueue(new TextEncoder().encode("01234"));
-                        },
-                        cancel() {
-                            readerCancelled = true;
-                        },
-                    }),
-                    contentLength: 5,
-                    totalSize: 5,
-                };
+                return { body: new TextEncoder().encode("01234"), contentLength: 5, totalSize: 5 };
             },
         };
-        const handler = serveObject(store, { key: () => "x", writeStallTimeoutMs: 30 });
-
-        const req = Object.assign(new EventEmitter(), {
-            method: "GET",
-            url: "/x",
-            headers: {} as Record<string, string | string[] | undefined>,
-        }) as unknown as IncomingMessage;
-
-        const res = Object.assign(new EventEmitter(), {
-            headersSent: false,
-            destroyed: false,
-            writeHead(this: { headersSent: boolean }) {
-                this.headersSent = true;
-                return this;
-            },
-            // Permanent backpressure: never returns true, never emits 'drain'.
-            write() {
-                return false;
-            },
-            end() {
-                /* no-op */
-            },
-            destroy(this: { destroyed: boolean }) {
-                this.destroyed = true;
-            },
-        }) as unknown as ServerResponse;
-
-        await handler(req, res);
-
+        res.writeHead = () => {
+            throw new Error("socket torn down mid-write");
+        };
+        await serveObject(store, { key: () => "x" })(req, res as unknown as ServerResponse);
         expect(res.destroyed).toBe(true);
-        expect(readerCancelled).toBe(true);
+        expect(res.listenerCount("close")).toBe(0);
+    });
+
+    test("a throwing extractor answers a hardened 500 and reports the raw error with its context", async () => {
+        const failure = new Error("router blew up");
+        const reports: [unknown, unknown][] = [];
+        const { store, req, res } = backpressured();
+        let head: unknown[] = [];
+        let sent: unknown;
+        res.writeHead = (...args: unknown[]) => {
+            head = args;
+            res.headersSent = true;
+            return res;
+        };
+        res.end = (chunk?: unknown) => {
+            sent = chunk;
+            res.ended = true;
+        };
+        await serveObject(store, {
+            key: () => {
+                throw failure;
+            },
+            onError: (err, ctx) => reports.push([err, ctx]),
+        })(req, res as unknown as ServerResponse);
+
+        expect(reports).toEqual([[failure, { key: "", operation: "context" }]]);
+        expect(head[0]).toBe(500);
+        expect(head[1]).toEqual({
+            "Content-Type": "text/plain; charset=utf-8",
+            "Content-Length": "21",
+            "Accept-Ranges": "none",
+            "X-Content-Type-Options": "nosniff",
+            "Cache-Control": "no-store",
+            "Content-Security-Policy": "default-src 'none'",
+        });
+        expect(new TextDecoder().decode(sent as Uint8Array)).toBe("Internal Server Error");
+        expect(res.listenerCount("close")).toBe(0);
+    });
+
+    test("a throwing extractor on a response already on the wire tears the socket down", async () => {
+        // Middleware ahead of the handler may already have sent the headers.
+        const { store, req, res } = backpressured();
+        res.headersSent = true;
+        let wroteHead = false;
+        res.writeHead = () => {
+            wroteHead = true;
+            return res;
+        };
+        await serveObject(store, {
+            key: () => {
+                throw new Error("router blew up");
+            },
+        })(req, res as unknown as ServerResponse);
+        expect(wroteHead).toBe(false);
+        expect(res.ended).toBe(false);
+        expect(res.destroyed).toBe(true);
     });
 
     test("storage stream erroring mid-transfer truncates the response and the server survives", async () => {
@@ -347,5 +558,126 @@ describe("node adapter failure paths", () => {
                 expect(await again.text()).toBe("0123456789");
             },
         );
+    });
+});
+
+describe("node adapter client-disconnect signal", () => {
+    test("a request that has been read to its end is not a client that left", async () => {
+        let seen: AbortSignal | undefined;
+        const { store, req, res } = backpressured({ chunks: 6 });
+        const getObject = store.getObject.bind(store);
+        store.getObject = (key, opts) => {
+            seen = opts?.signal;
+            return getObject(key, opts);
+        };
+        const serving = serveObject(store, { key: () => "x", writeStallTimeoutMs: 0 })(
+            req,
+            res as unknown as ServerResponse,
+        );
+        await res.parked();
+        // IncomingMessage emits "close" once it is drained, whatever the socket does.
+        req.emit("close");
+        expect(seen?.aborted).toBe(false);
+        res.destroyed = true;
+        res.emit("close");
+        await serving;
+    });
+
+    test("a response already closed when the handler starts reaches the store with an aborted signal", async () => {
+        let seen: AbortSignal | undefined;
+        const { store, req, res } = backpressured();
+        const getObject = store.getObject.bind(store);
+        store.getObject = (key, opts) => {
+            seen = opts?.signal;
+            return getObject(key, opts);
+        };
+        res.destroyed = true;
+        await serveObject(store, { key: () => "x" })(req, res as unknown as ServerResponse);
+        expect(seen?.aborted).toBe(true);
+        expect(res.written).toBe(0);
+        expect(res.listenerCount("close")).toBe(0);
+    });
+
+    test("a response that closed after it finished is not a client abort", async () => {
+        let seen: AbortSignal | undefined;
+        const { store, req, res } = backpressured();
+        res.write = () => {
+            res.written++;
+            return true;
+        };
+        const getObject = store.getObject.bind(store);
+        store.getObject = (key, opts) => {
+            seen = opts?.signal;
+            return getObject(key, opts);
+        };
+        const handler = serveObject(store, { key: () => "x" });
+        const serving = handler(req, res as unknown as ServerResponse);
+        Object.assign(res, { writableFinished: true });
+        res.emit("close");
+        await serving;
+        expect(seen?.aborted).toBe(false);
+    });
+
+    test("a client that leaves after the request was drained still aborts the store read", async () => {
+        let storeSignal: AbortSignal | undefined;
+        const aborted = Promise.withResolvers<void>();
+        const store: ObjectStore = {
+            supportsRange: true,
+            async headObject() {
+                return { contentLength: 10 };
+            },
+            async getObject(_key, opts) {
+                storeSignal = opts?.signal;
+                opts?.signal?.addEventListener("abort", () => aborted.resolve());
+                // The read never completes on its own: only the abort ends it.
+                await aborted.promise;
+                throw new DOMException("aborted", "AbortError");
+            },
+        };
+        const handler = serveObject(store, { key: () => "x" });
+        const started = Promise.withResolvers<void>();
+        await withServer(
+            (req, res) => {
+                // Something upstream drains the request before the handler runs.
+                req.resume();
+                req.once("end", () => {
+                    started.resolve();
+                    void handler(req, res);
+                });
+            },
+            async (base) => {
+                const controller = new AbortController();
+                const pending = fetch(`${base}/x`, { signal: controller.signal }).catch(() => undefined);
+                await started.promise;
+                await new Promise((resolve) => setTimeout(resolve, 20));
+                expect(storeSignal?.aborted).toBe(false);
+                controller.abort();
+                await pending;
+                await aborted.promise;
+                expect(storeSignal?.aborted).toBe(true);
+            },
+        );
+    });
+
+    test("an auditKey extractor that yields nothing keys the request as unkeyed", async () => {
+        const failing: ObjectStore = {
+            supportsRange: true,
+            async headObject() {
+                throw new Error("backend rejected private/report.pdf");
+            },
+            async getObject() {
+                throw new Error("unreachable");
+            },
+        };
+        const { req, res } = backpressured();
+        req.headers["if-none-match"] = '"x"';
+        const seen: { err: unknown; key: string }[] = [];
+        await serveObject(failing, {
+            key: () => "private/report.pdf",
+            auditKey: () => undefined,
+            onError: (err, ctx) => void seen.push({ err, key: ctx.key }),
+        })(req, res as unknown as ServerResponse);
+
+        expect(seen).toEqual([{ err: { name: "Error", operation: "head" }, key: "unkeyed" }]);
     });
 });

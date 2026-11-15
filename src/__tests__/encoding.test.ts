@@ -232,3 +232,49 @@ describe("x-gzip is gzip (RFC 9110 Section 8.4.1.3)", () => {
         expect(parseAcceptEncoding("x-gzip;q=0.2, gzip;q=0.9")).toEqual([{ coding: "gzip", q: 0.9 }]);
     });
 });
+
+describe("Accept-Encoding qvalue grammar (RFC 9110 Section 12.4.2)", () => {
+    test.each([
+        ["gzip;q=1", 1],
+        ["gzip;q=1.", 1],
+        ["gzip;q=1.0", 1],
+        ["gzip;q=1.00", 1],
+        ["gzip;q=1.000", 1],
+        ["gzip;q=0", 0],
+        ["gzip;q=0.", 0],
+        ["gzip;q=0.5", 0.5],
+        ["gzip;q=0.12", 0.12],
+        ["gzip;q=0.555", 0.555],
+    ])("%s is accepted with its quality", (header, q) => {
+        expect(parseAcceptEncoding(header)).toEqual([{ coding: "gzip", q }]);
+    });
+
+    test.each(["gzip;q=x0.5", "gzip;q=a1", "gzip;q=0.5555", "gzip;q=1.0001", "gzip;q=2", "gzip;q=-0.5"])(
+        "%s is a malformed member and is skipped",
+        (header) => {
+            expect(parseAcceptEncoding(`${header}, br`)).toEqual([{ coding: "br", q: 1 }]);
+        },
+    );
+
+    test("whitespace is tolerated around the parameter name, the '=' and the value", () => {
+        expect(parseAcceptEncoding("gzip ; q = 0.5")).toEqual([{ coding: "gzip", q: 0.5 }]);
+        expect(parseAcceptEncoding("gzip;q =0")).toEqual([{ coding: "gzip", q: 0 }]);
+        expect(parseAcceptEncoding("gzip;q= 0.25")).toEqual([{ coding: "gzip", q: 0.25 }]);
+        expect(parseAcceptEncoding("gzip;q=0.25 ")).toEqual([{ coding: "gzip", q: 0.25 }]);
+    });
+});
+
+describe("isCompressibleMime structured suffix", () => {
+    test.each([
+        ["image/a+json", true],
+        ["application/x+yaml", true],
+        ["application/x+xml", true],
+        ["image/json", false],
+        ["image/xml", false],
+        ["model/yaml", false],
+        ["model/toml", false],
+        ["model/text", false],
+    ])("%s -> %p", (mime, expected) => {
+        expect(isCompressibleMime(mime)).toBe(expected);
+    });
+});

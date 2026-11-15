@@ -109,16 +109,42 @@ function checkTiers(heading, major, { summary, sections, seen }) {
 /** The top-level bullet lines of a section's text. */
 const bulletsOf = (text) => text.split("\n").filter((l) => /^[-*] /.test(l));
 
+/**
+ * An advisory id: GHSA plus three groups of four from GitHub's 27-letter
+ * alphabet, so a placeholder such as GHSA-TBD fails, and the lookahead refuses a
+ * longer id-like token (a fourth group) rather than accepting its prefix.
+ */
+const GHSA_ID = "GHSA(?:-[23456789cfghjmpqrvwx]{4}){3}(?![-\\w])";
+
+/** A Security bullet opens with exactly one bold advisory id. */
+const SECURITY_LEAD = new RegExp(`^[-*] \\*\\*(${GHSA_ID})\\*\\*`);
+
+/**
+ * The advisory each `### Security` bullet is about: the bold id it opens with,
+ * or null for a bullet that does not open with one. Other ids later in a bullet
+ * are back-references and are not read.
+ * @param {string} text the section's text
+ * @returns {{ line: string, id: string | null }[]}
+ */
+export const securityBullets = (text) =>
+    bulletsOf(text).map((line) => ({ line, id: SECURITY_LEAD.exec(line)?.[1] ?? null }));
+
 /** The defect in a `### Security` section's bullets, or null. */
 function checkSecurity(text) {
-    const items = bulletsOf(text);
+    const items = securityBullets(text);
     if (items.length === 0)
         return "CHANGELOG.md's `### Security` has no bullets: drop the section when nothing was fixed";
-    // An id is GHSA plus three groups of four from GitHub's 27-letter alphabet, so
-    // a placeholder such as GHSA-TBD fails, and a bullet names exactly one advisory.
-    const bare = items.find((l) => (l.match(/GHSA(?:-[23456789cfghjmpqrvwx]{4}){3}/g) ?? []).length !== 1);
-    return bare
-        ? `CHANGELOG.md's \`### Security\` bullet must name exactly one well-formed GHSA id: ${bare.slice(0, 60)}`
+    const bare = items.find((b) => b.id === null);
+    if (bare)
+        return `CHANGELOG.md's \`### Security\` bullet must open with its bold GHSA id (\`- **GHSA-xxxx-xxxx-xxxx**\`): ${bare.line.slice(0, 60)}`;
+    const dup = items.find((b, i) => items.findIndex((o) => o.id === b.id) !== i);
+    return dup ? `CHANGELOG.md's \`### Security\` names ${dup.id} in two bullets: one bullet per advisory` : null;
+}
+
+/** The defect when a `Security` heading sits under Details, where it would escape the tier check and the release body. */
+function checkDemotedSecurity(details) {
+    return /^#{4,6}\s+Security\s*$/im.test(details ?? "")
+        ? "CHANGELOG.md's `### Details` holds a `Security` heading: Security is a `### Security` tier of its own"
         : null;
 }
 
@@ -140,7 +166,8 @@ function checkUpgrading(text, major, upgrading) {
 /**
  * The defect in the top entry's shape, or null when it is the two-tier release
  * body: a summary, then `### Highlights`, `### Upgrading` (required on a
- * major), an optional `### Security` whose every bullet names a `GHSA-` id, and
+ * major), an optional `### Security` whose every bullet opens with one distinct
+ * bold `GHSA-` id (later ids are back-references), and
  * `### Details`. A major's Upgrading checklist has one linked line per numbered
  * section of its UPGRADING.md part.
  * @param {string} version
@@ -157,6 +184,8 @@ export function checkChangelogShape(version, changelog, upgrading) {
     const security = entry.sections.get("Security");
     const securityProblem = security === undefined ? null : checkSecurity(security);
     if (securityProblem) return securityProblem;
+    const demoted = checkDemotedSecurity(entry.sections.get("Details"));
+    if (demoted) return demoted;
     return major > 0 ? checkUpgrading(entry.sections.get("Upgrading") ?? "", major, upgrading) : null;
 }
 

@@ -1,7 +1,7 @@
 {
   "name": "partial-content",
-  "version": "5.0.0",
-  "description": "RFC-compliant HTTP file serving and resumable uploads for any storage backend. Range requests (206), conditional caching (304/412), Content-Disposition, ETag generation, and a resumable-upload engine speaking tus 1.0 and the IETF resumable-uploads draft. Zero dependencies.",
+  "version": "6.0.0",
+  "description": "RFC-compliant HTTP file serving for any storage backend. Range requests (206), conditional caching (304/412), Content-Disposition, ETag generation, and RFC 9530 digests where the backend holds one. Serves S3, R2, GCS, Azure Blob, the filesystem and plain HTTP origins. Zero dependencies.",
   "keywords": [
     "206",
     "304",
@@ -23,22 +23,17 @@
     "hetzner",
     "hono",
     "http",
-    "multipart-upload",
     "nextjs",
     "object-storage",
-    "optimistic-concurrency",
     "partial-content",
     "pdf",
     "presigned-url",
     "r2",
     "range-request",
-    "resumable-upload",
     "resume-download",
     "s3",
     "streaming",
     "supabase-storage",
-    "tus",
-    "upload",
     "video-seeking"
   ],
   "homepage": "https://github.com/nordvec/partial-content#readme",
@@ -143,25 +138,7 @@
       "import": "./dist/conformance.js",
       "default": "./dist/conformance.js"
     },
-    "./package.json": "./package.json",
-    "./redis-locker": {
-      "types": "./dist/redis-locker.d.ts",
-      "bun": "./src/redis-locker.ts",
-      "import": "./dist/redis-locker.js",
-      "default": "./dist/redis-locker.js"
-    },
-    "./tus": {
-      "types": "./dist/tus.d.ts",
-      "bun": "./src/tus.ts",
-      "import": "./dist/tus.js",
-      "default": "./dist/tus.js"
-    },
-    "./upload": {
-      "types": "./dist/upload.d.ts",
-      "bun": "./src/upload.ts",
-      "import": "./dist/upload.js",
-      "default": "./dist/upload.js"
-    }
+    "./package.json": "./package.json"
   },
   "publishConfig": {
     "access": "public",
@@ -179,11 +156,10 @@
     "check:doc-types": "node scripts/check-doc-types.mjs",
     "check:doc-options": "node scripts/check-doc-options.mjs",
     "check:api-docs": "node scripts/api-doc-regions.mjs --check",
-    "typecheck:tests": "bun check -p tsconfig.tests.json",
-    "typecheck": "bun check",
+    "typecheck:tests": "tsrs --noEmit --incremental false -p tsconfig.tests.json",
+    "typecheck": "tsrs --noEmit --incremental false",
     "bench": "npm run build && node bench/run.mjs",
     "smoke": "npm run build && node smoke/smoke.mjs",
-    "smoke:node": "npm run build && node smoke/node-bridge.mjs",
     "check:exports": "npm run build && attw --pack . --profile esm-only",
     "check:consumer-types": "npm run build && tsc --noEmit -p smoke/tsconfig.consumer.json",
     "test:live": "bun test src/__tests__/s3-live.test.ts",
@@ -191,10 +167,10 @@
   },
   "devDependencies": {
     "@arethetypeswrong/cli": "^0.18.5",
-    "@aws-sdk/client-s3": "^3.1155.0",
-    "@aws-sdk/s3-request-presigner": "^3.1155.0",
+    "@aws-sdk/client-s3": "^3.1161.0",
+    "@aws-sdk/s3-request-presigner": "^3.1161.0",
     "@size-limit/preset-small-lib": "^14.3.0",
-    "@stryker-mutator/core": "^10.0.0",
+    "@stryker-mutator/core": "^10.1.1",
     "@types/bun": "^1.4.4",
     "@types/node": "^26.6.6",
     "autocannon": "^8.0.0",
@@ -202,6 +178,7 @@
     "send": "^1.2.1",
     "sirv": "^3.0.2",
     "size-limit": "^14.3.0",
+    "tsrs": "0.24.0-ts7.1.0-beta",
     "typescript": "^6.0.3"
   },
   "peerDependencies": {

@@ -18,10 +18,15 @@ import {
     StoreUnavailableError,
     classifyStoreRead,
     nodeStreamToWeb,
+    projectError,
     guardStreamLength,
     resolveServedRange,
     parseRetryAfterSeconds,
     reservedKeyGuard,
+    urlKeyGuard,
+    retryAfterFrom,
+    failRead,
+    isPlainObjectKey,
     isObjectNotFoundError,
     isObjectChangedError,
     isStoreUnavailableError,
@@ -30,6 +35,18 @@ import {
     type ObjectStream,
     type StoreErrorClassifiers,
 } from "../object-store";
+import type { ReadRange } from "../kernel";
+
+// ─── ReadRange: the open end is an absent value ──────────────────────────────
+
+describe("ReadRange", () => {
+    test("a store cannot compute a length from an open range without handling the open case", () => {
+        const range: ReadRange = { start: 5, end: undefined };
+        // @ts-expect-error `end` is `number | undefined`, so arithmetic on it is a compile error
+        const length: number = range.end - range.start + 1;
+        expect(Number.isNaN(length)).toBe(true);
+    });
+});
 
 // ─── classifyStoreRead: shared error-classification pipeline ─────────────────
 
@@ -173,16 +190,20 @@ describe("parseRetryAfterSeconds", () => {
         expect(parseRetryAfterSeconds(-5)).toBeUndefined();
         expect(parseRetryAfterSeconds(NaN)).toBeUndefined();
         expect(parseRetryAfterSeconds(Infinity)).toBeUndefined();
-        // A huge finite hint whose floor exceeds MAX_SAFE_INTEGER must be dropped,
-        // not emitted as `1e+21` (which violates the delay-seconds DIGIT+ grammar).
-        expect(parseRetryAfterSeconds(1e21)).toBeUndefined();
+        // A huge finite hint is capped at one day, never emitted as `1e+21`
+        // (which violates the delay-seconds DIGIT+ grammar) or relayed as given.
+        expect(parseRetryAfterSeconds(1e21)).toBe(86_400);
+        expect(parseRetryAfterSeconds(Number.MAX_SAFE_INTEGER)).toBe(86_400);
+        expect(parseRetryAfterSeconds(86_401)).toBe(86_400);
+        expect(parseRetryAfterSeconds(86_400)).toBe(86_400);
     });
 
     test("delay-seconds strings parse; non-numeric/out-of-range drop", () => {
         expect(parseRetryAfterSeconds("7")).toBe(7);
         expect(parseRetryAfterSeconds("  12  ")).toBe(12);
         expect(parseRetryAfterSeconds("soon")).toBeUndefined();
-        expect(parseRetryAfterSeconds("99999999999999999999")).toBeUndefined();
+        expect(parseRetryAfterSeconds("99999999999999999999")).toBe(86_400);
+        expect(parseRetryAfterSeconds("9007199254740991")).toBe(86_400);
         expect(parseRetryAfterSeconds(null)).toBeUndefined();
         expect(parseRetryAfterSeconds(undefined)).toBeUndefined();
     });
@@ -195,6 +216,80 @@ describe("parseRetryAfterSeconds", () => {
         expect(secs).toBeLessThanOrEqual(60);
         // A past date clamps to 0, never negative.
         expect(parseRetryAfterSeconds(new Date(Date.now() - 60_000).toUTCString(), { allowHttpDate: true })).toBe(0);
+    });
+
+    test("text that only Number() reads as a number is not delay-seconds", () => {
+        expect(parseRetryAfterSeconds("0x12")).toBeUndefined();
+        expect(parseRetryAfterSeconds("1e3")).toBeUndefined();
+    });
+
+    test("text that is no date yields nothing even when dates are allowed", () => {
+        expect(parseRetryAfterSeconds("soon", { allowHttpDate: true })).toBeUndefined();
+    });
+
+    // A lenient date parser reads each of these as some date in the past, and
+    // "in the past" is relayed as `Retry-After: 0`: retry at once.
+    test.each(["1.5", "-5", "+7", "Jan 1", "2026-01-01", "1e3", "12 seconds", "Tue, 31 Feb 2026 10:00:00 GMT"])(
+        "%p is neither delay-seconds nor an HTTP-date, so it is dropped and never read as 0",
+        (text) => {
+            expect(parseRetryAfterSeconds(text, { allowHttpDate: true })).toBeUndefined();
+        },
+    );
+
+    test("the three RFC 9110 HTTP-date forms are read, and a far date is capped at one day", () => {
+        const soon = new Date(Date.now() + 120_000);
+        const delta = parseRetryAfterSeconds(soon.toUTCString(), { allowHttpDate: true });
+        expect(delta).toBeGreaterThanOrEqual(118);
+        expect(delta).toBeLessThanOrEqual(121);
+        expect(parseRetryAfterSeconds("Fri, 31 Dec 9999 23:59:59 GMT", { allowHttpDate: true })).toBe(86_400);
+        expect(parseRetryAfterSeconds("Sun Nov  6 08:49:37 1994", { allowHttpDate: true })).toBe(0);
+        expect(parseRetryAfterSeconds("Sunday, 06-Nov-94 08:49:37 GMT", { allowHttpDate: true })).toBe(0);
+    });
+
+    test("retryAfterFrom applies the same grammar and cap to a header bag", () => {
+        expect(retryAfterFrom(new Headers({ "retry-after": "1.5" }))).toBeUndefined();
+        expect(retryAfterFrom({ "retry-after": "999999999" })).toBe(86_400);
+        expect(retryAfterFrom(new Headers({ "retry-after": "30" }))).toBe(30);
+    });
+});
+
+describe("error matchers are total", () => {
+    const hostile = [
+        new Proxy(new Error("x"), {
+            get() {
+                throw new Error("trap");
+            },
+            getPrototypeOf() {
+                throw new Error("trap");
+            },
+        }),
+        Object.defineProperty(new Error("x"), "name", {
+            get() {
+                throw new Error("getter");
+            },
+        }),
+    ];
+    test.each(hostile)("a thrown value that cannot be read matches nothing and throws nothing", (err) => {
+        expect(isObjectNotFoundError(err)).toBe(false);
+        expect(isObjectChangedError(err)).toBe(false);
+        expect(isStoreUnavailableError(err)).toBe(false);
+    });
+});
+
+describe("urlKeyGuard reads a backslash as a separator in the reserved-prefix test", () => {
+    test.each([".partial-content-uploads\\x", ".uploads\\tok", "\\.uploads\\tok", ".uploads\\\\tok", ".UPLOADS\\tok"])(
+        "%p is refused",
+        (key) => {
+            const guard = urlKeyGuard([".uploads/", ".partial-content-uploads/"], { keys: "verbatim", foldCase: true });
+            expect(() => guard(key)).toThrow(ObjectNotFoundError);
+        },
+    );
+    test("a backslash elsewhere in a key is not a reserved prefix", () => {
+        const guard = urlKeyGuard([".uploads/"], { keys: "verbatim" });
+        expect(() => guard("docs\\.uploads\\x")).not.toThrow();
+    });
+    test("the public guard keeps reading a backslash as an ordinary character", () => {
+        expect(() => reservedKeyGuard(".uploads/", { keys: "verbatim" })(".uploads\\x")).not.toThrow();
     });
 });
 
@@ -321,13 +416,17 @@ describe("store error cause wiring", () => {
         expect(new StoreUnavailableError("c", { retryAfterSeconds: 30 }).retryAfterSeconds).toBe(30);
     });
 
-    test("retryAfterSeconds is normalized at construction (floor valid, drop hostile)", () => {
-        // A NaN/negative/infinite/out-of-safe-range hint (hostile header, buggy
-        // third-party classifier) must never be retained, so a direct reader of
+    test("retryAfterSeconds is normalized at construction (floor valid, drop hostile, cap at one day)", () => {
+        // A NaN, negative or infinite hint (hostile header, buggy third-party
+        // classifier) is never retained, so a direct reader of
         // `.retryAfterSeconds` off the contract sees `undefined`, not garbage.
-        for (const bad of [NaN, -5, -0.1, Infinity, -Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+        for (const bad of [NaN, -5, -0.1, Infinity, -Infinity]) {
             expect(new StoreUnavailableError("k", { retryAfterSeconds: bad }).retryAfterSeconds).toBeUndefined();
         }
+        // A finite hint above one day is capped, so one origin response cannot park a client for longer.
+        expect(
+            new StoreUnavailableError("k", { retryAfterSeconds: Number.MAX_SAFE_INTEGER + 1 }).retryAfterSeconds,
+        ).toBe(86_400);
         // A non-negative finite hint is floored to whole seconds; zero is valid.
         expect(new StoreUnavailableError("k", { retryAfterSeconds: 2.9 }).retryAfterSeconds).toBe(2);
         expect(new StoreUnavailableError("k", { retryAfterSeconds: 0 }).retryAfterSeconds).toBe(0);
@@ -429,6 +528,36 @@ describe("nodeStreamToWeb abort propagation", () => {
         expect(h.calls.remove).toBe(0);
     });
 
+    test("the abort listener is detached when the source fails mid-read", async () => {
+        const h = createSignalHarness();
+        // A source that fails on its first read.
+        async function* gen(): AsyncGenerator<Uint8Array> {
+            throw new Error("backend read failed");
+        }
+        const reader = nodeStreamToWeb(gen(), { signal: h.signal, destroy: () => {} }).getReader();
+        await expect(reader.read()).rejects.toThrow("backend read failed");
+        expect(h.calls.remove).toBe(1);
+    });
+
+    test("the abort listener is detached when the source overruns its length", async () => {
+        const h = createSignalHarness();
+        async function* gen(): AsyncGenerator<Uint8Array> {
+            yield new Uint8Array(2);
+        }
+        const reader = nodeStreamToWeb(gen(), { signal: h.signal, destroy: () => {}, expectedBytes: 1 }).getReader();
+        await expect(reader.read()).rejects.toThrow("more than 1 bytes");
+        expect(h.calls.remove).toBe(1);
+    });
+
+    test("the abort listener is detached when the consumer cancels", async () => {
+        const h = createSignalHarness();
+        async function* gen(): AsyncGenerator<Uint8Array> {
+            yield new Uint8Array(1);
+        }
+        await nodeStreamToWeb(gen(), { signal: h.signal, destroy: () => {} }).cancel("client gone");
+        expect(h.calls.remove).toBe(1);
+    });
+
     test("completes cleanly when the signal has no removeEventListener", async () => {
         // removeEventListener is optional on the signal type. A signal that
         // only supports addEventListener must not crash detach on completion.
@@ -455,6 +584,14 @@ describe("nodeStreamToWeb teardown without a destroy capability", () => {
         const reader = nodeStreamToWeb(gen()).getReader();
         await reader.read();
         await expect(reader.read()).rejects.toThrow("backend read failed");
+    });
+
+    test("an overrun with no destroy capability reports the overrun, not a crash", async () => {
+        async function* gen(): AsyncGenerator<Uint8Array> {
+            yield new Uint8Array(2);
+        }
+        const reader = nodeStreamToWeb(gen(), { expectedBytes: 1 }).getReader();
+        await expect(reader.read()).rejects.toThrow("more than 1 bytes");
     });
 
     test("cancel resolves cleanly when there is no destroy capability", async () => {
@@ -488,6 +625,50 @@ describe("nodeStreamToWeb teardown without a destroy capability", () => {
 // ─── reservedKeyGuard ───────────────────────────────────────────────────────
 
 describe("reservedKeyGuard", () => {
+    test("refuses a key whose dot or empty segments a URL resolver would turn into the reserved namespace", () => {
+        const guard = reservedKeyGuard([".uploads/", ".partial-content-uploads/"]);
+        const routes = [
+            "photos/../.uploads/v6/seg/id/pub/p1",
+            "./.uploads/v6/rec/x",
+            "a/%2e%2e/.uploads/v6/rec/x",
+            "a/.%2E/.uploads/x",
+            "a/%2e/.uploads/x",
+            "a\\..\\.uploads\\v6\\rec\\x",
+            "/.uploads/v6/rec/x",
+            "a//.uploads/x",
+            "photos/",
+            "",
+        ];
+        for (const key of routes) expect(() => guard(key)).toThrow(ObjectNotFoundError);
+        // Dots inside a name are not segments.
+        for (const key of ["photos/a..b.jpg", "...", "v1.2/notes.txt", ".well-known/x"]) {
+            expect(() => guard(key)).not.toThrow();
+        }
+    });
+
+    test("a tab, newline or carriage return the URL parser deletes cannot hide a dot or empty segment", () => {
+        const dotKeys = [".\t./x", ".\r./x", ".\n./x", "%2e\t%2e/x", "a/.\t/b"];
+        const reserved = [".uploads/"];
+        for (const key of dotKeys) {
+            expect(isPlainObjectKey(key)).toBe(false);
+            expect(() => reservedKeyGuard(reserved)(key)).toThrow(ObjectNotFoundError);
+            expect(() => urlKeyGuard(reserved, { keys: "verbatim" })(key)).toThrow(ObjectNotFoundError);
+        }
+        expect(isPlainObjectKey("a/\t/b")).toBe(false);
+        expect(() => reservedKeyGuard(reserved)("a/\t/b")).toThrow(ObjectNotFoundError);
+        expect(() => urlKeyGuard(reserved, { keys: "verbatim" })("a/\t/b")).not.toThrow();
+        // A tab inside a name is not a segment of its own.
+        expect(isPlainObjectKey("a/b\tc/d")).toBe(true);
+    });
+
+    test("names a plain key by its segments", () => {
+        expect(isPlainObjectKey("a/b/c.txt")).toBe(true);
+        expect(isPlainObjectKey("a/../b")).toBe(false);
+        expect(isPlainObjectKey("a/%2E%2e/b")).toBe(false);
+        expect(isPlainObjectKey("a\\b")).toBe(true);
+        expect(isPlainObjectKey("a\\.\\b")).toBe(false);
+    });
+
     test("refuses the prefix itself and everything under it", () => {
         const guard = reservedKeyGuard(".uploads/");
         // The bare form matters on its own: a store fronting a flat namespace
@@ -517,25 +698,79 @@ describe("reservedKeyGuard", () => {
         expect(() => guard(".uploads/token")).toThrow(ObjectNotFoundError);
         expect(() => guard(".partial-content-uploads")).toThrow(ObjectNotFoundError);
         expect(() => guard(".partial-content-uploads/token.info")).toThrow(ObjectNotFoundError);
-        for (const key of ["", "/", "any/key", ".uploadsomething"]) {
+        for (const key of ["any/key", ".uploadsomething"]) {
             expect(() => guard(key)).not.toThrow();
         }
     });
 
     test("a list of only empty entries guards nothing at all", () => {
-        const guard = reservedKeyGuard(["", ""]);
+        const guard = reservedKeyGuard(["", ""], { keys: "verbatim" });
         for (const key of ["", "/", ".uploads/token", "any/key"]) {
             expect(() => guard(key)).not.toThrow();
         }
     });
 
     test("an empty prefix guards nothing at all", () => {
-        const guard = reservedKeyGuard("");
+        const guard = reservedKeyGuard("", { keys: "verbatim" });
         // The opt-out for a location no upload store shares. It must not
         // silently become a guard on "/" instead.
         for (const key of ["", "/", "/anything", ".uploads", ".uploads/token", "any/key"]) {
             expect(() => guard(key)).not.toThrow();
         }
+    });
+
+    test("a prefix that would reserve nothing is refused at construction", () => {
+        for (const bad of ["/.uploads/", "./.uploads", "a//b", "a/../b", "/"]) {
+            expect(() => reservedKeyGuard(bad)).toThrow(TypeError);
+        }
+    });
+
+    test("the plain-key policy refuses non-plain keys even with no prefix", () => {
+        const guard = reservedKeyGuard("");
+        expect(() => guard("a/../b")).toThrow(ObjectNotFoundError);
+        expect(() => guard("a//b")).toThrow(ObjectNotFoundError);
+        expect(() => guard("a/b")).not.toThrow();
+    });
+
+    test("the verbatim policy leaves non-plain keys to the caller", () => {
+        const guard = reservedKeyGuard(".uploads/", { keys: "verbatim" });
+        expect(() => guard("a//b")).not.toThrow();
+        expect(() => guard(".uploads/x")).toThrow(ObjectNotFoundError);
+    });
+
+    test("foldCase refuses a reserved prefix under another case", () => {
+        const guard = reservedKeyGuard(".uploads/", { keys: "verbatim", foldCase: true });
+        expect(() => guard(".UPLOADS/x")).toThrow(ObjectNotFoundError);
+        expect(() => guard(".uploads")).toThrow(ObjectNotFoundError);
+        expect(() => guard("other/x")).not.toThrow();
+    });
+
+    test("foldCase refuses the compatibility and dotless spellings a case-insensitive volume equates", () => {
+        const uploads = reservedKeyGuard(".uploads/", { keys: "verbatim", foldCase: true });
+        expect(() => uploads(".uploadſ/x")).toThrow(ObjectNotFoundError); // U+017F long s
+        expect(() => uploads(".UPLOADſ/x")).toThrow(ObjectNotFoundError);
+        const partial = reservedKeyGuard(".partial-content-uploads/", { keys: "verbatim", foldCase: true });
+        expect(() => partial(".partıal-content-uploads/x")).toThrow(ObjectNotFoundError); // U+0131 dotless i
+        expect(() => partial(".PARTIAL-content-uploads/x")).toThrow(ObjectNotFoundError);
+        expect(() => partial("partial/x")).not.toThrow();
+    });
+
+    test("urlKeyGuard refuses a dot segment under every key policy, the public guard does not", () => {
+        for (const keys of ["plain", "verbatim"] as const) {
+            const guard = urlKeyGuard(".uploads/", { keys });
+            for (const key of ["../x", "a/./b", "a/../b", "..", ".", "a\\..\\b", "a/.. /b"]) {
+                expect(() => guard(key)).toThrow(ObjectNotFoundError);
+            }
+        }
+        expect(() => reservedKeyGuard(".uploads/", { keys: "verbatim" })("a/../b")).not.toThrow();
+    });
+
+    test("urlKeyGuard under verbatim tests the slash-collapsed spelling against the reserved prefix", () => {
+        const guard = urlKeyGuard(".uploads/", { keys: "verbatim" });
+        expect(() => guard("/.uploads/x")).toThrow(ObjectNotFoundError);
+        expect(() => guard(".uploads//x")).toThrow(ObjectNotFoundError);
+        expect(() => guard("docs//q1.pdf")).not.toThrow();
+        expect(() => guard("tenant:42/a.pdf")).not.toThrow();
     });
 
     test("the refusal carries the key on its field, never in its message", () => {
@@ -547,6 +782,74 @@ describe("reservedKeyGuard", () => {
             expect((err as ObjectNotFoundError).key).toBe(".uploads/secret");
             expect((err as Error).message).not.toContain("secret");
         }
+    });
+});
+
+// ─── retryAfterFrom and failRead ────────────────────────────────────────────
+
+describe("retryAfterFrom", () => {
+    test("reads a record and a Headers-like object, delay-seconds and HTTP-date", () => {
+        expect(retryAfterFrom({ "retry-after": "7" })).toBe(7);
+        expect(retryAfterFrom(new Headers({ "retry-after": "12" }))).toBe(12);
+        const soon = new Date(Date.now() + 30_000).toUTCString();
+        expect(retryAfterFrom({ "retry-after": soon })).toBeGreaterThanOrEqual(28);
+    });
+
+    test("a missing, malformed or hostile header bag yields undefined and never throws", () => {
+        const throwingGet = {
+            get: () => {
+                throw new Error("boom");
+            },
+        };
+        const throwingRecord = new Proxy(
+            {},
+            {
+                get: () => {
+                    throw new Error("boom");
+                },
+            },
+        );
+        for (const bag of [
+            undefined,
+            null,
+            5,
+            "x",
+            {},
+            { get: "nope" },
+            { "retry-after": "soon" },
+            throwingGet,
+            throwingRecord,
+        ]) {
+            expect(retryAfterFrom(bag)).toBeUndefined();
+        }
+    });
+});
+
+describe("failRead", () => {
+    test("releases, then throws the read's own error", () => {
+        let released = 0;
+        const failure = new Error("degenerate");
+        expect(() => failRead(() => (released += 1), failure)).toThrow(failure);
+        expect(released).toBe(1);
+    });
+
+    test("a release that throws or rejects never masks the read's error", async () => {
+        const failure = new Error("degenerate");
+        expect(() =>
+            failRead(() => {
+                throw new Error("release failed");
+            }, failure),
+        ).toThrow(failure);
+        const unhandled: unknown[] = [];
+        const onUnhandled = (reason: unknown) => unhandled.push(reason);
+        process.on("unhandledRejection", onUnhandled);
+        try {
+            expect(() => failRead(() => Promise.reject(new Error("cancel failed")), failure)).toThrow(failure);
+            await new Promise((resolve) => setTimeout(resolve, 10));
+        } finally {
+            process.off("unhandledRejection", onUnhandled);
+        }
+        expect(unhandled).toEqual([]);
     });
 });
 
@@ -707,9 +1010,34 @@ describe("guardStreamLength fixes the length where the runtime can", () => {
             }
         };
         try {
-            await expect(new Response(guardStreamLength(bodyOf(3), 7)).arrayBuffer()).rejects.toThrow();
+            await expect(new Response(guardStreamLength(bodyOf(3), 7)).arrayBuffer()).rejects.toThrow(
+                "source changed mid-read",
+            );
         } finally {
             delete g.FixedLengthStream;
         }
+    });
+});
+
+// ─── projectError ───────────────────────────────────────────────────────────
+
+describe("projectError", () => {
+    test("a thrown non-object projects to its typeof, null included", () => {
+        expect(projectError("boom")).toStrictEqual({ name: "string" });
+        expect(projectError(null)).toStrictEqual({ name: "object" });
+    });
+
+    test("no operation means no operation field", () => {
+        expect(Object.hasOwn(projectError(new Error("x")), "operation")).toBe(false);
+        expect(projectError(new Error("x"), "read").operation).toBe("read");
+    });
+
+    test("a cause chain stops at the depth bound", () => {
+        let err: { name: string; cause?: unknown } = { name: "E" };
+        for (let i = 0; i < 12; i++) err = { name: "E", cause: err };
+
+        let depth = 0;
+        for (let p = projectError(err).cause; p !== undefined; p = p.cause) depth++;
+        expect(depth).toBe(8);
     });
 });

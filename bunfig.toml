@@ -1,0 +1,6 @@
+# The bunfig.toml of the standalone public repo, copied there under that name (AGENTS.md, "Releasing"). The dev
+# home's own bunfig.toml also names a commit-cap preload that lives outside this package, so it is not synced.
+#
+# Bun reports crashes and usage to a non-EU endpoint unless this is off.
+telemetry = false
+

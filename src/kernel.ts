@@ -28,29 +28,23 @@ import { NON_FIELD_VALUE_BYTES, resolveMediaType } from "./media-type.ts";
 export interface ParsedRange {
     /** First byte position (0-indexed). */
     start: number;
-    /**
-     * Last byte position (inclusive). May equal {@link OPEN_ENDED} on the
-     * single-round-trip fast path, meaning "to end of object" -- the range's
-     * true end is unknown until the backend responds. Adapters MUST treat
-     * `end === OPEN_ENDED` as an open-ended read (`bytes=start-`, or omit the
-     * count) rather than emitting the sentinel as a literal last-byte-pos.
-     */
+    /** Last byte position (inclusive). */
     end: number;
 }
 
 /**
- * Sentinel `ParsedRange.end` meaning "to the end of the object". Used only
- * by the fast path for a `bytes=a-` request, where the total size is not yet
- * known. It is deliberately NOT `Number.MAX_SAFE_INTEGER`-as-a-magic-number
- * at call sites: adapters compare against this named constant and emit the
- * idiomatic open-ended wire form, so no 16-digit last-byte-pos ever reaches
- * a backend or proxy that might reject it.
+ * The byte range a store is asked to read: inclusive bounds, with `end`
+ * `undefined` for "to the end of the object" (a `bytes=a-` request, where the
+ * total size is not yet known). The open form is an absent value rather than a
+ * number, so a store cannot compute a length from it without first handling
+ * the open case. A present `end` may exceed the object size; stores clamp it
+ * and report the bounds actually served.
  */
-export const OPEN_ENDED = Number.MAX_SAFE_INTEGER;
-
-/** True when a range is the fast-path open-ended form (`bytes=start-`). */
-export function isOpenEndedRange(range: { end: number } | undefined | null): boolean {
-    return range?.end === OPEN_ENDED;
+export interface ReadRange {
+    /** First byte position (0-indexed). */
+    start: number;
+    /** Last byte position (inclusive), or `undefined` to read to the end. */
+    end: number | undefined;
 }
 
 /** Options for building range response headers. */
@@ -767,8 +761,6 @@ export function buildRangeResponseHeaders(opts: RangeResponseHeaderOpts): RangeR
     }
 
     if (range) {
-        // OPEN_ENDED must be resolved to served bounds before serialization;
-        // emitting it would put a 16-digit last-byte-pos on the wire.
         assertServedRange("buildRangeResponseHeaders", range, totalSize);
         // 206 Partial Content. The body length is the range span, so an unknown
         // total is emitted honestly as `*` (RFC 9110 Section 14.4) rather than a
@@ -1273,23 +1265,6 @@ export interface ETagSource {
 }
 
 /**
- * Field names {@link generateETag} does not read, mapped to the
- * {@link ETagSource} field that carries the same metadata.
- *
- * A JavaScript caller reaches `generateETag` with no compiler to check the
- * shape, and each of these names reads as absent. The answer would then be no
- * validator at all, or a weak `W/"<size>-<mtime>"` for a store that has a
- * strong one: a cache-correctness failure with no error, refusing `If-Range`
- * resumes and turning every `If-Match` write into a 412. Refusing the call
- * makes it arrive as a stack trace instead.
- */
-const RETIRED_ETAG_SOURCE_FIELDS: ReadonlyMap<string, keyof ETagSource> = new Map([
-    ["hash", "etag"],
-    ["size", "contentLength"],
-    ["mtime", "lastModified"],
-]);
-
-/**
  * Derive an entity-tag from storage metadata.
  *
  * This is a **formatter**, not a hasher. It classifies what the storage backend
@@ -1309,11 +1284,10 @@ const RETIRED_ETAG_SOURCE_FIELDS: ReadonlyMap<string, keyof ETagSource> = new Ma
  * @param source - Storage metadata to derive the ETag from, such as an
  *   `ObjectStore` HEAD result
  * @returns A correctly-typed ETag string, or `undefined` if insufficient metadata
- * @throws TypeError if `source` is not an object, or carries a retired field
- *   name whose value would otherwise be read as absent
+ * @throws TypeError if `source` is not an object
  */
 export function generateETag(source: ETagSource): string | undefined {
-    assertETagSourceFields(source);
+    assertETagSource(source);
     // Strong path: the backend's own version identifier is a byte-exact
     // validator. An empty opaque-tag identifies no version, so it falls back.
     const tag = normalizeETag(source.etag);
@@ -1339,25 +1313,15 @@ function normalizeETag(etag: string | undefined): string | undefined {
 }
 
 /**
- * Reject an argument that cannot produce the validator its author intended.
- *
- * Only the retired field names are refused. Any other extra property is
+ * Reject an argument that is not metadata at all. Any extra property is
  * ignored on purpose, because the supported call passes a whole store HEAD
  * result and that carries fields (`digest`, `pin`) an entity-tag never reads.
  */
-function assertETagSourceFields(source: ETagSource): void {
+function assertETagSource(source: ETagSource): void {
     if (source === null || typeof source !== "object") {
         throw new TypeError(
             `generateETag: expected storage metadata, received ${source === null ? "null" : typeof source}`,
         );
-    }
-    for (const [retired, current] of RETIRED_ETAG_SOURCE_FIELDS) {
-        // Only a field the caller wrote, and only when the replacement is
-        // absent: a store HEAD result may carry a same-named field of its own
-        // beside the one generateETag reads.
-        if (Object.hasOwn(source, retired) && source[current] === undefined) {
-            throw new TypeError(`generateETag: "${retired}" is not a field of ETagSource; pass it as "${current}"`);
-        }
     }
 }
 
@@ -1390,8 +1354,8 @@ function toEpochMs(m: Date | number | string | undefined): number | undefined {
 
 /**
  * Bounds the range parser could never produce (non-integer or unordered
- * positions, an end at or past a known total, the OPEN_ENDED sentinel with an
- * unknown one) throw rather than serialize an invalid Content-Range.
+ * positions, an end at or past a known total) throw rather than serialize an
+ * invalid Content-Range.
  */
 function assertServedRange(fn: string, range: ParsedRange, totalSize: number | undefined): void {
     if (
@@ -1399,7 +1363,7 @@ function assertServedRange(fn: string, range: ParsedRange, totalSize: number | u
         !Number.isSafeInteger(range.end) ||
         range.start < 0 ||
         range.start > range.end ||
-        (totalSize !== undefined ? range.end >= totalSize : range.end === OPEN_ENDED)
+        (totalSize !== undefined && range.end >= totalSize)
     ) {
         throw new RangeError(`${fn}: invalid range ${range.start}-${range.end} for totalSize ${totalSize ?? "*"}`);
     }
@@ -1665,7 +1629,7 @@ function roundTripSeconds(monthIdx: number, day: number, hh: number, mm: number,
  * per RFC 9110. Backend metadata keeps the lenient `parseHttpSeconds` path
  * (adapters may hand us ISO 8601; that is our own input, not wire input).
  */
-function parseRequestHttpSeconds(s: string): number {
+export function parseRequestHttpSeconds(s: string): number {
     // IMF-fixdate and RFC 850 both carry an explicit GMT zone, so Date.parse
     // reads them as UTC (and applies the RFC 850 two-digit-year pivot). The
     // round-trip guard then rejects a day/time the grammar admits but the

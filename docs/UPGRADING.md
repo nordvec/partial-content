@@ -3,6 +3,293 @@
 Version-to-version migration. For moving to this package from another file
 server, see [MIGRATION.md](./MIGRATION.md), which is a different document.
 
+## 5.x to 6.0
+
+6.0 is the serving half of the package. It has no upload support, by design:
+the resumable-upload write side is removed, not deferred, and no later 6.x
+release adds it back.
+
+Six breaking changes. Section 1 reaches you if you accept uploads with
+partial-content; section 2 reaches `s3Store`, `azureStore` and `httpStore`;
+section 3 reaches you if any object in an S3, GCS, Azure or R2 bucket was
+stored with a content coding; section 4 reaches you if you import
+`redactErrorText`; section 5 reaches you if you import `toWebRequest`,
+`sendResponse` or `nodeHandler`; section 6 reaches you if you implement
+`ObjectStore` or import `OPEN_ENDED` or `isOpenEndedRange`.
+
+### 1. Upload support is removed
+
+Removed, with no replacement in this package: the `partial-content/tus` and
+`partial-content/upload` subpaths (`createTusHandler`, `createUploadHandler`,
+`createUploadOrchestrator`), every upload store (`s3UploadStore`,
+`r2UploadStore`, `gcsUploadStore`, `azureUploadStore`, `fsUploadStore`,
+`memoryUploadStore`), the `ResumableWriteStore` contract and its types, the
+upload error classes and their `is*` matchers (`UploadNotFoundError`,
+`UploadOffsetConflictError`, `UploadAppendBoundError`, `UploadOverrunError`,
+`UploadDigestMismatchError` and the rest), `UPLOAD_STORE_CONTRACT_VERSION`,
+the `partial-content/redis-locker` subpath and the upload lockers, and `checkResumableWriteStore` from
+`partial-content/conformance` (`checkObjectStore` and
+`formatConformanceReport` stay).
+
+5.x is superseded when 6.0 ships and receives no further fixes:
+[SECURITY.md](../SECURITY.md) supports only the latest release, with no
+backports. That leaves two paths:
+
+- **Stay on 5.x** for uploads, knowing that it is unmaintained and carries the
+  known defects below.
+- **Move uploads to presigned direct-to-storage writes**: the client uploads
+  straight to the bucket (an S3 presigned PUT or multipart upload, an R2 or GCS
+  signed URL, an Azure SAS), your server authorizes by issuing the URL, and 6.0
+  serves the finished object. A resumable flow is the storage service's own
+  multipart or resumable API.
+
+Known write-side defects in 5.x, unfixed there:
+
+- **The reported offset can move backwards after a crash**, by up to the
+  staged remainder on the S3 store, or by one acknowledged write on a store
+  without exact offset recovery. The IETF resumable-upload draft says the
+  offset MUST NOT decrease, so a client must keep the bytes it may need to
+  re-send.
+- **Azure, a finished upload answers 410 and its completion callback is never
+  delivered.** A probe racing a completion can lay the invalidated state over
+  the fresh complete record, so the published object's upload answers `410`
+  from then on and `onUploadComplete` is never called again for it.
+- **S3, a completer that lost its lock can publish a short object**: when the
+  length was undeclared at its record read, the parked tail is missing from
+  what it publishes.
+- **tus, the creation path reports the raw token** and an unscrubbed error to
+  the event and error sinks even with `auditKey` set.
+- **R2, a holder whose lease lapsed can reuse a part number** the new holder
+  already recorded, replacing its data.
+- **R2, completion attributed by key existence**: a retry that finds the
+  completing marker set and the multipart upload gone treats any object at the
+  key as this upload's completion.
+- **fs, a completion that lost its lease renames the file an open append still
+  writes to**, after the digest was verified.
+- **fs, the completion's sidecar snapshot is written back unmerged**, which can
+  recreate a reaped upload attributed to whatever object sits at the key.
+
+### 2. A store with a reserved prefix refuses a key that is not plain
+
+On `s3Store`, `azureStore` and `httpStore`, a key with an empty segment (a
+leading `/`, a `//`, a trailing `/`) or a `.` or `..` segment in any spelling,
+`%2e` included, with `\` counted as a separator, is answered `404`.
+`/invoices/2026.pdf` and `reports//q1.pdf`, both served by 5.0.0, are now
+`404`. These three build a request URL from the key, so such a key can
+resolve into the reserved prefix by a spelling the prefix match did not see.
+`r2Store`, `gcsStore` and `fsStore` are unaffected: the R2 binding and the GCS
+client take the key verbatim, and `fsStore` tests the reservation on the path
+a key resolves to. The policy is the `keys` option (`"plain"` or
+`"verbatim"`) on every object store, separate from the prefix: a store whose
+origin or bucket really holds keys with an empty segment passes
+`keys: "verbatim"`, and then owns the safety of that spelling. A dot segment
+is refused on these three stores under either policy, since the URL they
+build resolves it before the backend sees the path and no object could be
+addressed by it. Under `"verbatim"` the reserved prefix is also tested against
+the key with its repeated slashes collapsed, the spelling the URL resolves to.
+`httpStore`, which hands the raw key to a URL the consumer builds, also
+refuses under either policy a key that starts with `/` or `\`, with a special scheme such as `https:` or `file:`, or with a C0 control or a space at either end, and fetches only an `http:` or `https:` URL from `url()`.
+A URL from `url()` or a followed redirect that carries a user name or
+password is refused with a `TypeError`; pass credentials in `headers`.
+A key holding `?`, `#`, `\`, a tab, a CR or an LF is fetched only when the
+built URL's percent-decoded path holds it, since a URL parser rewrites those
+characters or cuts the path at them: a `url()` whose path does not carry the
+key intact now answers `404` for such a key. Encode it into the path with
+`encodeKeyPath(key)` to keep serving it; a key that begins with `?` or `#`,
+or has a segment that does (`#1 Invoice.pdf`), is served that way too. Under
+`keys: "verbatim"`, call `encodeKeyPath(key, { keys: "verbatim" })` so a key
+with an empty segment is encoded rather than refused (a leading empty segment
+is refused under either policy, since `//` begins an authority). A `url()` that puts the
+key in a query value, or maps it to another name (a lookup, a hash), answers
+`404` for such a key, and so does any `url()` for a key with a lone surrogate.
+
+A key longer than the backend can hold is answered `404` before any request:
+1,024 UTF-8 bytes on `s3Store`, `r2Store`, `gcsStore` and `httpStore`, 4,096
+on `azureStore` (whose limit is 1,024 characters). `httpStore` takes
+`maxKeyBytes` for an origin that holds longer names.
+
+The 5.0.0 reserved-prefix defaults are unchanged: `s3Store` and `fsStore`
+refuse `.uploads/`, `r2Store`, `gcsStore` and `azureStore` refuse
+`.partial-content-uploads/`, and `httpStore` refuses both. `reservedPrefix: ""`
+now opts out of the prefix only; the key policy stays on (`keys: "verbatim"`
+turns off its empty-segment half). A prefix that would reserve nothing, such
+as `"/.uploads/"` or `"a//b"`, throws a `TypeError` when the store is built.
+`reservedPrefix` accepts an array on every store, where 5.0.0 took one only on
+`httpStore`.
+
+The defaults stay through 6.x. 7.0 changes the `reservedPrefix` default to
+`""`, since only a location a 5.x upload store once wrote holds that
+bookkeeping: a deployment that shared one sets the prefix explicitly before
+upgrading to 7.0. The dot-segment refusal on `s3Store`, `azureStore` and
+`httpStore` is not a default and stays.
+
+Two further changes close spellings of a reserved key. `httpStore` compares
+the prefix with case and normal form folded, since an origin on a
+case-insensitive volume resolves `.UPLOADS/x` into `.uploads/x`. `fsStore`
+compares the reservation as a prefix of the resolved path only: a real file
+named `%2e%2e.txt` is served, where 5.0.0 refused it as a traversal spelling.
+
+### 3. An object stored with a content coding is served with that coding
+
+`s3Store`, `gcsStore`, `azureStore` and `r2Store` now read the stored
+`Content-Encoding`. An object uploaded with `--content-encoding gzip` was
+served by 5.x as identity bytes under its encoded length; it is now served as
+`Content-Encoding: gzip` with the stored bytes, and a range selects bytes of
+the encoded body. A client that does not decode gzip now receives gzip. A
+multi-range request for such an object is answered with the whole body.
+`gcsStore` reads with `decompress: false` so the bytes match the stored size.
+A custom `ObjectStore` that wraps a decoding client reports
+`ObjectMetadata.contentEncoding` or disables the decoding.
+
+Only a registered coding is served as one: `gzip` (with `x-gzip` spelled
+`gzip`), `deflate`, `br`, `zstd`, `compress`, and the other names in the IANA
+HTTP Content Coding Registry (`aes128gcm`, `dcb`, `dcz`, `exi`,
+`pack200-gzip`), which the store passes through without decoding. A stored
+`identity`, `none`, `aws-chunked`, a MIME transfer-encoding name (`base64`,
+`binary`, `7bit`, `8bit`, `quoted-printable`) or a value that is plainly not a
+coding (a charset such as `utf-8`, a media type) is served as identity, as 5.x
+served it; an unregistered token makes the read fail with a `502` instead of
+guessing a header.
+
+### 4. `redactErrorText` is no longer exported
+
+Nothing in the serving path called it: under an `auditKey` the error handed to
+`onError` is a `ProjectedError` (`name`, `code`, `status`, `operation` and the
+`cause` chain projected the same way). Remove the import and branch on those
+fields; a caller that needs to scrub free text writes its own, since the
+needles are the caller's. `httpStore` surfaces a failure it did not author
+(from `url()`, `headers()`, `fetch` or a body read; an `ObjectNotFoundError`
+thrown by `url()`, and any failure of `url()` on a key that is not a URL
+reference at all, is not found) as a new `Error` with a
+message of the store's own wording such as `httpStore GET: origin request failed`, the original
+`name` and `code`, and a `cause` that is the `ProjectedError` of the original:
+its message, stack and other properties, which can quote the origin URL, are
+not carried. A transport failure also keeps a well-formed `status` and
+`retryAfterSeconds`. A failure of `url()` or `headers()` keeps neither, and any
+other `name` the handler classifies by (`NotFound`, `ObjectChangedError`)
+becomes `Error`, so it is served as `502`: a `url()` that means not found throws
+`ObjectNotFoundError` (served `404`), and one that means unavailable throws
+`StoreUnavailableError` (served `503`, with its `retryAfterSeconds` as
+`Retry-After`), each recognised by class or by `name`, so a second copy of
+the package loaded under the other module system is read the same way.
+Branch on `name` and `code`. Under an `auditKey` the projection
+also covers an error your own `onServe`, `onTransfer` or `onTiming` hook
+throws.
+
+### 5. The Fetch bridge is removed from `partial-content/node`
+
+`toWebRequest`, `sendResponse` and `nodeHandler` converted between a Node
+request and a Fetch `Request` so a Fetch handler could run on `http.createServer`.
+Serving files never used them: `serveObject` from `partial-content/node` writes
+the response itself, and a Fetch-shaped handler is what `partial-content/web`
+already is. Replace a Node mount of a Fetch handler with the runtime's own
+adapter, or with `serveObject` from `partial-content/node` for a file route.
+`ToWebRequestOptions`, `SendResponseOptions`, `NodeHandlerOptions` and the
+`readStallTimeoutMs`, `onExpectContinue` and `answerExpectContinue` options go
+with them. `writeStallTimeoutMs` stays on `serveObject`.
+
+### 6. A read to the end of the object has no `end`
+
+`getObject` receives a `ReadRange`, `{ start: number; end: number | undefined }`,
+and an open read (`bytes=3-`) has an `end` of `undefined`. 5.x passed the
+sentinel `OPEN_ENDED` (`Number.MAX_SAFE_INTEGER`) as a number, and a store that
+computed `end - start + 1` sent a length of about 9e15 to its backend. The
+sentinel and `isOpenEndedRange` are removed from the root exports.
+
+`ObjectStore.headObject` and `getObject` are now declared as function
+properties, so the compiler checks a store's parameters strictly: a store typed
+`opts?: { range?: ParsedRange }` no longer compiles, where under 5.x it did and
+sent `bytes=3-undefined`. Type the options as `GetObjectOptions` (or the range
+as `ReadRange`), emit the open form (`bytes=3-`, an offset-only read) when `end`
+is `undefined`, and report the bounds the backend served. A test double that
+reassigns `store.getObject` keeps working; the properties are not `readonly`.
+
+A sent `ifMatch` counts as a pinned read only from a store that sets
+`pinsReads: true`, the flag that says it refuses a read whose object no longer
+matches. A custom store that enforces `ifMatch` and reports no validator from
+`getObject` sets the flag, or its reads are served without the `HEAD`'s ETag
+and digest; `checkObjectStore` probes the claim. The built-in S3, R2, GCS,
+Azure and memory stores set it.
+
+### Also changed
+
+These change behavior without breaking a call that was correct.
+
+- A caller's `securityHeaders` Content-Security-Policy on inline active
+  content (SVG, HTML) is composed with the default `sandbox` directive,
+  `<yours>, sandbox`, where it replaced the sandbox before. A policy that
+  must not sandbox is not expressible; serve such content as an attachment.
+- With `precompressed`, the coding variants are probed in parallel, and a
+  sibling the store answered not-found for is not probed again for 30
+  seconds. A variant uploaded inside that window is served after it expires.
+  A variant deleted between the probe and the read is answered from the
+  identity object instead of a `404`.
+- A throwing `onTiming` is reported to `onError` as operation `"audit"`
+  and the response is unaffected. A throwing `disposition`,
+  `securityHeaders` or `preferSignedUrl` answers `500` and reports operation
+  `"context"` on every adapter; the handler no longer rejects. The same
+  answer covers a `disposition` result other than `"inline"` or
+  `"attachment"`, a `securityHeaders` result that is not a plain object, a
+  `preferSignedUrl` result that is not a boolean (an `async` callback is a
+  promise), and a `ctx` that is not an object or has a non-string
+  `cacheControl`; an unknown `disposition` string or a `signedUrlExpiresSeconds`
+  that is not an integer of at least 1 throws at construction.
+- `onServe`, `onTransfer`, `onTiming` and `onError` may be `async`: a
+  rejected promise is routed to `onError` (operation `"audit"`) and never
+  becomes an unhandled rejection, which exits Node by default. The promise is
+  observed, never awaited. A throwing or rejecting `onError` is swallowed on
+  every path and every adapter, where it escaped the handler before.
+- A store failure after the headers are committed (a body that errors
+  mid-stream, a lazy multipart part that fails or changed) is reported to
+  `onError` with operation `"get"`, unless the request's signal had aborted.
+- A client abort is decided from the request signal alone. An `AbortError` a
+  store raises while the signal is live (its own deadline) is a store failure:
+  reported to `onError` and answered `502` or `503`, where it was a silent
+  `499`.
+- With `precompressed`, a variant is served only while the identity object
+  exists and is not newer than the variant: the identity's `HEAD` joins the
+  variant probes in the same round, deleting the identity stops its variants
+  being served, and a stale variant is skipped. A variant the store confirmed
+  is remembered for 30 seconds, so a repeat request probes down to it and no
+  further. The variants are sibling keys you control; see
+  [SECURITY.md](../SECURITY.md).
+- The default `cacheControl` is `private, no-cache, no-transform`.
+- The Node adapter takes the client-gone signal from the response's `close`
+  (when it had not finished), not from the request's, so a request that was
+  already read to its end no longer hides a disconnect or fakes one.
+- When the Node or Hono adapter's `auditKey` extractor returns `undefined`,
+  events carry `"unkeyed"` and `onError` receives the projected error, where
+  the storage key and the raw error were the fallback.
+- `precompressed` refuses an inherited name such as `"constructor"` at
+  construction.
+- A store that ignores `Range` on a multi-range request is answered with the
+  whole representation as a `200`, as it already was for a single range,
+  where 5.x answered `502`.
+- `httpStore` handles origin redirects itself and always sends
+  `redirect: "manual"`, so the default refusal works on Cloudflare Workers,
+  whose `fetch` rejects `redirect: "error"`. The option takes `"error"` or
+  `"follow"`; `"manual"`, which surfaced the 3xx as a failed read exactly as
+  `"error"` does, is removed from the type. Under `"follow"` at most 10 hops
+  are followed, to `http:` or `https:` only and never from `https:` to
+  `http:`, each through the injected `fetch`, and a hop to another origin
+  carries none of the configured `headers`.
+- `httpStore`'s `url` may return a `URL` or a promise of one, so a presigner
+  can be awaited in place; a result that is neither a string nor a `URL` is a
+  `TypeError` and no longer a `404`. A `headers` record holding an invalid
+  name or value throws at construction.
+- A `Retry-After` relayed from a store is read only as delay-seconds or an
+  RFC 9110 HTTP-date and is capped at 86400 seconds; a value such as `1.5` or
+  `-5`, which was relayed as `0`, is dropped.
+- A `ctx.key` that is not a string answers `500` and reports operation
+  `"context"`, where it reached the store and answered `502`.
+
+- `generateETag` no longer throws for the 4.x field names `hash`, `size` and
+  `mtime`; it reads `etag`, `contentLength` and `lastModified` only, so a
+  caller still passing the old names gets a weak validator or none.
+- `writeStallTimeoutMs` on the Node adapter is clamped to the largest timer
+  delay, 2^31 - 1 ms. A larger value fired after about a millisecond in
+  5.0.0; it now waits the clamped delay.
+
 ## 4.x to 5.0
 
 Forty-five breaking changes. Which of them reach you depends on what you implement:
@@ -347,10 +634,12 @@ orchestrator.verifiedDigests.includes("sha-256")
 ```
 
 `digestOnComplete` is `readonly UploadDigestAlgorithm[] | false`, where the
-algorithms are `"sha-256"` and `"sha-512"`. The orchestrator hands a store only
+algorithm is `"sha-256"`, the only one verified. The orchestrator hands a store only
 the algorithms it lists, and a mismatch in any must throw
 `UploadDigestMismatchError`, which now carries the `algorithm`. The memory and
-filesystem stores verify `sha-512` as well. A `Repr-Digest` member whose value
+filesystem stores verify `sha-256`; a `sha-512` assertion is dropped, and
+`digestPolicy: "require-verifiable"` refuses a request that asserts nothing
+else. A `Repr-Digest` member whose value
 is not the length its algorithm produces is ignored.
 
 ### 23. `key()` runs after the policy, and uploads take `authorize`
@@ -670,20 +959,21 @@ branch on `ctx.operation`.
   the deadline the creating policy fixes; record it and report it unchanged as
   `StoredUploadState.expiresAt` (the harness check
   `state-reports-the-recorded-expiry`). A store that drops it leaves each request
-  to judge expiry by the max age it resolves, as before.
+  to judge expiry by the max age it resolves, as before. (Part of the write-store contract that 6.0 removes; section 1.)
 - **Unlocked state reads (store authors).** `admit()` and `resourceExists()`
   read state with `repair: false` (`UploadStateReadOptions`), from a caller that
   holds no lock. Honour it: a store that heals bookkeeping on read skips the
-  write and reports the state it derived.
+  write and reports the state it derived. (Part of the write-store contract that 6.0 removes; section 1.)
 - **Store fencing and body release (store authors).** `claimUpload()`, the
   `epoch` passed to `appendChunk`, `completeUpload` and `abortUpload`, and
   `AppendChunkOptions.releaseBody` are optional. Implement `claimUpload` to
   refuse a superseded writer with `UploadOffsetConflictError`, and call
-  `opts.releaseBody?.()` at every early exit so the unread body is cancelled.
+  `opts.releaseBody?.()` at every early exit so the unread body is cancelled. (Part of the write-store contract that 6.0 removes, section 1;
+  the engine fences its own writes.)
 - **`onAllocated` and `onResumptionSupported`.** `onResumptionSupported` fires
   when the resource is allocated, before the creation body is read, with the
   interim response's `headers`. On the orchestrator,
-  `CreateUploadRequest.onAllocated(uploadToken)` runs under the lock.
+  `CreateUploadRequest.onAllocated(uploadToken)` runs once the resource exists (6.0 has no lock).
 - **Error codes and guards.** Upload errors carry a stable `code`
   (`UPLOAD_NOT_FOUND` and its siblings), the matchers are type guards, and
   `UPLOAD_STORE_CONTRACT_VERSION` is exported.

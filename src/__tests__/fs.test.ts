@@ -1,4 +1,5 @@
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
+import { removeTree } from "./temp-cleanup.ts";
 import { appendFile, mkdtemp, rm, symlink, writeFile, mkdir, utimes } from "node:fs/promises";
 import { execFileSync } from "node:child_process";
 import { closeSync, openSync, renameSync, rmSync, writeFileSync } from "node:fs";
@@ -26,7 +27,7 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
-    await rm(root, { recursive: true, force: true });
+    await removeTree(root);
 });
 
 describe("fsStore: headObject", () => {
@@ -157,7 +158,7 @@ describe("fsStore: getObject", () => {
         const store = fsStore({ root });
         const ac = new AbortController();
         ac.abort();
-        await expect(store.getObject("hello.txt", { signal: ac.signal })).rejects.toThrow();
+        await expect(store.getObject("hello.txt", { signal: ac.signal })).rejects.toThrow("The operation was aborted");
     });
 
     test("small transfers return bytes with the handle already closed", async () => {
@@ -233,7 +234,9 @@ describe("fsStore: large transfers (ReadStream path, above the single-read limit
         const result = await store.getObject("big.bin");
         // Cancel without reading: autoClose must release the handle so the
         // afterAll rm() does not fail with EBUSY on Windows.
-        await asStream(result.body).cancel();
+        const stream = asStream(result.body);
+        await stream.cancel();
+        expect(stream.locked).toBe(false);
     });
 
     test("a file exactly at the single-read limit takes the byte-body fast path", async () => {
@@ -576,7 +579,7 @@ describe("fsStore: opt-in hot-object cache", () => {
             await new Promise((r) => setTimeout(r, 60));
             expect(await drain((await store.getObject("mut.txt")).body)).toBe("version-TWO!");
         } finally {
-            await rm(dir, { recursive: true, force: true });
+            await removeTree(dir);
         }
     });
 
@@ -596,7 +599,7 @@ describe("fsStore: opt-in hot-object cache", () => {
                 expect(await drain((await store.getObject(`f${i}.txt`)).body)).toBe(`body-${i}`);
             }
         } finally {
-            await rm(dir, { recursive: true, force: true });
+            await removeTree(dir);
         }
     });
 
@@ -620,7 +623,7 @@ describe("fsStore: opt-in hot-object cache", () => {
             await rm(join(dir, "f0.txt"));
             await expect(store.getObject("f0.txt")).rejects.toBeInstanceOf(ObjectNotFoundError);
         } finally {
-            await rm(dir, { recursive: true, force: true });
+            await removeTree(dir);
         }
     });
 
@@ -637,7 +640,7 @@ describe("fsStore: opt-in hot-object cache", () => {
             await rm(join(dir, "r.txt"));
             await expect(store.getObject("r.txt")).rejects.toBeInstanceOf(ObjectNotFoundError);
         } finally {
-            await rm(dir, { recursive: true, force: true });
+            await removeTree(dir);
         }
     });
 
@@ -657,7 +660,7 @@ describe("fsStore: opt-in hot-object cache", () => {
             await rm(join(dir, "r.txt"));
             await expect(store.getObject("r.txt")).rejects.toBeInstanceOf(ObjectNotFoundError);
         } finally {
-            await rm(dir, { recursive: true, force: true });
+            await removeTree(dir);
         }
     });
 
@@ -671,7 +674,7 @@ describe("fsStore: opt-in hot-object cache", () => {
             await rm(join(dir, "six.txt"));
             expect(await drain((await store.getObject("six.txt")).body)).toBe("sixby!");
         } finally {
-            await rm(dir, { recursive: true, force: true });
+            await removeTree(dir);
         }
     });
 
@@ -689,7 +692,7 @@ describe("fsStore: opt-in hot-object cache", () => {
             expect(await drain((await store.getObject("a.txt")).body)).toBe("aaaaaa");
             expect(await drain((await store.getObject("b.txt")).body)).toBe("bbbbbb");
         } finally {
-            await rm(dir, { recursive: true, force: true });
+            await removeTree(dir);
         }
     });
 
@@ -709,7 +712,7 @@ describe("fsStore: opt-in hot-object cache", () => {
             expect((await store.getObject("x.bin")).contentLength).toBe(100 * 1024);
             expect((await store.getObject("y.bin")).contentLength).toBe(100 * 1024);
         } finally {
-            await rm(dir, { recursive: true, force: true });
+            await removeTree(dir);
         }
     });
 
@@ -733,7 +736,7 @@ describe("fsStore: opt-in hot-object cache", () => {
             await rm(join(dir, "f0.txt"));
             await expect(store.getObject("f0.txt")).rejects.toBeInstanceOf(ObjectNotFoundError);
         } finally {
-            await rm(dir, { recursive: true, force: true });
+            await removeTree(dir);
         }
     });
 
@@ -764,7 +767,7 @@ describe("fsStore: opt-in hot-object cache", () => {
             await rm(join(dir, "b1.txt"));
             expect(await drain((await store.getObject("b1.txt")).body)).toBe("body-1");
         } finally {
-            await rm(dir, { recursive: true, force: true });
+            await removeTree(dir);
         }
     });
 
@@ -787,7 +790,7 @@ describe("fsStore: opt-in hot-object cache", () => {
             await rm(join(dir, "big.txt"));
             await expect(store.getObject("big.txt")).rejects.toBeInstanceOf(ObjectNotFoundError);
         } finally {
-            await rm(dir, { recursive: true, force: true });
+            await removeTree(dir);
         }
     });
 
@@ -804,7 +807,7 @@ describe("fsStore: opt-in hot-object cache", () => {
             // ...but no bytes were retained: a GET must hit disk and miss.
             await expect(store.getObject("doc.txt")).rejects.toBeInstanceOf(ObjectNotFoundError);
         } finally {
-            await rm(dir, { recursive: true, force: true });
+            await removeTree(dir);
         }
     });
 
@@ -841,7 +844,7 @@ describe("fsStore: opt-in hot-object cache", () => {
                 RangeError,
             );
         } finally {
-            await rm(dir, { recursive: true, force: true });
+            await removeTree(dir);
         }
     });
 
@@ -865,7 +868,7 @@ describe("fsStore: opt-in hot-object cache", () => {
             expect(fromMemory.body).toBeInstanceOf(Uint8Array);
             expect(await drain(fromMemory.body)).toBe("bbbb");
         } finally {
-            await rm(dir, { recursive: true, force: true });
+            await removeTree(dir);
         }
     });
 
@@ -886,7 +889,7 @@ describe("fsStore: opt-in hot-object cache", () => {
             expect(served.body).toBeInstanceOf(Uint8Array);
             expect(await drain(served.body)).toBe("0123456789");
         } finally {
-            await rm(dir, { recursive: true, force: true });
+            await removeTree(dir);
         }
     });
 
@@ -907,7 +910,7 @@ describe("fsStore: opt-in hot-object cache", () => {
             expect(after.contentLength).toBe(15);
             expect(after.etag).not.toBe(before.etag);
         } finally {
-            await rm(dir, { recursive: true, force: true });
+            await removeTree(dir);
         }
     });
 });
@@ -999,7 +1002,7 @@ describe("fsStore: symlinks", () => {
     });
 
     afterAll(async () => {
-        await rm(base, { recursive: true, force: true });
+        await removeTree(base);
     });
 
     test("a directory link out of the root is refused by default", async () => {
@@ -1074,7 +1077,7 @@ describe("fsStore: non-regular files", () => {
                 await expect(store.headObject("pipe")).rejects.toBeInstanceOf(ObjectNotFoundError);
             }
         } finally {
-            await rm(dir, { recursive: true, force: true });
+            await removeTree(dir);
         }
     });
 });

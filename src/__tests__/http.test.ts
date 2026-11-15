@@ -76,13 +76,17 @@ describe("httpStore: reserved upload bookkeeping", () => {
     });
 
     test("an ordinary key that merely carries an encoding is still fetched", async () => {
-        // The guard decides on what the origin would resolve to, not on whether
-        // a key is spelled plainly: a key with a percent-encoded space, or one
-        // whose dot segments resolve inside the published namespace, is ordinary.
         const { store, urls } = counting();
         await store.headObject("docs/a%20b.pdf");
-        await store.headObject("docs/2026/../a.pdf");
-        expect(urls).toEqual(["https://origin.example/docs/a%20b.pdf", "https://origin.example/docs/2026/../a.pdf"]);
+        expect(urls).toEqual(["https://origin.example/docs/a%20b.pdf"]);
+    });
+
+    test("a key with a dot segment is refused before any request, wherever it resolves", async () => {
+        // The origin, not this store, decides what a dot segment resolves to, so no key that has one is sent.
+        const { store, urls } = counting();
+        await expect(store.headObject("docs/2026/../a.pdf")).rejects.toBeInstanceOf(ObjectNotFoundError);
+        await expect(store.headObject("docs/../.uploads/v6/rec/x")).rejects.toBeInstanceOf(ObjectNotFoundError);
+        expect(urls).toEqual([]);
     });
 
     test("a published key is fetched", async () => {
@@ -884,35 +888,345 @@ describe("httpStore: degenerate origin responses", () => {
         expect(result.contentLength).toBe(0);
         expect(result.totalSize).toBe(0);
     });
+});
 
-    test("redirect policy reaches fetch on both HEAD and GET", async () => {
-        const seen: string[] = [];
+describe("httpStore: redirects are handled by the store, never by the runtime", () => {
+    const ok = (): Response => new Response("x", { headers: { "Content-Length": "1" } });
+    const to = (location: string | null, status = 302): Response =>
+        new Response(null, { status, headers: location === null ? {} : { Location: location } });
+
+    for (const redirect of [undefined, "error", "follow"] as const) {
+        test(`every request goes out with redirect "manual" (policy ${redirect})`, async () => {
+            // One runtime refuses "error" outright, so the store never sends it.
+            const seen: string[] = [];
+            const store = httpStore({
+                url: (key) => `https://origin.example/${key}`,
+                redirect,
+                fetch: stubFetch((_url, init) => {
+                    seen.push(String(init.redirect));
+                    return ok();
+                }),
+            });
+            await store.headObject("doc.pdf");
+            await store.getObject("doc.pdf");
+            expect(seen).toEqual(["manual", "manual"]);
+        });
+    }
+
+    test("by default a 3xx fails the read and its target is never requested", async () => {
+        const fetched: string[] = [];
         const store = httpStore({
             url: (key) => `https://origin.example/${key}`,
-            redirect: "error",
-            fetch: stubFetch((_url, init) => {
-                seen.push(String(init.redirect));
-                return new Response("x", { headers: { "Content-Length": "1" } });
+            fetch: stubFetch((url) => {
+                fetched.push(url);
+                return to("http://169.254.169.254/latest/meta-data/");
             }),
         });
-        await store.headObject("doc.pdf");
-        await store.getObject("doc.pdf");
-
-        expect(seen).toEqual(["error", "error"]);
+        await expect(store.headObject("doc.pdf")).rejects.toThrow("httpStore HEAD failed: 302");
+        await expect(store.getObject("doc.pdf")).rejects.toThrow("httpStore GET failed: 302");
+        expect(fetched).toEqual(["https://origin.example/doc.pdf", "https://origin.example/doc.pdf"]);
     });
 
-    test("redirect defaults to 'error' (no SSRF-by-default via a hostile 3xx)", async () => {
-        const seen: string[] = [];
+    test("follow: each hop goes through the injected fetch, resolved against the URL that answered", async () => {
+        const fetched: string[] = [];
         const store = httpStore({
-            url: (key) => `https://origin.example/${key}`,
-            fetch: stubFetch((_url, init) => {
-                seen.push(String(init.redirect));
-                return new Response("x", { headers: { "Content-Length": "1" } });
+            url: (key) => `https://origin.example/a/${key}`,
+            redirect: "follow",
+            fetch: stubFetch((url) => {
+                fetched.push(url);
+                if (url.endsWith("/a/doc.pdf")) return to("../b/doc.pdf", 307);
+                if (url.endsWith("/b/doc.pdf")) return to("https://cdn.example/doc.pdf", 301);
+                return ok();
             }),
         });
-        await store.headObject("doc.pdf");
-        await store.getObject("doc.pdf");
+        expect((await store.getObject("doc.pdf")).contentLength).toBe(1);
+        expect(fetched).toEqual([
+            "https://origin.example/a/doc.pdf",
+            "https://origin.example/b/doc.pdf",
+            "https://cdn.example/doc.pdf",
+        ]);
+    });
 
-        expect(seen).toEqual(["error", "error"]);
+    test("follow: a hop to another origin carries no caller header, a same-origin hop keeps them", async () => {
+        const seen: Record<string, string>[] = [];
+        const store = httpStore({
+            url: (key) => `https://origin.example/${key}`,
+            headers: { Authorization: "Bearer t", "X-Api-Key": "k", Cookie: "s=1" },
+            redirect: "follow",
+            fetch: stubFetch((url, init) => {
+                seen.push(headersOf(init));
+                if (url === "https://origin.example/doc.pdf") return to("/moved.pdf");
+                if (url === "https://origin.example/moved.pdf") return to("https://cdn.example/doc.pdf");
+                if (url === "https://cdn.example/doc.pdf") return to("https://origin.example/back.pdf");
+                return new Response("x", { status: 206, headers: { "Content-Range": "bytes 0-0/1" } });
+            }),
+        });
+        await store.getObject("doc.pdf", { range: { start: 0, end: 0 }, ifMatch: '"v1"' });
+
+        expect(seen[1]).toMatchObject({ authorization: "Bearer t", "x-api-key": "k", cookie: "s=1" });
+        const own = { "accept-encoding": "identity", range: "bytes=0-0", "if-match": '"v1"' };
+        // Dropped at the first foreign origin, and not restored on the way back.
+        expect(seen[2]).toEqual(own);
+        expect(seen[3]).toEqual(own);
+    });
+
+    const refusedHops: Record<string, string | null> = {
+        "a scheme that is not http or https": "file:///etc/passwd",
+        "another unknown scheme": "gopher://internal.example/x",
+        "a downgrade from https to http": "http://origin.example/doc.pdf",
+        "no Location": null,
+        "a Location that is not a URL": "http://[bad",
+    };
+    for (const [what, location] of Object.entries(refusedHops)) {
+        test(`follow: a redirect to ${what} is refused without another request`, async () => {
+            let requests = 0;
+            const store = httpStore({
+                url: (key) => `https://origin.example/${key}`,
+                redirect: "follow",
+                fetch: stubFetch(() => {
+                    requests++;
+                    return to(location);
+                }),
+            });
+            await expect(store.getObject("doc.pdf")).rejects.toThrow(
+                "httpStore GET: the origin's redirect was refused",
+            );
+            expect(requests).toBe(1);
+        });
+    }
+
+    test("follow: a redirect loop stops after 10 hops", async () => {
+        let requests = 0;
+        const store = httpStore({
+            url: (key) => `https://origin.example/${key}`,
+            redirect: "follow",
+            fetch: stubFetch(() => {
+                requests++;
+                return to("/again");
+            }),
+        });
+        await expect(store.headObject("doc.pdf")).rejects.toThrow("httpStore HEAD: the origin's redirect was refused");
+        expect(requests).toBe(11);
+    });
+
+    test("follow: a redirect body is released before the next hop", async () => {
+        let cancelled = 0;
+        const store = httpStore({
+            url: (key) => `https://origin.example/${key}`,
+            redirect: "follow",
+            fetch: stubFetch((url) => {
+                if (url.endsWith("/next")) return ok();
+                const body = new ReadableStream<Uint8Array>({
+                    cancel() {
+                        cancelled++;
+                    },
+                });
+                return new Response(body, { status: 302, headers: { Location: "/next" } });
+            }),
+        });
+        await store.getObject("doc.pdf");
+        expect(cancelled).toBe(1);
+    });
+});
+
+describe("httpStore: key spellings the guard reads", () => {
+    const ok = stubFetch(() => new Response(null, { status: 200, headers: { "content-length": "3", etag: '"e"' } }));
+
+    test("a key that is not valid percent-encoding is read as written", async () => {
+        const meta = await httpStore({ url: (k) => `https://o.example/${k}`, fetch: ok }).headObject("docs/a%zz.pdf");
+        expect(meta.contentLength).toBe(3);
+    });
+
+    test("a verbatim store reads a key no URL parser resolves", async () => {
+        const store = httpStore({ url: () => "https://o.example/x", fetch: ok, keys: "verbatim" });
+        expect((await store.headObject("a/[x")).contentLength).toBe(3);
+    });
+
+    test("a url() that builds a non-http(s) URL is refused before any fetch", async () => {
+        let fetched = 0;
+        const counted = (async () => {
+            fetched++;
+            return new Response("abc");
+        }) as unknown as typeof fetch;
+        for (const built of ["localhost:8080/x", "s3://bucket/x", "file:///etc/passwd", "relative/x"]) {
+            const store = httpStore({ url: () => built, fetch: counted });
+            await expect(store.headObject("docs/q1.pdf")).rejects.toBeInstanceOf(ObjectNotFoundError);
+            await expect(store.getObject("docs/q1.pdf")).rejects.toBeInstanceOf(ObjectNotFoundError);
+        }
+        expect(fetched).toBe(0);
+    });
+
+    test("a key that starts with a special scheme is refused under either policy", async () => {
+        // `new URL(key, base)` would take its host from the key.
+        for (const keys of ["plain", "verbatim"] as const) {
+            const store = httpStore({ url: () => "https://o.example/x", fetch: ok, keys });
+            await expect(store.headObject("http://[x")).rejects.toBeInstanceOf(ObjectNotFoundError);
+            await expect(store.headObject("http:/evil.example/x")).rejects.toBeInstanceOf(ObjectNotFoundError);
+        }
+    });
+
+    test("a verbatim store reads a key with an empty segment, which a plain one refuses", async () => {
+        const url = (): string => "https://o.example/x";
+        expect((await httpStore({ url, fetch: ok, keys: "verbatim" }).headObject("a//b")).contentLength).toBe(3);
+        await expect(httpStore({ url, fetch: ok }).headObject("a//b")).rejects.toBeInstanceOf(ObjectNotFoundError);
+    });
+});
+
+describe("httpStore: dot segments and the verbatim key policy", () => {
+    function counting(keys?: "plain" | "verbatim") {
+        const urls: string[] = [];
+        const store = httpStore({
+            url: (key) => `https://origin.example/${key}`,
+            keys,
+            fetch: stubFetch((url) => {
+                urls.push(url);
+                return new Response(null, { headers: { "Content-Length": "1" } });
+            }),
+        });
+        return { store, urls };
+    }
+
+    const DOT_SEGMENT_KEYS = [
+        "../private/secret.pdf",
+        "a/../.uploads/x",
+        "a/./b",
+        "%2e%2e/x",
+        "a/%2E%2e/b",
+        "a\\..\\b",
+        "．．/x",
+        "a/.%2e/b",
+        "a/.. /b",
+        // The URL parser deletes ASCII tab and newline before it splits the path.
+        ".\t./private/secret.pdf",
+        ".\r./x",
+        ".\n./x",
+        "%2e\t%2e/x",
+    ];
+
+    for (const keys of ["plain", "verbatim"] as const) {
+        test(`${keys}: a key with a dot segment in any spelling is refused before any request`, async () => {
+            const { store, urls } = counting(keys);
+            for (const key of DOT_SEGMENT_KEYS) {
+                await expect(store.headObject(key)).rejects.toBeInstanceOf(ObjectNotFoundError);
+                await expect(store.getObject(key)).rejects.toBeInstanceOf(ObjectNotFoundError);
+            }
+            expect(urls).toEqual([]);
+        });
+    }
+
+    test("plain: a segment of only tab, newline or carriage return is an empty segment", async () => {
+        const { store, urls } = counting("plain");
+        await expect(store.headObject("a/\t/b")).rejects.toBeInstanceOf(ObjectNotFoundError);
+        await expect(store.getObject("a/\r\n/b")).rejects.toBeInstanceOf(ObjectNotFoundError);
+        expect(urls).toEqual([]);
+    });
+
+    test("verbatim: the empty segment is the only thing the policy lets through", async () => {
+        const { store, urls } = counting("verbatim");
+        await store.headObject("reports//q1.pdf");
+        expect(urls).toEqual(["https://origin.example/reports//q1.pdf"]);
+    });
+
+    test("verbatim: a reserved prefix is also tested against the slash-collapsed key", async () => {
+        const { store, urls } = counting("verbatim");
+        for (const key of [".uploads//x", "/.uploads/x", "//.partial-content-uploads//x"]) {
+            await expect(store.headObject(key)).rejects.toBeInstanceOf(ObjectNotFoundError);
+        }
+        expect(urls).toEqual([]);
+    });
+
+    test("a key shaped like a scheme is a path, and reaches the origin", async () => {
+        const { store, urls } = counting();
+        await store.headObject("ab:c");
+        await store.headObject("tenant:42/a.pdf");
+        expect(urls).toEqual(["https://origin.example/ab:c", "https://origin.example/tenant:42/a.pdf"]);
+    });
+
+    test("trailing dots and spaces of a segment do not hide the reserved prefix", async () => {
+        const { store, urls } = counting();
+        for (const key of [".uploads./x", ".uploads /x", ".uploads. ./x", ".partial-content-uploads../x.info"]) {
+            await expect(store.headObject(key)).rejects.toBeInstanceOf(ObjectNotFoundError);
+        }
+        expect(urls).toEqual([]);
+        // A key that merely ends in a dot elsewhere is an ordinary key.
+        await store.headObject("docs/v1.");
+        expect(urls).toEqual(["https://origin.example/docs/v1."]);
+    });
+});
+
+describe("httpStore: bodies it does not serve", () => {
+    /**
+     * A 404 whose body is one chunk and then, only when read again, its end:
+     * with no high-water mark nothing ends the body unless the drain asks.
+     */
+    function notFoundWith(chunk: Uint8Array): { fetch: typeof globalThis.fetch; cancelled: () => boolean } {
+        let cancelled = false;
+        const fetch = stubFetch(
+            () =>
+                new Response(
+                    new ReadableStream<Uint8Array>(
+                        {
+                            start(controller) {
+                                controller.enqueue(chunk);
+                            },
+                            pull(controller) {
+                                controller.close();
+                            },
+                            cancel() {
+                                cancelled = true;
+                            },
+                        },
+                        { highWaterMark: 0 },
+                    ),
+                    { status: 404 },
+                ),
+        );
+        return { fetch, cancelled: () => cancelled };
+    }
+
+    test("an error body up to the drain bound is read to its end, so the connection is reused", async () => {
+        const origin = notFoundWith(new Uint8Array(64 * 1024));
+        await expect(
+            httpStore({ url: () => "https://o.example/x", fetch: origin.fetch }).getObject("k"),
+        ).rejects.toBeInstanceOf(ObjectNotFoundError);
+        expect(origin.cancelled()).toBe(false);
+    });
+
+    test("an error body past the drain bound is cancelled", async () => {
+        const origin = notFoundWith(new Uint8Array(64 * 1024 + 1));
+        await expect(
+            httpStore({ url: () => "https://o.example/x", fetch: origin.fetch }).getObject("k"),
+        ).rejects.toBeInstanceOf(ObjectNotFoundError);
+        expect(origin.cancelled()).toBe(true);
+    });
+});
+
+describe("httpStore: served body backpressure", () => {
+    test("an unread body reads at most one chunk ahead of the consumer", async () => {
+        let pulls = 0;
+        // A response shape over the raw stream: a runtime Response may read its
+        // body source ahead, which would hide the store's own read-ahead.
+        const fetch = stubFetch(
+            () =>
+                ({
+                    status: 200,
+                    ok: true,
+                    headers: new Headers({ "content-length": "30", etag: '"e"' }),
+                    body: new ReadableStream<Uint8Array>(
+                        {
+                            pull(controller) {
+                                pulls++;
+                                controller.enqueue(new Uint8Array(3));
+                                if (pulls === 10) controller.close();
+                            },
+                        },
+                        { highWaterMark: 0 },
+                    ),
+                }) as unknown as Response,
+        );
+        const obj = await httpStore({ url: () => "https://o.example/x", fetch }).getObject("k");
+        for (let i = 0; i < 5; i++) await new Promise((resolve) => setImmediate(resolve));
+        expect(pulls).toBeLessThanOrEqual(1);
+        expect((await new Response(asStream(obj.body)).arrayBuffer()).byteLength).toBe(30);
     });
 });

@@ -14,13 +14,13 @@ Implementation details, RFC deviations, and architecture decisions for `partial-
 - Write-side preconditions (If-Match / If-None-Match / If-Unmodified-Since)
 - ETag derivation from storage metadata
 - Security-hardened `Content-Disposition`
-- Resumable-upload protocol evaluation: one wire-agnostic engine under two
-  dialects, tus 1.0 and the IETF resumable-uploads draft (see
-  [Resumable Uploads](#resumable-uploads))
 
 **Non-goals** (deliberately the caller's responsibility)
 
 - **I/O.** No reads, writes, streaming, or network calls. You bring the bytes.
+- **Uploads.** The package serves stored objects and does not accept them: a
+  client writes to storage directly (a presigned or signed URL) or through a
+  route of your own, and the result is served from here.
 - **Authentication / authorization.** The library assumes the request was already deemed allowed. Gate access *before* calling it.
 - **Caching policy.** It never emits `Cache-Control` on its own -- it only echoes a value you pass in `meta.cacheControl` (orchestrator) or `opts.cacheControl` (standalone builder). `Vary`, `Expires`, and `Date` are left to your runtime (see the [Response Header Matrix](#response-header-matrix)). The one exception is `Vary: Accept-Encoding` when the `precompressed` option makes the response encoding-negotiated (see [Precompressed Variants](#precompressed-variants-and-content-encoding)).
 - **Serve-time compression.** Encoding negotiation (`precompressed`) only ever
@@ -381,10 +381,10 @@ bounds/total are parsed from the backend's actual `Content-Range` -- plus
 fs and memory, whose served bounds, validators, and bytes come from one
 open handle or one slice and are coherent by construction), the
 orchestrator issues a single GET. `bytes=a-b` and `bytes=a-` qualify (an
-open end travels through the adapters as the `OPEN_ENDED` sentinel and is
+open end travels through the adapters as an absent `ReadRange.end` and is
 emitted in each backend's idiomatic open form -- `bytes=a-` on the wire, an
-offset-only read for R2, offset-without-count for Azure -- never as a
-literal 16-digit last-byte-pos); suffix, multi-range, and malformed specs
+offset-only read for R2, offset-without-count for Azure -- so no store can
+compute a length from it by accident); suffix, multi-range, and malformed specs
 fall back to the validating HEAD path. Validators, bounds, and digest all come from
 the GET response itself, so the fast path is inherently TOCTOU-atomic. If
 the backend rejects the range natively (start beyond EOF) the request
@@ -408,13 +408,12 @@ two calls. The web adapter closes it in layers:
    streams directly from that immutable generation without re-fetching
    metadata -- the HEAD->GET pair costs exactly one metadata round trip.
    Foreign or stale pins are ignored and the adapter revalidates from
-   scratch. One narrow divergence: if a GCS pinned generation is *hard*
-   deleted mid-flight (an overwrite with both Object Versioning and
-   soft-delete off), `createReadStream` errors after the response headers
-   commit, so the client sees a torn transfer rather than an
-   `ObjectChangedError` + revalidation. Modern buckets default to
-   soft-delete, which keeps the pinned generation readable and masks this;
-   the outcome is a failed transfer the client retries, never spliced bytes.
+   scratch. If a GCS pinned generation is *hard* deleted mid-flight (an
+   overwrite with both Object Versioning and soft-delete off), the store
+   waits for the first chunk before the response is committed and maps the
+   missing generation to `ObjectChangedError`, so the adapter revalidates.
+   A deletion after the first chunk has been read ends the transfer short,
+   which the client sees as a failed transfer it retries, never spliced bytes.
 2. **One re-validation.** On `ObjectChangedError` the adapter re-runs
    HEAD + evaluation once against the new state, so the client gets a
    coherent answer (a stale `If-Range` now correctly yields a full 200 of
@@ -587,384 +586,45 @@ protocol honest:
   `Content-Range` describes the encoded bytes. A resumed `.br` download is
   byte-correct where naive precompressed servers (which reuse the identity
   file's size or ETag) corrupt caches.
+- **An object stored already encoded is a representation too.** When the
+  backend keeps a content coding with the object (`aws s3 cp
+  --content-encoding gzip`, GCS `gsutil cp -Z`, Azure and R2 HTTP metadata),
+  the store reports it and the response carries `Content-Encoding` over the
+  stored bytes, with the stored length, ETag and digest. Ranges address the
+  encoded bytes (RFC 9110 Section 14.2). The client receives that coding
+  whatever its `Accept-Encoding` said (Section 12.5.3 permits it), so store
+  content that must reach non-decoding clients unencoded. A multi-range
+  request serves the whole encoded body, for the framing reason below. A
+  store whose client library decodes in flight must turn that off or refuse the
+  object: `gcsStore` reads with `decompress: false`, and `httpStore` refuses
+  an origin response that carries a coding because `fetch` has already decoded
+  it.
+- **`encodeBody: "manual"` on Workers.** `serveObject` marks any response that
+  carries `Content-Encoding` so Cloudflare Workers does not compress the
+  already-encoded bytes a second time; other runtimes ignore the member. A
+  consumer building its own `Response` from `serveObjectRaw` parts passes it
+  itself.
 - **`Vary: Accept-Encoding` on every success response for the type** --
   variant hits, identity fallbacks, 304s, and HEAD -- so shared caches key
   compressible objects on the request coding. A caller-supplied `Vary`
   (via `securityHeaders`) is extended, never clobbered.
+- **The identity object authorizes its variants.** A variant is a sibling key
+  the deployer controls, never one a user can name; the authorization checked
+  for the key covers it. It is served only while the identity object exists
+  and is not newer than the variant, which is why every negotiated request
+  also sends the identity's `HEAD`, in the same round as the variant probes
+  (no extra round trip). A coding the store confirmed is remembered for 30
+  seconds, so a repeat request probes down to it and no further, and a
+  variant that vanished is answered from the identity object.
 - **Multi-range requests serve identity.** `multipart/byteranges` over an
   encoded representation has no interoperable framing story, so comma
   ranges skip negotiation entirely rather than emit something undefined.
 - **`no-transform` guidance.** If a proxy or CDN re-compresses a response,
   every byte-exact promise (ranges, `Repr-Digest`, strong validators) breaks
-  silently. `buildCacheControl()` therefore defaults `no-transform` on; if
-  you hand-write `cacheControl` strings for digest- or range-heavy routes,
-  add it yourself.
-
-## Resumable Uploads
-
-The write side follows the same doctrine as the read side: a pure decision
-core that never touches bytes, wire dialects that only translate headers, and
-storage adapters that are honest about what their backend can actually
-promise.
-
-### One engine, two dialects
-
-There are two live resumable-upload wire protocols worth speaking: tus 1.0
-(the widely deployed de-facto standard) and the IETF draft
-(`draft-ietf-httpbis-resumable-upload`, its standards-track successor). Their
-wire syntax differs; their semantics are the same protocol: create a
-resource, probe its offset, append at the offset, complete, cancel. So the
-package implements the semantics ONCE, as a pure state machine that evaluates
-every interaction (create, probe, append, cancel) against caller-supplied
-state and policy and returns a typed verdict, and each dialect is a thin
-translation layer: parse this protocol's headers into an intent, map the
-verdict back to this protocol's statuses and header names. The dialects
-contain no protocol decisions at all, which is what keeps two wires from
-drifting into two subtly different upload semantics.
-
-Between the engine and storage sits an orchestrator that owns sequencing:
-every interaction runs under the resource's lock, state is fetched fresh from
-the store inside the lock immediately before evaluation (nothing from an
-earlier request is ever reused), and the orchestrator executes exactly the
-verdict's action and nothing else.
-
-### The interop-version allowlist {3, 5, 6, 9, 10}
-
-The IETF handler speaks the draft revisions clients implement, identified by
-their interop versions: 3 (draft-01), 5 (draft-03), 6 (draft-04/-05), 9
-(draft-12), and 10 (draft-13 and -14). The draft itself forbids cross-version interop, so versions are a
-compiled allowlist and an unlisted version is answered 400 with the supported
-set named.
-
-Several versions are served from one endpoint because the draft's negotiation
-is deliberately all-or-nothing: a request declares its version and is answered
-entirely in that version's terms, and a server that does not recognize the
-declared one is told not to announce support at all. Keeping the older rows is
-therefore what lets a client upgrade on its own schedule rather than on ours.
-The wire differences are encoded in one explicit mapping table, one row per
-version and every difference a named field, so no behavior is reachable by
-guessing at a version number. The most important is the completeness header
-flip: interop 3 sends `Upload-Incomplete` (`?1` asserts NOT complete), interop
-5, 6, 9 and 10 send `Upload-Complete` (`?1` asserts complete). Both names ride
-requests and responses, so the polarity is a per-version fact, never a renamed
-boolean.
-
-Interop 10 adds one behavior of its own. A 2xx answer to a creation or append
-of an incomplete upload acknowledges that the whole request content was
-received (draft-13), so a creation or append the server interrupted after some
-bytes became durable (the client went away, a newer request preempted it, the
-store yielded) is answered 409 with the durable offset to resume from, where
-the older versions answer 201 or 204 with that offset. An interrupted creation
-keeps its `Location`, since nothing else reaches the durable prefix.
-
-Interop 9 and 10 turn on three behaviors the older rows leave off. `Upload-Limit`
-(an RFC 8941 dictionary of `max-size`, `min-size`, `max-append-size`,
-`min-append-size`, `max-age`) rides a creation that leaves the upload
-incomplete and a successful offset retrieval, both required (draft-13 Sections
-4.2.2 and 4.3.2), and any rejection a limit caused, which is the difference
-between a client that retries at a stated number and one that halves its chunk
-size until something sticks; `min-size` is always emitted, defaulting to 0,
-because an empty structured-field value is not a valid dictionary and a server
-enforcing no limits still has to say so rather than send nothing.
-
-`max-age` is the remaining lifetime of the resource the answer concerns,
-counted from the response (Section 4.1.4), so every answer about a resource
-derives it from one deadline, the creation instant plus `maxAgeSeconds`, and
-floors the seconds left: rounding up would promise time the resource does not
-have, and a client that schedules a resume on that promise finds a 404. A limit
-rejection about an existing resource states that same remaining lifetime
-rather than the configured one, because the section asks that the end time a
-client derives "SHOULD NOT decrease" between responses, and restating the
-configured lifetime would push it forward for the next probe to pull back.
-Only where no resource exists (OPTIONS, a creation refused before allocating)
-is the configured lifetime the answer. `GET` becomes an offset
-probe beside `HEAD`, and the `Allow` on a 405 names it only where the version
-admits it, so the refusal never advertises a method that version does not
-define. And a content-free append to an already-complete upload becomes
-replayable.
-
-That last one is the one place two supported versions answer the same request
-differently, and it is a conformance obligation rather than a preference.
-draft-05 Section 4.4.2 has the server "MUST NOT modify the upload resource and
-MUST respond with a 400 (Bad Request) status code", which a client written
-against interop 3, 5 or 6 uses to learn that its upload finished; replaying a
-success there would deny it that signal. draft-12 Section 4.4.2 revises the
-rule for the case the older one was getting wrong, a completion whose response
-the client never received, and says the server "can choose to replay the final
-response to the client if the request to append to the completed upload is
-valid". The behaviors are incompatible, so the version decides and the table
-carries it as a field. A client that wants the retry to succeed asks for
-interop 9 or 10.
-
-Validity is the load-bearing word, and it is version-independent: only a
-request carrying no content can be a replay of the completion. The same
-section has the server "MUST prevent the offset from exceeding the
-representation's length", and a completed upload sits AT its length, so
-content appended there has nowhere to land. Such a request is refused as a
-length inconsistency (400, the registered `inconsistent-upload-length` problem
-type where the version defines it) on every version, rather than acknowledged
-with a status that would report success for bytes no store received. A
-declared `Content-Length` decides whether content is present; an append that
-declares no size falls back to whether a body arrived at all.
-
-`Repr-Digest` verification (RFC 9530) is the mirror-image decision, and goes
-the other way. It is offered on every version this endpoint serves, interop 9
-and 10 included, whose draft revisions carry no upload-digest text of their own.
-RFC 9530 defines the field independently of any upload protocol; honoring an
-assertion the client volunteered cannot break a client that sends none, since
-absent means unverified exactly as before. Withdrawing it from the newest
-version would remove an integrity guarantee from the consumers most likely to
-want one, in exchange for nothing a client can observe.
-
-### Offsets are backend-derived, never stored counters
-
-The write contract's one load-bearing rule: `getUploadState().offset` must be
-computed from storage bookkeeping the backend itself maintains -- a part
-listing, an uncommitted-block list, an fsynced file size -- never from a
-counter the adapter persisted alongside the data. A stored counter and the
-bytes it describes cannot be written atomically: crash between them and one
-is a lie. If the counter runs ahead, the client resumes past bytes that never
-landed and the object is silently corrupt; that drift is exactly the
-corruption class resumable uploads exist to prevent. Deriving the offset from
-the durable artifacts themselves makes the crash case boring: whatever
-survived IS the offset. The engine treats adapter-reported state as
-authoritative truth, and a malformed state (offset past a known length
-without invalidation) throws loudly as an adapter bug rather than laundering
-corruption into protocol answers. The one backend with no listing to derive
-from, R2, keeps a ledger written after each part lands, so it never runs ahead
-of the bytes, and it declares `exactOffsetRecovery: false` because the ledger
-is the adapter's own record rather than backend truth.
-
-### Three bounds on one append, two consequences
-
-Three constraints can bind a single append, and collapsing them into one
-number is the mistake this design exists to avoid. Room toward a known length
-and room under the policy's `maxSize` bound the REPRESENTATION: they describe
-the object being assembled. `maxAppendSize` bounds THIS REQUEST only, whether
-it comes from server policy or from a backend's own per-call ceiling. The
-engine derives all three in one place, hands the store the tightest of them
-as `maxBytes`, and states which kind it is through `maxBytesFatal`, because
-only the store sees the stream and nothing upstream can enforce a bound on
-bytes it never reads.
-
-Crossing a representation bound is terminal. The surplus bytes have nowhere
-to go and the upload can never be completed coherently, so the store
-invalidates the resource durably and throws `UploadOverrunError`, after which
-every probe and every append refuses. Returning normally instead would answer
-a destroyed upload with a success and an offset the client cannot build on.
-
-Crossing the per-request ceiling is not terminal, and treating it as though
-it were is how a resumable situation becomes a lost one. A body that runs
-past `maxAppendSize` has done nothing to the representation, so the store
-stops at the bound, keeps the accepted prefix durable, and throws
-`UploadAppendBoundError` carrying the truthful offset. Both dialects answer
-413 and the client resumes from that offset in smaller chunks, so an upload
-survives a chunk that was merely too big. That is the whole reason the two
-bounds carry different consequences rather than one.
-
-Ties go to the representation bound: at equal values, crossing the per-append
-cap crosses the total as well, and the terminal reading is the correct one.
-
-Which representation bound binds decides the ANSWER, not the consequence.
-Both invalidate, but they are different faults and the protocols answer them
-differently. A body past the length the client itself declared is a length
-inconsistency, answered 400 on both dialects. A body past the server's
-`maxSize` is a size violation, answered 413 (RFC 9110's Content Too Large),
-carrying `Tus-Max-Size` on the tus dialect, which has a vocabulary for the
-limit. A tie means the client declared exactly the maximum, so its own
-declaration is the one it broke. The engine carries the distinction as
-`fatalReason` and the orchestrator maps it, so neither dialect decides it and
-the two wires cannot answer the same fault differently.
-
-The streaming bound only ever fires on a body whose size was not knowable in
-advance. A known content size is checked against all three constraints before
-a byte is written, and an oversized append is refused up front with the
-resource untouched, invalidation being reserved for bytes that actually
-landed past a bound. The fatal path therefore exists for the one case that
-cannot be checked ahead of time: an unknown-length (chunked) body, whose size
-the server learns only by counting it.
-
-### Cooperative-preemption locking
-
-The race that shapes the lock design: a client's connection drops mid-append,
-and the client resumes (probe, then append) BEFORE the server has noticed the
-dead socket. A plain acquire-or-wait mutex would stall every resume behind
-the zombie holder's timeout. Cooperative preemption inverts it: `acquire`
-hands the holder a `lock.signal` (an `AbortSignal`), a later acquirer aborts
-it, and the holder, which threads that signal into its store write, yields at
-the next chunk boundary (flushing what it has, so the offset stays truthful).
-The lock hands over in milliseconds. Modelling the yield as a signal rather
-than a callback is deliberate: the holder cannot silently ignore a
-cancellation it has to pass into every write, and because an `AbortSignal`
-carries latched state (not just a one-shot event), a preempt that lands during
-hand-over, before the holder starts its next write, is honored the instant the
-write begins rather than lost. Probes take the lock too: deriving an offset
-can be a multi-call read against the backend, and answering from a torn
-snapshot while an append is mid-flight would hand the client an offset its
-very next request fails on. A holder that cannot be interrupted surfaces as a
-retryable 423 after the acquire timeout, never an indefinite hang. The
-default locker is in-process; multi-instance deployments supply their own
-through the same tiny interface (`partial-content/redis-locker` is one).
-Cooperative cancellation has an observation-latency ceiling: a holder stalled
-past the point it should have yielded can still land one write. What makes
-that non-corrupting is the store's own preflight, so it is a required
-capability rather than a courtesy: `appendChunk` re-derives durable state at
-the start of every call and answers `UploadOffsetConflictError` instead of
-writing when the claimed offset disagrees, and a store declares it through
-`enforcesOffsetCheck`, which `createUploadOrchestrator` refuses to construct
-without. The lock cannot carry the guarantee itself, because it serializes
-writers without proving the writer still holds it, and no single-process
-deployment can opt out: the store is where the deployment shape stops being
-knowable, since the same store runs behind the in-process locker today and a
-distributed one tomorrow with nothing in the code to notice. The flag claims a
-preflight per call and not one atomic step with the bytes, so the residual is
-the one write above, bounded by the lock signal every adapter tests at each
-chunk boundary; closing it entirely needs a backend-enforced fencing token.
-
-### The post-abort grace window
-
-When a client vanishes mid-append, the bytes that already arrived deserve to
-become durable: the tus core protocol's network-failure guidance has both
-sides keep as much transferred data as possible, and the next probe must
-report an offset that reflects reality. So the orchestrator decouples the
-storage signal from the request signal: on client abort, the store write gets
-a grace window (default 10 s) to flush what it received before it is
-cancelled. Without the window, an aborted request would tear down the storage
-write mid-flush and the durable offset would be smaller than it honestly
-could be, costing the client a re-upload of bytes the server already had.
-
-### Per-backend mapping honesty
-
-Each write store maps the contract onto what its backend can actually do, and
-declares capability flags that say so instead of leaving a caller to assume.
-Every adapter accepts an append of ANY size and buffers to its backend's real
-granularity internally, so the orchestrator never re-chunks: `appendGranularity`
-and `uniformPartSize` are efficiency hints for whoever sizes the chunks, and
-`exactOffsetRecovery` is a disclosure to weigh when choosing a backend. Only
-`atomicCompletion` and `enforcesOffsetCheck` gate construction, and both are
-required:
-
-- **Filesystem**: appends are fsynced before they are acknowledged, because
-  `exactOffsetRecovery` is only honest if a post-crash `stat` can never see
-  bytes that were acked but not flushed. Completion verifies any asserted
-  SHA-256 or SHA-512 by streaming the assembled file, then publishes with a same-volume
-  atomic `rename()`: a failed or crashed completion never leaves a torn
-  object visible.
-- **S3-compatible**: multipart uploads enforce a 5 MiB floor on every
-  non-final part, so appends buffer to the upload's part size (fixed at
-  creation, at least the floor) and the sub-part remainder is parked in a
-  tail object, prepended to the next append or committed as the size-exempt
-  final part at completion. The offset derives from `ListParts` plus the
-  tail's size. The optional flexible-checksums
-  mode gives per-part transport integrity only: multipart SHA-256 checksums
-  are composite (a hash of per-part hashes), so no S3 backend can verify a
-  caller-asserted whole-representation SHA-256 at completion, and the store
-  declares `digestOnComplete: false` rather than pretending.
-- **GCS**: deliberately NOT the native resumable sessions, which demand
-  256 KiB append alignment and bind the whole upload to one session URI --
-  breaking byte-exact appends and stateless crash recovery. Instead each
-  append is its own immutable chunk object (a single-shot object write is
-  atomic: a chunk fully exists or does not exist), the offset is the sum of
-  listed chunk sizes, and completion assembles via server-side compose,
-  level by level under the 32-source cap, with a single final compose onto
-  the destination key so publication is all-or-nothing. Chunks are deleted
-  only after that final compose, so a crashed completion retries from intact
-  chunks.
-- **Azure**: appends stage uncommitted blocks on the final blob (invisible to
-  readers until commit), the offset derives from the uncommitted-block list,
-  and `Put Block List` publishes atomically. A freshly created upload with no
-  data staged would be indistinguishable from a missing one, so creation
-  stages a one-byte sentinel block under a reserved id: excluded from offset
-  sums, never committed, dropped by Azure at commit time. Azure's native GC
-  reaps uncommitted blocks after 7 days; the sweep hook reaps the small
-  bookkeeping blobs Azure will not.
-- **R2**: the native multipart binding exposes no ListParts, so the adapter
-  keeps its own durable part ledger, rewritten after every accepted part, and
-  derives the offset from it. The write ordering (part first, then ledger)
-  means a crash between the two orphans the just-uploaded part and the
-  derived offset honestly excludes it. That honesty has a hard limit, and it
-  is why R2 is the one store declaring `exactOffsetRecovery: false`: the
-  ledger is the adapter's own bookkeeping, not backend-derived truth, and the
-  binding offers nothing to cross-check it against. R2 also requires every
-  non-final part of an upload to be the same size, so appends buffer to a
-  fixed part size recorded at creation.
-
-### A declared capability is not a demonstrated one
-
-Two capability flags gate construction, and both are claims a store makes
-about its own behavior. `createUploadOrchestrator` can check that a store
-DECLARES `atomicCompletion` and `enforcesOffsetCheck`, and nothing at
-construction can tell a store that performs the at-write offset check from one
-that reports `true` and writes anyway. Documenting the obligation harder does
-not close that, because the failure mode is not a store author who disagrees;
-it is one who believes the flag is true and never had a way to find out.
-
-The second store presents as working. Appends land, uploads complete, and the
-guarantee is absent exactly when a distributed lock is stolen from a holder
-that stalled past its TTL and came back, which is the case nobody exercises by
-hand. So the checks ship as code (`partial-content/conformance`), not as
-prose: a plain async function per obligation, over the store's own public
-surface, with no test framework and no dependencies, so a store author can run
-it under any runner, in CI, or as a startup self-test against a staging
-bucket. The factory-not-instance signature is the same reasoning applied to
-durability: an offset held in process memory and one derived from the backend
-are indistinguishable until a second instance reads the same upload, so the
-harness makes one.
-
-What it must not do is launder an unverified guarantee into a green report.
-A store that is in-process by construction cannot demonstrate cross-instance
-durability at all, so `restartable: false` SKIPS those checks and reports them
-as skipped, rather than passing them or quietly omitting them: a report that
-counted them as passes would be a worse artifact than no report, since it
-would answer a question it never asked.
-
-The read side has the same gap for a different reason. No `ObjectStore`
-capability is gated at construction the way the write side's two are, and the
-obligations a custom read store most often misses are invisible while it
-serves bytes correctly: the total size reported on a partial read, which becomes the
-`Content-Range` total a client sizes its remaining requests against, and
-whether an absent key fails distinguishably from an outage, which decides
-between a 404 and a 502 a caching layer will retry. So `checkObjectStore`
-runs the read contract as assertions too, against an object the store already
-serves. It never creates and never deletes, because the contract has no
-vocabulary for either and a read store may front something immutable, which
-is what lets the check run where the real objects are instead of somewhere a
-fixture can be written. A store declaring `supportsRange: false` gets the same
-treatment as `restartable: false` on the write side: the range obligations are
-reported skipped, never passed.
-
-### Deliberate omissions
-
-- **No concatenation extension** (tus): a parallel-upload pattern with
-  substantial storage surface (partial uploads merged server-side), outside
-  the dialect's scope.
-- **The checksum extension verifies BUFFERED content** (tus
-  `Upload-Checksum`, opt-in via `checksum` on the tus handler): the
-  extension's discard-on-mismatch is only honest when unverified bytes never
-  reach the store, and a streamed append is durable as it flows, so a
-  checksummed request is buffered (hard-capped, construction-enforced),
-  verified, and only then appended. Streaming verification would need a
-  store-level "un-append" (truncate-to-offset) capability; if the contract
-  ever grows one, the buffer becomes an optimization instead of a
-  requirement. Hashing is caller-injected (`TusChecksumOptions`) with a
-  WebCrypto default (`webCryptoChecksum`) covering the spec-mandatory
-  `sha1`; the trailer variant (checksum-trailer) is descoped because Fetch
-  exposes no portable Request trailer API. Whole-representation verification
-  at completion (the IETF dialect's `Repr-Digest`) exists where the store can
-  honestly provide it.
-- **No `104 (Upload Resumption Supported)` interim responses** from the Fetch
-  handlers: a Fetch `Response` cannot carry interim responses, and the draft
-  only asks servers to send 104 when they can. The
-  `onResumptionSupported` hook carries the same facts, the `Upload-Limit`
-  the 104 must state on interop 9 and 10 included, so a transport that can
-  write interim responses may emit the 104 itself.
-- **No stored final response**: where a revision permits replaying the answer
-  to an append against an already-complete upload (interop 9 and 10), the reply is
-  synthesized from the durable facts, the offset and the completeness, not
-  served from a copy of the original completion response kept somewhere. The
-  durable facts are what a resumable protocol is defined in terms of, and
-  keeping response bodies alive past the request that produced them would add
-  a retention surface for no answer a client can distinguish.
+  silently. `buildCacheControl()` therefore defaults `no-transform` on, and
+  the serving handler's default is `private, no-cache, no-transform`; if you
+  hand-write `cacheControl` strings for digest- or range-heavy routes, add it
+  yourself.
 
 ## Runtime Notes
 

@@ -1,5 +1,215 @@
 # Changelog
 
+## 6.0.0 (2026-11-15)
+
+6.0 is the serving half of the package and has no upload support, by design:
+the resumable-upload write side is removed, not deferred. There are 6 breaking
+changes. Upload users stay on 5.x, which is superseded and receives no further
+fixes, or move uploads to presigned direct-to-storage writes; the 5.x upload
+code is preserved at the git tag `partial-content-write-side-parked-20261108`.
+
+### Highlights
+
+- The package is serving only: range and conditional requests, `Content-Disposition`, ETags and RFC 9530 digests where the backend holds one (S3 with checksums, R2, GCS with `digestMetadataKey`, an HTTP origin sending `Repr-Digest`, memory), over S3, R2, GCS, Azure Blob, the filesystem, plain HTTP origins and memory, in one zero-dependency kernel.
+- Upload support is removed, with no replacement in this package ([details](#upload-support-is-removed)).
+- `s3Store`, `azureStore` and `httpStore` refuse a key that is not plain, so no spelling of a key reaches a 5.x upload store's bookkeeping ([details](#a-key-that-is-not-plain-is-refused)).
+- `reservedPrefix` accepts a list on every store.
+- An object stored with a content coding is served with `Content-Encoding` over its stored bytes, and `serveObject` sets `encodeBody: "manual"` so Workers does not encode an encoded body again ([details](#an-object-stored-with-a-content-coding-is-served-with-it)).
+
+### Upgrading
+
+Each line links its section in `docs/UPGRADING.md`, widest reach first.
+
+- `s3Store`, `azureStore` and `httpStore` answer `404` for a key with a dot segment, and for one with an empty segment unless `keys: "verbatim"` is passed; every store that builds a request from the key answers `404` for a key longer than its backend holds. [2](docs/UPGRADING.md#2-a-store-with-a-reserved-prefix-refuses-a-key-that-is-not-plain)
+- An object stored with a content coding is served with that coding over its stored bytes, where 5.x served the encoded bytes as identity. [3](docs/UPGRADING.md#3-an-object-stored-with-a-content-coding-is-served-with-that-coding)
+- `toWebRequest`, `sendResponse` and `nodeHandler` are removed from `partial-content/node`; `serveObject` there is unchanged. [5](docs/UPGRADING.md#5-the-fetch-bridge-is-removed-from-partial-contentnode)
+- `redactErrorText` is no longer exported; branch on the `ProjectedError` fields instead. [4](docs/UPGRADING.md#4-redacterrortext-is-no-longer-exported)
+- A custom `ObjectStore` receives an open read as a `ReadRange` with no `end`; `OPEN_ENDED` and `isOpenEndedRange` are removed, and `headObject` and `getObject` are function properties, so a store that assumes a numeric `end` stops compiling. A store that enforces `ifMatch` says so with `pinsReads: true`. [6](docs/UPGRADING.md#6-a-read-to-the-end-of-the-object-has-no-end)
+- Upload support is removed: the tus, upload and redis-locker subpaths, every upload store and the write-side contract. [1](docs/UPGRADING.md#1-upload-support-is-removed)
+
+### Security
+
+- **GHSA-89p4-h3g3-4xgr** (Moderate, CVSS 5.9; `< 6.0.0`): `azureStore` passed the key to the Azure client as a URL path, which resolves `.` and `..` segments, so a key such as `../private/secret.pdf` read a blob in another container the store's credential could reach, and `createSignedUrl` signed one. [Details](#a-key-that-is-not-plain-is-refused)
+- **GHSA-g337-rqrv-3pwx** (Moderate; `= 5.0.0`, patched in none): The 5.0.0 fix of GHSA-pc6h-x4f9-g882 leaves one case open: an S3 upload completer that lost its lock while the length was undeclared may publish a short object. Workaround: move uploads to presigned direct-to-storage writes. [Details](#upload-support-is-removed)
+- **GHSA-33h6-pvcj-8xf3** (Moderate; `= 5.0.0`, patched in none): The 5.0.0 fix of GHSA-p45v-q42w-8p8w leaves a holder whose lease lapsed able to keep writing: on the filesystem upload store into a file already verified and published, on the R2 upload store over a part the new holder recorded, which wedges the completion. Workaround: move uploads to presigned direct-to-storage writes. [Details](#upload-support-is-removed)
+- **GHSA-99qc-7crc-mwqj** (Low; `>= 4.0.0, < 6.0.0`): A key such as `photos/../.partial-content-uploads/x` passed the reserved-prefix check on `azureStore`, and a case or empty-segment variant such as `.UPLOADS/x` or `a//../.uploads/x` passed it on `httpStore`, completing the 5.0.0 fix of GHSA-xpr4-6p72-3498. [Details](#a-key-that-is-not-plain-is-refused)
+- **GHSA-wmv3-crv6-xh32** (Low; `< 6.0.0`): On Bun and Deno, an `httpStore` network or mid-body error carried the full origin URL, a presigned signature included, to `onError` when no `auditKey` was set. [Details](#serving-path-behavior-that-changed-without-breaking-a-correct-call)
+- **GHSA-6x4w-gv2g-xhx9** (Low, CVSS 3.7; `>= 1.1.0, < 6.0.0`): On Windows, `fsStore` stripped a key's trailing dots and spaces before its device-name check in time quadratic in the length of such a run, so one request with a long run stalled the event loop (about 320 ms for 16 KiB). The strip is now one linear pass. [Details](#a-key-that-is-not-plain-is-refused)
+- **GHSA-623w-c8vr-6626** (Low; `= 5.0.0`, patched in none): When the configured `auditKey` returns `undefined`, upload events report the raw upload token, a case the 5.0.0 fix of GHSA-6vjh-ggjr-q7xr left open. Workaround: make `auditKey` always return a string, or move uploads to presigned direct-to-storage writes. [Details](#upload-support-is-removed)
+
+### Details
+
+#### Upload support is removed
+
+Removed, with no replacement: `partial-content/tus`, `partial-content/upload`
+and `partial-content/redis-locker`, the upload stores on every backend
+subpath, the `ResumableWriteStore` contract and its types, the upload error
+classes and matchers, `UPLOAD_STORE_CONTRACT_VERSION` and
+`checkResumableWriteStore`. `checkObjectStore` and `formatConformanceReport`
+stay in `partial-content/conformance`. The known 5.x write-side defects, unfixed
+there, are listed in `docs/UPGRADING.md`; 6.0 contains none of that code.
+
+#### A key that is not plain is refused
+
+The reserved-prefix check compared only the key's spelling with the prefix, so
+a key with a dot segment could name the reserved location once a request URL
+or path was built from it. On `azureStore` the same resolution reached past the
+container itself: `../other/blob` read a blob in another container the
+credential could reach. `s3Store`, `azureStore` and `httpStore`, which build
+a URL from the key, now answer `404` for a key with a `.` or `..` segment
+under either key policy, and for one with an empty segment under `keys:
+"plain"`, `%2e` in either case included and `\` counted as a separator, the
+segments the WHATWG URL Standard (section 4.1) treats as dot or empty. This
+also refuses keys that only look unusual, such as `/invoices/2026.pdf` or
+`reports//q1.pdf`; under `keys: "verbatim"` the prefix is also tested against
+the key with repeated slashes collapsed. `httpStore`, which hands the raw key
+to a URL the consumer builds, also refuses under either policy a key that
+starts with `/` or `\`, with a special scheme such as `https:` or `file:`, or
+with a C0 control or a space at either end, fetches only an `http:` or
+`https:` URL from `url()`, never one carrying a user name or password, and looks for a dot segment and the reserved prefixes in the part of the key before any `?`
+or `#` as well. A key holding `?`, `#`, `\`, a tab, a CR or an LF, which a URL parser
+rewrites or cuts the path at, is fetched only when the built URL's decoded
+path holds it, so a `url()` that interpolates the raw key into a path answers
+`404` for it, as does one that puts the key in a query value or maps it to
+another name; a key that begins with `?` or `#`, such as `#1 Invoice.pdf`, is
+served when `url()` encodes it with `encodeKeyPath`. Dot segments and the
+reserved prefixes are also looked for in the key's NFKC form, so a fullwidth
+solidus or full stop is read as the URL parser reads it. `encodeKeyPath`
+refuses a key with a leading empty segment, and takes `{ keys: "verbatim" }`
+to encode any other empty segment. `s3Store`, `r2Store`,
+`gcsStore` and `httpStore` answer `404` for a key over 1,024 UTF-8 bytes and
+`azureStore` for one over 4,096 (`maxKeyBytes` on `httpStore`), before any
+other reading of it, and each reading is linear in the key's length, as is
+`fsStore`'s Windows device-name check. `r2Store` and `gcsStore` take the key verbatim and serve it,
+and `fsStore` tests the reservation on the path a key resolves to. The key
+policy is the `keys` option (`"plain"` or `"verbatim"`), separate from the
+prefix: `reservedPrefix: ""` opts out of the prefix only, and a prefix that
+would reserve nothing (`"/.uploads/"`) throws a `TypeError` at construction.
+`httpStore` compares the prefix with case and normal form folded. `fsStore`
+no longer refuses a real file named `%2e%2e.txt`.
+
+#### An object stored with a content coding is served with it
+
+`s3Store`, `gcsStore`, `azureStore` and `r2Store` ignored the stored
+`Content-Encoding`, so an object uploaded with `--content-encoding gzip` was
+served as `200` with gzip bytes and no coding, under validators and a digest
+that vouched for the wrong representation. `ObjectMetadata` and `ObjectStream`
+gain `contentEncoding`, the stores fill it, and the response carries
+`Content-Encoding` over the stored bytes: length, ETag, digest and ranges all
+describe the encoded body (RFC 9110 Section 14.2), and a multi-range request is
+answered with the whole body. `gcsStore` reads with `decompress: false`.
+`httpStore` keeps refusing an origin response that carries a coding, because
+`fetch` has decoded it. `serveObject` sets `encodeBody: "manual"` on any
+response with a `Content-Encoding`, so Cloudflare Workers does not compress a
+precompressed variant or a stored-encoded object a second time.
+`representationCoding` normalizes a stored value for custom stores: a
+coding in the IANA HTTP Content Coding Registry is served as one, `identity`,
+`none`, `aws-chunked`, a MIME transfer-encoding name (`base64`, `7bit`) and
+values that are not codings (a charset name) are identity, and any other token
+is refused.
+
+#### A read to the end of the object has no end
+
+`getObject` receives a `ReadRange` whose `end` is `undefined` for `bytes=a-`,
+where 5.x passed `OPEN_ENDED`, a number a store could do arithmetic on and send
+to its backend. `OPEN_ENDED` and `isOpenEndedRange` are removed from the root
+exports. `headObject` and `getObject` are declared as function properties, so a
+store written for the closed range fails to compile instead of sending
+`bytes=3-undefined`. A sent `ifMatch` counts as a pinned read only from a
+store that sets `pinsReads: true`; the built-in S3, R2, GCS, Azure and memory
+stores set it, and a custom store that enforces `ifMatch` without reporting a
+validator from `getObject` sets it to keep the `HEAD`'s ETag and digest.
+
+#### checkObjectStore checks what the serving path emits
+
+The harness asserted bytes and `contentLength` only, so a store that shifted
+the served bounds, reported a window's digest on a ranged read or reported no
+total on a full read passed with `ok: true` while `serveObject` corrupted its
+responses. It now also checks the served span of a window, `totalSize` and an
+absent `range` on a full read, the digest on full and ranged reads, HEAD and GET
+validator and coding agreement, a pinned read and a read pinned to a stale
+validator, and for an `authoritativeRange` store an
+open-ended range and a past-EOF end. A custom store that passed 5.x may now
+report failures that were always there. Each check has a deadline (`timeoutMs`,
+10 seconds by default), so a store that never settles fails the check instead of
+hanging the run.
+
+#### Serving-path behavior that changed without breaking a correct call
+
+- A caller's Content-Security-Policy from `securityHeaders` on inline active
+  content is composed with the default `sandbox` directive, no longer
+  replacing it.
+- With `precompressed`, the coding variants and the identity object are probed
+  in one round trip; a variant is served only while the identity exists and is
+  not newer than the variant, a sibling answered not-found is not probed again for 30
+  seconds, a confirmed variant is remembered for 30 seconds, and a variant
+  removed between probe and read is answered from the identity object instead
+  of a `404`.
+- `onServe`, `onTransfer`, `onTiming` and `onError` may be `async`; a throw or
+  rejection reports to `onError` as `"audit"`, and a failing `onError` is
+  swallowed on every adapter. A throwing or ill-typed `disposition`,
+  `securityHeaders`, `preferSignedUrl` or `ctx` answers `500` as `"context"`
+  instead of rejecting the handler, and an invalid static `disposition` or
+  `signedUrlExpiresSeconds` throws at construction. A multipart response
+  releases its first part when the framing throws.
+- A store failure after the headers are sent reports to `onError` as `"get"`.
+  A client abort is decided from the request signal alone, so a store's own
+  `AbortError` is a store failure answered `502` or `503`, where it was a
+  silent `499`; the Node adapter reads a disconnect from the response's
+  `close`.
+- The default `cacheControl` is `private, no-cache, no-transform`, so an
+  intermediary does not re-compress a body its digest and validators describe.
+- When the Node or Hono `auditKey` extractor returns `undefined`, events carry
+  `"unkeyed"` and `onError` the projected error, where the storage key was the
+  fallback.
+- A store that ignores `Range` on a multi-range request is answered with the
+  whole representation as a `200`, where it was a `502`.
+- `httpStore` surfaces a failure it did not author (from `url()`, `headers()`,
+  `fetch` or a body read) as a new error with a message of its own wording and the original
+  `name` and `code`, so the origin URL, a presigned query string included,
+  never reaches `onError`; a `name` or `code` that is not identifier-shaped,
+  and a field whose read throws, are left out. Under an `auditKey` the error
+  from a failing `onServe`, `onTransfer` or `onTiming` hook is projected too.
+  A failure of `url()` or `headers()` carries no `status` or
+  `retryAfterSeconds` and is served as `502`; an `ObjectNotFoundError` or
+  `StoreUnavailableError` thrown by `url()`, recognised by class or by `name`,
+  is served as `404`, or as `503` with its `Retry-After`.
+- The Fetch, Node and Hono adapters build every plain-text error response the
+  same way, with `Accept-Ranges: none` and a `Content-Length` counted in bytes,
+  and a `HEAD` response's origin body is always released.
+- `httpStore` handles redirects itself and always sends `redirect: "manual"`,
+  so the default refusal works on Cloudflare Workers, whose `fetch` rejects
+  `redirect: "error"`. `redirect` takes `"error"` or `"follow"`; under
+  `"follow"` at most 10 hops are followed, to `http:` or `https:` only and
+  never from `https:` to `http:`, each through the injected `fetch`, and a hop
+  to another origin carries none of the configured `headers`.
+- `httpStore`'s `url` may return a `URL` or a promise of one; a result that is
+  neither a string nor a `URL` is a `TypeError`, and a `headers` record with an
+  invalid name or value throws at construction.
+- A relayed `Retry-After` is read only as delay-seconds or an RFC 9110
+  HTTP-date and capped at 86400 seconds.
+- A `ctx.key` that is not a string answers `500` with operation `"context"`.
+- `redactErrorText` is internal ([details](#redacterrortext-is-no-longer-exported)).
+- `generateETag` no longer throws for the 4.x names `hash`, `size` and `mtime`.
+
+#### The Fetch bridge is removed from `partial-content/node`
+
+`toWebRequest`, `sendResponse`, `nodeHandler` and their option types are
+removed. A file route uses `serveObject` from `partial-content/node`, which
+writes the response itself and is unchanged; a Fetch-shaped handler is what
+`partial-content/web` already is. `docs/UPGRADING.md` section 5.
+
+#### `redactErrorText` is no longer exported
+
+Nothing in the serving path called it, and the `ProjectedError` allow-list
+under an `auditKey` is the one redaction model. Branch on `name`, `code`,
+`status` and `operation`; `docs/UPGRADING.md` section 4.
+
+#### Stall timeouts past the largest timer delay
+
+The Node adapter clamps `writeStallTimeoutMs` to 2^31 - 1 ms. A larger value overflowed the timer and fired after about a
+millisecond in 5.0.0, aborting a healthy stream.
+
 ## 5.0.0 (2026-10-27)
 
 The write path stops inferring facts it can observe, and 15 defects in published

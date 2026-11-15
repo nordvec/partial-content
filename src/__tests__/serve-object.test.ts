@@ -1,6 +1,7 @@
 import { describe, test, expect, mock } from "bun:test";
 import { serveObject, type ServeContext } from "../web";
-import type { ObjectStore, ObjectMetadata, ObjectStream, ParsedRange } from "../web";
+import type { ObjectStore, ObjectMetadata, ObjectStream } from "../web";
+import type { ReadRange } from "../index";
 import { StoreUnavailableError } from "../object-store";
 
 // ─── Test Helpers ───────────────────────────────────────────────────────────
@@ -17,7 +18,7 @@ function createMockStore(overrides?: Partial<ObjectStore>): ObjectStore {
         getObject: mock(
             async (
                 _key: string,
-                _opts?: { range?: ParsedRange; signal?: AbortSignal; ifMatch?: string },
+                _opts?: { range?: ReadRange; signal?: AbortSignal; ifMatch?: string },
             ): Promise<ObjectStream> => ({
                 body: new ReadableStream<Uint8Array<ArrayBuffer>>({
                     start(controller) {
@@ -91,7 +92,7 @@ describe("serveObject", () => {
 
     test("returns 206 on valid Range with conditional headers", async () => {
         const rangeStore = createMockStore({
-            getObject: mock(async (_key: string, _opts?: { range?: ParsedRange }): Promise<ObjectStream> => ({
+            getObject: mock(async (_key: string, _opts?: { range?: ReadRange }): Promise<ObjectStream> => ({
                 body: new ReadableStream<Uint8Array<ArrayBuffer>>({
                     start(controller) {
                         controller.enqueue(new Uint8Array([1, 2, 3]));
@@ -126,7 +127,7 @@ describe("serveObject", () => {
         // before the browser has an ETag. The adapter must HEAD to get totalSize,
         // parse the range, then GET with the resolved range.
         const rangeStore = createMockStore({
-            getObject: mock(async (_key: string, _opts?: { range?: ParsedRange }): Promise<ObjectStream> => ({
+            getObject: mock(async (_key: string, _opts?: { range?: ReadRange }): Promise<ObjectStream> => ({
                 body: new ReadableStream<Uint8Array<ArrayBuffer>>({
                     start(controller) {
                         controller.enqueue(new Uint8Array([1, 2, 3]));
@@ -236,7 +237,7 @@ describe("serveObject", () => {
     test("TOCTOU guard: degrades to 200 when store ignores range (no ContentRange)", async () => {
         // Simulate: a range was requested via conditionals, but S3 returned full content
         const noRangeStore = createMockStore({
-            getObject: mock(async (_key: string, _opts?: { range?: ParsedRange }): Promise<ObjectStream> => ({
+            getObject: mock(async (_key: string, _opts?: { range?: ReadRange }): Promise<ObjectStream> => ({
                 body: new ReadableStream<Uint8Array<ArrayBuffer>>({
                     start(c) {
                         c.close();
@@ -403,7 +404,7 @@ describe("serveObject", () => {
         const getSpy = mock(
             async (
                 _key: string,
-                _opts?: { range?: ParsedRange; signal?: AbortSignal; ifMatch?: string },
+                _opts?: { range?: ReadRange; signal?: AbortSignal; ifMatch?: string },
             ): Promise<ObjectStream> => ({
                 body: new ReadableStream<Uint8Array<ArrayBuffer>>({
                     start(controller) {
@@ -612,7 +613,7 @@ describe("serveObject", () => {
         expect(errorSpy.mock.calls[0][1]).toEqual({ key: "reports/q4.pdf", operation: "get" });
     });
 
-    test("does not call onError on AbortError", async () => {
+    test("does not call onError when the client aborted", async () => {
         const abortError = new DOMException("Aborted", "AbortError");
         const store = createMockStore({
             headObject: mock(async () => {
@@ -622,11 +623,29 @@ describe("serveObject", () => {
         const errorSpy = mock((_err: unknown, _ctx: { key: string; operation: string }) => {});
         const handler = serveObject(store, { onError: errorSpy });
 
-        const req = mockRequest({ "if-none-match": '"xyz"' });
+        const req = new Request("http://localhost/stream", {
+            headers: { "if-none-match": '"xyz"' },
+            signal: AbortSignal.abort(),
+        });
         const response = await handler(req, defaultCtx());
 
         expect(response.status).toBe(499);
         expect(errorSpy).not.toHaveBeenCalled();
+    });
+
+    test("reports an AbortError the store raised on its own while the client is connected", async () => {
+        const store = createMockStore({
+            headObject: mock(async () => {
+                throw new DOMException("origin timeout", "AbortError");
+            }),
+        });
+        const errorSpy = mock((_err: unknown, _ctx: { key: string; operation: string }) => {});
+        const handler = serveObject(store, { onError: errorSpy });
+
+        const response = await handler(mockRequest({ "if-none-match": '"xyz"' }), defaultCtx());
+
+        expect(response.status).toBe(502);
+        expect(errorSpy).toHaveBeenCalledTimes(1);
     });
 
     test("all success responses include statusText", async () => {
@@ -942,7 +961,7 @@ describe("serveObject", () => {
     test("onServe fires on 206 with range metadata", async () => {
         const events: Array<Record<string, unknown>> = [];
         const rangeStore = createMockStore({
-            getObject: mock(async (_key: string, _opts?: { range?: ParsedRange }): Promise<ObjectStream> => ({
+            getObject: mock(async (_key: string, _opts?: { range?: ReadRange }): Promise<ObjectStream> => ({
                 body: new ReadableStream({
                     start(controller) {
                         controller.enqueue(new Uint8Array([72, 101, 108, 108, 111]));
@@ -1023,7 +1042,7 @@ describe("serveObject", () => {
             getObject: mock(
                 async (
                     _key: string,
-                    _opts?: { range?: ParsedRange; signal?: AbortSignal; ifMatch?: string },
+                    _opts?: { range?: ReadRange; signal?: AbortSignal; ifMatch?: string },
                 ): Promise<ObjectStream> => ({
                     body: new ReadableStream<Uint8Array<ArrayBuffer>>({
                         start(controller) {
