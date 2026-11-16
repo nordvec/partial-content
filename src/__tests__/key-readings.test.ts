@@ -374,20 +374,18 @@ describe("httpStore releases a HEAD body", () => {
 });
 
 describe("the backend error classifiers are total", () => {
-    const hostile = new Proxy(
-        {},
-        {
-            get: () => {
-                throw new Error("getter");
-            },
-            getPrototypeOf: () => {
-                throw new Error("trap");
-            },
-            has: () => {
-                throw new Error("trap");
-            },
+    // An Error target types the Proxy as an Error; every trap still throws, so no read of it succeeds.
+    const hostile = new Proxy(new Error("hostile"), {
+        get: () => {
+            throw new Error("getter");
         },
-    );
+        getPrototypeOf: () => {
+            throw new Error("trap");
+        },
+        has: () => {
+            throw new Error("trap");
+        },
+    });
     const throwingGetter = Object.defineProperty(new Error("x"), "statusCode", {
         get: () => {
             throw new Error("getter");
@@ -419,6 +417,7 @@ describe("the backend error classifiers are total", () => {
         // Caught in place: returning the Proxy from a promise would read its `then`.
         let failure: unknown;
         try {
+            // oxlint-disable-next-line typescript/prefer-promise-reject-errors -- the non-Error rejection is the input under test: a backend may reject with any value
             await classifyStoreRead("k", () => Promise.reject(hostile), {
                 notFound: () => {
                     throw new Error("classifier");
