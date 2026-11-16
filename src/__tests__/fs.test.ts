@@ -30,6 +30,16 @@ afterAll(async () => {
     await removeTree(root);
 });
 
+describe("fsStore: root", () => {
+    test("refuses a relative, missing or non-string root at construction", () => {
+        const refusal = /fsStore: options\.root must be an absolute path/;
+        expect(() => fsStore({ root: "public" })).toThrow(refusal);
+        expect(() => fsStore({ root: "./public" })).toThrow(refusal);
+        expect(() => fsStore({ root: 7 as never })).toThrow(refusal);
+        expect(() => fsStore(undefined as never)).toThrow(refusal);
+    });
+});
+
 describe("fsStore: headObject", () => {
     test("returns size and HTTP-date Last-Modified", async () => {
         const store = fsStore({ root });

@@ -26,6 +26,8 @@ import {
     urlKeyGuard,
     retryAfterFrom,
     failRead,
+    readPath,
+    withoutTrailing,
     isPlainObjectKey,
     isObjectNotFoundError,
     isObjectChangedError,
@@ -819,9 +821,35 @@ describe("retryAfterFrom", () => {
             { "retry-after": "soon" },
             throwingGet,
             throwingRecord,
+            // A function is not a header bag, even one carrying a `get`.
+            Object.assign(() => undefined, { get: () => "5", "retry-after": "5" }),
         ]) {
             expect(retryAfterFrom(bag)).toBeUndefined();
         }
+    });
+});
+
+describe("readPath", () => {
+    test("walks objects and functions, and stops at a primitive or null", () => {
+        expect(readPath({ a: { b: 1 } }, "a", "b")).toBe(1);
+        expect(
+            readPath(
+                Object.assign(() => undefined, { status: 503 }),
+                "status",
+            ),
+        ).toBe(503);
+        expect(readPath("text", "length")).toBeUndefined();
+        expect(readPath(7, "toFixed")).toBeUndefined();
+        expect(readPath({ a: null }, "a", "b")).toBeUndefined();
+    });
+});
+
+describe("withoutTrailing", () => {
+    test("strips only the trailing run, and a text made of it entirely becomes empty", () => {
+        expect(withoutTrailing("a//", "/")).toBe("a");
+        expect(withoutTrailing("a", "/")).toBe("a");
+        expect(withoutTrailing("///", "/")).toBe("");
+        expect(withoutTrailing("", "/")).toBe("");
     });
 });
 
@@ -1025,6 +1053,22 @@ describe("projectError", () => {
     test("a thrown non-object projects to its typeof, null included", () => {
         expect(projectError("boom")).toStrictEqual({ name: "string" });
         expect(projectError(null)).toStrictEqual({ name: "object" });
+    });
+
+    test("a status is projected only as an integer from 100 to 599", () => {
+        expect(projectError({ status: 100 }).status).toBe(100);
+        expect(projectError({ status: 599 }).status).toBe(599);
+        for (const status of [99, 600, 503.5, "503"]) {
+            expect(Object.hasOwn(projectError({ status }), "status")).toBe(false);
+        }
+    });
+
+    test("a name or code is projected only when it is a string or number, never a value that stringifies to one", () => {
+        const stringifies = { toString: () => "ECONNRESET" };
+        const projected = projectError({ name: stringifies, code: stringifies });
+        expect(projected.name).toBe("Error");
+        expect(Object.hasOwn(projected, "code")).toBe(false);
+        expect(projectError({ name: "AbortError", code: 7 })).toStrictEqual({ name: "AbortError", code: 7 });
     });
 
     test("no operation means no operation field", () => {

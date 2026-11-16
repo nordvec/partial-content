@@ -206,6 +206,11 @@ function mockContainer(opts: MockAzureOpts = {}): AzureContainerClient {
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 describe("azureStore: headObject", () => {
+    test("declares that its reads are pinned to the validated version", () => {
+        // download() sends conditions.ifMatch, so the orchestrator may skip its own pinning.
+        expect(azureStore({ containerClient: mockContainer() }).pinsReads).toBe(true);
+    });
+
     test("maps blob properties to ObjectMetadata", async () => {
         const store = azureStore({ containerClient: mockContainer() });
         const meta = await store.headObject("doc.pdf");
@@ -467,6 +472,13 @@ describe("azureStore: createSignedUrl", () => {
             containerClient: mockContainer({ sasError: new RangeError("Must provide 'permissions' and 'expiresOn'") }),
         });
         await expect(store.createSignedUrl!("doc.pdf", { expiresInSeconds: 60 })).rejects.toBeInstanceOf(RangeError);
+    });
+
+    test("a RangeError whose message is not a string throws, even one that stringifies to the refusal", async () => {
+        const sasError = new RangeError();
+        Object.defineProperty(sasError, "message", { value: { toString: () => NO_SHARED_KEY } });
+        const store = azureStore({ containerClient: mockContainer({ sasError }) });
+        await expect(store.createSignedUrl!("doc.pdf", { expiresInSeconds: 60 })).rejects.toBe(sasError);
     });
 
     test("an aborted signal rejects with its reason before anything is signed", async () => {

@@ -67,6 +67,10 @@ describe("representationCoding", () => {
             "iso-8859-1",
             "us-ascii",
             "windows-1252",
+            "utf-16",
+            "iso-8859-15",
+            "latin1",
+            "latin-1",
             "text/plain; charset=utf-8",
             "charset=utf-8",
             "a b",
@@ -85,7 +89,8 @@ describe("representationCoding", () => {
     });
 
     test("refuses an unregistered token it cannot tell from a coding", () => {
-        for (const unknown of ["foo", "gzip, foo", "g!z", "x-custom"]) {
+        // A charset name is identity only as the whole token: one with a prefix or a suffix is not a charset.
+        for (const unknown of ["foo", "gzip, foo", "g!z", "x-custom", "xutf-8", "utf-8x", "x-latin1"]) {
             expect(() => representationCoding(unknown)).toThrow(TypeError);
         }
     });
