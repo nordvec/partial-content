@@ -1,4 +1,4 @@
-import { describe, test, expect, mock, vi } from "bun:test";
+import { describe, test, expect, mock } from "bun:test";
 import { fileURLToPath } from "node:url";
 import { s3Store, ObjectChangedError, ObjectNotFoundError, StoreUnavailableError } from "../s3";
 import { nodeStreamToWeb } from "../object-store";
@@ -486,7 +486,7 @@ describe("s3Store: SDK body shapes", () => {
 describe("s3Store: createSignedUrl", () => {
     test("returns ok with a presigned URL and forwards the disposition", async () => {
         const seen: Array<{ input: Record<string, unknown>; expiresIn?: number }> = [];
-        vi.doMock("@aws-sdk/s3-request-presigner", () => ({
+        mock.module("@aws-sdk/s3-request-presigner", () => ({
             getSignedUrl: async (
                 _client: unknown,
                 command: { input: Record<string, unknown> },
@@ -514,7 +514,7 @@ describe("s3Store: createSignedUrl", () => {
 
     test("forces attachment + inert content type even without a downloadFilename", async () => {
         const seen: Array<{ input: Record<string, unknown> }> = [];
-        vi.doMock("@aws-sdk/s3-request-presigner", () => ({
+        mock.module("@aws-sdk/s3-request-presigner", () => ({
             getSignedUrl: async (_client: unknown, command: { input: Record<string, unknown> }) => {
                 seen.push({ input: command.input });
                 return "https://bucket.s3.example/doc?signature=abc";
@@ -534,7 +534,7 @@ describe("s3Store: createSignedUrl", () => {
 
     test("cacheControl override rides the signed response, absent when unset", async () => {
         const seen: Array<{ input: Record<string, unknown> }> = [];
-        vi.doMock("@aws-sdk/s3-request-presigner", () => ({
+        mock.module("@aws-sdk/s3-request-presigner", () => ({
             getSignedUrl: async (_client: unknown, command: { input: Record<string, unknown> }) => {
                 seen.push({ input: command.input });
                 return "https://bucket.s3.example/doc?signature=abc";
@@ -558,7 +558,7 @@ describe("s3Store: createSignedUrl", () => {
     test("a signing failure throws: ok: false is reserved for a store that cannot sign", async () => {
         // A credential provider that fails means signing was supposed to work.
         // Answering ok: false would silently turn it into a streamed response.
-        vi.doMock("@aws-sdk/s3-request-presigner", () => ({
+        mock.module("@aws-sdk/s3-request-presigner", () => ({
             getSignedUrl: async () => {
                 throw new Error("credentials expired");
             },
@@ -602,7 +602,7 @@ describe("s3Store: createSignedUrl", () => {
     test("an aborted signal is honoured before and after signing", async () => {
         let signed = 0;
         const controller = new AbortController();
-        vi.doMock("@aws-sdk/s3-request-presigner", () => ({
+        mock.module("@aws-sdk/s3-request-presigner", () => ({
             getSignedUrl: async () => {
                 signed += 1;
                 controller.abort(new Error("caller went away"));
@@ -760,7 +760,7 @@ describe("s3Store: reserved keys are refused on every read, signing included", (
     function countingStore(opts: { reservedPrefix?: string; keys?: "plain" | "verbatim" } = {}) {
         let sends = 0;
         let signs = 0;
-        vi.doMock("@aws-sdk/s3-request-presigner", () => ({
+        mock.module("@aws-sdk/s3-request-presigner", () => ({
             getSignedUrl: async () => {
                 signs += 1;
                 return "https://bucket.s3.example/doc?signature=abc";

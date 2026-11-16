@@ -99,6 +99,23 @@ export default {
             files: ["src/__tests__/**/*.ts"],
             rules: {
                 "no-empty": ["error", { allowEmptyCatch: false }],
+                // The public repository runs this suite on the stable Bun its CI pins,
+                // while the monorepo typechecks it against canary bun-types, so a
+                // canary-only `vi` member (setSystemTime, stubEnv, doMock) compiles
+                // here and fails there. The stable bun:test exports cover each one.
+                "no-restricted-imports": [
+                    "error",
+                    {
+                        paths: [
+                            {
+                                name: "bun:test",
+                                importNames: ["vi"],
+                                message:
+                                    "Use the stable bun:test exports (mock, mock.module, spyOn, setSystemTime) and restore process.env by hand; the public CI runs stable Bun, where vi lacks members the canary types declare.",
+                            },
+                        ],
+                    },
+                ],
             },
         },
     ],

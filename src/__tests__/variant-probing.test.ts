@@ -64,14 +64,12 @@ afterEach(() => setSystemTime());
 describe("variant probing", () => {
     test("the candidate variants are probed together, not one after another", async () => {
         const p = probed(memoryStore({ objects: { "app.json": { body: PLAIN } } }), 25);
-        const started = performance.now();
         const res = await run(serveObject(p.store, { precompressed: true }));
-        const elapsed = performance.now() - started;
         expect(res.status).toBe(200);
         expect(p.heads.toSorted()).toEqual(["app.json", "app.json.br", "app.json.gz", "app.json.zst"]);
+        // Concurrency is read from the store's in-flight count, never from
+        // wall-clock time, which a loaded machine stretches past any bound.
         expect(p.peak()).toBe(4);
-        // Four sequential 25 ms probes would take at least 100 ms.
-        expect(elapsed).toBeLessThan(70);
     });
 
     test("the best-ranked hit wins whichever probe answers first", async () => {

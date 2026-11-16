@@ -1,4 +1,4 @@
-import { describe, test, expect, vi, spyOn } from "bun:test";
+import { describe, test, expect, setSystemTime, spyOn } from "bun:test";
 import {
     parseRangeHeader,
     parseRanges,
@@ -3089,22 +3089,22 @@ describe("fromNodeHeaders prototype safety", () => {
 
 describe("If-Range date strong-validator rule (RFC 9110 13.1.5 step 1)", () => {
     test("a Last-Modified in the current second is weak: range must be ignored", () => {
-        vi.setSystemTime(new Date("2025-06-28T12:00:00.500Z"));
+        setSystemTime(new Date("2025-06-28T12:00:00.500Z"));
         try {
             const date = "Sat, 28 Jun 2025 12:00:00 GMT";
             expect(isRangeFresh(mockHeaders({ "if-range": date }), undefined, date)).toBe(false);
         } finally {
-            vi.setSystemTime();
+            setSystemTime();
         }
     });
 
     test("a Last-Modified whose second has fully elapsed is strong: range honored", () => {
-        vi.setSystemTime(new Date("2025-06-28T12:00:05.000Z"));
+        setSystemTime(new Date("2025-06-28T12:00:05.000Z"));
         try {
             const date = "Sat, 28 Jun 2025 12:00:00 GMT";
             expect(isRangeFresh(mockHeaders({ "if-range": date }), undefined, date)).toBe(true);
         } finally {
-            vi.setSystemTime();
+            setSystemTime();
         }
     });
 });
@@ -3226,11 +3226,11 @@ describe("a future Last-Modified is clamped to now", () => {
     const FUTURE = "2025-06-28T13:00:00.000Z";
 
     function atNow<T>(fn: () => T): T {
-        vi.setSystemTime(NOW);
+        setSystemTime(NOW);
         try {
             return fn();
         } finally {
-            vi.setSystemTime();
+            setSystemTime();
         }
     }
 
@@ -3296,11 +3296,13 @@ describe("a future Last-Modified is clamped to now", () => {
 
 describe("a zoneless ISO lastModified is read as UTC", () => {
     function inZone<T>(tz: string, fn: () => T): T {
-        vi.stubEnv("TZ", tz);
+        const prior = process.env.TZ;
+        process.env.TZ = tz;
         try {
             return fn();
         } finally {
-            vi.unstubAllEnvs();
+            if (prior === undefined) delete process.env.TZ;
+            else process.env.TZ = prior;
         }
     }
 
@@ -3547,12 +3549,12 @@ describe("If-Range entity-tag and date comparison (RFC 9110 Section 13.1.5)", ()
         const http = "Sun, 06 Nov 1994 08:49:37 GMT";
         const lastMod = Date.parse(http);
         try {
-            vi.setSystemTime(new Date(lastMod + 999));
+            setSystemTime(new Date(lastMod + 999));
             expect(isRangeFresh(mockHeaders({ "if-range": http }), undefined, http)).toBe(false);
-            vi.setSystemTime(new Date(lastMod + 1000));
+            setSystemTime(new Date(lastMod + 1000));
             expect(isRangeFresh(mockHeaders({ "if-range": http }), undefined, http)).toBe(true);
         } finally {
-            vi.setSystemTime();
+            setSystemTime();
         }
     });
 });
