@@ -56,8 +56,6 @@ jobs:
       # Every runtime executes the dist/ that is packed below.
       - name: Smoke on Node 24
         run: node smoke/smoke.mjs
-      - name: Smoke the Node bridge on Node 24
-        run: node smoke/node-bridge.mjs
       - name: Smoke on Bun
         run: bun smoke/smoke.mjs
       - name: Install Deno

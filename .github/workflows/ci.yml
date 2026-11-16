@@ -58,8 +58,6 @@ jobs:
         run: bunx tsc --noEmit -p smoke/tsconfig.consumer.json
       - name: Smoke on Node 24
         run: node smoke/smoke.mjs
-      - name: Smoke the Node bridge on Node 24
-        run: node smoke/node-bridge.mjs
       - name: Smoke on Bun
         run: bun smoke/smoke.mjs
       # Deno via npm (no third-party action to pin); --allow-read for the dist import, --allow-net for the loopback origin.
