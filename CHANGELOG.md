@@ -164,6 +164,9 @@ hanging the run.
   fallback.
 - A store that ignores `Range` on a multi-range request is answered with the
   whole representation as a `200`, where it was a `502`.
+- `fsStore` answers a key whose name is longer than the filesystem can hold
+  (`ENAMETOOLONG`) as not found, served `404`, where the raw error was served
+  `502`.
 - `httpStore` surfaces a failure it did not author (from `url()`, `headers()`,
   `fetch` or a body read) as a new error with a message of its own wording and the original
   `name` and `code`, so the origin URL, a presigned query string included,

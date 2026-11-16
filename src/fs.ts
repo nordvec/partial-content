@@ -843,7 +843,11 @@ function errnoCode(err: unknown): string | undefined {
     return (err as NodeJS.ErrnoException | undefined)?.code;
 }
 
-/** Absent, including a final-component link an O_NOFOLLOW open refused (ELOOP). */
+/**
+ * Absent, including a final-component link an O_NOFOLLOW open refused (ELOOP)
+ * and a name longer than the filesystem can hold (ENAMETOOLONG), under which
+ * no object can exist.
+ */
 function isFileNotFound(err: unknown): boolean {
-    return ["ENOENT", "ENOTDIR", "ELOOP"].includes(`${errnoCode(err)}`);
+    return ["ENOENT", "ENOTDIR", "ELOOP", "ENAMETOOLONG"].includes(`${errnoCode(err)}`);
 }

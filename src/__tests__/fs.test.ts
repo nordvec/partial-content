@@ -111,6 +111,13 @@ describe("fsStore: headObject", () => {
         await expect(store.getObject("hello.txt/child")).rejects.toBeInstanceOf(ObjectNotFoundError);
     });
 
+    test("a name longer than the filesystem holds is not-found (ENAMETOOLONG), not a raw errno", async () => {
+        const store = fsStore({ root });
+        const key = `${"x".repeat(300)}.txt`;
+        await expect(store.headObject(key)).rejects.toBeInstanceOf(ObjectNotFoundError);
+        await expect(store.getObject(key)).rejects.toBeInstanceOf(ObjectNotFoundError);
+    });
+
     test("accepts an empty options object (no signal)", async () => {
         const store = fsStore({ root });
         expect((await store.headObject("hello.txt", {})).contentLength).toBe(20);
